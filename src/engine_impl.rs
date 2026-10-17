@@ -310,6 +310,59 @@ pub async fn cancelled(cancel: &Arc<AtomicBool>) {
     while !cancel.load(Ordering::Acquire) { tokio::time::sleep(std::time::Duration::from_millis(20)).await; }
 }
 
+const COMPACTION_PROMPT: &str = "Summarize the conversation for another coding agent to continue. Preserve the user's goal, constraints, decisions, changed files, executed commands and their results, unresolved errors, and next actions. Quote relevant identifiers and paths. Do not perform the task or call tools. Produce a substantive continuation summary.";
+
+/// Compact history mid-turn: ask the model for a continuation summary and
+/// persist it as a summary message. build_messages restarts history from the
+/// newest summary, so the next request carries the summary instead of the
+/// transcript that overflowed the provider's context window.
+async fn compact_history(app: &App, adapter: &dyn provider::ProviderAdapter, model: &ModelRef, sid: &str, parent: &str, messages: Vec<Value>, limit: Option<u64>) -> Result<(), String> {
+    // The summarizer must not overflow the way the full transcript did: keep
+    // the freshest tail, sized in rough characters (~4 chars/token).
+    let budget = limit.unwrap_or(64_000).saturating_mul(2).max(8_000) as usize;
+    let mut total = 0usize;
+    let mut start = messages.len();
+    while start > 0 {
+        let size = messages[start - 1]["content"].to_string().len();
+        if start < messages.len() && total + size > budget { break; }
+        total += size;
+        start -= 1;
+    }
+    let mut request_messages: Vec<Value> = messages.into_iter().skip(start).collect();
+    if request_messages.is_empty() { return Err("Nothing to compact".into()); }
+    request_messages.push(json!({"role": "user", "content": "Produce the continuation summary now."}));
+    let request = ChatRequest { model: model.model_id.clone(), system: COMPACTION_PROMPT.into(), messages: request_messages, tools: Vec::new(), variant: None, session_id: Some(sid.into()) };
+    let mut stream = adapter.stream(request).await.map_err(|error| error.message)?;
+    let mut summary = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            ProviderEvent::TextDelta(delta) => summary.push_str(&delta),
+            ProviderEvent::Finished { .. } => break,
+            ProviderEvent::Error(error) => return Err(error),
+            _ => {}
+        }
+    }
+    let text = summary.trim();
+    if text.is_empty() { return Err("provider returned an empty compaction summary".into()); }
+    let now = now_ms();
+    let mid = hex_id("msg_");
+    let part = json!({"id": hex_id("prt_"), "sessionID": sid, "messageID": mid, "type": "text", "text": text, "time": {"start": now, "end": now}});
+    let info = MessageInfo {
+        id: mid, session_id: sid.into(), role: "assistant".into(),
+        time: MessageTime { created: now, completed: Some(now) },
+        parent_id: Some(parent.into()),
+        model_id: Some(model.model_id.clone()), provider_id: Some(model.provider_id.clone()),
+        agent: Some("compaction".into()), mode: Some("compaction".into()),
+        cost: Some(0.0), tokens: Some(Tokens::default()), summary: Some(true),
+        ..Default::default()
+    };
+    app.store.add_message(&MessageWithParts { info: info.clone(), parts: vec![part.clone()] })?;
+    emit_message(&info);
+    emit_part(&part);
+    bus().emit("session.compacted", json!({"sessionID": sid}));
+    Ok(())
+}
+
 async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: PromptRequest, cancel: Arc<AtomicBool>) -> Result<Value,String> {
     let session = app.store.get_session(sid)?.ok_or("Session not found")?;
     let app=app.for_directory(&session.directory)?;
@@ -337,7 +390,8 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
     };
     if read_only { system.push_str("\n\nThis is a read-only analysis session. Use the supplied reading and search tools. Do not modify files or request execution tools."); }
     if compact {
-        system.push_str("\n\nSummarize the conversation for another coding agent to continue. Preserve the user's goal, constraints, decisions, changed files, executed commands and their results, unresolved errors, and next actions. Quote relevant identifiers and paths. Do not perform the task or call tools. Produce a substantive continuation summary.");
+        system.push_str("\n\n");
+        system.push_str(COMPACTION_PROMPT);
     }
     if request.command.is_some() && !compact {
         expand_shell_templates(&app,engine.clone(),&session,&request,&cfg,&cancel).await?;
@@ -356,6 +410,12 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
     let max_steps = cfg.agent.get(agent).and_then(|a| a["steps"].as_u64().or_else(|| a["maxSteps"].as_u64())).unwrap_or(100).clamp(1,1000);
     let mut recent_calls=VecDeque::new();
     let mut last = None;
+    // Context-window tracking: catalog limit when configured, the limit named
+    // in a provider overflow error when not.
+    let mut context_limit = cfg.provider(&model.provider_id).and_then(|p| p.models.get(&model.model_id))
+        .and_then(|m| m.limit.as_ref()).and_then(|v| v["context"].as_u64());
+    let mut reactive_compactions: u32 = 0;
+    let mut proactive_compactions: u32 = 0;
     for step in 0..max_steps {
         if cancel.load(Ordering::Acquire) { return Err("Aborted".into()); }
         // History reloads can span megabytes of JSON; keep them off the async workers.
@@ -467,6 +527,22 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
                     update_status(&app,sid,json!({"type":"busy"}));
                 }
                 Err(error) => {
+                    // A context overflow can never succeed verbatim: compact
+                    // the history to the provider's stated window and replay
+                    // this step against the summary.
+                    if error.overflow && reactive_compactions < 2 && !cancel.load(Ordering::Acquire) {
+                        if let Some(parsed) = provider::parse_context_limit(&error.message) { context_limit = Some(parsed); }
+                        match compact_history(&app, adapter.as_ref(), model, sid, uid, messages.clone(), context_limit).await {
+                            Ok(()) => {
+                                reactive_compactions += 1;
+                                let (store, sid_text, uid_text) = (app.store.clone(), sid.to_string(), uid.to_string());
+                                messages = tokio::task::spawn_blocking(move || build_messages(&store, &sid_text, &uid_text)).await.map_err(|e| e.to_string())??;
+                                if compact { messages.push(json!({"role":"user","content":"Produce the continuation summary now."})); }
+                                continue 'attempt;
+                            }
+                            Err(compact_error) => eprintln!("ocmini: auto-compaction failed: {compact_error}"),
+                        }
+                    }
                     fail_message(&app,&mut info,&error.message,cancel.load(Ordering::Acquire))?;
                     return Err(error.message);
                 }
@@ -537,6 +613,22 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
             }
             bus().emit("session.compacted",json!({"sessionID":sid}));
             break;
+        }
+        // Compacting only after the window is full burns a failed request;
+        // when the window is known, compact as the step approaches it.
+        let used = usage.input + usage.output + usage.reasoning + usage.cache.read + usage.cache.write;
+        if proactive_compactions == 0 && context_limit.is_some_and(|limit| used >= limit as i64 * 95 / 100) {
+            proactive_compactions += 1;
+            let (store, sid_text, uid_text) = (app.store.clone(), sid.to_string(), uid.to_string());
+            match tokio::task::spawn_blocking(move || build_messages(&store, &sid_text, &uid_text)).await {
+                Ok(Ok(history)) => {
+                    if let Err(error) = compact_history(&app, adapter.as_ref(), model, sid, uid, history, context_limit).await {
+                        eprintln!("ocmini: proactive compaction failed: {error}");
+                    }
+                }
+                Ok(Err(error)) => eprintln!("ocmini: proactive compaction rebuild failed: {error}"),
+                Err(error) => eprintln!("ocmini: proactive compaction rebuild failed: {error}"),
+            }
         }
         if tool_parts.is_empty() || app.store.has_waiting(sid)? { break; }
         if step+1==max_steps {

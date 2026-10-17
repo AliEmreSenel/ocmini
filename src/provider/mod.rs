@@ -32,11 +32,15 @@ pub struct ProviderError {
     pub message: String,
     pub retryable: bool,
     pub retry_after: Option<Duration>,
+    /// The provider rejected the request because the prompt exceeds the
+    /// model's context window. Retrying the same request can never work;
+    /// the engine compacts the history and retries once.
+    pub overflow: bool,
 }
 
 impl ProviderError {
     pub fn fatal(message: impl Into<String>) -> Self {
-        Self { message: message.into(), retryable: false, retry_after: None }
+        Self { message: message.into(), retryable: false, retry_after: None, overflow: false }
     }
 }
 
@@ -71,6 +75,34 @@ pub fn stream_retryable(message: &str) -> bool {
      "stream ended before", "decoding response body", "connection", "connection reset",
      "broken pipe", "timed out", "tls", "dns", "transport", "body stream"]
         .iter().any(|marker| lower.contains(marker))
+}
+
+/// Requests rejected for exceeding the model's context window. Retrying the
+/// identical request can never succeed; the engine compacts and retries.
+pub fn context_overflow(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["maximum context length", "context length exceeded", "prompt is too long",
+     "reduce the length of the input prompt", "input tokens are too long",
+     "exceeds the maximum context", "exceed the model's maximum", "context window exceeded",
+     "token limit exceeded", "maximum context window"]
+        .iter().any(|marker| lower.contains(marker))
+}
+
+/// The window size a provider names in its overflow error ("maximum context
+/// length is 262144 tokens", "213000 tokens > 200000 maximum"), so compaction
+/// can target the real limit even for models absent from the catalog.
+pub fn parse_context_limit(message: &str) -> Option<u64> {
+    fn first_number(text: &str) -> Option<u64> {
+        let start = text.find(|c: char| c.is_ascii_digit())?;
+        text[start..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+    }
+    let lower = message.to_ascii_lowercase();
+    for marker in ["maximum context length is", "context length of", "maximum context window of", "tokens >"] {
+        if let Some(index) = lower.find(marker) {
+            if let Some(limit) = first_number(&lower[index + marker.len()..]) { return Some(limit); }
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -300,10 +332,10 @@ impl Settings {
         if let Some(timeout) = self.total_timeout { request = request.timeout(timeout); }
         let response = if let Some(timeout) = self.header_timeout {
             tokio::time::timeout(timeout, request.send()).await
-                .map_err(|_| ProviderError { message: format!("{} did not return response headers within {} seconds", self.provider_id, timeout.as_secs()), retryable: true, retry_after: None })?
-                .map_err(|e| ProviderError { message: format!("{} request failed: {}", self.provider_id, e.without_url()), retryable: true, retry_after: None })?
+                .map_err(|_| ProviderError { message: format!("{} did not return response headers within {} seconds", self.provider_id, timeout.as_secs()), retryable: true, retry_after: None, overflow: false })?
+                .map_err(|e| ProviderError { message: format!("{} request failed: {}", self.provider_id, e.without_url()), retryable: true, retry_after: None, overflow: false })?
         } else {
-            request.send().await.map_err(|e| ProviderError { message: format!("{} request failed: {}", self.provider_id, e.without_url()), retryable: true, retry_after: None })?
+            request.send().await.map_err(|e| ProviderError { message: format!("{} request failed: {}", self.provider_id, e.without_url()), retryable: true, retry_after: None, overflow: false })?
         };
         if !response.status().is_success() {
             let status = response.status();
@@ -314,7 +346,8 @@ impl Settings {
             let message = serde_json::from_slice::<Value>(&value).ok().map(|v| error_message(&v)).unwrap_or_else(|| String::from_utf8_lossy(&value).chars().take(2000).collect());
             let message = if self.token.is_empty() { message } else { message.replace(&self.token, "[redacted]") };
             let retryable = status_retryable(status);
-            return Err(ProviderError { message: format!("{} HTTP {status}: {message}", self.provider_id), retryable, retry_after: if retryable { retry_after } else { None } });
+            let overflow = matches!(status.as_u16(), 400 | 413 | 422) && context_overflow(&message);
+            return Err(ProviderError { message: format!("{} HTTP {status}: {message}", self.provider_id), retryable, retry_after: if retryable { retry_after } else { None }, overflow });
         }
         Ok(response)
     }
@@ -382,5 +415,14 @@ mod tests {
     fn usage_buckets_are_disjoint() {
         let usage = usage_openai(&json!({"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens_details":{"reasoning_tokens":20}}), false);
         assert_eq!((usage.input, usage.output, usage.reasoning, usage.cache.read), (60, 30, 20, 40));
+    }
+    #[test]
+    fn overflow_detection_and_limit_parsing() {
+        assert!(context_overflow("pllm5 HTTP 400: This model\'s maximum context length is 262144 tokens. However, you requested 0 output tokens and your prompt contains at least 262145 input tokens"));
+        assert!(context_overflow("prompt is too long: 213000 tokens > 200000 maximum"));
+        assert!(!context_overflow("provider stream failed: error decoding response body"));
+        assert_eq!(parse_context_limit("maximum context length is 262144 tokens. your prompt contains 262145"), Some(262144));
+        assert_eq!(parse_context_limit("prompt is too long: 213000 tokens > 200000 maximum"), Some(200000));
+        assert_eq!(parse_context_limit("no numbers here"), None);
     }
 }
