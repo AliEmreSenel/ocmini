@@ -3,8 +3,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 pub fn hex_id(prefix: &str) -> String {
@@ -12,16 +14,26 @@ pub fn hex_id(prefix: &str) -> String {
     let mut s = String::with_capacity(prefix.len() + 26);
     s.push_str(prefix);
     use rand::Rng;
-    let bytes: Vec<u8> = (0..26).map(|_| CH[rand::rng().random_range(0..CH.len())]).collect();
+    let bytes: Vec<u8> = (0..26)
+        .map(|_| CH[rand::rng().random_range(0..CH.len())])
+        .collect();
     s.push_str(&String::from_utf8(bytes).unwrap());
     s
 }
 
 pub fn slug() -> String {
-    const A: &[&str] = &["clever", "silent", "brave", "lucky", "calm", "eager", "gentle", "proud"];
-    const B: &[&str] = &["eagle", "falcon", "otter", "wolf", "comet", "river", "maple", "ember"];
+    const A: &[&str] = &[
+        "clever", "silent", "brave", "lucky", "calm", "eager", "gentle", "proud",
+    ];
+    const B: &[&str] = &[
+        "eagle", "falcon", "otter", "wolf", "comet", "river", "maple", "ember",
+    ];
     use rand::Rng;
-    format!("{}-{}", A[rand::rng().random_range(0..A.len())], B[rand::rng().random_range(0..B.len())])
+    format!(
+        "{}-{}",
+        A[rand::rng().random_range(0..A.len())],
+        B[rand::rng().random_range(0..B.len())]
+    )
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -187,8 +199,15 @@ pub struct PromptRequest {
 pub enum ProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
-    ToolCallStart { call_id: String, name: String, args: String },
-    Finished { finish: String, usage: Tokens },
+    ToolCallStart {
+        call_id: String,
+        name: String,
+        args: String,
+    },
+    Finished {
+        finish: String,
+        usage: Tokens,
+    },
     Metadata(Value),
     Error(String),
 }
@@ -234,5 +253,4 @@ pub struct ToolOutput {
 #[derive(Debug)]
 pub struct ToolError {
     pub message: String,
-    pub denied: bool,
 }

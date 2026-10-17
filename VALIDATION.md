@@ -1,67 +1,38 @@
-# Patch scope and validation record
+# Validation
 
-Prepared on 2026-10-17 against the three supplied source archives. `SOURCE-PROVENANCE.json` records their exact hashes; no current upstream branch or live T3 installation was assumed to match these snapshots.
+The runtime targets the OpenCode 1.x contract consumed by the supplied T3 source snapshot. [SPEC-CONTRACT.md](SPEC-CONTRACT.md) documents that contract; `SOURCE-PROVENANCE.json` retains the source archive hashes.
 
-## What this patch changes
+## Reproduce the checks
 
-The patch replaces the incomplete OpenCode-compatible shim with a durable headless execution loop and the OpenCode 1.x HTTP/SSE surface consumed by the supplied T3 integration. Its protocol target is documented with source paths in `SPEC-CONTRACT.md`.
-
-Major changes include durable and idempotent prompt admission, steering without concurrent loops, real history forks, compaction that supplies subsequent model context, interruption recovery, exact event/part ordering, full tool permissions/questions, real task children, usable coding tools, stdio/Streamable HTTP MCP and native provider streaming through Chat Completions, Responses and Anthropic Messages.
-
-OpenCode's UI applications, hosting/account services, package/plugin installation, updater, LSP fleet and 2.x service protocol are excluded. The terminal UI and old shape fuzzer have been deleted. `chrono` and `crossterm` are removed. Libraries added for subprocess cleanup, ignore-aware search, Markdown frontmatter and HTML conversion implement runtime behavior described in the README.
-
-## Executed checks
-
-| Check | Result | What it establishes |
-| --- | --- | --- |
-| Source contract audit | Completed | Compared T3's 1.x adapter, runtime, CLI parsers, usage reader and text generation call sites with the implemented routes and event fields |
-| Independent source review | Completed | Reviewed provider/engine, tool/MCP, server/store interfaces and likely ownership, async lock and cancellation issues; this is not compiler evidence |
-| SQL extraction and preparation | Passed | All 39 unique SQL statements extracted from `src/store.rs` prepare in SQLite |
-| SQLite behavior checks | Passed | 11 checks covering stable upsert order, unfinished response selection, inbox claims, recovery, orphan cleanup, guarded descendant deletion and unrelated-session preservation |
-| Incomplete implementation macro scan | Passed | No `todo!` or `unimplemented!` macros in runtime source; unsupported protocols return explicit errors |
-| Patch whitespace check | Passed during packaging | `git diff --check` accepts the final source changes |
-| Patch application | Passed during packaging | `git apply --check` and `git apply` succeed against a fresh extraction of the supplied original ocmini archive |
-| Applied tree comparison | Passed during packaging | Applying the patch reproduces the supplied updated source tree byte for byte |
-
-The SQL check is reproducible with:
+Use stable Rust and a C compiler/linker for bundled SQLite:
 
 ```sh
-python3 scripts/verify_store_sql.py
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo build --release --locked
 ```
 
-Its captured output is in `validation/store-sql-results.json`. It runs the actual extracted SQL, but does not execute Rust transaction boundaries, serializers, the engine or HTTP handlers. SQL success must not be presented as end-to-end runtime success.
+The Linux CI workflow runs these same checks. Dependencies are pinned in `Cargo.lock`. No Python tooling is required.
 
-## Authored Rust tests: not executed here
+## Executed checks (2026-10-17)
 
-The tree contains 75 Rust tests: 15 process/HTTP integration scenarios and 60 unit/module tests. They use loopback scripted peers and temporary state rather than paid-provider credentials.
+On Linux with stable Rust 1.97.1, formatting and Clippy with warnings denied passed. All 88 tests passed: 68 unit tests and 20 process/HTTP integration tests. Interactive pseudo-terminal checks passed for Unicode, multiline paste, arrow keys, Ctrl+C abort, Ctrl+D exit and terminal restoration after both exit and SIGTERM.
 
-The integration scenarios cover process and CLI compatibility, Basic auth, scope isolation, client IDs and admission retries, streamed-part ordering, attachments/usage, active-turn steering, permission and question continuation, actual task child execution, stalled-stream abort, fork integrity and restart, commands, default agents/models, compaction reuse, failed MCP connection/reconnection, scoped SSE, durable no-reply prompts and truncated provider failures. Individual scenarios can cover more than one behavior.
+The optimized release build and executable version/help checks passed using the installed `nightly-2026-08-01` toolchain (Rust 1.99.0-nightly). A concurrent update removed the shared stable toolchain during the initial release link, so the release check used this dated toolchain. CI continues to build releases with stable Rust.
 
-Module tests cover configuration/JSONC and metadata, auth parsing, provider protocol selection and variants, SSE framing, usage accounting, signed/encrypted reasoning replay, MCP lifecycle and tool calls, patch/file tools, process cleanup, skill parsing, web conversion, permissions and persistence invariants.
+## Coverage
 
-Required build gate:
+Unit tests exercise configuration/JSONC, ordered permissions, YAML frontmatter, credentials, provider protocols and usage, SSE framing, MCP lifecycle, coding tools, process cleanup and persistence. Atomic-write tests verify symlink handling, executable permissions, private credential-cache permissions and temporary-file cleanup. Glob tests include more than 32 brace alternatives to detect silent search omissions.
 
-```sh
-cargo test --all-targets
-cargo build --release
-```
+Persistence tests execute the actual Rust store with bundled SQLite. They cover stable message/part upsert ordering, idempotent admission, prompt claims, recovery of interrupted assistant/tool work, retention of queued prompts and completed responses, live-instance leases, legacy orphan cleanup, guarded recursive deletion and unrelated-session preservation. The former Python script extracted SQL from Rust source using regexes; it and its captured result have been removed in favor of these runtime tests.
 
-`.github/workflows/ci.yml` runs these commands and the SQL checker on Linux. The workflow is part of the patch; no successful CI run is claimed.
+Process/HTTP integration tests use isolated temporary state and loopback provider/MCP fixtures. They cover CLI help/version/error behavior, startup and Basic authentication, directory scope, model/agent inventory, prompt admission and retries, streaming order, attachments/usage, steering, approvals/questions, child tasks, cancellation, forks/restart, commands, compaction and provider/MCP failures. They do not require paid-provider credentials.
 
-## Checks that could not run
+Terminal smoke checks use an interactive pseudo-terminal to verify Unicode input, bracketed multiline paste, ignored arrow sequences, Ctrl+C abort, Ctrl+D exit and restoration of terminal attributes. Terminal input uses `crossterm`; shutdown signals use Tokio so the terminal guard restores state on normal signal-driven exit.
 
-The construction environment has no `cargo`, `rustc`, `rustfmt` or Rust toolchain cache. Attempts to obtain a toolchain through the allowed network path were denied by the environment's proxy. Consequently:
+## Boundaries
 
-- The Rust source has not been compiled or linked here.
-- None of the 75 Rust tests has been executed here.
-- No Rust formatting or Clippy result is available.
-- No built binary, generated `Cargo.lock`, benchmark or live-provider transcript is included.
-- No native T3 SDK session or full T3 application workflow has run against this implementation.
+Local fixture tests do not establish successful live-provider calls or full T3 application workflows. No startup, memory, binary-size or throughput benchmarks are claimed. Native Google/Gemini, Vertex, Bedrock, Azure authentication, arbitrary npm provider SDKs, MCP browser OAuth and legacy MCP HTTP+SSE are outside the implemented protocol surface.
 
-Static review can miss syntax/type errors, incorrect crate APIs, timing bugs and semantic integration errors. A passing Rust build and test suite is still necessary. Live-provider and T3 application validation is also necessary for a deployment claim.
-
-## Deployment boundaries
-
-The implementation targets the supplied T3 OpenCode 1.x integration. It does not promise compatibility with an unspecified future T3 release or every provider SDK in OpenCode. Unsupported vendor-native protocols, browser authorization, legacy MCP HTTP+SSE, audio on transports that do not accept it and unsupported credentials fail explicitly. Manual compaction is implemented; automatic token-budget compaction is not.
-
-The original OpenCode config and credentials remain read-only. ocmini owns its transcript store, refreshed-token cache and usage mirror. Existing ocmini state receives additive schema changes and startup recovery; preserve a database copy when upgrading an existing deployment. Reverting the T3 binary setting selects the original backend again, but does not migrate ocmini conversations into OpenCode.
+The original OpenCode config and credentials remain read-only. ocmini owns its transcript store, refreshed-token cache and usage mirror. Preserve a database copy when upgrading an existing deployment. Reverting T3's binary setting selects the original backend; it does not migrate ocmini conversations into OpenCode.

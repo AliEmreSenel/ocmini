@@ -19,18 +19,27 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new() -> Self { Self { first_line: true, ..Self::default() } }
+    pub fn new() -> Self {
+        Self {
+            first_line: true,
+            ..Self::default()
+        }
+    }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, String> {
         let mut frames = Vec::new();
         for byte in bytes {
             if self.skip_lf {
                 self.skip_lf = false;
-                if *byte == b'\n' { continue; }
+                if *byte == b'\n' {
+                    continue;
+                }
             }
             if *byte == b'\r' || *byte == b'\n' {
                 self.skip_lf = *byte == b'\r';
-                if let Some(frame) = self.finish_line()? { frames.push(frame); }
+                if let Some(frame) = self.finish_line()? {
+                    frames.push(frame);
+                }
             } else {
                 self.line.push(*byte);
                 if self.line.len() + self.size > 16 * 1024 * 1024 {
@@ -43,14 +52,27 @@ impl Decoder {
 
     fn finish_line(&mut self) -> Result<Option<Frame>, String> {
         let bytes = std::mem::take(&mut self.line);
-        let line = std::str::from_utf8(&bytes).map_err(|_| "provider SSE stream contains invalid UTF-8")?;
-        let line = if self.first_line { self.first_line = false; line.trim_start_matches('\u{feff}') } else { line };
-        if line.is_empty() { return Ok(self.take_frame()); }
-        if line.starts_with(':') { return Ok(None); }
+        let line = std::str::from_utf8(&bytes)
+            .map_err(|_| "provider SSE stream contains invalid UTF-8")?;
+        let line = if self.first_line {
+            self.first_line = false;
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
+        if line.is_empty() {
+            return Ok(self.take_frame());
+        }
+        if line.starts_with(':') {
+            return Ok(None);
+        }
         let (field, value) = line.split_once(':').unwrap_or((line, ""));
         let value = value.strip_prefix(' ').unwrap_or(value);
         match field {
-            "data" => { self.size += value.len() + 1; self.data.push(value.to_string()); }
+            "data" => {
+                self.size += value.len() + 1;
+                self.data.push(value.to_string());
+            }
             "event" => self.event = value.to_string(),
             _ => {}
         }
@@ -59,21 +81,34 @@ impl Decoder {
 
     fn take_frame(&mut self) -> Option<Frame> {
         self.size = 0;
-        if self.data.is_empty() { self.event.clear(); return None; }
-        Some(Frame { event: std::mem::take(&mut self.event), data: std::mem::take(&mut self.data).join("\n") })
+        if self.data.is_empty() {
+            self.event.clear();
+            return None;
+        }
+        Some(Frame {
+            event: std::mem::take(&mut self.event),
+            data: std::mem::take(&mut self.data).join("\n"),
+        })
     }
 
     pub fn finish(&mut self) -> Result<Vec<Frame>, String> {
         let mut frames = Vec::new();
         if !self.line.is_empty() {
-            if let Some(frame) = self.finish_line()? { frames.push(frame); }
+            if let Some(frame) = self.finish_line()? {
+                frames.push(frame);
+            }
         }
-        if let Some(frame) = self.take_frame() { frames.push(frame); }
+        if let Some(frame) = self.take_frame() {
+            frames.push(frame);
+        }
         Ok(frames)
     }
 }
 
-pub fn frames(response: reqwest::Response, timeout: Duration) -> Pin<Box<dyn Stream<Item = Result<Frame, String>> + Send>> {
+pub fn frames(
+    response: reqwest::Response,
+    timeout: Duration,
+) -> Pin<Box<dyn Stream<Item = Result<Frame, String>> + Send>> {
     Box::pin(stream! {
         let mut bytes = response.bytes_stream();
         let mut decoder = Decoder::new();

@@ -32,7 +32,7 @@ After a successful bind, stdout contains one flushed line:
 opencode server listening on http://<bound-address>:<actual-port>
 ```
 
-Port zero chooses an available port and the banner reports the actual port. IPv6 literals are bracketed. Diagnostics go to stderr. Both `--option=value` and `--option value` are supported. Invalid options or port values exit unsuccessfully instead of silently using defaults. No arguments display help. There is no separate terminal UI.
+Port zero chooses an available port and the banner reports the actual port. IPv6 literals are bracketed. Diagnostics go to stderr. Both `--option=value` and `--option value` are supported. Invalid options or port values exit unsuccessfully instead of silently using defaults. No arguments start terminal chat; `--help` displays command help. The `tui` command accepts `--model provider/model` and `--directory DIR` and uses the same engine as the HTTP server.
 
 T3's other probes are:
 

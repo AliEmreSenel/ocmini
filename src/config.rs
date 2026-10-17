@@ -110,18 +110,28 @@ impl Config {
     /// sessions this is a hot disk path, so entries are cached briefly; T3
     /// config overlays take effect within the TTL.
     pub fn load_for(directory: &str) -> Result<Config, String> {
-        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Config)>>> = std::sync::OnceLock::new();
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Config)>>,
+        > = std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         if let Some((created, config)) = cache.lock().unwrap().get(directory) {
-            if created.elapsed() < std::time::Duration::from_secs(3) { return Ok(config.clone()); }
+            if created.elapsed() < std::time::Duration::from_secs(3) {
+                return Ok(config.clone());
+            }
         }
         let config = Self::load_uncached(directory)?;
-        cache.lock().unwrap().insert(directory.to_string(), (std::time::Instant::now(), config.clone()));
+        cache.lock().unwrap().insert(
+            directory.to_string(),
+            (std::time::Instant::now(), config.clone()),
+        );
         Ok(config)
     }
 
     fn load_uncached(directory: &str) -> Result<Config, String> {
-        let directory = absolute_path(Path::new(directory), &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let directory = absolute_path(
+            Path::new(directory),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
         let global = PathBuf::from(config_home()).join("opencode");
         let mut value = json!({});
         let mut seen = HashSet::new();
@@ -132,12 +142,20 @@ impl Config {
         load_markdown(&mut value, &global, "command", "template")?;
         if let Ok(path) = std::env::var("OPENCODE_CONFIG") {
             if !path.trim().is_empty() {
-                merge_file(&mut value, &absolute_path(Path::new(&path), &directory), true, &mut seen)?;
+                merge_file(
+                    &mut value,
+                    &absolute_path(Path::new(&path), &directory),
+                    true,
+                    &mut seen,
+                )?;
             }
         }
         let mut ancestors: Vec<_> = directory.ancestors().collect();
         ancestors.reverse();
-        if std::env::var("OPENCODE_DISABLE_PROJECT_CONFIG").map(|v| v != "1" && v != "true").unwrap_or(true) {
+        if std::env::var("OPENCODE_DISABLE_PROJECT_CONFIG")
+            .map(|v| v != "1" && v != "true")
+            .unwrap_or(true)
+        {
             for base in ancestors {
                 for name in ["opencode.json", "opencode.jsonc"] {
                     merge_file(&mut value, &base.join(name), false, &mut seen)?;
@@ -168,13 +186,20 @@ impl Config {
                 deep_merge(&mut value, overlay);
             }
         }
-        let mut cfg: Config = serde_json::from_value(value).map_err(|e| format!("invalid OpenCode configuration: {e}"))?;
+        let mut cfg: Config = serde_json::from_value(value)
+            .map_err(|e| format!("invalid OpenCode configuration: {e}"))?;
         validate_permission(&cfg.permission)?;
         for (pid, p) in cfg.provider.iter_mut() {
-            if p.name.is_empty() { p.name = pid.clone(); }
+            if p.name.is_empty() {
+                p.name = pid.clone();
+            }
             for (mid, m) in p.models.iter_mut() {
-                if m.id.is_empty() { m.id = mid.clone(); }
-                if m.name.is_empty() { m.name = mid.clone(); }
+                if m.id.is_empty() {
+                    m.id = mid.clone();
+                }
+                if m.name.is_empty() {
+                    m.name = mid.clone();
+                }
             }
         }
         Ok(cfg)
@@ -182,19 +207,32 @@ impl Config {
 
     pub fn provider_enabled(&self, id: &str) -> bool {
         !self.disabled_providers.iter().any(|item| item == id)
-            && self.enabled_providers.as_ref().map(|items| items.iter().any(|item| item == id)).unwrap_or(true)
+            && self
+                .enabled_providers
+                .as_ref()
+                .map(|items| items.iter().any(|item| item == id))
+                .unwrap_or(true)
     }
 
     pub fn catalog(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for (pid, p) in &self.provider {
-            if !self.provider_enabled(pid) { continue; }
+            if !self.provider_enabled(pid) {
+                continue;
+            }
             let whitelist = p.extra.get("whitelist").and_then(Value::as_array);
             let blacklist = p.extra.get("blacklist").and_then(Value::as_array);
             for (mid, m) in &p.models {
-                if blacklist.map(|list| list.iter().any(|v| v == mid)).unwrap_or(false)
-                    || whitelist.map(|list| !list.iter().any(|v| v == mid)).unwrap_or(false)
-                    || m.extra.get("disabled").and_then(Value::as_bool) == Some(true) { continue; }
+                if blacklist
+                    .map(|list| list.iter().any(|v| v == mid))
+                    .unwrap_or(false)
+                    || whitelist
+                        .map(|list| !list.iter().any(|v| v == mid))
+                        .unwrap_or(false)
+                    || m.extra.get("disabled").and_then(Value::as_bool) == Some(true)
+                {
+                    continue;
+                }
                 let mut model = serde_json::to_value(m).unwrap_or_else(|_| json!({}));
                 model["id"] = json!(format!("{pid}/{mid}"));
                 model["providerID"] = json!(pid);
@@ -206,30 +244,59 @@ impl Config {
         out
     }
 
-    pub fn provider(&self, id: &str) -> Option<&ProviderCfg> { self.provider.get(id) }
+    pub fn provider(&self, id: &str) -> Option<&ProviderCfg> {
+        self.provider.get(id)
+    }
 
-    pub fn permission_rules(&self) -> Vec<PermissionRule> { permission_rules(&self.permission) }
+    pub fn permission_rules(&self) -> Vec<PermissionRule> {
+        permission_rules(&self.permission)
+    }
 
     pub fn skill_paths(&self) -> Vec<String> {
-        let paths = if self.skills.is_array() { Some(&self.skills) } else { self.skills.get("paths") };
-        paths.and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default()
+        let paths = if self.skills.is_array() {
+            Some(&self.skills)
+        } else {
+            self.skills.get("paths")
+        };
+        paths
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
 pub fn permission_rules(value: &Value) -> Vec<PermissionRule> {
     let mut out = Vec::new();
     if let Some(action) = value.as_str() {
-        out.push(PermissionRule { permission: "*".into(), pattern: "*".into(), action: action.into() });
+        out.push(PermissionRule {
+            permission: "*".into(),
+            pattern: "*".into(),
+            action: action.into(),
+        });
     }
     if let Some(rules) = value.as_object() {
         for (permission, patterns) in rules {
             if let Some(action) = patterns.as_str() {
-                out.push(PermissionRule { permission: permission.clone(), pattern: "*".into(), action: action.into() });
+                out.push(PermissionRule {
+                    permission: permission.clone(),
+                    pattern: "*".into(),
+                    action: action.into(),
+                });
             }
             if let Some(patterns) = patterns.as_object() {
                 for (pattern, action) in patterns {
                     if let Some(action) = action.as_str() {
-                        out.push(PermissionRule { permission: permission.clone(), pattern: pattern.clone(), action: action.into() });
+                        out.push(PermissionRule {
+                            permission: permission.clone(),
+                            pattern: pattern.clone(),
+                            action: action.into(),
+                        });
                     }
                 }
             }
@@ -239,32 +306,70 @@ pub fn permission_rules(value: &Value) -> Vec<PermissionRule> {
 }
 
 fn validate_permission(value: &Value) -> Result<(), String> {
-    if value.is_null() { return Ok(()); }
+    if value.is_null() {
+        return Ok(());
+    }
     if let Some(action) = value.as_str() {
-        return if ["allow", "ask", "deny"].contains(&action) { Ok(()) } else { Err(format!("invalid permission action: {action}")) };
+        return if ["allow", "ask", "deny"].contains(&action) {
+            Ok(())
+        } else {
+            Err(format!("invalid permission action: {action}"))
+        };
     }
     if let Some(map) = value.as_object() {
-        for child in map.values() { validate_permission(child)?; }
+        for child in map.values() {
+            validate_permission(child)?;
+        }
         return Ok(());
     }
     Err("permission must be allow, ask, deny, or an object of permission rules".into())
 }
 
-fn merge_file(base: &mut Value, path: &Path, required: bool, seen: &mut HashSet<PathBuf>) -> Result<(), String> {
+fn merge_file(
+    base: &mut Value,
+    path: &Path,
+    required: bool,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<(), String> {
     let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !seen.insert(key) { return Ok(()); }
+    if !seen.insert(key) {
+        return Ok(());
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
     };
-    deep_merge(base, parse_config(&text, &path.display().to_string(), path.parent().unwrap_or(Path::new(".")))?);
+    deep_merge(
+        base,
+        parse_config(
+            &text,
+            &path.display().to_string(),
+            path.parent().unwrap_or(Path::new(".")),
+        )?,
+    );
     Ok(())
 }
 
 fn parse_config(text: &str, source: &str, base: &Path) -> Result<Value, String> {
-    let mut value: Value = serde_json::from_str(&strip_jsonc(text)).map_err(|e| format!("invalid config {source}: {e}"))?;
-    if !value.is_object() { return Err(format!("config {source} must be a JSON object")); }
+    let options = jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_non_finite_numbers: false,
+        allow_extended_string_escapes: false,
+    };
+    let mut value: Value =
+        jsonc_parser::parse_to_serde_value(text.trim_start_matches('\u{feff}'), &options)
+            .map_err(|e| format!("invalid config {source}: {e}"))?;
+    if !value.is_object() {
+        return Err(format!("config {source} must be a JSON object"));
+    }
     interpolate(&mut value, base).map_err(|e| format!("config {source}: {e}"))?;
     if let Some(paths) = value.get_mut("instructions").and_then(Value::as_array_mut) {
         for path in paths {
@@ -275,10 +380,16 @@ fn parse_config(text: &str, source: &str, base: &Path) -> Result<Value, String> 
             }
         }
     }
-    let paths = if value["skills"].is_array() { value.get_mut("skills") } else { value.get_mut("skills").and_then(|v| v.get_mut("paths")) };
+    let paths = if value["skills"].is_array() {
+        value.get_mut("skills")
+    } else {
+        value.get_mut("skills").and_then(|v| v.get_mut("paths"))
+    };
     if let Some(paths) = paths.and_then(Value::as_array_mut) {
         for path in paths {
-            if let Some(text) = path.as_str() { *path = json!(absolute_path(Path::new(text), base).to_string_lossy()); }
+            if let Some(text) = path.as_str() {
+                *path = json!(absolute_path(Path::new(text), base).to_string_lossy());
+            }
         }
     }
     if let Some(servers) = value.get_mut("mcp").and_then(Value::as_object_mut) {
@@ -298,12 +409,18 @@ pub fn deep_merge(base: &mut Value, overlay: Value) {
                 if let Some(previous) = base.get_mut(&key) {
                     if key == "instructions" {
                         if let (Some(a), Some(b)) = (previous.as_array_mut(), value.as_array()) {
-                            for item in b { if !a.contains(item) { a.push(item.clone()); } }
+                            for item in b {
+                                if !a.contains(item) {
+                                    a.push(item.clone());
+                                }
+                            }
                             continue;
                         }
                     }
                     deep_merge(previous, value);
-                } else { base.insert(key, value); }
+                } else {
+                    base.insert(key, value);
+                }
             }
         }
         (base, overlay) => *base = overlay,
@@ -318,22 +435,35 @@ fn interpolate(value: &mut Value, base: &Path) -> Result<(), String> {
             while let Some(start) = rest.find('{') {
                 output.push_str(&rest[..start]);
                 rest = &rest[start..];
-                let Some(end) = rest.find('}') else { break; };
+                let Some(end) = rest.find('}') else {
+                    break;
+                };
                 let token = &rest[1..end];
                 if let Some(name) = token.strip_prefix("env:") {
                     output.push_str(&std::env::var(name).unwrap_or_default());
                 } else if let Some(path) = token.strip_prefix("file:") {
                     let path = absolute_path(Path::new(path), base);
-                    let content = std::fs::read_to_string(&path).map_err(|e| format!("cannot load {}: {e}", path.display()))?;
+                    let content = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("cannot load {}: {e}", path.display()))?;
                     output.push_str(content.trim_end());
-                } else { output.push_str(&rest[..=end]); }
+                } else {
+                    output.push_str(&rest[..=end]);
+                }
                 rest = &rest[end + 1..];
             }
             output.push_str(rest);
             *text = output;
         }
-        Value::Array(items) => { for item in items { interpolate(item, base)?; } }
-        Value::Object(items) => { for item in items.values_mut() { interpolate(item, base)?; } }
+        Value::Array(items) => {
+            for item in items {
+                interpolate(item, base)?;
+            }
+        }
+        Value::Object(items) => {
+            for item in items.values_mut() {
+                interpolate(item, base)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -342,17 +472,41 @@ fn interpolate(value: &mut Value, base: &Path) -> Result<(), String> {
 fn load_markdown(value: &mut Value, root: &Path, kind: &str, body_key: &str) -> Result<(), String> {
     for folder in [kind.to_string(), format!("{kind}s")] {
         let directory = root.join(folder);
-        if !directory.is_dir() { continue; }
-        for entry in walkdir::WalkDir::new(&directory).max_depth(8).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.path().extension().and_then(|e| e.to_str()) != Some("md") { continue; }
-            let content = std::fs::read_to_string(entry.path()).map_err(|e| format!("cannot read {}: {e}", entry.path().display()))?;
-            let name = entry.path().strip_prefix(&directory).unwrap_or(entry.path()).with_extension("").to_string_lossy().replace('\\', "/");
-            let (frontmatter, body) = markdown_frontmatter(&content).map_err(|e| format!("invalid frontmatter in {}: {e}", entry.path().display()))?;
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&directory)
+            .max_depth(8)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|e| e.to_str()) != Some("md")
+            {
+                continue;
+            }
+            let content = std::fs::read_to_string(entry.path())
+                .map_err(|e| format!("cannot read {}: {e}", entry.path().display()))?;
+            let name = entry
+                .path()
+                .strip_prefix(&directory)
+                .unwrap_or(entry.path())
+                .with_extension("")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let (frontmatter, body) = markdown_frontmatter(&content)
+                .map_err(|e| format!("invalid frontmatter in {}: {e}", entry.path().display()))?;
             let mut item = Value::Object(frontmatter);
             item[body_key] = json!(body.trim());
-            if value.get(kind).is_none() { value[kind] = json!({}); }
+            if value.get(kind).is_none() {
+                value[kind] = json!({});
+            }
             if let Some(map) = value.get_mut(kind).and_then(Value::as_object_mut) {
-                if let Some(current) = map.get_mut(&name) { deep_merge(current, item); } else { map.insert(name, item); }
+                if let Some(current) = map.get_mut(&name) {
+                    deep_merge(current, item);
+                } else {
+                    map.insert(name, item);
+                }
             }
         }
     }
@@ -360,12 +514,25 @@ fn load_markdown(value: &mut Value, root: &Path, kind: &str, body_key: &str) -> 
 }
 
 fn markdown_frontmatter(content: &str) -> Result<(Map<String, Value>, &str), String> {
-    let Some(rest) = content.strip_prefix("---\n").or_else(|| content.strip_prefix("---\r\n")) else { return Ok((Map::new(), content)); };
+    let Some(rest) = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+    else {
+        return Ok((Map::new(), content));
+    };
     let mut offset = 0;
     for line in rest.split_inclusive('\n') {
         if line.trim_end_matches(['\r', '\n']) == "---" {
-            let frontmatter: Value = serde_yaml::from_str(&rest[..offset]).map_err(|e| e.to_string())?;
-            let map = if frontmatter.is_null() { Map::new() } else { frontmatter.as_object().cloned().ok_or("YAML frontmatter must be a mapping")? };
+            let frontmatter: Value =
+                serde_saphyr::from_str(&rest[..offset]).map_err(|e| e.to_string())?;
+            let map = if frontmatter.is_null() {
+                Map::new()
+            } else {
+                frontmatter
+                    .as_object()
+                    .cloned()
+                    .ok_or("YAML frontmatter must be a mapping")?
+            };
             return Ok((map, &rest[offset + line.len()..]));
         }
         offset += line.len();
@@ -373,84 +540,101 @@ fn markdown_frontmatter(content: &str) -> Result<(Map<String, Value>, &str), Str
     Err("missing closing --- delimiter".into())
 }
 
-pub fn config_home() -> String { std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", home())) }
-fn home() -> String { std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into()) }
-pub fn data_home() -> String { std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home())) }
-pub fn store_path() -> PathBuf { Path::new(&data_home()).join("ocmini").join("ocmini.db") }
+pub fn config_home() -> String {
+    std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", home()))
+}
+fn home() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into())
+}
+pub fn data_home() -> String {
+    std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home()))
+}
+pub fn store_path() -> PathBuf {
+    Path::new(&data_home()).join("ocmini").join("ocmini.db")
+}
 
 pub fn absolute_path(path: &Path, base: &Path) -> PathBuf {
     let text = path.to_string_lossy();
-    if text == "~" { return PathBuf::from(home()); }
-    if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) { return PathBuf::from(home()).join(rest); }
-    if path.is_absolute() { path.to_path_buf() } else { base.join(path) }
-}
-
-pub fn strip_jsonc(src: &str) -> String {
-    let bytes = src.trim_start_matches('\u{feff}').as_bytes();
-    let mut cleaned = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut string = false;
-    while i < bytes.len() {
-        let current = bytes[i];
-        if string {
-            cleaned.push(current); i += 1;
-            if current == b'\\' && i < bytes.len() { cleaned.push(bytes[i]); i += 1; }
-            else if current == b'"' { string = false; }
-            continue;
-        }
-        if current == b'"' { string = true; cleaned.push(current); i += 1; continue; }
-        if current == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            while i < bytes.len() && bytes[i] != b'\n' { cleaned.push(b' '); i += 1; }
-            continue;
-        }
-        if current == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            let start = i; i += 2;
-            while i + 1 < bytes.len() && &bytes[i..i + 2] != b"*/" { i += 1; }
-            if i + 1 >= bytes.len() { cleaned.extend_from_slice(&bytes[start..]); break; }
-            i += 2;
-            cleaned.extend(bytes[start..i].iter().map(|b| if *b == b'\n' || *b == b'\r' { *b } else { b' ' }));
-            continue;
-        }
-        cleaned.push(current); i += 1;
+    if text == "~" {
+        return PathBuf::from(home());
     }
-    string = false; i = 0;
-    while i < cleaned.len() {
-        let current = cleaned[i];
-        if string {
-            if current == b'\\' { i += 2; continue; }
-            if current == b'"' { string = false; }
-        } else if current == b'"' { string = true; }
-        else if current == b',' {
-            let mut next = i + 1;
-            while next < cleaned.len() && cleaned[next].is_ascii_whitespace() { next += 1; }
-            if matches!(cleaned.get(next), Some(b'}' | b']')) { cleaned[i] = b' '; }
-        }
-        i += 1;
+    if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
+        return PathBuf::from(home()).join(rest);
     }
-    String::from_utf8(cleaned).expect("JSONC processing preserves UTF-8")
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn jsonc_rejects_json5_and_malformed_input() {
+        for text in [
+            "{key: 1}",
+            "{'key': 1}",
+            "{\"a\":1 \"b\":2}",
+            "{\"a\":0x10}",
+            "{} {}",
+            "// empty",
+            "[]",
+        ] {
+            assert!(
+                parse_config(text, "test", Path::new(".")).is_err(),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_config(
+                "\u{feff}{\"permission\": {\"*\": \"ask\", \"read\": \"allow\",},}",
+                "test",
+                Path::new(".")
+            )
+            .unwrap()["permission"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["*", "read"]
+        );
+    }
+    #[test]
     fn jsonc_preserves_unicode_and_string_punctuation() {
-        let value: Value = serde_json::from_str(&strip_jsonc("{\n// note\n\"text\":\"café 中文 ,} https://x/\\\"\", /* c */ \"array\":[1,2,],\n}")).unwrap();
+        let value: Value = parse_config(
+            "{\n// note\n\"text\":\"café 中文 ,} https://x/\\\"\", /* c */ \"array\":[1,2,],\n}",
+            "test",
+            Path::new("."),
+        )
+        .unwrap();
         assert_eq!(value["text"], "café 中文 ,} https://x/\"");
         assert_eq!(value["array"], json!([1, 2]));
-        assert!(serde_json::from_str::<Value>(&strip_jsonc("{} /* unfinished")).is_err());
+        assert!(parse_config("{} /* unfinished", "test", Path::new(".")).is_err());
     }
     #[test]
     fn overlays_preserve_provider_models_and_every_config_section() {
         let mut base = json!({"provider":{"local":{"options":{"baseURL":"http://localhost/v1"},"models":{"a":{}}}},"permission":{"*":"ask","edit":"deny"},"instructions":["a"]});
-        deep_merge(&mut base, json!({"provider":{"local":{"options":{"apiKey":"secret"},"models":{"b":{"variants":{"careful":{"reasoningEffort":"high"}}}}}},"permission":{"edit":"allow"},"mcp":{"x":{"enabled":false}},"instructions":["b","a"]}));
+        deep_merge(
+            &mut base,
+            json!({"provider":{"local":{"options":{"apiKey":"secret"},"models":{"b":{"variants":{"careful":{"reasoningEffort":"high"}}}}}},"permission":{"edit":"allow"},"mcp":{"x":{"enabled":false}},"instructions":["b","a"]}),
+        );
         let cfg: Config = serde_json::from_value(base).unwrap();
         assert_eq!(cfg.provider["local"].models.len(), 2);
-        assert_eq!(cfg.provider["local"].options.base_url, "http://localhost/v1");
+        assert_eq!(
+            cfg.provider["local"].options.base_url,
+            "http://localhost/v1"
+        );
         assert_eq!(cfg.permission_rules().len(), 2);
         assert_eq!(cfg.instructions, ["a", "b"]);
         assert_eq!(cfg.mcp["x"].enabled, Some(false));
-        assert!(serde_json::to_value(&cfg.provider["local"].models["b"]).unwrap()["variants"].is_object());
+        assert!(
+            serde_json::to_value(&cfg.provider["local"].models["b"]).unwrap()["variants"]
+                .is_object()
+        );
     }
     #[test]
     fn nested_permissions_and_catalog_filtering() {

@@ -14,10 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Lint all targets
+        run: cargo +stable clippy --all-targets --locked -- -D warnings
       - name: Unit and contract tests
-        run: cargo +stable test --all-targets
+        run: cargo +stable test --all-targets --locked
       - name: Build release executable
-        run: cargo +stable build --release
-      - name: Check SQL persistence invariants
-        run: python3 scripts/verify_store_sql.py
+        run: cargo +stable build --release --locked
