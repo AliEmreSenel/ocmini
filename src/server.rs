@@ -155,7 +155,7 @@ async fn prompt_async(
     tokio::spawn(async move {
         let _ = engine.start_turn(app, id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts), req.agent);
     });
-    StatusCode::OK
+    StatusCode::NO_CONTENT
 }
 
 async fn prompt_sync(
@@ -173,7 +173,7 @@ async fn prompt_sync(
     }
 }
 
-async fn command_run(State(st): State<AppState>, Path(id): Path<String>, Json(body): Json<Value>) -> StatusCode {
+async fn command_run(State(st): State<AppState>, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
     let model_id = body["modelID"].as_str().unwrap_or_default().to_string();
     let provider_id = body["providerID"].as_str().unwrap_or_default().to_string();
     let name = body["command"].as_str().unwrap_or_default().to_string();
@@ -192,10 +192,13 @@ async fn command_run(State(st): State<AppState>, Path(id): Path<String>, Json(bo
     let app = st.app.clone();
     let engine = st.engine.clone();
     let agent = body["agent"].as_str().map(str::to_string);
-    tokio::spawn(async move {
-        let _ = engine.start_turn(app, id, model_id, provider_id, full, agent);
-    });
-    StatusCode::OK
+    match engine
+        .run_sync(app, id, model_id, provider_id, full, agent)
+        .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
 }
 
 async fn abort(State(st): State<AppState>, Path(id): Path<String>) -> Json<bool> {
@@ -203,10 +206,10 @@ async fn abort(State(st): State<AppState>, Path(id): Path<String>) -> Json<bool>
     Json(true)
 }
 
-async fn summarize(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn summarize(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     match st.engine.summarize(st.app.clone(), id) {
-        Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::NOT_FOUND,
+        Ok(()) => Json(true).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
