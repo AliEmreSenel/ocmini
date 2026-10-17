@@ -89,6 +89,7 @@ pub fn run() {
         let mut pending_perm: Option<String> = None;
         let mut input = String::new();
         let mut agent: Option<String> = None;
+        let mut variant: Option<String> = None;
         let mut busy: Option<tokio::task::JoinHandle<()>> = None;
 
         let perm_mode = {
@@ -98,11 +99,20 @@ pub fn run() {
             if strict { "supervised" } else { "full-access" }
         };
         out(&format!(
-            "\x1b[1mocmini\x1b[0m 1.19.2 · {provider}/{model} · {cwd} · \x1b[33m{perm_mode}\x1b[0m\n\x1b[2m/quit /model <prov/id> /new /abort · Enter sends\x1b[0m\n"
+            "\x1b[1mocmini\x1b[0m 1.19.2 · {provider}/{model} · {cwd} · \x1b[33m{perm_mode}\x1b[0m\n\x1b[2m/quit /model <prov/id> /variant <level> /new /abort · Enter sends\x1b[0m\n"
         ));
         out("\x1b[36m> \x1b[0m");
 
         loop {
+            // Must run at the top of the loop: the event-drain and sleep paths
+            // below `continue`, so a bottom check only fires on keypresses and
+            // the prompt would not return after a turn.
+            if let Some(h) = &busy {
+                if h.is_finished() {
+                    busy = None;
+                    out("\x1b[36m> \x1b[0m");
+                }
+            }
             while let Ok(ev) = rx_bus.try_recv() {
                 let p = &ev.properties;
                 // sessionID is top-level for most events, nested in .part for
@@ -225,6 +235,17 @@ pub fn run() {
                         prompt();
                         continue;
                     }
+                    if let Some(rest) = text.strip_prefix("/variant ") {
+                        let v = rest.trim().to_string();
+                        if ["none", "low", "medium", "high", "xhigh"].contains(&v.as_str()) {
+                            variant = if v == "none" { None } else { Some(v.clone()) };
+                            out(&format!("\x1b[2mthinking: {v}\x1b[0m\n"));
+                        } else {
+                            out("\x1b[2musage: /variant none|low|medium|high|xhigh\x1b[0m\n");
+                        }
+                        prompt();
+                        continue;
+                    }
                     if text == "/new" {
                         session = app.store.create_session_owned("tui", &cwd);
                         out("\x1b[2mnew session\x1b[0m\n");
@@ -255,11 +276,11 @@ pub fn run() {
                     let app2 = app.clone();
                     let engine2 = engine.clone();
                     let sid = session.id.clone();
-                    let (p2, m2) = (provider.clone(), model.clone());
+                    let (p2, m2, v2) = (provider.clone(), model.clone(), variant.clone());
                     let agent = agent.clone();
                     let h = tokio::spawn(async move {
                         if let Err(e) = engine2
-                            .run_sync(app2, sid, m2, p2, text, agent.clone())
+                            .run_sync(app2, sid, m2, p2, text, agent.clone(), v2)
                             .await
                         {
                             out(&format!("\x1b[31m{e}\x1b[0m\n"));
@@ -269,12 +290,6 @@ pub fn run() {
                 }
             }
 
-            if let Some(h) = &busy {
-                if h.is_finished() {
-                    busy = None;
-                    out("\x1b[36m> \x1b[0m");
-                }
-            }
         }
         cleanup();
     });

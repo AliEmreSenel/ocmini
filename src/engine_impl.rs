@@ -119,6 +119,7 @@ async fn run_turn(
     provider_id: String,
     user_text: String,
     agent: Option<String>,
+    variant: Option<String>,
 ) -> Result<Value, String> {
     let is_plan = agent.as_deref() == Some("plan");
     let session = app.store.get_session(&session_id).ok_or("no session")?;
@@ -180,6 +181,7 @@ async fn run_turn(
             system: system.clone(),
             messages,
             tools: tool_defs.clone(),
+            variant: variant.clone(),
         };
         let mut stream = adapter.stream(req).await.map_err(|e| {
             bus().emit("session.error", json!({"sessionID": session_id, "error": {"name": "ProviderAuthError", "data": {"message": e.clone()}}}));
@@ -417,12 +419,13 @@ impl EngineApi for Engine {
         provider_id: String,
         text: String,
         agent: Option<String>,
+        variant: Option<String>,
     ) -> oneshot::Receiver<Value> {
         let (tx, rx) = oneshot::channel();
         let engine = ENGINE.get().cloned();
         tokio::spawn(async move {
             let engine = engine.unwrap_or_else(|| Arc::new(Engine::new()));
-            let res = run_turn(app, engine, session_id, model_id, provider_id, text, agent).await;
+            let res = run_turn(app, engine, session_id, model_id, provider_id, text, agent, variant).await;
             let _ = tx.send(res.unwrap_or(json!({"error": "turn failed"})));
         });
         rx
@@ -442,11 +445,12 @@ impl EngineApi for Engine {
         provider_id: String,
         text: String,
         agent: Option<String>,
+        variant: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>> {
         let engine = ENGINE.get().cloned();
         Box::pin(async move {
             let engine = engine.unwrap_or_else(|| Arc::new(Engine::new()));
-            run_turn(app, engine, session_id, model_id, provider_id, text, agent).await
+            run_turn(app, engine, session_id, model_id, provider_id, text, agent, variant).await
         })
     }
 

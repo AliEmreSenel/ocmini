@@ -148,6 +148,8 @@ pub struct PromptRequest {
     pub parts: Vec<PromptPart>,
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub variant: Option<String>,
 }
 
 #[derive(Clone, Debug)]

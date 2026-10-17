@@ -71,6 +71,9 @@ impl ProviderAdapter for OpenAiCompatAdapter {
         if !req.tools.is_empty() {
             body["tools"] = Value::Array(req.tools);
         }
+        if let Some(v) = req.variant.as_deref().filter(|v| *v != "none") {
+            body["reasoning_effort"] = json!(v);
+        }
         let mut request = reqwest::Client::new()
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)

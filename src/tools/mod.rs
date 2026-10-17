@@ -263,7 +263,7 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
             bus().emit("session.created", json!({"info": child}));
             let res = ctx
                 .engine
-                .run_sync(ctx.app.clone(), child.id.clone(), model, provider, prompt.to_string(), Some("general".into()))
+                .run_sync(ctx.app.clone(), child.id.clone(), model, provider, prompt.to_string(), Some("general".into()), None)
                 .await
                 .map_err(|e| ToolError { message: e, denied: false })?;
             let text = res["parts"]

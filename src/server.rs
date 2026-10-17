@@ -46,12 +46,38 @@ async fn api_info() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let hex = |c: u8| (c as char).to_digit(16);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn dir_of(headers: &HeaderMap) -> String {
     headers
         .get("x-opencode-directory")
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
-        .map(String::from)
+        .map(|v| {
+            // T3 sends this header percent-encoded (%2Fhome%2F...); opencode decodes it.
+            if v.contains("%2") || v.contains("%2F") || v.starts_with("%") {
+                percent_decode(v)
+            } else {
+                v.to_string()
+            }
+        })
         .unwrap_or_else(|| std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default())
 }
 
@@ -68,7 +94,7 @@ async fn session_create(State(st): State<AppState>, headers: HeaderMap, Json(bod
     let directory = body
         .get("directory")
         .and_then(|d| d.as_str())
-        .map(String::from)
+        .map(|d| percent_decode(d))
         .unwrap_or_else(|| dir_of(&headers));
     let s = Session {
         id: hex_id("ses_"),
@@ -153,7 +179,7 @@ async fn prompt_async(
     let app = st.app.clone();
     let engine = st.engine.clone();
     tokio::spawn(async move {
-        let _ = engine.start_turn(app, id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts), req.agent);
+        let _ = engine.start_turn(app, id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts), req.agent, req.variant);
     });
     StatusCode::NO_CONTENT
 }
@@ -165,7 +191,7 @@ async fn prompt_sync(
 ) -> Response {
     match st
         .engine
-        .run_sync(st.app.clone(), id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts), req.agent)
+        .run_sync(st.app.clone(), id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts), req.agent, req.variant)
         .await
     {
         Ok(v) => Json(v).into_response(),
@@ -193,7 +219,7 @@ async fn command_run(State(st): State<AppState>, Path(id): Path<String>, Json(bo
     let engine = st.engine.clone();
     let agent = body["agent"].as_str().map(str::to_string);
     match engine
-        .run_sync(app, id, model_id, provider_id, full, agent)
+        .run_sync(app, id, model_id, provider_id, full, agent, None)
         .await
     {
         Ok(v) => Json(v).into_response(),

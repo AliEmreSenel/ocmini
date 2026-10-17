@@ -138,6 +138,7 @@ pub trait EngineApi: Send + Sync + 'static {
         provider_id: String,
         text: String,
         agent: Option<String>,
+        variant: Option<String>,
     ) -> oneshot::Receiver<serde_json::Value>;
 
     fn abort(&self, session_id: &str);
@@ -150,6 +151,7 @@ pub trait EngineApi: Send + Sync + 'static {
         provider_id: String,
         text: String,
         agent: Option<String>,
+        variant: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>>;
 
     fn summarize(&self, app: App, session_id: String) -> Result<(), String>;

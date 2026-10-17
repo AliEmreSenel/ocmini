@@ -11,6 +11,7 @@ pub struct ChatRequest {
     pub system: String,
     pub messages: Vec<serde_json::Value>,
     pub tools: Vec<serde_json::Value>,
+    pub variant: Option<String>,
 }
 
 #[async_trait]

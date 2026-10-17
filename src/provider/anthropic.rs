@@ -62,7 +62,7 @@ fn openai_to_anthropic(req: &ChatRequest) -> Value {
             messages.push(json!({"role": role, "content": content}));
         }
     }
-    json!({
+    let mut body = json!({
         "model": req.model,
         "max_tokens": 16000,
         "stream": true,
@@ -73,7 +73,18 @@ fn openai_to_anthropic(req: &ChatRequest) -> Value {
             "description": t["function"]["description"],
             "input_schema": t["function"]["parameters"],
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(v) = req.variant.as_deref().filter(|v| *v != "none") {
+        let budget = match v {
+            "low" => 1024,
+            "medium" => 4096,
+            "high" => 10240,
+            _ => 24576,
+        };
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+        body["temperature"] = json!(1);
+    }
+    body
 }
 
 fn map_stop_reason(r: &str) -> String {
