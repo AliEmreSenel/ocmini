@@ -9,10 +9,11 @@ use crossterm::{
     },
     terminal,
 };
-use futures::StreamExt;
+use futures::{poll, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::task::Poll;
 
 struct RawMode;
 
@@ -33,24 +34,27 @@ impl Drop for RawMode {
     }
 }
 
-// Raw terminals do not translate LF to CRLF for transcript output.
+// Raw terminals do not translate LF to CRLF for transcript output. Exported so
+// the session picker shares one CRLF-safe printing path.
+#[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => { std::print!("{}", format!($($arg)*).replace('\n', "\r\n")) };
 }
+#[macro_export]
 macro_rules! println {
     () => { print!("\n") };
     ($($arg:tt)*) => { print!("{}\n", format!($($arg)*)) };
 }
 
-const RESET: &str = "\x1b[0m";
-const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
+pub(crate) const RESET: &str = "\x1b[0m";
+pub(crate) const DIM: &str = "\x1b[2m";
+pub(crate) const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
+pub(crate) const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     let mut chars = text.chars();
     let mut out: String = chars.by_ref().take(max).collect();
     if chars.next().is_some() {
@@ -85,7 +89,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear{RESET}");
+    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
     print!("{BOLD}›{RESET} ");
     let _ = std::io::stdout().flush();
 }
@@ -305,7 +309,7 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
     }
 }
 
-enum Key {
+pub(crate) enum Key {
     Char(char),
     Enter,
     Backspace,
@@ -313,20 +317,46 @@ enum Key {
     CtrlC,
     CtrlD,
     CtrlL,
+    CtrlR,
+    /// Move by N rows; page keys report a full page.
+    Up(usize),
+    Down(usize),
+    Home,
+    End,
+    Tab,
     Paste(String),
     Other,
 }
 
-fn decode_event(event: Event) -> Key {
+/// Rows a page key moves, matching the picker's viewport height.
+const PAGE: usize = 10;
+
+pub(crate) fn decode_event(event: Event) -> Key {
     match event {
         Event::Paste(text) => Key::Paste(text.replace("\r\n", "\n").replace('\r', "\n")),
         Event::Key(key) if key.kind != KeyEventKind::Release => match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => Key::CtrlC,
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => Key::CtrlD,
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => Key::CtrlL,
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => Key::CtrlR,
             (KeyCode::Enter, _) => Key::Enter,
             (KeyCode::Backspace, _) => Key::Backspace,
             (KeyCode::Esc, _) => Key::Esc,
+            (KeyCode::Up, modifiers) => Key::Up(if modifiers.contains(KeyModifiers::SHIFT) {
+                PAGE
+            } else {
+                1
+            }),
+            (KeyCode::Down, modifiers) => Key::Down(if modifiers.contains(KeyModifiers::SHIFT) {
+                PAGE
+            } else {
+                1
+            }),
+            (KeyCode::PageUp, _) => Key::Up(PAGE),
+            (KeyCode::PageDown, _) => Key::Down(PAGE),
+            (KeyCode::Home, _) => Key::Home,
+            (KeyCode::End, _) => Key::End,
+            (KeyCode::Tab, _) => Key::Tab,
             (KeyCode::Char(ch), modifiers)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
@@ -392,35 +422,58 @@ fn render_history(history: &[MessageWithParts]) {
     }
 }
 
+fn display_model(model_ref: Option<&crate::types::ModelRef>, config_model: &str) -> String {
+    let display = model_ref
+        .map(|model| format!("{}/{}", model.provider_id, model.model_id))
+        .unwrap_or_else(|| config_model.to_string());
+    if display.is_empty() {
+        "unconfigured".into()
+    } else {
+        display
+    }
+}
+
+/// Interactive resume path for `--resume`: needs a real terminal because it
+/// enters raw mode and reads keys before the chat loop exists.
+async fn pick_session(app: &App, directory: Option<&str>) -> Result<crate::types::Session, String> {
+    if !std::io::stdout().is_terminal() {
+        return Err("Session selection needs a terminal; resume by ID with --session ID".into());
+    }
+    let scope = directory.map(crate::sessions::directory).transpose()?;
+    let _raw = RawMode::enter().map_err(|error| format!("Cannot initialize terminal: {error}"))?;
+    let mut keys = EventStream::new();
+    crate::picker::select(&app.store, scope.as_deref(), &mut keys)
+        .await?
+        .ok_or_else(|| "No session selected".to_string())
+}
+
 pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     let app = App::new()?;
-    let session = crate::sessions::open(
-        &app.store,
-        args.directory.as_deref(),
-        args.session.as_deref(),
-        args.continue_last,
-    )?;
-    let app = app.for_directory(&session.directory)?;
+    let session = if args.resume {
+        pick_session(&app, args.directory.as_deref()).await?
+    } else {
+        crate::sessions::open(
+            &app.store,
+            args.directory.as_deref(),
+            args.session.as_deref(),
+            args.continue_last,
+        )?
+    };
+    let mut app = app.for_directory(&session.directory)?;
+    let mut session = session;
     let engine = Engine::new();
     let history = app.store.messages(&session.id)?;
     let previous = history
         .iter()
         .rev()
         .find(|message| message.info.role == "user");
-    let model_ref = args
+    let model_override = args.model.clone();
+    let mut model_ref = args
         .model
         .or_else(|| previous.and_then(|message| message.info.model.clone()));
-    let agent = previous.and_then(|message| message.info.agent.clone());
-    let variant = previous.and_then(|message| message.info.variant.clone());
-    let model_display = model_ref
-        .as_ref()
-        .map(|model| format!("{}/{}", model.provider_id, model.model_id))
-        .unwrap_or_else(|| app.config.lock().unwrap().model.clone());
-    let model_display = if model_display.is_empty() {
-        "unconfigured".into()
-    } else {
-        model_display
-    };
+    let mut agent = previous.and_then(|message| message.info.agent.clone());
+    let mut variant = previous.and_then(|message| message.info.variant.clone());
+    let mut model_display = display_model(model_ref.as_ref(), &app.config.lock().unwrap().model);
 
     let shutdown =
         shutdown_signal().map_err(|error| format!("Cannot listen for shutdown: {error}"))?;
@@ -457,6 +510,56 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     Key::CtrlC => { engine.abort(&session.id); println!("\n{YELLOW}⏹ aborted{RESET}"); }
                     Key::CtrlL => print!("\x1b[2J\x1b[H"),
+                    Key::CtrlR if !pending_permission && !pending_question => {
+                        print!("\x1b[J");
+                        let picked = crate::picker::select(&app.store, None, &mut keys).await?;
+                        // The picker reads stdin through this same stream; keys typed
+                        // while it was open are queued here and must not reach the prompt.
+                        while let Poll::Ready(Some(_)) = poll!(keys.next()) {}
+                        match picked {
+                            None => print_prompt(&model_display),
+                            Some(picked) => {
+                                match crate::sessions::open(
+                                    &app.store,
+                                    None,
+                                    Some(&picked.id),
+                                    false,
+                                ) {
+                                    Err(error) => {
+                                        println!("{RED}error:{RESET} {error}");
+                                        print_prompt(&model_display);
+                                    }
+                                    Ok(resumed) => {
+                                        engine.abort(&session.id);
+                                        app = app.for_directory(&resumed.directory)?;
+                                        session = resumed;
+                                        let history = app.store.messages(&session.id)?;
+                                        let previous = history.iter().rev().find(|message| {
+                                            message.info.role == "user"
+                                        });
+                                        model_ref = model_override.clone().or_else(|| {
+                                            previous.and_then(|message| message.info.model.clone())
+                                        });
+                                        agent = previous
+                                            .and_then(|message| message.info.agent.clone());
+                                        variant = previous
+                                            .and_then(|message| message.info.variant.clone());
+                                        model_display = display_model(
+                                            model_ref.as_ref(),
+                                            &app.config.lock().unwrap().model,
+                                        );
+                                        line.clear();
+                                        println!(
+                                            "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}",
+                                            session.id, session.directory
+                                        );
+                                        render_history(&history);
+                                        print_prompt(&model_display);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Key::Char(ch) if pending_permission => {
                         if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() {
                             match ch {

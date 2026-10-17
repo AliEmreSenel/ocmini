@@ -13,7 +13,7 @@ ocmini --model local/my-model --directory ~/project
 ocmini serve --hostname 127.0.0.1 --port 4096
 ```
 
-Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+C aborts the current turn, Ctrl+D exits.
+Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector.
 
 To use it with T3 Code, set the OpenCode provider's binary path to the installed `ocmini` executable.
 
@@ -21,10 +21,13 @@ To use it with T3 Code, set the OpenCode provider's binary path to the installed
 
 ```sh
 ocmini --continue                         # latest session in this project
+ocmini --resume                           # interactive session selector
 ocmini session list                       # saved IDs, titles and directories
 ocmini --session ses_…                    # resume by ID
 ocmini session list --directory ~/project # filter by project
 ```
+
+The selector lists saved sessions with live search (title, ID, directory), a cycling sort order (updated/created/title, Tab) and arrow/page navigation; Enter resumes, Esc cancels. `Ctrl+R` opens it inside the chat to switch sessions.
 
 `--continue` and `--session` also work with `ocmini tui`. Resuming shows the saved conversation and keeps its last model and agent; `--model` overrides the model. An explicit session ID uses the saved project directory. A normal launch starts a new session.
 
