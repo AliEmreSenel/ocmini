@@ -7,8 +7,8 @@ A minimal, fast, drop-in replacement for `opencode serve` (v1 API) built for T3 
 
 | metric | ocmini | opencode 1.19.2 |
 |---|---|---|
-| startup to health | ~0.75 s | ~9.3 s |
-| idle RSS | ~5 MB | ~265 MB |
+| startup to health | ~50 ms | ~9.3 s |
+| idle RSS | ~2.6 MB | ~265 MB |
 | binary size | 8 MB | 186 MB |
 | session store growth | SQLite WAL, 30-day prune | unbounded |
 
@@ -35,7 +35,12 @@ cargo run --bin ocmini-fuzz         # differential shape fuzzer: spawns real ope
 ## TUI
 
 Run `ocmini` with no arguments for a minimal chat TUI (in-process engine, streaming deltas,
-tool lines, `/model <prov>/<id>`, `/new`, `/abort`, `/quit`, Ctrl+C aborts a running turn).
+tool lines, `/model <prov>/<id>`, `/plan`, `/build`, `/new`, `/abort`, `/quit`, Ctrl+C aborts a running turn).
+
+## Agent modes
+
+The `agent` field from T3 prompts is honored: `plan` hides and hard-blocks `write`/`edit`/`task`,
+and injects a read-only system prompt. All other agents run `build` (full tools).
 
 ## Use with T3 Code
 
