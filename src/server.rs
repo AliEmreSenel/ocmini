@@ -166,7 +166,8 @@ fn matches_directory(session: &Session, directory: Option<&str>) -> bool {
 
 fn scoped_session(st: &AppState, id: &str, headers: &HeaderMap, query: &ScopeQuery) -> Result<Session, ApiError> {
     let directory = requested_directory(headers, query)?;
-    st.app.store.get_session(id).filter(|session| matches_directory(session, directory.as_deref()))
+    st.app.store.get_session(id).map_err(ApiError::runtime)?
+        .filter(|session| matches_directory(session, directory.as_deref()))
         .ok_or_else(|| ApiError::not_found(format!("Session {id} was not found in this directory")))
 }
 
@@ -181,7 +182,7 @@ fn decode_rules(value: &Value) -> Result<Vec<PermissionRule>, ApiError> {
 
 async fn list_sessions(State(st): State<AppState>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Vec<Session>>, ApiError> {
     let directory = requested_directory(&headers, &query)?;
-    let mut sessions = st.app.store.list_sessions(None);
+    let mut sessions = st.app.store.list_sessions(None).map_err(ApiError::runtime)?;
     sessions.retain(|session| matches_directory(session, directory.as_deref())
         && (!query.roots.unwrap_or(false) || session.parent_id.is_none())
         && query.search.as_ref().is_none_or(|search| session.title.to_lowercase().contains(&search.to_lowercase())));
@@ -202,7 +203,7 @@ async fn session_create(State(st): State<AppState>, headers: HeaderMap, Query(qu
     let permission = body.get("permission").map(decode_rules).transpose()?;
     let parent = body.get("parentID").map(|value| value.as_str().ok_or_else(|| ApiError::invalid("parentID must be a string"))).transpose()?;
     if let Some(parent) = parent {
-        let parent_session = st.app.store.get_session(parent).ok_or_else(|| ApiError::not_found("Parent session not found"))?;
+        let parent_session = st.app.store.get_session(parent).map_err(ApiError::runtime)?.ok_or_else(|| ApiError::not_found("Parent session not found"))?;
         if !matches_directory(&parent_session, Some(&directory)) { return Err(ApiError::not_found("Parent session not found in this directory")); }
     }
     let mut session = st.app.store.try_create_session_owned(title, &directory).map_err(ApiError::runtime)?;
@@ -230,7 +231,7 @@ async fn session_patch(State(st): State<AppState>, Path(id): Path<String>, heade
 
 async fn session_delete(State(st): State<AppState>, Path(id): Path<String>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<bool>, ApiError> {
     let session = scoped_session(&st, &id, &headers, &query)?;
-    if st.app.store.is_busy(&id) { return Err(ApiError::busy()); }
+    if st.app.store.is_busy(&id).map_err(ApiError::runtime)? { return Err(ApiError::busy()); }
     st.app.store.delete_session(&id).map_err(ApiError::runtime)?;
     bus().emit("session.deleted", json!({"info": session}));
     Ok(Json(true))
@@ -238,28 +239,31 @@ async fn session_delete(State(st): State<AppState>, Path(id): Path<String>, head
 
 async fn session_children(State(st): State<AppState>, Path(id): Path<String>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Vec<Session>>, ApiError> {
     scoped_session(&st, &id, &headers, &query)?;
-    Ok(Json(st.app.store.children(&id)))
+    Ok(Json(st.app.store.children(&id).map_err(ApiError::runtime)?))
 }
 
 async fn session_status(State(st): State<AppState>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Value>, ApiError> {
     let directory = requested_directory(&headers, &query)?;
     let statuses = st.app.statuses.lock().unwrap().clone();
-    let status: Map<String, Value> = st.app.store.busy_sessions().into_iter()
-        .filter(|id| st.app.store.get_session(id).is_some_and(|session| matches_directory(&session, directory.as_deref())))
-        .map(|id| { let value = statuses.get(&id).cloned().unwrap_or_else(|| json!({"type": "busy"})); (id, value) }).collect();
+    let mut status = Map::new();
+    for id in st.app.store.busy_sessions().map_err(ApiError::runtime)? {
+        if st.app.store.get_session(&id).map_err(ApiError::runtime)?.is_some_and(|session| matches_directory(&session, directory.as_deref())) {
+            status.insert(id.clone(), statuses.get(&id).cloned().unwrap_or_else(|| json!({"type": "busy"})));
+        }
+    }
     Ok(Json(Value::Object(status)))
 }
 
 async fn session_messages(State(st): State<AppState>, Path(id): Path<String>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Vec<MessageWithParts>>, ApiError> {
     scoped_session(&st, &id, &headers, &query)?;
-    let mut messages = st.app.store.messages(&id);
+    let mut messages = st.app.store.messages(&id).map_err(ApiError::runtime)?;
     if let Some(limit) = query.limit { let remove = messages.len().saturating_sub(limit); messages.drain(..remove); }
     Ok(Json(messages))
 }
 
 async fn session_message(State(st): State<AppState>, Path((id, message_id)): Path<(String, String)>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<MessageWithParts>, ApiError> {
     scoped_session(&st, &id, &headers, &query)?;
-    st.app.store.messages(&id).into_iter().find(|message| message.info.id == message_id).map(Json)
+    st.app.store.messages(&id).map_err(ApiError::runtime)?.into_iter().find(|message| message.info.id == message_id).map(Json)
         .ok_or_else(|| ApiError::not_found("Message not found"))
 }
 
@@ -371,12 +375,12 @@ async fn summarize(State(st): State<AppState>, Path(id): Path<String>, headers: 
 
 async fn fork(State(st): State<AppState>, Path(id): Path<String>, headers: HeaderMap, Query(query): Query<ScopeQuery>, body: Option<Json<Value>>) -> Result<Json<Session>, ApiError> {
     let session = scoped_session(&st, &id, &headers, &query)?;
-    if st.app.store.is_busy(&id) { return Err(ApiError::busy()); }
+    if st.app.store.is_busy(&id).map_err(ApiError::runtime)? { return Err(ApiError::busy()); }
     let body = body.map(|body| body.0).unwrap_or_else(|| json!({}));
     if !body.is_object() { return Err(ApiError::invalid("Fork body must be an object")); }
     let boundary = body.get("messageID").map(|value| value.as_str().ok_or_else(|| ApiError::invalid("messageID must be a string"))).transpose()?;
     if let Some(boundary) = boundary {
-        if !st.app.store.messages(&id).iter().any(|message| message.info.id == boundary) { return Err(ApiError::not_found("Fork boundary message not found")); }
+        if !st.app.store.messages(&id).map_err(ApiError::runtime)?.iter().any(|message| message.info.id == boundary) { return Err(ApiError::not_found("Fork boundary message not found")); }
     }
     let fork = st.app.store.try_fork(&session, boundary).map_err(ApiError::runtime)?;
     bus().emit("session.created", json!({"info": fork}));
@@ -391,7 +395,7 @@ fn event_in_directory(event: &BusEvent, app: &App, directory: Option<&str>) -> b
     let session_id = event.properties.get("sessionID").and_then(Value::as_str)
         .or_else(|| event.properties.get("info").and_then(|info| info.get("sessionID")).and_then(Value::as_str))
         .or_else(|| event.properties.get("part").and_then(|part| part.get("sessionID")).and_then(Value::as_str));
-    session_id.is_none_or(|id| app.store.get_session(id).is_some_and(|session| matches_directory(&session, Some(directory))))
+    session_id.is_none_or(|id| app.store.get_session(id).ok().flatten().is_some_and(|session| matches_directory(&session, Some(directory))))
 }
 
 async fn event_stream(State(st): State<AppState>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Response, ApiError> {
@@ -408,8 +412,8 @@ async fn event_stream(State(st): State<AppState>, headers: HeaderMap, Query(quer
                     Ok(event) => if event_in_directory(&event, &st.app, directory.as_deref()) { yield Ok(Event::default().data(serde_json::to_string(&event).expect("serializable event"))); },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                         // Losing text or tool events must fail visibly instead of completing a partial turn.
-                        for id in st.app.store.busy_sessions() {
-                            if st.app.store.get_session(&id).is_some_and(|session| matches_directory(&session, directory.as_deref())) {
+                        for id in st.app.store.busy_sessions().unwrap_or_default() {
+                            if st.app.store.get_session(&id).ok().flatten().is_some_and(|session| matches_directory(&session, directory.as_deref())) {
                                 yield Ok(Event::default().data(json!({"id": hex_id("evt_"), "type": "session.error", "properties": {"sessionID": id, "error": {"name": "UnknownError", "data": {"message": format!("Event subscriber fell behind by {count} events; reconnect and reload the session")}}}}).to_string()));
                             }
                         }
@@ -426,7 +430,7 @@ async fn event_stream(State(st): State<AppState>, headers: HeaderMap, Query(quer
 
 async fn permission_list(State(st): State<AppState>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Value>, ApiError> {
     let directory = requested_directory(&headers, &query)?;
-    let requests: Vec<_> = st.app.perms.list().into_iter().filter(|request| st.app.store.get_session(&request.session_id).is_some_and(|session| matches_directory(&session, directory.as_deref()))).collect();
+    let requests: Vec<_> = st.app.perms.list().into_iter().filter(|request| st.app.store.get_session(&request.session_id).ok().flatten().is_some_and(|session| matches_directory(&session, directory.as_deref()))).collect();
     Ok(Json(json!(requests)))
 }
 
@@ -451,7 +455,7 @@ async fn permission_reply_session(State(st): State<AppState>, Path((session_id, 
 
 async fn question_list(State(st): State<AppState>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Value>, ApiError> {
     let directory = requested_directory(&headers, &query)?;
-    let requests: Vec<_> = st.app.questions.list().into_iter().filter(|request| st.app.store.get_session(&request.session_id).is_some_and(|session| matches_directory(&session, directory.as_deref()))).collect();
+    let requests: Vec<_> = st.app.questions.list().into_iter().filter(|request| st.app.store.get_session(&request.session_id).ok().flatten().is_some_and(|session| matches_directory(&session, directory.as_deref()))).collect();
     Ok(Json(json!(requests)))
 }
 
@@ -679,7 +683,7 @@ pub async fn serve(hostname: String, port: u16) -> Result<(), String> {
     let directory = std::env::current_dir().map_err(|error| format!("Cannot resolve working directory: {error}"))?;
     Config::load_for(&directory.to_string_lossy())?;
     let listener = tokio::net::TcpListener::bind((hostname.as_str(), port)).await.map_err(|error| format!("Cannot listen on {hostname}:{port}: {error}"))?;
-    let state = AppState { app: App::new(), engine: Arc::new(crate::engine_impl::Engine::new()), shutdown: tokio_util::sync::CancellationToken::new(), max_request_bytes };
+    let state = AppState { app: App::new()?, engine: Arc::new(crate::engine_impl::Engine::new()), shutdown: tokio_util::sync::CancellationToken::new(), max_request_bytes };
     state.engine.recover(state.app.clone());
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     let announced_host = if address.is_ipv6() { format!("[{}]", address.ip()) } else { address.ip().to_string() };
@@ -696,7 +700,7 @@ pub async fn serve(hostname: String, port: u16) -> Result<(), String> {
         }
         #[cfg(not(unix))]
         { let _ = tokio::signal::ctrl_c().await; }
-        for id in shutdown_state.app.store.busy_sessions() { shutdown_state.engine.abort(&id); }
+        for id in shutdown_state.app.store.busy_sessions().unwrap_or_default() { shutdown_state.engine.abort(&id); }
         shutdown_state.shutdown.cancel();
     }).await.map_err(|error| error.to_string())
 }

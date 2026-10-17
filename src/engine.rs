@@ -94,18 +94,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
-        let config=Config::load();
+    pub fn new() -> Result<Self, String> {
+        let config=Config::load()?;
         let directory=std::env::current_dir().unwrap_or_default();
         let directory=directory.to_string_lossy().into_owned();
         let (mcp,mcp_ready)=start_mcp(&config,&directory);
         let mcp_scopes=Arc::new(Mutex::new(std::collections::HashMap::from([(directory,(mcp.clone(),mcp_ready.clone()))])));
-        Self {
-            store:Arc::new(Store::open(&crate::config::store_path())), config:Arc::new(Mutex::new(config)),
+        Ok(Self {
+            store:Arc::new(Store::open(&crate::config::store_path(), &crate::types::hex_id("ocm_"))?), config:Arc::new(Mutex::new(config)),
             auth:Arc::new(AuthStore::load()), perms:PermissionState::default(), questions:QuestionState::default(),
             mcp, mcp_ready, mcp_scopes, usage:Arc::new(UsageDb::open()), always:Arc::new(Mutex::new(Default::default())),
             statuses:Arc::new(Mutex::new(Default::default())),
-        }
+        })
     }
 
     pub fn for_directory(&self,directory:&str)->Result<Self,String> {

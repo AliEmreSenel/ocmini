@@ -32,26 +32,49 @@ impl Engine {
             if let (Some(mid), Some(tx)) = (mid, tx) { current.waiters.entry(mid).or_default().push(tx); }
             return;
         }
+        if let Err(error) = app.store.claim(&sid) { eprintln!("ocmini: {error}"); }
         let cancel = Arc::new(AtomicBool::new(false));
         let mut waiters = HashMap::new();
         if let (Some(mid), Some(tx)) = (mid, tx) { waiters.insert(mid, vec![tx]); }
         running.insert(sid.clone(), Running { app: app.clone(), cancel: cancel.clone(), waiters });
-        app.store.set_busy(&sid, true);
+        if let Err(error) = app.store.set_busy(&sid, true) { eprintln!("ocmini: {error}"); }
         update_status(&app,&sid,json!({"type":"busy"}));
         drop(running);
         let engine = self.clone();
         tokio::spawn(async move { engine.drain(app, sid, cancel).await; });
     }
 
-    fn claim(&self, running:&mut HashMap<String,Running>, app:&App, sid:&str, mid:String, tx:oneshot::Sender<Value>)->Arc<AtomicBool> {
+    fn claim(&self, running:&mut HashMap<String,Running>, app:&App, sid:&str, mid:String, tx:oneshot::Sender<Value>)->Result<Arc<AtomicBool>,String> {
+        app.store.claim(sid)?;
         let cancel=Arc::new(AtomicBool::new(false));
         running.insert(sid.into(),Running{app:app.clone(),cancel:cancel.clone(),waiters:HashMap::from([(mid,vec![tx])])});
-        app.store.set_busy(sid,true);
+        app.store.set_busy(sid,true)?;
         update_status(app,sid,json!({"type":"busy"}));
-        cancel
+        Ok(cancel)
     }
 
     async fn drain(&self, app: App, sid: String, cancel: Arc<AtomicBool>) {
+        // Keep the ownership lease fresh while this instance owns the session,
+        // so a sibling instance's restart recovery ignores its live work.
+        let heartbeat = {
+            let (app, sid, cancel) = (app.clone(), sid.clone(), cancel.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => { let _ = app.store.heartbeat(&sid); }
+                        _ = cancelled(&cancel) => break,
+                    }
+                }
+            })
+        };
+        self.drain_inner(&app, &sid, &cancel).await;
+        heartbeat.abort();
+    }
+
+    async fn drain_inner(&self, app: &App, sid: &str, cancel: &Arc<AtomicBool>) {
+        let sid = sid.to_string();
+        let app = app.clone();
+        let cancel = cancel.clone();
         loop {
             // Admission and the idle transition share this lock. A prompt cannot
             // land between the final inbox check and releasing session ownership.
@@ -97,7 +120,8 @@ impl Engine {
 fn finish_running(app: &App, sid: &str, running: Option<Running>, error: Option<&str>) {
     app.perms.reject_all(sid);
     app.questions.reject_all(sid);
-    app.store.set_busy(sid, false);
+    app.store.release(sid);
+    if let Err(error) = app.store.set_busy(sid, false) { eprintln!("ocmini: {error}"); }
     if let Some(running) = running {
         let value = json!({"error":error.unwrap_or("Prompt is no longer pending")});
         for waiters in running.waiters.into_values() {
@@ -119,30 +143,30 @@ fn update_status(app:&App,sid:&str,status:Value) {
 
 impl EngineApi for Engine {
     fn start_turn(&self, app: App, sid: String, mut request: PromptRequest) -> Result<oneshot::Receiver<Value>, String> {
-        let session = app.store.get_session(&sid).ok_or("Session not found")?;
+        let session = app.store.get_session(&sid)?.ok_or("Session not found")?;
         let mut guard = self.running.lock().unwrap();
         let mid = request.message_id.clone().unwrap_or_else(|| hex_id("msg_"));
         if mid.is_empty() || mid.len() > 256 || !mid.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) {
             return Err("messageID must contain 1–256 ASCII letters, digits, underscores or hyphens".into());
         }
         let (tx, rx) = oneshot::channel();
-        if let Some(owner) = app.store.message_owner(&mid) {
+        if let Some(owner) = app.store.message_owner(&mid)? {
             if owner != sid { return Err("messageID already belongs to another session".into()); }
-            let existing = app.store.message(&sid, &mid).ok_or("Message not found")?;
+            let existing = app.store.message(&sid, &mid)?.ok_or("Message not found")?;
             if existing.info.role != "user" { return Err("messageID already belongs to an assistant message".into()); }
-            if app.store.is_pending_message(&mid) {
+            if app.store.is_pending_message(&mid)? {
                 if let Some(state) = guard.get_mut(&sid) {
                     state.waiters.entry(mid).or_default().push(tx);
                     return Ok(rx);
                 }
                 let scoped=app.for_directory(&session.directory)?;
-                let cancel=self.claim(&mut guard,&scoped,&sid,mid,tx);
+                let cancel=self.claim(&mut guard,&scoped,&sid,mid,tx)?;
                 drop(guard);
                 let engine=self.clone();
                 tokio::spawn(async move { engine.drain(scoped,sid,cancel).await; });
                 return Ok(rx);
             }
-            let result = app.store.messages(&sid).into_iter().rev().find(|m| m.info.parent_id.as_deref() == Some(&mid)).unwrap_or(existing);
+            let result = app.store.messages(&sid)?.into_iter().rev().find(|m| m.info.parent_id.as_deref() == Some(&mid)).unwrap_or(existing);
             let _ = tx.send(serde_json::to_value(result).map_err(|e| e.to_string())?);
             return Ok(rx);
         }
@@ -202,7 +226,7 @@ impl EngineApi for Engine {
             state.waiters.entry(mid).or_default().push(tx);
             return Ok(rx);
         }
-        let cancel=self.claim(&mut guard,&app,&sid,mid,tx);
+        let cancel=self.claim(&mut guard,&app,&sid,mid,tx)?;
         drop(guard);
         let engine=self.clone();
         tokio::spawn(async move { engine.drain(app,sid,cancel).await; });
@@ -219,7 +243,7 @@ impl EngineApi for Engine {
                 state.cancel.store(true, Ordering::Release);
                 state.app.perms.reject_all(&id);
                 state.app.questions.reject_all(&id);
-                queue.extend(state.app.store.children(&id).into_iter().map(|s| s.id));
+                queue.extend(state.app.store.children(&id).unwrap_or_default().into_iter().map(|s| s.id));
             }
         }
     }
@@ -241,8 +265,8 @@ impl EngineApi for Engine {
     }
 
     fn recover(&self, app: App) {
-        for sid in app.store.pending_sessions() {
-            if let Some(session) = app.store.get_session(&sid) {
+        for sid in app.store.pending_sessions().unwrap_or_default() {
+            if let Some(session) = app.store.get_session(&sid).unwrap_or_default() {
                 match app.for_directory(&session.directory) {
                     Ok(scoped) => self.wake(scoped, sid, None, None),
                     Err(error) => emit_error(&sid, &error, false),
@@ -263,7 +287,7 @@ fn resolve_model(cfg: &Config, app: &App, sid: &str, selected: Option<&ModelRef>
     if let Some(model) = cfg.model.split_once('/').filter(|(p,m)| !p.is_empty() && !m.is_empty()) {
         return Ok(ModelRef { provider_id:model.0.into(), model_id:model.1.into() });
     }
-    for message in app.store.messages(sid).iter().rev() {
+    for message in app.store.messages(sid)?.iter().rev() {
         if let Some(model) = &message.info.model { return Ok(model.clone()); }
         if let (Some(p),Some(m)) = (&message.info.provider_id,&message.info.model_id) { return Ok(ModelRef { provider_id:p.clone(),model_id:m.clone() }); }
     }
@@ -286,7 +310,7 @@ pub async fn cancelled(cancel: &Arc<AtomicBool>) {
 }
 
 async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: PromptRequest, cancel: Arc<AtomicBool>) -> Result<Value,String> {
-    let session = app.store.get_session(sid).ok_or("Session not found")?;
+    let session = app.store.get_session(sid)?.ok_or("Session not found")?;
     let app=app.for_directory(&session.directory)?;
     let uid = request.message_id.as_deref().ok_or("Admitted prompt has no messageID")?;
     let model = request.model.as_ref().ok_or("Admitted prompt has no model")?;
@@ -449,7 +473,7 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
                 }
             };
             // Task/question tools may publish metadata while blocked. Preserve it.
-            let existing=app.store.message(sid,&amid).and_then(|m|m.parts.into_iter().find(|p|p["id"]==part["id"]));
+            let existing=app.store.message(sid,&amid).ok().flatten().and_then(|m|m.parts.into_iter().find(|p|p["id"]==part["id"]));
             let running_metadata=existing.as_ref().map(|p|p["state"]["metadata"].clone()).unwrap_or_else(||json!({}));
             part["state"]=match output {
                 Ok(out)=>json!({"status":"completed","input":input,"output":out.output,"title":out.title,"metadata":out.metadata,"time":{"start":start,"end":now_ms()}}),
@@ -477,7 +501,7 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
         app.usage.record(&amid,sid,&model.provider_id,&model.model_id,&usage,now);
         record_session_usage(&app,sid,&usage,cost)?;
         emit_message(&info);
-        let response=app.store.message(sid,&amid).ok_or("Persisted response not found")?;
+        let response=app.store.message(sid,&amid)?.ok_or("Persisted response not found")?;
         last=Some(serde_json::to_value(response).map_err(|e|e.to_string())?);
         if compact {
             if text_part.as_ref().and_then(|p|p["text"].as_str()).is_none_or(|s|s.trim().is_empty()) {
@@ -487,7 +511,7 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
             bus().emit("session.compacted",json!({"sessionID":sid}));
             break;
         }
-        if tool_parts.is_empty() || app.store.has_waiting(sid) { break; }
+        if tool_parts.is_empty() || app.store.has_waiting(sid)? { break; }
         if step+1==max_steps {
             let message=format!("Agent step limit ({max_steps}) reached. Send another message to continue from the saved tool results.");
             emit_error(sid,&message,false);
@@ -528,7 +552,7 @@ fn cost_for(cfg:&Config,model:&ModelRef,usage:&Tokens)->f64 {
 }
 
 fn record_session_usage(app:&App,sid:&str,usage:&Tokens,cost:f64)->Result<(),String> {
-    let Some(mut session)=app.store.get_session(sid) else { return Ok(()); };
+    let Some(mut session)=app.store.get_session(sid)? else { return Ok(()); };
     session.cost+=cost; session.tokens.input+=usage.input; session.tokens.output+=usage.output; session.tokens.reasoning+=usage.reasoning;
     session.tokens.cache.read+=usage.cache.read; session.tokens.cache.write+=usage.cache.write; session.time.updated=Some(now_ms());
     app.store.update_session(&session)?;
@@ -537,7 +561,7 @@ fn record_session_usage(app:&App,sid:&str,usage:&Tokens,cost:f64)->Result<(),Str
 }
 
 fn build_messages(app:&App,sid:&str,through:&str)->Result<Vec<Value>,String> {
-    let history=app.store.messages(sid);
+    let history=app.store.messages(sid)?;
     let mut users=HashSet::new();
     for message in &history {
         if message.info.role=="user" { users.insert(message.info.id.clone()); }
@@ -733,7 +757,8 @@ async fn execute_tool(ctx:&ToolCtx,name:&str,input:&Value,cfg:&Config,request:&P
     if !tool_enabled(name,agent,cfg,request) || (["plan","explore"].contains(&agent)&&(execution_tool(name)||ctx.app.mcp.route(name).is_some())) {
         return Err(ToolError{message:format!("Tool '{name}' is disabled for this request"),denied:true});
     }
-    let session=ctx.app.store.get_session(&ctx.session_id).ok_or_else(||ToolError{message:"Session not found".into(),denied:true})?;
+    let session=ctx.app.store.get_session(&ctx.session_id).map_err(|e|ToolError{message:e,denied:true})?
+        .ok_or_else(||ToolError{message:"Session not found".into(),denied:true})?;
     let mut rules=permission_rules(cfg,&session,request);
     if let Some(always)=ctx.app.always.lock().unwrap().get(&ctx.session_id) { rules.extend(always.iter().cloned()); }
     let paths=tool_paths(&ctx.dir,name,input).map_err(|e|ToolError{message:e,denied:false})?;
@@ -778,7 +803,7 @@ async fn check_permission(ctx:&ToolCtx,rules:&[PermissionRule],permission:&str,p
     if reply=="always" {
         let rule=PermissionRule{permission:permission.into(),pattern:pattern.into(),action:"allow".into()};
         ctx.app.always.lock().unwrap().entry(ctx.session_id.clone()).or_default().push(rule.clone());
-        if let Some(mut session)=ctx.app.store.get_session(&ctx.session_id) {
+        if let Some(mut session)=ctx.app.store.get_session(&ctx.session_id).map_err(|e|ToolError{message:e,denied:false})? {
             session.permission.get_or_insert_with(Vec::new).push(rule);
             ctx.app.store.update_session(&session).map_err(|e|ToolError{message:e,denied:false})?;
         }
@@ -812,7 +837,7 @@ fn canonical_target(path:&Path)->Result<PathBuf,String> {
 
 async fn expand_shell_templates(app:&App,engine:Arc<dyn EngineApi>,session:&Session,request:&PromptRequest,cfg:&Config,cancel:&Arc<AtomicBool>)->Result<(),String> {
     let mid=request.message_id.as_deref().ok_or("Command prompt has no messageID")?;
-    let mut user=app.store.message(&session.id,mid).ok_or("Command prompt not found")?;
+    let mut user=app.store.message(&session.id,mid)?.ok_or("Command prompt not found")?;
     let re=regex::Regex::new(r"!`([^`]+)`").map_err(|e|e.to_string())?;
     for part in &mut user.parts {
         if part["type"]!="text" { continue; }
