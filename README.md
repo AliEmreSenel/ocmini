@@ -8,7 +8,7 @@ Build and validation instructions are in [VALIDATION.md](VALIDATION.md). Tests u
 
 ## Build and use with T3
 
-Use a current stable Rust toolchain with a C compiler/linker; SQLite is built from the bundled source. Linux is the initial validation target.
+Use Rust **1.85.0 or newer** with a C compiler/linker; SQLite is built from the bundled source. Linux is the initial validation target. The package declares its minimum Rust version and uses Cargo's Rust-version-aware resolver to keep dependency updates compatible.
 
 ```sh
 cargo test --all-targets --locked
@@ -75,7 +75,7 @@ System instructions include applicable `AGENTS.md` files, configured instruction
 
 ## Configuration and credentials
 
-Configuration uses OpenCode-shaped JSON/JSONC, parsed by `jsonc-parser` with comments and trailing commas enabled. Permission-rule order is preserved. Layers are merged in this order, with later values taking precedence:
+Configuration uses OpenCode-shaped JSON/JSONC, parsed by `serde_json_lenient` with comments and trailing commas enabled. Permission-rule order is preserved. Layers are merged in this order, with later values taking precedence:
 
 1. Global `$XDG_CONFIG_HOME/opencode/opencode.json` and `opencode.jsonc`, plus global agent/command Markdown.
 2. `OPENCODE_CONFIG`, when set.
@@ -150,11 +150,11 @@ The provider boundary is the three implemented HTTP protocols above. Native Goog
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --locked
 cargo build --release --locked
 ```
 
 Rust tests use local deterministic provider/MCP peers and temporary state. Coverage includes the HTTP/CLI contract, authentication, scoping, exact client IDs, admission, steering, abort, fork boundaries, part-before-delta ordering, commands, attachments, approvals/questions, compaction reuse, provider parsing, MCP failures and tool behavior. They do not require paid-provider credentials.
 
-Persistence checks execute the actual Rust store with bundled SQLite, including transactions, serializers, crash recovery, legacy migration and descendant deletion. CI runs formatting, Clippy, tests and a release build on Linux. Successful live-provider calls, full T3 application sessions and performance measurements still require validation in the target environment.
+Persistence checks execute the actual Rust store with bundled SQLite, including transactions, serializers, crash recovery, legacy migration and descendant deletion. CI runs tests, Clippy and a release build on Rust 1.85.0 and current stable, with compiler and lint warnings treated as errors. Formatting is checked on stable. Successful live-provider calls, full T3 application sessions and performance measurements still require validation in the target environment.

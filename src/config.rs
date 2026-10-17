@@ -352,21 +352,8 @@ fn merge_file(
 }
 
 fn parse_config(text: &str, source: &str, base: &Path) -> Result<Value, String> {
-    let options = jsonc_parser::ParseOptions {
-        allow_comments: true,
-        allow_trailing_commas: true,
-        allow_loose_object_property_names: false,
-        allow_missing_commas: false,
-        allow_single_quoted_strings: false,
-        allow_hexadecimal_numbers: false,
-        allow_unary_plus_numbers: false,
-        allow_bare_decimal_point_numbers: false,
-        allow_non_finite_numbers: false,
-        allow_extended_string_escapes: false,
-    };
-    let mut value: Value =
-        jsonc_parser::parse_to_serde_value(text.trim_start_matches('\u{feff}'), &options)
-            .map_err(|e| format!("invalid config {source}: {e}"))?;
+    let mut value: Value = serde_json_lenient::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("invalid config {source}: {e}"))?;
     if !value.is_object() {
         return Err(format!("config {source} must be a JSON object"));
     }
@@ -524,7 +511,7 @@ fn markdown_frontmatter(content: &str) -> Result<(Map<String, Value>, &str), Str
     for line in rest.split_inclusive('\n') {
         if line.trim_end_matches(['\r', '\n']) == "---" {
             let frontmatter: Value =
-                serde_saphyr::from_str(&rest[..offset]).map_err(|e| e.to_string())?;
+                yaml_serde::from_str(&rest[..offset]).map_err(|e| e.to_string())?;
             let map = if frontmatter.is_null() {
                 Map::new()
             } else {

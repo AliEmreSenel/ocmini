@@ -116,7 +116,7 @@ fn frontmatter(raw: &str) -> (BTreeMap<String, String>, &str) {
     if !found {
         return (BTreeMap::new(), raw);
     }
-    let parsed = serde_saphyr::from_str::<Value>(&header).unwrap_or(Value::Null);
+    let parsed = yaml_serde::from_str::<Value>(&header).unwrap_or(Value::Null);
     let fields = ["name", "description"]
         .into_iter()
         .filter_map(|key| {

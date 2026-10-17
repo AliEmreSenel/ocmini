@@ -11,15 +11,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      matrix:
+        rust: ["1.85.0", stable]
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Install Rust
+        run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt --component clippy
       - name: Check formatting
+        if: matrix.rust == 'stable'
         run: cargo +stable fmt --all -- --check
       - name: Lint all targets
-        run: cargo +stable clippy --all-targets --locked -- -D warnings
+        run: cargo +${{ matrix.rust }} clippy --all-targets --all-features --locked -- -D warnings
       - name: Unit and contract tests
-        run: cargo +stable test --all-targets --locked
+        run: cargo +${{ matrix.rust }} test --all-targets --locked
       - name: Build release executable
-        run: cargo +stable build --release --locked
+        run: cargo +${{ matrix.rust }} build --release --locked
