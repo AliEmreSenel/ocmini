@@ -75,7 +75,8 @@ enum PendingPrompt {
     Permission(String),
     Question {
         id: String,
-        questions: usize,
+        // One entry per question: its option labels in the numbered order shown.
+        options: Vec<Vec<String>>,
         answers: Vec<Vec<String>>,
         line: String,
     },
@@ -115,6 +116,25 @@ fn summarize_input(input: &Value) -> String {
         parts.push(input.to_string());
     }
     truncate(&parts.join(" "), 120)
+}
+
+/// Option label and description in the order shown to the user.
+fn option_values(options: &Value) -> Vec<(String, String)> {
+    options
+        .as_array()
+        .map(|list| list.as_slice())
+        .unwrap_or(&[][..])
+        .iter()
+        .map(|option| {
+            (
+                option["label"].as_str().unwrap_or_default().to_string(),
+                option["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
 }
 
 fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, session_id: &str) {
@@ -209,28 +229,21 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
         }
         "question.asked" => {
             let id = properties["id"].as_str().unwrap_or_default().to_string();
-            let mut questions = 0;
+            let mut options = Vec::new();
             if let Some(list) = properties["questions"].as_array() {
-                questions = list.len();
                 for question in list {
                     println!(
                         "\n{YELLOW}? {}{RESET}",
                         question["question"].as_str().unwrap_or_default()
                     );
-                    for (index, option) in question["options"]
-                        .as_array()
-                        .map(|o| o.as_slice())
-                        .unwrap_or(&[][..])
-                        .iter()
-                        .enumerate()
-                    {
+                    let choices = option_values(&question["options"]);
+                    for (index, (label, description)) in choices.iter().enumerate() {
                         println!(
-                            "  {CYAN}{}{RESET}. {} {DIM}{}{RESET}",
-                            index + 1,
-                            option["label"].as_str().unwrap_or_default(),
-                            option["description"].as_str().unwrap_or_default()
+                            "  {CYAN}{}{RESET}. {label} {DIM}{description}{RESET}",
+                            index + 1
                         );
                     }
+                    options.push(choices.into_iter().map(|(label, _)| label).collect());
                 }
                 println!("{DIM}type number(s), Enter to answer, Esc to dismiss{RESET}");
             }
@@ -238,7 +251,7 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
             let _ = std::io::stdout().flush();
             ui.prompt = Some(PendingPrompt::Question {
                 id,
-                questions,
+                options,
                 answers: Vec::new(),
                 line: String::new(),
             });
@@ -257,11 +270,27 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
     }
 }
 
+/// One answer line for one question. A typed number selects an option, and the
+/// answer carries that option's label: the question contract and the model both
+/// expect labels, so the displayed index must not reach the tool output.
+/// Anything else, including an out-of-range number, is a custom answer as typed.
+fn parse_answer(line: &str, labels: &[String]) -> Vec<String> {
+    line.split_ascii_whitespace()
+        .map(|token| match token.parse::<usize>() {
+            Ok(number) if number >= 1 => labels
+                .get(number - 1)
+                .cloned()
+                .unwrap_or_else(|| token.to_string()),
+            _ => token.to_string(),
+        })
+        .collect()
+}
+
 fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
     // True when the prompt finished and the normal input prompt should return.
     let PendingPrompt::Question {
         id,
-        questions,
+        options,
         answers,
         line,
     } = state
@@ -274,18 +303,16 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
             true
         }
         Key::Enter => {
-            let choices: Vec<String> = line
-                .split_ascii_whitespace()
-                .map(|token| match token.parse::<usize>() {
-                    Ok(number) if number >= 1 => (number - 1).to_string(),
-                    _ => token.to_string(),
-                })
-                .collect();
+            let labels = options
+                .get(answers.len())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let choices = parse_answer(line, labels);
             line.clear();
             if !choices.is_empty() {
                 answers.push(choices);
             }
-            if answers.len() >= *questions {
+            if answers.len() >= options.len() {
                 let payload = std::mem::take(answers);
                 let _ = app.questions.reply(id, payload);
                 return true;
@@ -630,4 +657,22 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     }
     engine.abort_and_wait(&session.id).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_answer;
+
+    #[test]
+    fn typed_numbers_answer_with_their_option_labels() {
+        let labels = ["session-rename-notes".to_string(), "scratch".to_string()];
+        assert_eq!(parse_answer("1", &labels), ["session-rename-notes"]);
+        assert_eq!(
+            parse_answer("1  2", &labels),
+            ["session-rename-notes", "scratch"]
+        );
+        // Free text and numbers without an option stay exactly as typed.
+        assert_eq!(parse_answer("keep-it-brief", &labels), ["keep-it-brief"]);
+        assert_eq!(parse_answer("0 9", &labels), ["0", "9"]);
+    }
 }
