@@ -24,9 +24,47 @@ pub struct ChatRequest {
 
 pub type EventStream = Box<dyn futures::Stream<Item = ProviderEvent> + Send + Unpin>;
 
+/// Provider failures carry their retry policy: flaky transports (connection
+/// resets, mid-body deaths, 5xx/429, overloaded events) must be retried with
+/// the provider's own Retry-After hint where available.
+#[derive(Debug, Clone)]
+pub struct ProviderError {
+    pub message: String,
+    pub retryable: bool,
+    pub retry_after: Option<Duration>,
+}
+
+impl ProviderError {
+    pub fn fatal(message: impl Into<String>) -> Self {
+        Self { message: message.into(), retryable: false, retry_after: None }
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Status codes that are safe to re-request: the request never completed.
+pub fn status_retryable(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Mid-stream failures observed before any tool executed. Transport deaths,
+/// stalled streams and provider overload events are transient; malformed
+/// protocol data is not.
+pub fn stream_retryable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["overload", "rate limit", "rate_limit", "stream failed", "stream timed out",
+     "stream ended before", "decoding response body", "connection", "connection reset",
+     "broken pipe", "timed out", "tls", "dns", "transport", "body stream"]
+        .iter().any(|marker| lower.contains(marker))
+}
+
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
-    async fn stream(&self, req: ChatRequest) -> Result<EventStream, String>;
+    async fn stream(&self, req: ChatRequest) -> Result<EventStream, ProviderError>;
 }
 
 struct Adapter {
@@ -61,8 +99,8 @@ pub(super) struct Settings {
 
 #[async_trait]
 impl ProviderAdapter for Adapter {
-    async fn stream(&self, req: ChatRequest) -> Result<EventStream, String> {
-        let (protocol, settings) = self.prepare(&req).await?;
+    async fn stream(&self, req: ChatRequest) -> Result<EventStream, ProviderError> {
+        let (protocol, settings) = self.prepare(&req).await.map_err(ProviderError::fatal)?;
         match protocol {
             Protocol::Chat => openai_compat::stream(settings, req).await,
             Protocol::Responses => responses::stream(settings, req).await,
@@ -232,33 +270,41 @@ fn default_base_url(provider: &str, _protocol: Protocol) -> Option<&'static str>
 }
 
 impl Settings {
-    pub async fn send(&self, endpoint: &str, body: &Value) -> Result<reqwest::Response, String> {
+    pub async fn send(&self, endpoint: &str, body: &Value) -> Result<reqwest::Response, ProviderError> {
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
         let mut headers = HeaderMap::new();
         headers.insert("accept", HeaderValue::from_static("text/event-stream, application/json"));
         headers.insert("user-agent", HeaderValue::from_static("ocmini"));
         if !self.token.is_empty() {
             let (name, value) = if endpoint == "messages" && !self.bearer { ("x-api-key", self.token.clone()) } else { ("authorization", format!("Bearer {}", self.token)) };
-            headers.insert(HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?, HeaderValue::from_str(&value).map_err(|_| "provider credential contains invalid header characters")?);
+            headers.insert(HeaderName::from_bytes(name.as_bytes()).map_err(|e| ProviderError::fatal(e.to_string()))?, HeaderValue::from_str(&value).map_err(|_| ProviderError::fatal("provider credential contains invalid header characters"))?);
         }
         if endpoint == "messages" { headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01")); }
         for (name, value) in &self.headers {
-            headers.insert(HeaderName::from_bytes(name.as_bytes()).map_err(|e| format!("invalid provider header {name}: {e}"))?, HeaderValue::from_str(value).map_err(|_| format!("invalid value for provider header {name}"))?);
+            headers.insert(HeaderName::from_bytes(name.as_bytes()).map_err(|e| ProviderError::fatal(format!("invalid provider header {name}: {e}")))?, HeaderValue::from_str(value).map_err(|_| ProviderError::fatal(format!("invalid value for provider header {name}")))?);
         }
         let suffix = format!("/{endpoint}");
         let url = if self.base_url.ends_with(&suffix) { self.base_url.clone() } else { format!("{}{suffix}", self.base_url.trim_end_matches('/')) };
-        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
+        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build().map_err(|e| ProviderError::fatal(e.to_string()))?;
         let mut request = client.post(url).headers(headers).json(body);
         if let Some(timeout) = self.total_timeout { request = request.timeout(timeout); }
         let response = if let Some(timeout) = self.header_timeout {
-            tokio::time::timeout(timeout, request.send()).await.map_err(|_| format!("{} did not return response headers within {} seconds", self.provider_id, timeout.as_secs()))?
-        } else { request.send().await }.map_err(|e| format!("{} request failed: {e}", self.provider_id))?;
+            tokio::time::timeout(timeout, request.send()).await
+                .map_err(|_| ProviderError { message: format!("{} did not return response headers within {} seconds", self.provider_id, timeout.as_secs()), retryable: true, retry_after: None })?
+                .map_err(|e| ProviderError { message: format!("{} request failed: {}", self.provider_id, e.without_url()), retryable: true, retry_after: None })?
+        } else {
+            request.send().await.map_err(|e| ProviderError { message: format!("{} request failed: {}", self.provider_id, e.without_url()), retryable: true, retry_after: None })?
+        };
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = response.headers().get("retry-after").and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|seconds| Duration::from_secs(seconds.min(120)));
             let value = read_response(response, self.chunk_timeout, 64 * 1024).await.unwrap_or_default();
             let message = serde_json::from_slice::<Value>(&value).ok().map(|v| error_message(&v)).unwrap_or_else(|| String::from_utf8_lossy(&value).chars().take(2000).collect());
             let message = if self.token.is_empty() { message } else { message.replace(&self.token, "[redacted]") };
-            return Err(format!("{} HTTP {status}: {message}", self.provider_id));
+            let retryable = status_retryable(status);
+            return Err(ProviderError { message: format!("{} HTTP {status}: {message}", self.provider_id), retryable, retry_after: if retryable { retry_after } else { None } });
         }
         Ok(response)
     }
