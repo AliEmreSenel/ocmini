@@ -13,7 +13,7 @@ ocmini --model local/my-model --directory ~/project
 ocmini serve --hostname 127.0.0.1 --port 4096
 ```
 
-Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector.
+Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+V attaches the image on the system clipboard, pasting a path to an image file attaches it, Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector. Clipboard image paste needs `wl-paste` (Wayland), `xclip` (X11), `osascript` (macOS) or PowerShell (Windows).
 
 To use it with T3 Code, set the OpenCode provider's binary path to the installed `ocmini` executable.
 
