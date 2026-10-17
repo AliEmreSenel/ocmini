@@ -147,8 +147,9 @@ impl AuthStore {
         if refresh.is_empty() {
             return Err(format!("OAuth credential for {provider} has expired and has no refresh token. Reconnect this provider with OpenCode."));
         }
-        let response = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| e.to_string())?
+        let response = crate::provider::client()
             .post("https://auth.openai.com/oauth/token")
+            .timeout(std::time::Duration::from_secs(30))
             .header("User-Agent", "ocmini")
             .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str()), ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")])
             .send().await.map_err(|e| format!("OpenAI OAuth refresh failed: {e}"))?;

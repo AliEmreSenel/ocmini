@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::engine::{bus, App, EngineApi};
 use crate::provider::{self, ChatRequest};
+use crate::store::Store;
 use crate::tools::{self, ToolCtx};
 use crate::types::*;
 use base64::Engine as Base64Engine;
@@ -357,7 +358,9 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
     let mut last = None;
     for step in 0..max_steps {
         if cancel.load(Ordering::Acquire) { return Err("Aborted".into()); }
-        let mut messages = build_messages(&app,sid,uid)?;
+        // History reloads can span megabytes of JSON; keep them off the async workers.
+        let (blocking_store, blocking_sid, blocking_uid) = (app.store.clone(), sid.to_string(), uid.to_string());
+        let mut messages = tokio::task::spawn_blocking(move || build_messages(&blocking_store, &blocking_sid, &blocking_uid)).await.map_err(|e| e.to_string())??;
         if compact { messages.push(json!({"role":"user","content":"Produce the continuation summary now."})); }
         let now = now_ms();
         let amid = hex_id("msg_");
@@ -370,80 +373,104 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
         let start_part=json!({"id":hex_id("prt_"),"sessionID":sid,"messageID":amid,"type":"step-start"});
         app.store.add_message(&MessageWithParts{info:info.clone(),parts:vec![start_part.clone()]})?;
         emit_message(&info); emit_part(&start_part);
-        let mut attempt=0;
-        let mut stream = loop {
-            let req=ChatRequest { model:model.model_id.clone(),system:system.clone(),messages:messages.clone(),tools:defs.clone(),variant:request.variant.clone(),session_id:Some(sid.into()) };
-            let opened=tokio::select! {
-                result=adapter.stream(req)=>result,
-                _=cancelled(&cancel)=>Err("Aborted".into()),
+        const MAX_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        let mut text_part: Option<StreamedPart> = None;
+        let mut reasoning_part: Option<StreamedPart> = None;
+        let mut tool_parts: Vec<Value> = Vec::new();
+        let mut metadata = Value::Null;
+        let mut finished = None;
+        'attempt: loop {
+            text_part = None; reasoning_part = None; tool_parts = Vec::new();
+            metadata = Value::Null;
+            finished = None;
+            let mut failure: Option<(String, bool)> = None; // (message, mid-stream)
+            let req = ChatRequest { model: model.model_id.clone(), system: system.clone(), messages: messages.clone(), tools: defs.clone(), variant: request.variant.clone(), session_id: Some(sid.into()) };
+            let opened = tokio::select! {
+                result = adapter.stream(req) => result,
+                _ = cancelled(&cancel) => Err(crate::provider::ProviderError::fatal("Aborted")),
             };
             match opened {
-                Ok(stream)=>break stream,
-                Err(error) if attempt<2 && retryable(&error) && !cancel.load(Ordering::Acquire)=>{
-                    attempt+=1;
-                    let delay=std::time::Duration::from_secs(1 << attempt);
-                    update_status(&app,sid,json!({"type":"retry","attempt":attempt,"message":error,"next":now_ms()+delay.as_millis() as i64}));
+                Ok(mut stream) => {
+                    loop {
+                        let event = tokio::select! {
+                            event = stream.next() => event,
+                            _ = cancelled(&cancel) => { failure = Some(("Aborted".to_string(), false)); break; }
+                        };
+                        let Some(event) = event else { break; };
+                        match event {
+                            ProviderEvent::TextDelta(delta) => append_delta(&app,sid,&amid,"text",&mut text_part,&delta)?,
+                            ProviderEvent::ReasoningDelta(delta) => append_delta(&app,sid,&amid,"reasoning",&mut reasoning_part,&delta)?,
+                            ProviderEvent::Metadata(value) => metadata = value,
+                            ProviderEvent::ToolCallStart{call_id,name,args} => {
+                                if call_id.is_empty() || name.is_empty() || tool_parts.iter().any(|p|p["callID"]==call_id) {
+                                    failure = Some(("Provider returned a missing or duplicate tool call identifier".to_string(), false)); break;
+                                }
+                                let input=serde_json::from_str::<Value>(&args);
+                                let state=match input {
+                                    Ok(input) if input.is_object()=>json!({"status":"pending","input":input,"raw":args}),
+                                    _=>json!({"status":"error","input":{},"error":"Provider returned invalid JSON tool arguments","time":{"start":now_ms(),"end":now_ms()}}),
+                                };
+                                let part=json!({"id":hex_id("prt_"),"sessionID":sid,"messageID":amid,"type":"tool","tool":name,"callID":call_id,"state":state});
+                                app.store.update_part(sid,&part)?; emit_part(&part); tool_parts.push(part);
+                            },
+                            ProviderEvent::Finished{finish,usage} => finished = Some((finish,usage)),
+                            ProviderEvent::Error(error) => { failure = Some((error, true)); break; }
+                        }
+                    }
+                    drop(stream);
+                    for part in [&mut text_part,&mut reasoning_part].into_iter().flatten() {
+                        part.part["time"]["end"]=json!(now_ms());
+                        app.store.update_part(sid,&part.part)?;
+                        emit_part(&part.part);
+                    }
+                    if failure.is_none() && finished.is_none() { failure = Some(("Provider stream ended before a completion event".to_string(), true)); }
+                    let (error, mid_stream) = match failure { Some(failure) => failure, None => break 'attempt };
+                    // Flaky connections kill streams mid-body, usually right after
+                    // headers arrive. Nothing executed yet, so a fresh request is safe.
+                    let transient = mid_stream && tool_parts.is_empty() && provider::stream_retryable(&error) && attempt < MAX_RETRIES && !cancel.load(Ordering::Acquire);
+                    if transient {
+                        for part in [&mut text_part,&mut reasoning_part].into_iter().flatten() {
+                            part.part["text"]=json!("");
+                            app.store.update_part(sid,&part.part)?;
+                            emit_part(&part.part);
+                        }
+                        attempt += 1;
+                        let delay = retry_delay(None, attempt);
+                        update_status(&app,sid,json!({"type":"retry","attempt":attempt,"message":error,"next":now_ms()+delay.as_millis() as i64}));
+                        tokio::select! { _=tokio::time::sleep(delay)=>{}, _=cancelled(&cancel)=>{} }
+                        if cancel.load(Ordering::Acquire) {
+                            fail_message(&app,&mut info,"Aborted",true)?;
+                            return Err("Aborted".into());
+                        }
+                        update_status(&app,sid,json!({"type":"busy"}));
+                        continue 'attempt;
+                    }
+                    for part in &mut tool_parts {
+                        if ["pending","running"].contains(&part["state"]["status"].as_str().unwrap_or_default()) {
+                            part["state"]=json!({"status":"error","input":part["state"]["input"],"error":error,"time":{"start":now_ms(),"end":now_ms()}});
+                            app.store.update_part(sid,part)?; emit_part(part);
+                        }
+                    }
+                    fail_message(&app,&mut info,&error,cancel.load(Ordering::Acquire))?;
+                    return Err(error);
+                }
+                Err(error) if error.retryable && attempt < MAX_RETRIES && !cancel.load(Ordering::Acquire) => {
+                    attempt += 1;
+                    let delay = retry_delay(error.retry_after, attempt);
+                    update_status(&app,sid,json!({"type":"retry","attempt":attempt,"message":error.message,"next":now_ms()+delay.as_millis() as i64}));
                     tokio::select! { _=tokio::time::sleep(delay)=>{}, _=cancelled(&cancel)=>{} }
                     if cancel.load(Ordering::Acquire) {
                         fail_message(&app,&mut info,"Aborted",true)?;
                         return Err("Aborted".into());
                     }
                     update_status(&app,sid,json!({"type":"busy"}));
-                },
-                Err(error)=>{
-                    fail_message(&app,&mut info,&error,cancel.load(Ordering::Acquire))?;
-                    return Err(error);
+                }
+                Err(error) => {
+                    fail_message(&app,&mut info,&error.message,cancel.load(Ordering::Acquire))?;
+                    return Err(error.message);
                 }
             }
-        };
-        let mut text_part:Option<Value>=None;
-        let mut reasoning_part:Option<Value>=None;
-        let mut tool_parts:Vec<Value>=Vec::new();
-        let mut metadata=Value::Null;
-        let mut finished=None;
-        let mut failure=None;
-        loop {
-            let event=tokio::select! {
-                event=stream.next()=>event,
-                _=cancelled(&cancel)=>{ failure=Some("Aborted".to_string()); break; }
-            };
-            let Some(event)=event else { break; };
-            match event {
-                ProviderEvent::TextDelta(delta)=>append_delta(&app,sid,&amid,"text",&mut text_part,&delta)?,
-                ProviderEvent::ReasoningDelta(delta)=>append_delta(&app,sid,&amid,"reasoning",&mut reasoning_part,&delta)?,
-                ProviderEvent::Metadata(value)=>metadata=value,
-                ProviderEvent::ToolCallStart{call_id,name,args}=>{
-                    if call_id.is_empty() || name.is_empty() || tool_parts.iter().any(|p|p["callID"]==call_id) {
-                        failure=Some("Provider returned a missing or duplicate tool call identifier".into()); break;
-                    }
-                    let input=serde_json::from_str::<Value>(&args);
-                    let state=match input {
-                        Ok(input) if input.is_object()=>json!({"status":"pending","input":input,"raw":args}),
-                        _=>json!({"status":"error","input":{},"error":"Provider returned invalid JSON tool arguments","time":{"start":now_ms(),"end":now_ms()}}),
-                    };
-                    let part=json!({"id":hex_id("prt_"),"sessionID":sid,"messageID":amid,"type":"tool","tool":name,"callID":call_id,"state":state});
-                    app.store.update_part(sid,&part)?; emit_part(&part); tool_parts.push(part);
-                },
-                ProviderEvent::Finished{finish,usage}=>finished=Some((finish,usage)),
-                ProviderEvent::Error(error)=>{ failure=Some(error); break; },
-            }
-        }
-        drop(stream);
-        for part in [&mut text_part,&mut reasoning_part].into_iter().flatten() {
-            part["time"]["end"]=json!(now_ms());
-            app.store.update_part(sid,part)?;
-            emit_part(part);
-        }
-        if failure.is_none() && finished.is_none() { failure=Some("Provider stream ended before a completion event".into()); }
-        if let Some(error)=failure {
-            for part in &mut tool_parts {
-                if ["pending","running"].contains(&part["state"]["status"].as_str().unwrap_or_default()) {
-                    part["state"]=json!({"status":"error","input":part["state"]["input"],"error":error,"time":{"start":now_ms(),"end":now_ms()}});
-                    app.store.update_part(sid,part)?; emit_part(part);
-                }
-            }
-            fail_message(&app,&mut info,&error,cancel.load(Ordering::Acquire))?;
-            return Err(error);
         }
         let (finish,usage)=finished.ok_or("Provider stream did not complete")?;
         let cost=cost_for(&cfg,model,&usage);
@@ -504,7 +531,7 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
         let response=app.store.message(sid,&amid)?.ok_or("Persisted response not found")?;
         last=Some(serde_json::to_value(response).map_err(|e|e.to_string())?);
         if compact {
-            if text_part.as_ref().and_then(|p|p["text"].as_str()).is_none_or(|s|s.trim().is_empty()) {
+            if text_part.as_ref().and_then(|p|p.part["text"].as_str()).is_none_or(|s|s.trim().is_empty()) {
                 fail_message(&app,&mut info,"Provider returned an empty compaction summary",false)?;
                 return Err("Provider returned an empty compaction summary".into());
             }
@@ -521,28 +548,47 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
     last.ok_or_else(||"Execution produced no assistant response".into())
 }
 
-fn append_delta(app:&App,sid:&str,mid:&str,kind:&str,current:&mut Option<Value>,delta:&str)->Result<(),String> {
+/// Streaming parts persist to SQLite at most every flush interval; deltas are
+/// announced on the bus immediately. Crash recovery marks the interrupted
+/// message, so the bounded persistence lag never presents partial text as done.
+struct StreamedPart {
+    part: Value,
+    last_flush: std::time::Instant,
+}
+
+const STREAM_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn append_delta(app:&App,sid:&str,mid:&str,kind:&str,current:&mut Option<StreamedPart>,delta:&str)->Result<(),String> {
     if delta.is_empty() { return Ok(()); }
     if current.is_none() {
         let part=json!({"id":hex_id("prt_"),"sessionID":sid,"messageID":mid,"type":kind,"text":"","time":{"start":now_ms()}});
         app.store.update_part(sid,&part)?;
         emit_part(&part);
-        *current=Some(part);
+        *current=Some(StreamedPart{part,last_flush:std::time::Instant::now()});
     }
-    let part=current.as_mut().ok_or("Missing streamed part")?;
-    let mut text=part["text"].as_str().unwrap_or_default().to_string();
-    text.push_str(delta); part["text"]=json!(text);
-    app.store.update_part(sid,part)?;
-    bus().emit("message.part.delta",json!({"sessionID":sid,"messageID":mid,"partID":part["id"],"field":"text","delta":delta}));
+    let entry=current.as_mut().ok_or("Missing streamed part")?;
+    entry.part["text"]=json!(format!("{}{}",entry.part["text"].as_str().unwrap_or_default(),delta));
+    bus().emit("message.part.delta",json!({"sessionID":sid,"messageID":mid,"partID":entry.part["id"],"field":"text","delta":delta}));
+    if entry.last_flush.elapsed() >= STREAM_FLUSH {
+        app.store.update_part(sid,&entry.part)?;
+        entry.last_flush=std::time::Instant::now();
+    }
     Ok(())
+}
+
+fn retry_delay(retry_after: Option<std::time::Duration>, attempt: u32) -> std::time::Duration {
+    let base = std::env::var("OCMINI_RETRY_BASE_MS").ok().and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0).unwrap_or(1000);
+    let base = std::time::Duration::from_millis(base);
+    let backoff = base * (1u32 << attempt.min(6));
+    let delay = retry_after.unwrap_or(backoff).min(std::time::Duration::from_secs(120));
+    let jitter = std::time::Duration::from_millis(rand::random::<u64>() % (base.as_millis() as u64 / 4 + 1));
+    delay + jitter
 }
 
 fn fail_message(app:&App,info:&mut MessageInfo,error:&str,aborted:bool)->Result<(),String> {
     info.time.completed=Some(now_ms().max(info.time.created)); info.error=Some(error_value(error,aborted));
     app.store.add_message(&MessageWithParts{info:info.clone(),parts:vec![]})?; emit_message(info); Ok(())
 }
-
-fn retryable(error:&str)->bool { ["429","502","503","504","overloaded","rate_limit"].iter().any(|s|error.to_lowercase().contains(s)) }
 
 fn cost_for(cfg:&Config,model:&ModelRef,usage:&Tokens)->f64 {
     let Some(info)=cfg.provider(&model.provider_id).and_then(|p|p.models.get(&model.model_id)) else { return 0.0; };
@@ -560,8 +606,8 @@ fn record_session_usage(app:&App,sid:&str,usage:&Tokens,cost:f64)->Result<(),Str
     Ok(())
 }
 
-fn build_messages(app:&App,sid:&str,through:&str)->Result<Vec<Value>,String> {
-    let history=app.store.messages(sid)?;
+fn build_messages(store:&Store,sid:&str,through:&str)->Result<Vec<Value>,String> {
+    let history=store.messages(sid)?;
     let mut users=HashSet::new();
     for message in &history {
         if message.info.role=="user" { users.insert(message.info.id.clone()); }
@@ -682,6 +728,20 @@ fn percent_bytes(value:&str)->Result<Vec<u8>,String> {
 }
 
 async fn system_prompt(cfg:&Config,directory:&str,agent:&str,provided:Option<&str>)->Result<String,String> {
+    let mut system=system_prompt_base(cfg,directory,agent).await?;
+    if let Some(provided)=provided { system.push_str("\n\n"); system.push_str(provided); }
+    Ok(system)
+}
+
+/// The AGENTS.md/skills/agent-prompt base is identical for every turn in a
+/// directory; reading those files per turn scales with sessions, so cache it.
+async fn system_prompt_base(cfg:&Config,directory:&str,agent:&str)->Result<String,String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(String,String),(std::time::Instant,String)>>> = std::sync::OnceLock::new();
+    let cache=CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key=(directory.to_string(),agent.to_string());
+    if let Some((created,prompt))=cache.lock().unwrap().get(&key) {
+        if created.elapsed()<std::time::Duration::from_secs(10) { return Ok(prompt.clone()); }
+    }
     let mut system=format!("You are ocmini, a coding agent. Work in {directory}. Read the code before changing it, follow project instructions, and report real tool results. Use available tools to complete the user's task. Operating system: {}.",std::env::consts::OS);
     let mut files=Vec::new();
     let global=PathBuf::from(crate::config::config_home()).join("opencode/AGENTS.md");
@@ -696,8 +756,7 @@ async fn system_prompt(cfg:&Config,directory:&str,agent:&str,provided:Option<&st
     let mut seen=HashSet::new();
     for instruction in &cfg.instructions {
         if instruction.starts_with("https://") || instruction.starts_with("http://") {
-            let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().map_err(|e|e.to_string())?;
-            let response=client.get(instruction).send().await.map_err(|e|format!("Instruction URL {instruction}: {e}"))?.error_for_status().map_err(|e|e.to_string())?;
+            let response=provider::client().get(instruction).timeout(std::time::Duration::from_secs(15)).send().await.map_err(|e|format!("Instruction URL {instruction}: {e}"))?.error_for_status().map_err(|e|e.to_string())?;
             let mut bytes=Vec::new(); let mut stream=response.bytes_stream();
             while let Some(chunk)=stream.next().await {
                 bytes.extend_from_slice(&chunk.map_err(|e|e.to_string())?);
@@ -727,7 +786,7 @@ async fn system_prompt(cfg:&Config,directory:&str,agent:&str,provided:Option<&st
             system.push_str(&format!("\n- {}: {}",skill["name"].as_str().unwrap_or_default(),skill["description"].as_str().unwrap_or_default()));
         }
     }
-    if let Some(provided)=provided { system.push_str("\n\n"); system.push_str(provided); }
+    cache.lock().unwrap().insert(key, (std::time::Instant::now(), system.clone()));
     Ok(system)
 }
 

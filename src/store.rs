@@ -12,6 +12,10 @@ const LEASE_MS: i64 = 60_000;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// WAL readers run on a dedicated connection so reads never queue behind
+    /// writes. In-memory test databases share tables through one connection.
+    read: Option<Mutex<Connection>>,
+    dirs: Mutex<std::collections::HashMap<String, String>>,
     instance: String,
 }
 
@@ -69,7 +73,8 @@ impl Store {
                  DELETE FROM todo WHERE session_id NOT IN (SELECT id FROM session);").map_err(sql_error)?;
             conn.pragma_update(None, "user_version", 2).map_err(sql_error)?;
         }
-        let store = Self { conn: Mutex::new(conn), instance: instance.to_string() };
+        let read = if path.to_string_lossy() == ":memory:" { None } else { Some(Mutex::new(open_connection(path)?)) };
+        let store = Self { conn: Mutex::new(conn), read, dirs: Mutex::new(Default::default()), instance: instance.to_string() };
         store.recover_interrupted()?;
         // Retention is opt-in: old thread history must remain resumable from T3.
         if let Ok(days) = std::env::var("OCMINI_RETENTION_DAYS") {
@@ -147,6 +152,16 @@ impl Store {
         tx.commit().map_err(sql_error)
     }
 
+    /// Cached session→directory lookup for event stream filtering; session
+    /// directories never change, so the only staleness is deleted sessions.
+    pub fn directory_of(&self, sid: &str) -> Option<String> {
+        if let Some(directory) = self.dirs.lock().unwrap().get(sid) { return Some(directory.clone()); }
+        let directory: Option<String> = self.with_read(|c| c
+            .query_row("SELECT json_extract(json,'$.directory') FROM session WHERE id=?1", params![sid], |r| r.get::<_, String>(0)).map_err(sql_error)).ok();
+        if let Some(directory) = &directory { self.dirs.lock().unwrap().insert(sid.to_string(), directory.clone()); }
+        directory
+    }
+
     pub fn prune(&self, before: i64) -> Result<usize, String> {
         let c = self.conn.lock().unwrap();
         c.execute("DELETE FROM session WHERE busy=0 AND time_updated<?1 AND id NOT IN (SELECT session_id FROM inbox) AND id NOT IN (SELECT parent_id FROM session WHERE parent_id IS NOT NULL) AND id NOT IN (SELECT session_id FROM owner WHERE lease_expires>=?2)", params![before, now_ms()]).map_err(sql_error)
@@ -178,11 +193,12 @@ impl Store {
     }
 
     pub fn list_sessions(&self, dir: Option<&str>) -> Result<Vec<Session>, String> {
-        let c = self.conn.lock().unwrap();
-        let mut stmt = c.prepare("SELECT json FROM session ORDER BY time_updated DESC,rowid").map_err(sql_error)?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(sql_error)?;
-        rows.map(|r| serde_json::from_str::<Session>(&r.map_err(sql_error)?).map_err(sql_error))
-            .filter(|s| s.as_ref().is_ok_and(|session| dir.is_none_or(|d| Path::new(&session.directory) == Path::new(d)))).collect()
+        self.with_read(|c| {
+            let mut stmt = c.prepare("SELECT json FROM session ORDER BY time_updated DESC,rowid").map_err(sql_error)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(sql_error)?;
+            rows.map(|r| serde_json::from_str::<Session>(&r.map_err(sql_error)?).map_err(sql_error))
+                .filter(|s| s.as_ref().is_ok_and(|session| dir.is_none_or(|d| Path::new(&session.directory) == Path::new(d)))).collect()
+        })
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>, String> {
@@ -224,14 +240,15 @@ impl Store {
     }
 
     pub fn is_busy(&self, id: &str) -> Result<bool, String> {
-        Ok(self.conn.lock().unwrap().query_row("SELECT busy FROM session WHERE id=?1", params![id], |r| r.get::<_, i32>(0)).optional().map_err(sql_error)?.unwrap_or(0) != 0)
+        Ok(self.with_read(|c| c.query_row("SELECT busy FROM session WHERE id=?1", params![id], |r| r.get::<_, i32>(0)).optional().map_err(sql_error))?.unwrap_or(0) != 0)
     }
 
     pub fn busy_sessions(&self) -> Result<Vec<String>, String> {
-        let c = self.conn.lock().unwrap();
-        let mut s = c.prepare("SELECT id FROM session WHERE busy=1 ORDER BY rowid").map_err(sql_error)?;
-        let rows = s.query_map([], |r| r.get(0)).map_err(sql_error)?;
-        rows.collect::<Result<_, _>>().map_err(sql_error)
+        self.with_read(|c| {
+            let mut s = c.prepare("SELECT id FROM session WHERE busy=1 ORDER BY rowid").map_err(sql_error)?;
+            let rows = s.query_map([], |r| r.get(0)).map_err(sql_error)?;
+            rows.collect::<Result<_, _>>().map_err(sql_error)
+        })
     }
 
     pub fn add_message(&self, m: &MessageWithParts) -> Result<(), String> {
@@ -249,8 +266,7 @@ impl Store {
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>, String> {
-        let c = self.conn.lock().unwrap();
-        read_messages(&c, session_id)
+        self.with_read(|c| read_messages(c, session_id))
     }
 
     pub fn message(&self, session_id: &str, id: &str) -> Result<Option<MessageWithParts>, String> {
@@ -258,7 +274,7 @@ impl Store {
     }
 
     pub fn message_owner(&self, id: &str) -> Result<Option<String>, String> {
-        self.conn.lock().unwrap().query_row("SELECT session_id FROM message WHERE id=?1", params![id], |r| r.get(0)).optional().map_err(sql_error)
+        self.with_read(|c| c.query_row("SELECT session_id FROM message WHERE id=?1", params![id], |r| r.get(0)).optional().map_err(sql_error))
     }
 
     /// The receipt, visible user message, and pending work commit together.
@@ -305,18 +321,19 @@ impl Store {
     }
 
     pub fn pending_sessions(&self) -> Result<Vec<String>, String> {
-        let c = self.conn.lock().unwrap();
-        let mut s = c.prepare("SELECT DISTINCT session_id FROM inbox WHERE started=0").map_err(sql_error)?;
-        let rows = s.query_map([], |r| r.get(0)).map_err(sql_error)?;
-        rows.collect::<Result<_, _>>().map_err(sql_error)
+        self.with_read(|c| {
+            let mut s = c.prepare("SELECT DISTINCT session_id FROM inbox WHERE started=0").map_err(sql_error)?;
+            let rows = s.query_map([], |r| r.get(0)).map_err(sql_error)?;
+            rows.collect::<Result<_, _>>().map_err(sql_error)
+        })
     }
 
     pub fn has_waiting(&self, sid: &str) -> Result<bool, String> {
-        self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE session_id=?1 AND started=0)", params![sid], |r| r.get(0)).map_err(sql_error)
+        self.with_read(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE session_id=?1 AND started=0)", params![sid], |r| r.get(0)).map_err(sql_error))
     }
 
     pub fn is_pending_message(&self, id: &str) -> Result<bool, String> {
-        self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE message_id=?1)", params![id], |r| r.get(0)).map_err(sql_error)
+        self.with_read(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE message_id=?1)", params![id], |r| r.get(0)).map_err(sql_error))
     }
 
     pub fn set_todos(&self, sid: &str, todos: &Value) -> Result<(), String> {
@@ -329,7 +346,7 @@ impl Store {
     }
 
     pub fn todos(&self, sid: &str) -> Result<Value, String> {
-        let raw: Option<String> = self.conn.lock().unwrap().query_row("SELECT json FROM todo WHERE session_id=?1", params![sid], |r| r.get(0)).optional().map_err(sql_error)?;
+        let raw: Option<String> = self.with_read(|c| c.query_row("SELECT json FROM todo WHERE session_id=?1", params![sid], |r| r.get(0)).optional().map_err(sql_error))?;
         Ok(raw.map(|s| serde_json::from_str(&s).map_err(sql_error)).transpose()?.unwrap_or_else(|| json!([])))
     }
 
@@ -382,6 +399,21 @@ impl Store {
         tx.commit().map_err(sql_error)?;
         Ok(s)
     }
+}
+
+impl Store {
+    fn with_read<T>(&self, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+        match &self.read {
+            Some(read) => f(&read.lock().unwrap()),
+            None => f(&self.conn.lock().unwrap()),
+        }
+    }
+}
+
+fn open_connection(path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(sql_error)?;
+    conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(sql_error)?;
+    Ok(conn)
 }
 
 fn save_message(tx: &Transaction<'_>, m: &MessageWithParts) -> Result<(), String> {
