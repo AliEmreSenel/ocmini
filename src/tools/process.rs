@@ -84,26 +84,22 @@ pub async fn shell(
     let stdout_task = tokio::spawn(capture(stdout));
     let stderr_task = tokio::spawn(capture(stderr));
     let status = tokio::select! {
-        result = child.wait() => result.map_err(|e| failure(format!("Shell wait failed: {e}")))?,
-        _ = tokio::time::sleep(timeout) => {
-            drop(group);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
-            return Err(failure(format!("Shell command timed out after {} milliseconds", timeout.as_millis())));
-        }
-        _ = cancelled(cancel) => {
-            drop(group);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
-            return Err(failure("Shell command cancelled"));
-        }
+        result = child.wait() => result.map_err(|e| failure(format!("Shell wait failed: {e}"))),
+        _ = tokio::time::sleep(timeout) => Err(failure(format!("Shell command timed out after {} milliseconds", timeout.as_millis()))),
+        _ = cancelled(cancel) => Err(failure("Shell command cancelled")),
     };
     // Kill background descendants before joining their inherited output pipes.
     drop(group);
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(error);
+        }
+    };
     let (stdout, stdout_total) = stdout_task
         .await
         .map_err(|e| failure(format!("Shell stdout task failed: {e}")))?
@@ -160,27 +156,30 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn timeout_kills_descendants_and_reaps_shell() {
         let directory = std::env::temp_dir();
         let pidfile = directory.join(format!("ocmini-test-{}", crate::types::hex_id("pid_")));
-        let command = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+        let command = format!("sleep 30 & echo $$ $! > '{}'; wait", pidfile.display());
         let result = shell(
             &command,
             &directory,
-            Duration::from_millis(150),
+            Duration::from_secs(1),
             Arc::new(AtomicBool::new(false)),
         )
         .await;
         assert!(result.unwrap_err().message.contains("timed out"));
-        let pid: i32 = std::fs::read_to_string(&pidfile)
+        let pids: Vec<i32> = std::fs::read_to_string(&pidfile)
             .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
         let _ = std::fs::remove_file(pidfile);
-        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-        assert!(state.is_err() || state.unwrap().split_whitespace().nth(2) == Some("Z"));
+        assert!(
+            !Path::new(&format!("/proc/{}", pids[0])).exists(),
+            "Shell was not reaped"
+        );
+        assert_process_stopped(pids[1]).await;
     }
 
     #[tokio::test]
@@ -230,13 +229,29 @@ mod tests {
         task.abort();
         let _ = task.await;
         let _ = std::fs::remove_file(pidfile);
-        for _ in 0..100 {
-            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-            if state.is_err() || state.unwrap().split_whitespace().nth(2) == Some("Z") {
-                return;
+        assert_process_stopped(pid).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_process_stopped(pid: i32) {
+        // SIGKILL delivery is asynchronous; the descendant can still be runnable
+        // after its parent has been reaped. Accept an exited or zombie process.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            || error.raw_os_error() == Some(libc::ESRCH) =>
+                    {
+                        return
+                    }
+                    Ok(state) if state.rsplit_once(") ").unwrap().1.starts_with('Z') => return,
+                    Err(error) => panic!("Cannot inspect process {pid}: {error}"),
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("Shell descendant survived dropped execution");
+        })
+        .await
+        .expect("Shell descendant survived process group termination");
     }
 }

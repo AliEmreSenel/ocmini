@@ -389,7 +389,7 @@ impl Adapter {
             .or_else(|| options["api"].as_str());
         let protocol = protocol(&self.provider_id, npm, explicit, &req.model, codex)?;
         if base_url.is_empty() {
-            base_url = default_base_url(&self.provider_id, protocol).ok_or_else(|| format!("provider {} has no supported default endpoint; configure provider.{}.options.baseURL", self.provider_id, self.provider_id))?.into();
+            base_url = default_base_url(&self.provider_id).ok_or_else(|| format!("provider {} has no supported default endpoint; configure provider.{}.options.baseURL", self.provider_id, self.provider_id))?.into();
         }
         if !self.configured
             && ![
@@ -628,7 +628,7 @@ fn protocol(
     })
 }
 
-fn default_base_url(provider: &str, _protocol: Protocol) -> Option<&'static str> {
+fn default_base_url(provider: &str) -> Option<&'static str> {
     Some(match provider {
         "openai" | "openai-codex" => "https://api.openai.com/v1",
         "anthropic" => "https://api.anthropic.com/v1",

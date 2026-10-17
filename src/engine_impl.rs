@@ -29,34 +29,25 @@ impl Engine {
         Self::default()
     }
 
-    fn wake(&self, app: App, sid: String, mid: Option<String>, tx: Option<oneshot::Sender<Value>>) {
+    pub async fn abort_and_wait(&self, sid: &str) {
+        self.abort(sid);
+        while self.running.lock().unwrap().contains_key(sid) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn wake(&self, app: App, sid: String) {
         let mut running = self.running.lock().unwrap();
-        if let Some(current) = running.get_mut(&sid) {
-            if let (Some(mid), Some(tx)) = (mid, tx) {
-                current.waiters.entry(mid).or_default().push(tx);
-            }
+        if running.contains_key(&sid) {
             return;
         }
-        if let Err(error) = app.store.claim(&sid) {
-            eprintln!("ocmini: {error}");
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut waiters = HashMap::new();
-        if let (Some(mid), Some(tx)) = (mid, tx) {
-            waiters.insert(mid, vec![tx]);
-        }
-        running.insert(
-            sid.clone(),
-            Running {
-                app: app.clone(),
-                cancel: cancel.clone(),
-                waiters,
-            },
-        );
-        if let Err(error) = app.store.set_busy(&sid, true) {
-            eprintln!("ocmini: {error}");
-        }
-        update_status(&app, &sid, json!({"type":"busy"}));
+        let cancel = match self.claim(&mut running, &app, &sid, None) {
+            Ok(cancel) => cancel,
+            Err(error) => {
+                emit_error(&sid, &error, false);
+                return;
+            }
+        };
         drop(running);
         let engine = self.clone();
         tokio::spawn(async move {
@@ -69,20 +60,22 @@ impl Engine {
         running: &mut HashMap<String, Running>,
         app: &App,
         sid: &str,
-        mid: String,
-        tx: oneshot::Sender<Value>,
+        waiter: Option<(String, oneshot::Sender<Value>)>,
     ) -> Result<Arc<AtomicBool>, String> {
         app.store.claim(sid)?;
+        app.store.set_busy(sid, true)?;
         let cancel = Arc::new(AtomicBool::new(false));
         running.insert(
             sid.into(),
             Running {
                 app: app.clone(),
                 cancel: cancel.clone(),
-                waiters: HashMap::from([(mid, vec![tx])]),
+                waiters: waiter
+                    .into_iter()
+                    .map(|(mid, tx)| (mid, vec![tx]))
+                    .collect(),
             },
         );
-        app.store.set_busy(sid, true)?;
         update_status(app, sid, json!({"type":"busy"}));
         Ok(cancel)
     }
@@ -223,7 +216,7 @@ impl EngineApi for Engine {
                     return Ok(rx);
                 }
                 let scoped = app.for_directory(&session.directory)?;
-                let cancel = self.claim(&mut guard, &scoped, &sid, mid, tx)?;
+                let cancel = self.claim(&mut guard, &scoped, &sid, Some((mid, tx)))?;
                 drop(guard);
                 let engine = self.clone();
                 tokio::spawn(async move {
@@ -354,7 +347,7 @@ impl EngineApi for Engine {
             state.waiters.entry(mid).or_default().push(tx);
             return Ok(rx);
         }
-        let cancel = self.claim(&mut guard, &app, &sid, mid, tx)?;
+        let cancel = self.claim(&mut guard, &app, &sid, Some((mid, tx)))?;
         drop(guard);
         let engine = self.clone();
         tokio::spawn(async move {
@@ -428,7 +421,7 @@ impl EngineApi for Engine {
         for sid in app.store.pending_sessions().unwrap_or_default() {
             if let Some(session) = app.store.get_session(&sid).unwrap_or_default() {
                 match app.for_directory(&session.directory) {
-                    Ok(scoped) => self.wake(scoped, sid, None, None),
+                    Ok(scoped) => self.wake(scoped, sid),
                     Err(error) => emit_error(&sid, &error, false),
                 }
             }

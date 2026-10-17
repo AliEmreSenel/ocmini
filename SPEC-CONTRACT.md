@@ -1,22 +1,8 @@
 # ocmini compatibility contract
 
-ocmini is a headless coding runtime implementing the OpenCode **1.x HTTP/SSE contract used by the supplied T3 Code snapshot**. Its compatibility version is `1.19.2-ocmini.0.2.0`; its package version is separate. This is an independent implementation, not an OpenCode release. The supplied `opencode-dev` archive contains a newer 2.x architecture, so copying its `/api` endpoints into a 1.x shim would select the wrong T3 adapter.
+ocmini implements the OpenCode 1.x HTTP/SSE API. Its compatibility version is `1.19.2-ocmini.0.2.0`; the package version is separate. `GET /api/info` returns 404 because the 2.x protocol is not supported. `GET /global/health` returns `healthy: true` and the compatibility version.
 
-This document specifies observable behavior. Tests are in `tests/contract.rs` and module tests. The presence of a test or an implementation is not evidence that it has been executed in every deployment environment.
-
-## Sources and protocol selection
-
-Paths in this section are relative to the supplied `t3code-main` archive:
-
-- `packages/provider-opencode/src/server/versionProbe.ts`: `--version` selects the adapter generation by major version; external servers are probed at `/api/info`, then `/global/health`.
-- `packages/provider-opencode/src/server/OpenCodeRuntime.ts`: server launch, Basic auth, health/version gate, CLI inventory parsers, file attachments, permission rules and answer conversion. The minimum accepted OpenCode compatibility version is 1.14.19.
-- `packages/provider-opencode/src/server/adapter.ts`: the actual session, prompt, event, steering, approval, question, compaction, child-session, rewind and fork behavior. It targets T3's orchestration V2 while speaking OpenCode 1.x through `@opencode-ai/sdk/v2`.
-- `packages/provider-opencode/src/server/textGeneration.ts`: synchronous model requests used for title generation and other structured text operations.
-- `packages/provider-opencode/src/server/status.ts`: model/variant/agent inventory and skill discovery.
-- `packages/provider-opencode/src/server/usage.ts`: SQLite usage-file discovery and message parsing.
-- `packages/shared/src/semver.ts`: version parsing and compatibility comparisons.
-
-The distinct OpenCode 2.x implementation lives under `packages/provider-opencode/src/server/v2/`. ocmini does not advertise that protocol. An authenticated `GET /api/info` therefore returns 404. `GET /global/health` returns JSON with `healthy: true` and the compatibility version. The prerelease suffix is accepted by the supplied T3 semver parser; a `+build` suffix is not.
+This document specifies observable behavior. Integration tests are grouped under `tests/contract/`, with unit tests beside their subsystems.
 
 ## Process and CLI contract
 
@@ -32,7 +18,7 @@ After a successful bind, stdout contains one flushed line:
 opencode server listening on http://<bound-address>:<actual-port>
 ```
 
-Port zero chooses an available port and the banner reports the actual port. IPv6 literals are bracketed. Diagnostics go to stderr. Both `--option=value` and `--option value` are supported. Invalid options or port values exit unsuccessfully instead of silently using defaults. No arguments start terminal chat; `--help` displays command help. The `tui` command accepts `--model provider/model` and `--directory DIR` and uses the same engine as the HTTP server.
+Port zero chooses an available port and the banner reports the actual port. IPv6 literals are bracketed. Diagnostics go to stderr. Both `--option=value` and `--option value` are supported. Invalid options or port values exit unsuccessfully instead of silently using defaults. No arguments start terminal chat; `--help` displays command help. Terminal chat accepts `--model provider/model`, `--directory DIR`, `--continue` (latest top-level session in that project) and `--session ID` (saved directory and history). These flags also work with `tui`. Resuming restores the last user model, agent and variant; an explicit model overrides the saved selection. `session list` prints saved IDs, titles and directories, with an optional `--directory DIR` filter.
 
 T3's other probes are:
 
@@ -43,7 +29,7 @@ T3's other probes are:
 | `agent list` | A `name (mode)` line followed by a JSON permission-rule array for each agent |
 | `debug skill` | One JSON array of discovered skills, including their absolute `location` |
 
-The model and agent CLI formats are **not** JSON arrays. Their parser behavior is covered by T3's `OpenCodeRuntime.cliParsers.test.ts`. Model IDs containing additional slashes are preserved after the first provider separator. Model data includes configured variants and limits; it is not reduced to names alone.
+The model and agent CLI formats are **not** JSON arrays. Model IDs containing additional slashes are preserved after the first provider separator. Model data includes configured variants and limits; it is not reduced to names alone.
 
 T3 supplies `OPENCODE_CONFIG_CONTENT` and, when applicable, `OPENCODE_SERVER_PASSWORD`. An empty `{}` config overlay must retain the user's file configuration. T3 does not need ocmini to rewrite OpenCode's config or credential files.
 
@@ -55,7 +41,7 @@ Requests are scoped by `directory` query parameter or `x-opencode-directory` hea
 
 Failed lookups return 404. Invalid bodies or invalid identifiers return a client error. Storage/provider failures must not be converted into successful empty responses. JSON errors carry `name` and `data.message` so T3 can display a useful error.
 
-The JSON request-body limit defaults to 128 MiB and can be set with `OCMINI_MAX_REQUEST_BYTES`. This bounds an individual HTTP body, not the combined size of local attachment files. T3 sends file URLs, so multiple native attachments do not become large inline JSON bodies. The supplied T3 contracts allow 100 attachments, 10 MiB per image and 80 MiB of images per turn; its OpenCode adapter forwards supported native files only up to 20 MiB each, with other attachments represented through prompt paths.
+The JSON request-body limit defaults to 128 MiB and can be set with `OCMINI_MAX_REQUEST_BYTES`. This bounds an individual HTTP body, not the combined size of local attachment files. T3 sends file URLs, so multiple native attachments do not become large inline JSON bodies. Native local attachments are limited to 20 MiB per file.
 
 ## Session and prompt operations
 
@@ -109,7 +95,7 @@ Cancellation must interrupt a stalled provider stream, a subprocess and a permis
 
 T3 sends `model` as a **string** on command requests, for example `provider/model`, plus `command`, `arguments`, `messageID`, optional `agent` and `variant`, and file `parts`. It does not send top-level `providerID` and `modelID` on this route.
 
-Commands come from configuration and Markdown command files. Argument expansion follows the supplied upstream `packages/core/src/config/plugin/command.ts`:
+Commands come from configuration and Markdown command files. Argument expansion supports:
 
 - `$ARGUMENTS` receives the literal complete argument string.
 - `$1`, `$2`, etc. use quoted argument grouping. The largest numbered placeholder receives the remaining arguments joined with spaces.
@@ -225,4 +211,4 @@ Session state and transcripts live in the ocmini SQLite database under the XDG d
 
 For T3's usage widget, a separate `opencode-ocmini.db` sidecar under the OpenCode XDG data directory contains a compatible `message` table with `id`, `session_id`, `data`, and `time_created`. Do not overwrite the real `opencode.db` or duplicate billed usage when copying history during a fork.
 
-The headless runtime intentionally does not include OpenCode's desktop/web/TUI applications, hosted account/billing services, plugin marketplace, automatic plugin/package installation, updater, LSP fleet or OpenCode 2.x background-service protocol. These are not required by the supplied T3 1.x adapter. Authentication mechanisms and provider formats that require those omitted integrations must fail honestly; the compatibility version is not a promise of support for every OpenCode distribution feature.
+The headless runtime intentionally does not include OpenCode's desktop/web/TUI applications, hosted account/billing services, plugin marketplace, automatic plugin/package installation, updater, LSP fleet or OpenCode 2.x background-service protocol. Authentication mechanisms and provider formats that require those omitted integrations must fail honestly; the compatibility version is not a promise of support for every OpenCode distribution feature.

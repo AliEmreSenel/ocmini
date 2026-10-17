@@ -1,10 +1,7 @@
-// An append-only terminal transcript over the
-// in-process engine. It subscribes to the same event bus T3 consumes over SSE,
-// so prompts, streaming text, reasoning, tool states, permissions and
-// questions all flow through the real runtime paths.
+// Terminal transcript and input over the shared session engine.
 use crate::engine::{self, App, EngineApi};
 use crate::engine_impl::Engine;
-use crate::types::{ModelRef, PromptRequest, Session};
+use crate::types::{MessageWithParts, PromptRequest};
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
@@ -16,7 +13,6 @@ use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 
 struct RawMode;
 
@@ -55,8 +51,9 @@ const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 
 fn truncate(text: &str, max: usize) -> String {
-    let mut out: String = text.chars().take(max).collect();
-    if out.chars().count() < text.chars().count() {
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
         out.push('…');
     }
     out.replace('\n', " ")
@@ -88,7 +85,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · agent build · Enter send · paste inserts all lines · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear{RESET}");
+    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear{RESET}");
     print!("{BOLD}›{RESET} ");
     let _ = std::io::stdout().flush();
 }
@@ -120,6 +117,7 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
     let properties = &event.properties;
     if properties["sessionID"]
         .as_str()
+        .or_else(|| properties["part"]["sessionID"].as_str())
         .is_some_and(|id| id != session_id)
     {
         return;
@@ -136,7 +134,7 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
                         "reasoning"
                     };
                     let is_new = ui.part_kind.insert(part_id.clone(), kind).is_none();
-                    if is_new && ui.headered.insert(part_id.clone()) {
+                    if is_new {
                         if kind == "reasoning" {
                             println!("\n{DIM}◦ thinking{RESET}");
                         } else {
@@ -364,30 +362,65 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     })
 }
 
-pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(), String> {
+fn render_history(history: &[MessageWithParts]) {
+    for message in history {
+        println!("\n{BOLD}{}{RESET}", message.info.role);
+        for part in &message.parts {
+            match part["type"].as_str() {
+                Some("text") => println!("{}", part["text"].as_str().unwrap_or_default()),
+                Some("tool") => println!(
+                    "{DIM}● {} · {}{RESET}",
+                    part["tool"].as_str().unwrap_or("tool"),
+                    part["state"]["status"].as_str().unwrap_or_default()
+                ),
+                Some("file") => println!(
+                    "{DIM}attachment: {}{RESET}",
+                    part["filename"]
+                        .as_str()
+                        .or_else(|| part["url"].as_str())
+                        .unwrap_or("file")
+                ),
+                _ => {}
+            }
+        }
+        if let Some(error) = &message.info.error {
+            println!(
+                "{RED}error: {}{RESET}",
+                error["data"]["message"].as_str().unwrap_or("interrupted")
+            );
+        }
+    }
+}
+
+pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     let app = App::new()?;
-    let directory = directory.unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    let app = app.for_directory(&directory)?;
-    let engine: Arc<dyn EngineApi> = Arc::new(Engine::new());
-    let session: Session = app
-        .store
-        .try_create_session_owned("tui session", &directory)?;
-    let model_display = model
-        .clone()
-        .or_else(|| Some(app.config.lock().unwrap().model.clone()))
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| "unconfigured".into());
-    let model_ref = model
-        .as_deref()
-        .and_then(|text| text.split_once('/'))
-        .map(|(provider, id)| ModelRef {
-            provider_id: provider.into(),
-            model_id: id.into(),
-        });
+    let session = crate::sessions::open(
+        &app.store,
+        args.directory.as_deref(),
+        args.session.as_deref(),
+        args.continue_last,
+    )?;
+    let app = app.for_directory(&session.directory)?;
+    let engine = Engine::new();
+    let history = app.store.messages(&session.id)?;
+    let previous = history
+        .iter()
+        .rev()
+        .find(|message| message.info.role == "user");
+    let model_ref = args
+        .model
+        .or_else(|| previous.and_then(|message| message.info.model.clone()));
+    let agent = previous.and_then(|message| message.info.agent.clone());
+    let variant = previous.and_then(|message| message.info.variant.clone());
+    let model_display = model_ref
+        .as_ref()
+        .map(|model| format!("{}/{}", model.provider_id, model.model_id))
+        .unwrap_or_else(|| app.config.lock().unwrap().model.clone());
+    let model_display = if model_display.is_empty() {
+        "unconfigured".into()
+    } else {
+        model_display
+    };
 
     let shutdown =
         shutdown_signal().map_err(|error| format!("Cannot listen for shutdown: {error}"))?;
@@ -407,6 +440,8 @@ pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(),
         "{BOLD}ocmini{RESET} {DIM}{}{RESET}",
         crate::OPENCODE_COMPAT_VERSION
     );
+    println!("{DIM}session {} · {}{RESET}", session.id, session.directory);
+    render_history(&history);
     print_prompt(&model_display);
 
     loop {
@@ -464,7 +499,8 @@ pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(),
                             let request = PromptRequest {
                                 message_id: Some(crate::types::hex_id("msg_")),
                                 model: model_ref.clone(),
-                                agent: Some("build".into()),
+                                agent: agent.clone(),
+                                variant: variant.clone(),
                                 parts: vec![serde_json::json!({"type": "text", "text": text})],
                                 ..Default::default()
                             };
@@ -489,6 +525,6 @@ pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(),
             }
         }
     }
-    engine.abort(&session.id);
+    engine.abort_and_wait(&session.id).await;
     Ok(())
 }
