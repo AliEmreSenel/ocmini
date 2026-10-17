@@ -90,6 +90,19 @@ impl Config {
                 }
             }
         }
+        // Config entries omit id/name; real opencode derives them from the model
+        // key. T3's registry builds provider/model slugs from model.id, so an
+        // empty id yields dead "provider/" entries that fail slug parsing.
+        for p in cfg.provider.values_mut() {
+            for (mid, m) in p.models.iter_mut() {
+                if m.id.is_empty() {
+                    m.id = mid.clone();
+                }
+                if m.name.is_empty() {
+                    m.name = mid.clone();
+                }
+            }
+        }
         cfg
     }
 
