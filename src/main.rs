@@ -9,6 +9,7 @@ mod provider;
 mod server;
 mod store;
 mod tools;
+mod tui;
 mod types;
 mod usage_db;
 
@@ -19,6 +20,8 @@ const HELP: &str = "ocmini — a compact OpenCode-compatible coding runtime
 Usage:
   ocmini                                  Show this help
   ocmini serve [--hostname HOST] [--port N] Start the HTTP/SSE server
+  ocmini tui [--model provider/model] [--directory DIR]
+                                           Minimal interactive terminal chat
   ocmini models [PROVIDER] [--verbose]      List available models
   ocmini agent list                       List available agents
   ocmini debug skill                      Print discovered skills as JSON
@@ -46,6 +49,33 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "--version" | "-V" | "version" if args.len() == 1 => {
             println!("{OPENCODE_COMPAT_VERSION}");
             Ok(())
+        }
+        "tui" => {
+            let mut model = None;
+            let mut directory = None;
+            let mut index = 1;
+            while index < args.len() {
+                let (option, inline) = args[index]
+                    .split_once('=')
+                    .map(|(name, value)| (name, Some(value)))
+                    .unwrap_or((args[index].as_str(), None));
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        index += 1;
+                        args.get(index).map(String::as_str).ok_or_else(|| format!("{option} requires a value"))?
+                    }
+                };
+                match option {
+                    "--model" => model = Some(value.to_owned()),
+                    "--directory" => directory = Some(value.to_owned()),
+                    other => return Err(format!("Unknown tui option: {other}")),
+                }
+                index += 1;
+            }
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|error| format!("Cannot start runtime: {error}"))?;
+            runtime.block_on(tui::run(model, directory))
         }
         "serve" => {
             let mut hostname = "127.0.0.1".to_owned();

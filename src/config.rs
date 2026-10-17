@@ -101,12 +101,9 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load() -> Config {
+    pub fn load() -> Result<Config, String> {
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::load_for(&directory.to_string_lossy()).unwrap_or_else(|error| {
-            eprintln!("ocmini: {error}");
-            std::process::exit(1);
-        })
+        Self::load_for(&directory.to_string_lossy())
     }
 
     pub fn load_for(directory: &str) -> Result<Config, String> {

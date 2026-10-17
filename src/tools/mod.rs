@@ -25,7 +25,7 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     pub fn update_metadata(&self, metadata: Value) -> Result<(), ToolError> {
-        let message = self.app.store.message(&self.session_id, &self.message_id)
+        let message = self.app.store.message(&self.session_id, &self.message_id).map_err(failure)?
             .ok_or_else(|| failure("Tool message no longer exists"))?;
         let mut part = message.parts.into_iter().find(|part| part["id"].as_str() == Some(self.part_id.as_str()))
             .ok_or_else(|| failure("Tool part no longer exists"))?;
@@ -205,15 +205,16 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
             if config["disable"] == true || config["mode"] == "primary" { return Err(failure(format!("Agent {agent:?} is unavailable as a subagent"))); }
         }
     }
-    let parent = ctx.app.store.get_session(&ctx.session_id).ok_or_else(|| failure("Parent session does not exist"))?;
+    let parent = ctx.app.store.get_session(&ctx.session_id).map_err(failure)?
+        .ok_or_else(|| failure("Parent session does not exist"))?;
     let mut ancestor = parent.parent_id.clone();
     let mut depth = 0;
     while let Some(id) = ancestor {
         depth += 1;
         if depth >= 8 { return Err(failure("Subagent nesting limit (8) reached")); }
-        ancestor = ctx.app.store.get_session(&id).and_then(|session| session.parent_id);
+        ancestor = ctx.app.store.get_session(&id).ok().flatten().and_then(|session| session.parent_id);
     }
-    let mut model = ctx.app.store.messages(&ctx.session_id).into_iter().rev().find_map(|message| {
+    let mut model = ctx.app.store.messages(&ctx.session_id).unwrap_or_default().into_iter().rev().find_map(|message| {
         message.info.model.or_else(|| Some(ModelRef { provider_id: message.info.provider_id?, model_id: message.info.model_id? }))
     });
     if let Some(selected) = ctx.app.config.lock().unwrap().agent.get(agent).and_then(|value| value["model"].as_str()) {
@@ -222,7 +223,8 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
         model = Some(ModelRef { provider_id: provider.into(), model_id: selected.into() });
     }
     let child = if let Some(id) = input["task_id"].as_str() {
-        let child = ctx.app.store.get_session(id).ok_or_else(|| failure(format!("Task session {id:?} does not exist")))?;
+        let child = ctx.app.store.get_session(id).map_err(failure)?
+            .ok_or_else(|| failure(format!("Task session {id:?} does not exist")))?;
         if child.parent_id.as_deref() != Some(ctx.session_id.as_str()) { return Err(failure("task_id must identify a child of the current session")); }
         child
     } else {
