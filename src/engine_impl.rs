@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::engine::{bus, App, EngineApi};
 use crate::provider::{self, ChatRequest};
+use crate::store::Store;
 use crate::tools::{self, ToolCtx};
 use crate::types::*;
 use base64::Engine as Base64Engine;
@@ -357,7 +358,9 @@ async fn run_turn(app: App, engine: Arc<dyn EngineApi>, sid: &str, request: Prom
     let mut last = None;
     for step in 0..max_steps {
         if cancel.load(Ordering::Acquire) { return Err("Aborted".into()); }
-        let mut messages = build_messages(&app,sid,uid)?;
+        // History reloads can span megabytes of JSON; keep them off the async workers.
+        let (blocking_store, blocking_sid, blocking_uid) = (app.store.clone(), sid.to_string(), uid.to_string());
+        let mut messages = tokio::task::spawn_blocking(move || build_messages(&blocking_store, &blocking_sid, &blocking_uid)).await.map_err(|e| e.to_string())??;
         if compact { messages.push(json!({"role":"user","content":"Produce the continuation summary now."})); }
         let now = now_ms();
         let amid = hex_id("msg_");
@@ -603,8 +606,8 @@ fn record_session_usage(app:&App,sid:&str,usage:&Tokens,cost:f64)->Result<(),Str
     Ok(())
 }
 
-fn build_messages(app:&App,sid:&str,through:&str)->Result<Vec<Value>,String> {
-    let history=app.store.messages(sid)?;
+fn build_messages(store:&Store,sid:&str,through:&str)->Result<Vec<Value>,String> {
+    let history=store.messages(sid)?;
     let mut users=HashSet::new();
     for message in &history {
         if message.info.role=="user" { users.insert(message.info.id.clone()); }
@@ -725,6 +728,20 @@ fn percent_bytes(value:&str)->Result<Vec<u8>,String> {
 }
 
 async fn system_prompt(cfg:&Config,directory:&str,agent:&str,provided:Option<&str>)->Result<String,String> {
+    let mut system=system_prompt_base(cfg,directory,agent).await?;
+    if let Some(provided)=provided { system.push_str("\n\n"); system.push_str(provided); }
+    Ok(system)
+}
+
+/// The AGENTS.md/skills/agent-prompt base is identical for every turn in a
+/// directory; reading those files per turn scales with sessions, so cache it.
+async fn system_prompt_base(cfg:&Config,directory:&str,agent:&str)->Result<String,String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(String,String),(std::time::Instant,String)>>> = std::sync::OnceLock::new();
+    let cache=CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key=(directory.to_string(),agent.to_string());
+    if let Some((created,prompt))=cache.lock().unwrap().get(&key) {
+        if created.elapsed()<std::time::Duration::from_secs(10) { return Ok(prompt.clone()); }
+    }
     let mut system=format!("You are ocmini, a coding agent. Work in {directory}. Read the code before changing it, follow project instructions, and report real tool results. Use available tools to complete the user's task. Operating system: {}.",std::env::consts::OS);
     let mut files=Vec::new();
     let global=PathBuf::from(crate::config::config_home()).join("opencode/AGENTS.md");
@@ -739,8 +756,7 @@ async fn system_prompt(cfg:&Config,directory:&str,agent:&str,provided:Option<&st
     let mut seen=HashSet::new();
     for instruction in &cfg.instructions {
         if instruction.starts_with("https://") || instruction.starts_with("http://") {
-            let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().map_err(|e|e.to_string())?;
-            let response=client.get(instruction).send().await.map_err(|e|format!("Instruction URL {instruction}: {e}"))?.error_for_status().map_err(|e|e.to_string())?;
+            let response=provider::client().get(instruction).timeout(std::time::Duration::from_secs(15)).send().await.map_err(|e|format!("Instruction URL {instruction}: {e}"))?.error_for_status().map_err(|e|e.to_string())?;
             let mut bytes=Vec::new(); let mut stream=response.bytes_stream();
             while let Some(chunk)=stream.next().await {
                 bytes.extend_from_slice(&chunk.map_err(|e|e.to_string())?);
@@ -770,7 +786,7 @@ async fn system_prompt(cfg:&Config,directory:&str,agent:&str,provided:Option<&st
             system.push_str(&format!("\n- {}: {}",skill["name"].as_str().unwrap_or_default(),skill["description"].as_str().unwrap_or_default()));
         }
     }
-    if let Some(provided)=provided { system.push_str("\n\n"); system.push_str(provided); }
+    cache.lock().unwrap().insert(key, (std::time::Instant::now(), system.clone()));
     Ok(system)
 }
 

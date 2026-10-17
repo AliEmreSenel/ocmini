@@ -56,7 +56,7 @@ async fn discover(id: &str, config: &Config, auth: &AuthStore) -> Result<HashMap
     for suffix in ["/chat/completions", "/responses", "/messages"] {
         if let Some(stripped) = base.strip_suffix(suffix) { base = stripped; break; }
     }
-    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(6)).build().map_err(|e| e.to_string())?;
+    let client = super::client();
     let mut models = HashMap::new();
     let mut after: Option<String> = None;
     for _ in 0..10 {

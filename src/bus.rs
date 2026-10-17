@@ -8,7 +8,7 @@ pub struct Bus {
 
 impl Bus {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(4096);
+        let (tx, _) = broadcast::channel(16384);
         Self { tx }
     }
 
