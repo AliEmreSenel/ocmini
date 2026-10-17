@@ -4,22 +4,35 @@ The runtime targets the OpenCode 1.x contract consumed by the supplied T3 source
 
 ## Reproduce the checks
 
-Use stable Rust and a C compiler/linker for bundled SQLite:
+Use Rust 1.85.0 or newer and a C compiler/linker for bundled SQLite:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --locked
 cargo build --release --locked
 ```
 
-The Linux CI workflow runs these same checks. Dependencies are pinned in `Cargo.lock`. No Python tooling is required.
+The Linux CI workflow runs tests, Clippy and release builds on both Rust 1.85.0 and current stable, with `RUSTFLAGS="-D warnings"` and Clippy's `-D warnings` enforcing warning-free code. Formatting runs on stable. Dependencies are pinned in `Cargo.lock`; `rust-version = "1.85"` and resolver version 3 keep dependency resolution aware of the minimum supported compiler. JSONC uses `serde_json_lenient`, and YAML frontmatter uses the YAML organization's `yaml_serde`, both compatible with the minimum compiler. No Python tooling is required.
+
+To reproduce the minimum-version checks:
+
+```sh
+rustup toolchain install 1.85.0 --profile minimal --component clippy
+RUSTFLAGS="-D warnings" cargo +1.85.0 test --all-targets --locked
+RUSTFLAGS="-D warnings" cargo +1.85.0 clippy --all-targets --all-features --locked -- -D warnings
+RUSTFLAGS="-D warnings" cargo +1.85.0 build --release --locked
+```
 
 ## Executed checks (2026-10-17)
 
-On Linux with stable Rust 1.97.1, formatting and Clippy with warnings denied passed. All 88 tests passed: 68 unit tests and 20 process/HTTP integration tests. Interactive pseudo-terminal checks passed for Unicode, multiline paste, arrow keys, Ctrl+C abort, Ctrl+D exit and terminal restoration after both exit and SIGTERM.
+On Linux with Rust 1.85.0 and stable Rust 1.99.1, all 88 tests passed on each compiler: 68 unit tests and 20 process/HTTP integration tests. Both runs used `RUSTFLAGS="-D warnings"`. Clippy passed on both compilers with `--all-targets --all-features --locked -- -D warnings`, with no warning suppressions added. Formatting passed on stable.
 
-The optimized release build and executable version/help checks passed using the installed `nightly-2026-08-01` toolchain (Rust 1.99.0-nightly). A concurrent update removed the shared stable toolchain during the initial release link, so the release check used this dated toolchain. CI continues to build releases with stable Rust.
+This uses the actual minimum compiler, rather than relying only on crate metadata: `ignore` 0.4.30 uses newer let-chain syntax without declaring a higher minimum compiler, so the package explicitly selects 0.4.29.
+
+The preceding cleanup also passed interactive pseudo-terminal checks for Unicode, multiline paste, arrow keys, Ctrl+C abort, Ctrl+D exit and terminal restoration after both exit and SIGTERM.
+
+The optimized release build passed on Rust 1.85.0 with `RUSTFLAGS="-D warnings"`, with no compiler warnings. The resulting executable passed version/help smoke checks. CI runs the same warning-free release build on Rust 1.85.0 and current stable.
 
 ## Coverage
 

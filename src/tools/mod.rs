@@ -198,9 +198,9 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                 .as_array()
                 .ok_or_else(|| failure("todos must be an array"))?;
             for todo in todos {
-                if !todo["content"]
+                if todo["content"]
                     .as_str()
-                    .is_some_and(|text| !text.trim().is_empty())
+                    .is_none_or(|text| text.trim().is_empty())
                     || !matches!(
                         todo["status"].as_str(),
                         Some("pending" | "in_progress" | "completed" | "cancelled")
