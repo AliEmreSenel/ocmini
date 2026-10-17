@@ -114,6 +114,8 @@ async fn cli_help_version_and_invalid_arguments_do_not_start_the_runtime() {
         vec!["--model", "invalid"],
         vec!["--continue", "--session", "ses_example"],
         vec!["tui", "--continue", "--session", "ses_example"],
+        vec!["--resume", "--session", "ses_example"],
+        vec!["tui", "--resume", "--continue"],
         vec!["models", "a", "b"],
         vec!["--model", "local/test", "serve"],
     ] {
@@ -125,6 +127,28 @@ async fn cli_help_version_and_invalid_arguments_do_not_start_the_runtime() {
         assert!(!output.status.success(), "{arguments:?}");
         assert!(!output.stderr.is_empty(), "{arguments:?}");
     }
+}
+
+#[tokio::test]
+async fn interactive_session_picker_reports_the_missing_terminal_without_touching_sessions() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    // Piped test runs have no TTY: --resume must fail cleanly and list must stay intact.
+    let output = configured_command(server.root.path(), &server.directory)
+        .args(["--resume"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("needs a terminal"));
+    assert!(server
+        .get(&format!("/session/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ mod engine;
 mod engine_impl;
 mod mcp;
 mod permission;
+mod picker;
 mod provider;
 mod server;
 mod sessions;
@@ -39,6 +40,14 @@ struct TuiArgs {
     /// Resume a session by ID, using its saved directory
     #[arg(short = 's', long, value_name = "ID")]
     session: Option<String>,
+    /// Pick a saved session interactively (search and sort)
+    #[arg(
+        short = 'r',
+        long,
+        conflicts_with = "session",
+        conflicts_with = "continue_last"
+    )]
+    resume: bool,
 }
 
 #[derive(Subcommand)]

@@ -13,7 +13,7 @@ cargo build --release --locked
 
 CI runs tests, Clippy and release builds on Rust 1.85.0 and stable with warnings treated as errors. Formatting runs on stable. To check the minimum compiler locally, install it with `rustup toolchain install 1.85.0 --profile minimal --component clippy` and use `cargo +1.85.0`.
 
-Checked on Linux on 2026-10-17: all 94 tests and Clippy passed on Rust 1.85.0 and stable. The four process tests also passed 25 consecutive runs. Pseudo-terminal checks verified history and context reuse, saved model/agent/directory, model overrides, Unicode, terminal restoration and immediate resume after exiting during a stalled request.
+Checked on Linux on 2026-10-17: all 100 tests and Clippy passed on Rust 1.85.0 and stable. The four process tests also passed 25 consecutive runs. Pseudo-terminal checks verified history and context reuse, saved model/agent/directory, model overrides, Unicode, terminal restoration and immediate resume after exiting during a stalled request.
 
 ## Test layout
 
@@ -24,6 +24,6 @@ Tests use temporary state, bundled SQLite and local HTTP/MCP peers. They cover p
 
 ## Manual checks
 
-Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation.
+Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.
 
 Live-provider calls and full client-application workflows require validation in the target environment. Local tests do not establish performance or compatibility with unsupported provider protocols. See [SPEC-CONTRACT.md](SPEC-CONTRACT.md) for the API surface.
