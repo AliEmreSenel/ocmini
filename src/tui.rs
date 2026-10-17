@@ -11,17 +11,26 @@ use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-pub struct RawTerminal;
-
-impl RawTerminal {
-    pub fn available() -> bool {
-        unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 }
-    }
-}
-
 #[cfg(unix)]
 struct RawMode {
     saved: libc::termios,
+}
+
+/// Raw mode must survive being killed: T3 terminates the TUI with signals,
+/// and a terminal left in raw mode is broken for the user's shell.
+#[cfg(unix)]
+fn install_terminal_restore(saved: &libc::termios) {
+    static SAVED: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+    extern "C" fn restore_exit(sig: libc::c_int) -> ! {
+        if let Some(saved) = SAVED.get() {
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, saved) };
+        }
+        unsafe { libc::_exit(128 + sig) };
+    }
+    let _ = SAVED.set(*saved);
+    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+        unsafe { libc::signal(sig, restore_exit as libc::sighandler_t) };
+    }
 }
 
 #[cfg(unix)]
@@ -31,7 +40,12 @@ impl RawMode {
         if unsafe { libc::tcgetattr(0, &mut saved) } != 0 { return None; }
         let mut raw = saved;
         unsafe { libc::cfmakeraw(&mut raw) };
+        // cfmakeraw clears OPOST, so "\n" stops becoming CRLF and every
+        // printed line walks down the screen in stairs. Keep output post-
+        // processing on; input stays fully raw.
+        raw.c_oflag |= libc::OPOST | libc::ONLCR;
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 { return None; }
+        install_terminal_restore(&saved);
         Some(Self { saved })
     }
 }
@@ -230,6 +244,54 @@ fn decode_key(byte: u8) -> Key {
     }
 }
 
+fn stdin_readable(timeout_ms: i32) -> bool {
+    let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut fd, 1, timeout_ms) > 0 }
+}
+
+/// Raw mode delivers raw bytes: multibyte UTF-8 must be reassembled and
+/// arrow/home/pgup escape sequences must be consumed whole, or their
+/// "[A" tails get typed into the prompt as text.
+fn read_stdin_keys(tx: mpsc::UnboundedSender<Key>) {
+    let mut stdin = std::io::stdin();
+    let mut byte = [0u8; 1];
+    loop {
+        match std::io::Read::read(&mut stdin, &mut byte) {
+            Ok(0) | Err(_) => { let _ = tx.send(Key::CtrlD); return; }
+            Ok(_) => {}
+        }
+        match byte[0] {
+            27 => {
+                // Escape only starts a sequence if bytes follow it; a lone
+                // Esc (dismiss prompts) must not swallow the next keystroke.
+                if !stdin_readable(30) { let _ = tx.send(Key::Esc); continue; }
+                if std::io::Read::read(&mut stdin, &mut byte).is_err() { continue; }
+                if matches!(byte[0], b'[' | b'O') {
+                    for _ in 0..8 {
+                        if std::io::Read::read(&mut stdin, &mut byte).is_err() { break; }
+                        if (0x40..=0x7e).contains(&byte[0]) { break; }
+                    }
+                } else {
+                    let _ = tx.send(Key::Esc);
+                    let _ = tx.send(decode_key(byte[0]));
+                }
+            }
+            lead @ 0xC2..=0xF4 => {
+                let extra = match lead { 0xC2..=0xDF => 1, 0xE0..=0xEF => 2, _ => 3 };
+                let mut seq = vec![lead];
+                for _ in 0..extra {
+                    if std::io::Read::read(&mut stdin, &mut byte).is_err() { break; }
+                    seq.push(byte[0]);
+                }
+                if let Ok(text) = String::from_utf8(seq) {
+                    for ch in text.chars() { let _ = tx.send(Key::Char(ch)); }
+                }
+            }
+            other => { let _ = tx.send(decode_key(other)); }
+        }
+    }
+}
+
 pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(), String> {
     let app = App::new()?;
     let directory = directory.unwrap_or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
@@ -241,16 +303,8 @@ pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(),
 
     let raw = RawMode::enter();
     let mut events = engine::bus().subscribe();
-    let (bytes_tx, mut bytes_rx) = mpsc::unbounded_channel::<u8>();
-    std::thread::spawn(move || {
-        let mut byte = [0u8; 1];
-        loop {
-            match std::io::Read::read(&mut std::io::stdin(), &mut byte) {
-                Ok(0) | Err(_) => { let _ = bytes_tx.send(4); return; }
-                Ok(_) => { if bytes_tx.send(byte[0]).is_err() { return; } }
-            }
-        }
-    });
+    let (keys_tx, mut keys_rx) = mpsc::unbounded_channel::<Key>();
+    std::thread::spawn(move || read_stdin_keys(keys_tx));
 
     let mut line = String::new();
     let mut ui = Ui { part_kind: HashMap::new(), headered: std::collections::HashSet::new(), tool_done: std::collections::HashSet::new(), busy: false, prompt: None };
@@ -259,11 +313,11 @@ pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(),
 
     loop {
         tokio::select! {
-            byte = bytes_rx.recv() => {
-                let Some(byte) = byte else { break; };
+            key = keys_rx.recv() => {
+                let Some(key) = key else { break; };
                 let pending_permission = matches!(ui.prompt, Some(PendingPrompt::Permission(_)));
                 let pending_question = matches!(ui.prompt, Some(PendingPrompt::Question { .. }));
-                match decode_key(byte) {
+                match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     Key::CtrlC => { engine.abort(&session.id); println!("\n{YELLOW}⏹ aborted{RESET}"); }
