@@ -123,7 +123,7 @@ async fn run_turn(
     let is_plan = agent.as_deref() == Some("plan");
     let session = app.store.get_session(&session_id).ok_or("no session")?;
     app.store.set_busy(&session_id, true);
-    bus().emit("session.status", json!({"sessionID": session_id, "status": "busy"}));
+    bus().emit("session.status", json!({"sessionID": session_id, "status": {"type": "busy"}}));
 
     let now = now_ms();
     let uid = hex_id("msg_");
@@ -143,8 +143,8 @@ async fn run_turn(
         parts: vec![part_text(&u_part, &session_id, &uid, &user_text)],
     };
     app.store.add_message(&user_msg);
-    bus().emit("message.updated", json!({"info": user_msg.info}));
-    bus().emit("message.part.updated", json!({"part": user_msg.parts[0]}));
+    bus().emit("message.updated", json!({"sessionID": session_id, "info": user_msg.info}));
+    bus().emit("message.part.updated", json!({"sessionID": session_id, "part": user_msg.parts[0], "time": {"created": now_ms()}}));
 
     let cancel = Arc::new(AtomicBool::new(false));
     cancels().lock().unwrap().insert(session_id.clone(), cancel.clone());
@@ -204,7 +204,7 @@ async fn run_turn(
                 info_emitted = true;
                 bus().emit(
                     "message.updated",
-                    json!({"info": assistant_info(&amid, &session_id, &model_id, &provider_id, created)}),
+                    json!({"sessionID": session_id, "info": assistant_info(&amid, &session_id, &model_id, &provider_id, created)}),
                 );
             }
         };
@@ -219,7 +219,7 @@ async fn run_turn(
                 ProviderEvent::ReasoningDelta(d) => {
                     ensure_info();
                     reason_acc.push_str(&d);
-                    bus().emit("message.part.updated", json!({"part": part_reasoning(&reason_part, &session_id, &amid, &reason_acc)}));
+                    bus().emit("message.part.updated", json!({"sessionID": session_id, "part": part_reasoning(&reason_part, &session_id, &amid, &reason_acc), "time": {"created": now_ms()}}));
                 }
                 ProviderEvent::ToolCallStart { call_id, name, args } => {
                     ensure_info();
@@ -231,7 +231,7 @@ async fn run_turn(
                         "state": {"status": "running", "input": input, "time": {"start": now_ms()}}
                     });
                     app.store.update_part(&session_id, &part);
-                    bus().emit("message.part.updated", json!({"part": part}));
+                    bus().emit("message.part.updated", json!({"sessionID": session_id, "part": part, "time": {"created": now_ms()}}));
                     tool_parts.push(part);
                 }
                 ProviderEvent::Finished { finish, usage } => {
@@ -254,13 +254,13 @@ async fn run_turn(
         if !reason_acc.is_empty() {
             let p = part_reasoning(&reason_part, &session_id, &amid, &reason_acc);
             app.store.update_part(&session_id, &p);
-            bus().emit("message.part.updated", json!({"part": p.clone()}));
+            bus().emit("message.part.updated", json!({"sessionID": session_id, "part": p.clone(), "time": {"created": now_ms()}}));
             parts.push(p);
         }
         if !text_acc.is_empty() {
             let p = part_text(&text_part, &session_id, &amid, &text_acc);
             app.store.update_part(&session_id, &p);
-            bus().emit("message.part.updated", json!({"part": p.clone()}));
+            bus().emit("message.part.updated", json!({"sessionID": session_id, "part": p.clone(), "time": {"created": now_ms()}}));
             parts.push(p);
         }
         parts.extend(tool_parts.iter().cloned());
@@ -271,7 +271,7 @@ async fn run_turn(
         info.tokens = Some(usage.clone());
         app.store.add_message(&MessageWithParts { info: info.clone(), parts });
         app.usage.record(&amid, &session_id, &provider_id, &model_id, &usage, created);
-        bus().emit("message.updated", json!({"info": info}));
+        bus().emit("message.updated", json!({"sessionID": session_id, "info": info}));
 
         if tool_parts.is_empty() {
             break;
@@ -313,7 +313,9 @@ async fn run_turn(
                     json!({"tool": name, "input": input, "patterns": [pattern.clone()]}),
                     vec![pattern.clone()],
                 );
-                bus().emit("permission.asked", serde_json::to_value(&req).unwrap());
+                let mut asked = serde_json::to_value(&req).unwrap();
+                asked["tool"] = json!(name);
+                bus().emit("permission.asked", asked);
                 let reply = tokio::select! {
                     r = rx => r.unwrap_or_else(|_| "reject".into()),
                     _ = poll_cancel(cancel.clone()) => "reject".into(),
@@ -342,13 +344,16 @@ async fn run_turn(
                 }
             }
             app.store.update_part(&session_id, &updated);
-            bus().emit("message.part.updated", json!({"part": updated}));
+            bus().emit("message.part.updated", json!({"sessionID": session_id, "part": updated, "time": {"created": now_ms()}}));
         }
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        bus().emit("session.error", json!({"sessionID": session_id, "error": {"name": "MessageAbortedError", "data": {"message": "Aborted"}}}));
+    }
     app.store.set_busy(&session_id, false);
     cancels().lock().unwrap().remove(&session_id);
-    bus().emit("session.status", json!({"sessionID": session_id, "status": "idle"}));
+    bus().emit("session.status", json!({"sessionID": session_id, "status": {"type": "idle"}}));
     bus().emit("session.idle", json!({"sessionID": session_id}));
     let msgs = app.store.messages(&session_id);
     Ok(json!({"info": msgs.last().map(|m| m.info.clone()), "parts": msgs.last().map(|m| m.parts.clone()).unwrap_or_default()}))
