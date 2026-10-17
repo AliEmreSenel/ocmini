@@ -21,26 +21,29 @@ fn prompt() {
 
 fn out(s: &str) {
     let mut o = stdout();
-    let _ = o.write_all(s.as_bytes());
+    // raw mode disables ONLCR: bare \n moves the cursor down without CR,
+    // which cascades all output diagonally. Always emit CRLF.
+    let _ = o.write_all(s.replace('\n', "\r\n").as_bytes());
     let _ = o.flush();
 }
 
 fn print_tool(part: &Value) {
     let tool = part["tool"].as_str().unwrap_or("?");
     let st = part["state"]["status"].as_str().unwrap_or("");
-    let icon = match st {
-        "running" => "⚙",
-        "completed" => "✔",
-        "error" => "✖",
-        _ => "•",
+    let (icon, col) = match st {
+        "running" => ("⚙", "\x1b[33m"),
+        "completed" => ("✔", "\x1b[32m"),
+        "error" => ("✖", "\x1b[31m"),
+        _ => ("•", "\x1b[2m"),
     };
     let mut detail = String::new();
-    if let Some(cmd) = part["state"]["input"]["command"].as_str() {
-        detail = cmd.chars().take(60).collect();
-    } else if let Some(f) = part["state"]["input"]["filePath"].as_str() {
-        detail = f.to_string();
+    for key in ["command", "filePath", "url", "pattern", "path", "subagent_type"] {
+        if let Some(v) = part["state"]["input"][key].as_str() {
+            detail = v.chars().take(90).collect();
+            break;
+        }
     }
-    out(&format!("\x1b[2m  {icon} {tool} {st} {detail}\x1b[0m\n"));
+    out(&format!("{col}{icon} {tool}\x1b[0m \x1b[2m{detail}\x1b[0m\n"));
 }
 
 pub fn run() {
@@ -88,15 +91,27 @@ pub fn run() {
         let mut agent: Option<String> = None;
         let mut busy: Option<tokio::task::JoinHandle<()>> = None;
 
+        let perm_mode = {
+            let cfg = app.config.lock().unwrap();
+            let rules = crate::permission::default_rules(&cfg.permission);
+            let strict = rules.iter().any(|r| r.action == "ask" || r.action == "deny");
+            if strict { "supervised" } else { "full-access" }
+        };
         out(&format!(
-            "\x1b[1mocmini\x1b[0m 1.19.2 · {provider}/{model} · {cwd}\n\x1b[2m/quit /model <prov/id> /new /abort · Enter sends\x1b[0m\n"
+            "\x1b[1mocmini\x1b[0m 1.19.2 · {provider}/{model} · {cwd} · \x1b[33m{perm_mode}\x1b[0m\n\x1b[2m/quit /model <prov/id> /new /abort · Enter sends\x1b[0m\n"
         ));
         out("\x1b[36m> \x1b[0m");
 
         loop {
             while let Ok(ev) = rx_bus.try_recv() {
                 let p = &ev.properties;
-                if p["sessionID"].as_str().unwrap_or_default() != session.id {
+                // sessionID is top-level for most events, nested in .part for
+                // message.part.updated (tool/reasoning parts) — check both.
+                let ev_sid = p["sessionID"]
+                    .as_str()
+                    .or_else(|| p["part"]["sessionID"].as_str())
+                    .unwrap_or_default();
+                if ev_sid != session.id {
                     continue;
                 }
                 match ev.r#type.as_str() {
