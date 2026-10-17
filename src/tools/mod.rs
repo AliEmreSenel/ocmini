@@ -25,12 +25,22 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     pub fn update_metadata(&self, metadata: Value) -> Result<(), ToolError> {
-        let message = self.app.store.message(&self.session_id, &self.message_id).map_err(failure)?
+        let message = self
+            .app
+            .store
+            .message(&self.session_id, &self.message_id)
+            .map_err(failure)?
             .ok_or_else(|| failure("Tool message no longer exists"))?;
-        let mut part = message.parts.into_iter().find(|part| part["id"].as_str() == Some(self.part_id.as_str()))
+        let mut part = message
+            .parts
+            .into_iter()
+            .find(|part| part["id"].as_str() == Some(self.part_id.as_str()))
             .ok_or_else(|| failure("Tool part no longer exists"))?;
         part["state"]["metadata"] = metadata;
-        self.app.store.update_part(&self.session_id, &part).map_err(failure)?;
+        self.app
+            .store
+            .update_part(&self.session_id, &part)
+            .map_err(failure)?;
         bus().emit("message.part.updated", json!({"part":part}));
         Ok(())
     }
@@ -58,24 +68,45 @@ fn fn_def(name: &str, description: &str, parameters: Value) -> Value {
 }
 
 fn failure(message: impl Into<String>) -> ToolError {
-    ToolError { message: message.into(), denied: false }
+    ToolError {
+        message: message.into(),
+    }
 }
 
 fn required<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    input.get(key).and_then(Value::as_str).ok_or_else(|| failure(format!("{key} must be a string")))
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure(format!("{key} must be a string")))
 }
 
 pub fn resolve_path(directory: &str, path: &str) -> PathBuf {
     let expanded = if path == "~" || path.starts_with("~/") {
-        std::env::var("HOME").map(|home| PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or(""))).unwrap_or_else(|_| PathBuf::from(path))
-    } else { PathBuf::from(path) };
-    let absolute = if expanded.is_absolute() { expanded } else { Path::new(directory).join(expanded) };
-    let absolute = if absolute.is_absolute() { absolute } else { std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(absolute) };
+        std::env::var("HOME")
+            .map(|home| PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or("")))
+            .unwrap_or_else(|_| PathBuf::from(path))
+    } else {
+        PathBuf::from(path)
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        Path::new(directory).join(expanded)
+    };
+    let absolute = if absolute.is_absolute() {
+        absolute
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(absolute)
+    };
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
         match component {
-            Component::CurDir => {},
-            Component::ParentDir => { normalized.pop(); },
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
             other => normalized.push(other.as_os_str()),
         }
     }
@@ -83,12 +114,23 @@ pub fn resolve_path(directory: &str, path: &str) -> PathBuf {
 }
 
 fn cap_out(value: &str, max: usize) -> String {
-    if value.len() <= max { return value.into(); }
+    if value.len() <= max {
+        return value.into();
+    }
     let mut head = max / 2;
-    while head > 0 && !value.is_char_boundary(head) { head -= 1; }
+    while head > 0 && !value.is_char_boundary(head) {
+        head -= 1;
+    }
     let mut tail = value.len() - max / 2;
-    while tail < value.len() && !value.is_char_boundary(tail) { tail += 1; }
-    format!("{}\n\n[... {} bytes truncated ...]\n{}", &value[..head], tail - head, &value[tail..])
+    while tail < value.len() && !value.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n\n[... {} bytes truncated ...]\n{}",
+        &value[..head],
+        tail - head,
+        &value[tail..]
+    )
 }
 
 async fn cancelled(flag: Arc<AtomicBool>) {
@@ -98,62 +140,133 @@ async fn cancelled(flag: Arc<AtomicBool>) {
 }
 
 pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOutput, ToolError> {
-    if !input.is_object() { return Err(failure("Tool input must be an object")); }
-    if ctx.cancel.load(Ordering::Acquire) { return Err(failure("Tool cancelled")); }
+    if !input.is_object() {
+        return Err(failure("Tool input must be an object"));
+    }
+    if ctx.cancel.load(Ordering::Acquire) {
+        return Err(failure("Tool cancelled"));
+    }
     match name {
         "bash" => {
             let command = required(input, "command")?;
             let timeout = match input.get("timeout") {
                 None | Some(Value::Null) => 120_000,
-                Some(value) => value.as_u64().filter(|v| *v > 0 && *v <= 600_000).ok_or_else(|| failure("timeout must be 1..600000 milliseconds"))?,
+                Some(value) => value
+                    .as_u64()
+                    .filter(|v| *v > 0 && *v <= 600_000)
+                    .ok_or_else(|| failure("timeout must be 1..600000 milliseconds"))?,
             };
-            let directory = resolve_path(&ctx.dir, input["workdir"].as_str().or_else(|| input["cwd"].as_str()).unwrap_or("."));
-            process::shell(command, &directory, Duration::from_millis(timeout), ctx.cancel.clone()).await
+            let directory = resolve_path(
+                &ctx.dir,
+                input["workdir"]
+                    .as_str()
+                    .or_else(|| input["cwd"].as_str())
+                    .unwrap_or("."),
+            );
+            process::shell(
+                command,
+                &directory,
+                Duration::from_millis(timeout),
+                ctx.cancel.clone(),
+            )
+            .await
         }
         "read" | "write" | "edit" | "glob" | "grep" => {
             let directory = ctx.dir.clone();
             let name = name.to_owned();
             let input = input.clone();
             let cancel = ctx.cancel.clone();
-            tokio::task::spawn_blocking(move || files::run(&directory, &name, &input, &cancel)).await.map_err(|e| failure(format!("File operation failed: {e}")))?
+            tokio::task::spawn_blocking(move || files::run(&directory, &name, &input, &cancel))
+                .await
+                .map_err(|e| failure(format!("File operation failed: {e}")))?
         }
         "apply_patch" | "patch" => {
-            let text = input["patchText"].as_str().or_else(|| input["patch"].as_str()).ok_or_else(|| failure("patchText must be a string"))?.to_owned();
+            let text = input["patchText"]
+                .as_str()
+                .or_else(|| input["patch"].as_str())
+                .ok_or_else(|| failure("patchText must be a string"))?
+                .to_owned();
             let directory = ctx.dir.clone();
             let cancel = ctx.cancel.clone();
-            tokio::task::spawn_blocking(move || patch::apply(&directory, &text, &cancel)).await.map_err(|e| failure(format!("Patch operation failed: {e}")))?
+            tokio::task::spawn_blocking(move || patch::apply(&directory, &text, &cancel))
+                .await
+                .map_err(|e| failure(format!("Patch operation failed: {e}")))?
         }
         "webfetch" => web::fetch(input, ctx.cancel.clone()).await,
         "todowrite" => {
-            let todos = input["todos"].as_array().ok_or_else(|| failure("todos must be an array"))?;
+            let todos = input["todos"]
+                .as_array()
+                .ok_or_else(|| failure("todos must be an array"))?;
             for todo in todos {
-                if !todo["content"].as_str().is_some_and(|text| !text.trim().is_empty()) || !matches!(todo["status"].as_str(), Some("pending" | "in_progress" | "completed" | "cancelled")) || !matches!(todo["priority"].as_str(), Some("high" | "medium" | "low")) {
+                if !todo["content"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty())
+                    || !matches!(
+                        todo["status"].as_str(),
+                        Some("pending" | "in_progress" | "completed" | "cancelled")
+                    )
+                    || !matches!(todo["priority"].as_str(), Some("high" | "medium" | "low"))
+                {
                     return Err(failure("Each todo needs nonempty content, a valid status, and high/medium/low priority"));
                 }
             }
-            ctx.app.store.set_todos(&ctx.session_id, &input["todos"]).map_err(failure)?;
-            bus().emit("todo.updated", json!({"sessionID":ctx.session_id,"todos":todos}));
+            ctx.app
+                .store
+                .set_todos(&ctx.session_id, &input["todos"])
+                .map_err(failure)?;
+            bus().emit(
+                "todo.updated",
+                json!({"sessionID":ctx.session_id,"todos":todos}),
+            );
             Ok(ToolOutput {
                 output: serde_json::to_string_pretty(todos).map_err(|e| failure(e.to_string()))?,
-                title: format!("{} todos", todos.len()), metadata: json!({"todos":todos}),
+                title: format!("{} todos", todos.len()),
+                metadata: json!({"todos":todos}),
             })
         }
         "question" => question(ctx, input).await,
         "task" => task(ctx, input).await,
         "skill" => {
-            let name = input["name"].as_str().or_else(|| input["id"].as_str()).ok_or_else(|| failure("name must be a string"))?;
+            let name = input["name"]
+                .as_str()
+                .or_else(|| input["id"].as_str())
+                .ok_or_else(|| failure("name must be a string"))?;
             let paths = ctx.app.config.lock().unwrap().skill_paths();
             skills::load(&ctx.dir, &paths, name)
         }
         _ => {
-            let (server, tool) = ctx.app.mcp.route(name).ok_or_else(|| failure(format!("Unknown tool {name:?}")))?;
-            let result = ctx.app.mcp.call_result_async(&server, &tool, input.clone(), ctx.cancel.clone()).await.map_err(failure)?;
+            let (server, tool) = ctx
+                .app
+                .mcp
+                .route(name)
+                .ok_or_else(|| failure(format!("Unknown tool {name:?}")))?;
+            let result = ctx
+                .app
+                .mcp
+                .call_result_async(&server, &tool, input.clone(), ctx.cancel.clone())
+                .await
+                .map_err(failure)?;
             let output = crate::mcp::render_result(&result);
-            let attachments: Vec<Value> = result["content"].as_array().map(|items| items.iter().filter(|item| {
-                matches!(item["type"].as_str(), Some("image" | "audio")) || item["type"] == "resource" && item["resource"]["blob"].is_string()
-            }).cloned().collect()).unwrap_or_default();
+            let attachments: Vec<Value> = result["content"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            matches!(item["type"].as_str(), Some("image" | "audio"))
+                                || item["type"] == "resource"
+                                    && item["resource"]["blob"].is_string()
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             let truncated = output.len() > 200 * 1024;
-            Ok(ToolOutput { output: cap_out(&output, 200 * 1024), title: format!("{server}/{tool}"), metadata: json!({"server":server,"tool":tool,"truncated":truncated,"attachments":attachments}) })
+            Ok(ToolOutput {
+                output: cap_out(&output, 200 * 1024),
+                title: format!("{server}/{tool}"),
+                metadata: json!({"server":server,"tool":tool,"truncated":truncated,"attachments":attachments}),
+            })
         }
     }
 }
@@ -163,25 +276,65 @@ struct QuestionGuard {
     id: String,
 }
 impl Drop for QuestionGuard {
-    fn drop(&mut self) { self.state.reject(&self.id); }
+    fn drop(&mut self) {
+        self.state.reject(&self.id);
+    }
 }
 
 async fn question(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
-    let questions = input["questions"].as_array().filter(|questions| !questions.is_empty()).ok_or_else(|| failure("questions must be a nonempty array"))?;
+    let questions = input["questions"]
+        .as_array()
+        .filter(|questions| !questions.is_empty())
+        .ok_or_else(|| failure("questions must be a nonempty array"))?;
     for question in questions {
-        if !question["question"].is_string() || !question["header"].is_string() || !question["options"].as_array().is_some_and(|options| options.iter().all(|option| option["label"].is_string() && option["description"].is_string())) {
+        if !question["question"].is_string()
+            || !question["header"].is_string()
+            || !question["options"].as_array().is_some_and(|options| {
+                options
+                    .iter()
+                    .all(|option| option["label"].is_string() && option["description"].is_string())
+            })
+        {
             return Err(failure("Every question needs question/header strings and an options array containing label/description strings"));
         }
     }
-    let (request, receiver) = ctx.app.questions.ask_for_tool(&ctx.session_id, Value::Array(questions.clone()), Some(json!({"messageID":ctx.message_id,"callID":ctx.call_id})));
-    let _guard = QuestionGuard { state: ctx.app.questions.clone(), id: request.id.clone() };
-    bus().emit("question.asked", serde_json::to_value(&request).map_err(|e| failure(e.to_string()))?);
+    let (request, receiver) = ctx.app.questions.ask_for_tool(
+        &ctx.session_id,
+        Value::Array(questions.clone()),
+        Some(json!({"messageID":ctx.message_id,"callID":ctx.call_id})),
+    );
+    let _guard = QuestionGuard {
+        state: ctx.app.questions.clone(),
+        id: request.id.clone(),
+    };
+    bus().emit(
+        "question.asked",
+        serde_json::to_value(&request).map_err(|e| failure(e.to_string()))?,
+    );
     let answers = tokio::select! {
         answers = receiver => answers.map_err(|_| failure("Question cancelled"))?,
         _ = cancelled(ctx.cancel.clone()) => return Err(failure("Question cancelled")),
-    }.ok_or_else(|| ToolError { message: "User dismissed the question".into(), denied: true })?;
-    let text = questions.iter().zip(&answers).map(|(question, answer)| format!("{}: {}", question["question"].as_str().unwrap_or_default(), answer.join(", "))).collect::<Vec<_>>().join("\n");
-    Ok(ToolOutput { output: text, title: "User answered".into(), metadata: json!({"questions":questions,"answers":answers}) })
+    }
+    .ok_or_else(|| ToolError {
+        message: "User dismissed the question".into(),
+    })?;
+    let text = questions
+        .iter()
+        .zip(&answers)
+        .map(|(question, answer)| {
+            format!(
+                "{}: {}",
+                question["question"].as_str().unwrap_or_default(),
+                answer.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ToolOutput {
+        output: text,
+        title: "User answered".into(),
+        metadata: json!({"questions":questions,"answers":answers}),
+    })
 }
 
 struct ChildGuard {
@@ -190,42 +343,101 @@ struct ChildGuard {
     armed: bool,
 }
 impl Drop for ChildGuard {
-    fn drop(&mut self) { if self.armed { self.engine.abort(&self.session_id); } }
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.abort(&self.session_id);
+        }
+    }
 }
 
 async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
     let prompt = required(input, "prompt")?;
     let description = required(input, "description")?;
     let agent = required(input, "subagent_type")?;
-    if prompt.trim().is_empty() { return Err(failure("prompt must not be empty")); }
+    if prompt.trim().is_empty() {
+        return Err(failure("prompt must not be empty"));
+    }
     {
         let config = ctx.app.config.lock().unwrap();
-        if !matches!(agent, "general" | "explore") && !config.agent.contains_key(agent) { return Err(failure(format!("Unknown subagent {agent:?}"))); }
+        if !matches!(agent, "general" | "explore") && !config.agent.contains_key(agent) {
+            return Err(failure(format!("Unknown subagent {agent:?}")));
+        }
         if let Some(config) = config.agent.get(agent) {
-            if config["disable"] == true || config["mode"] == "primary" { return Err(failure(format!("Agent {agent:?} is unavailable as a subagent"))); }
+            if config["disable"] == true || config["mode"] == "primary" {
+                return Err(failure(format!(
+                    "Agent {agent:?} is unavailable as a subagent"
+                )));
+            }
         }
     }
-    let parent = ctx.app.store.get_session(&ctx.session_id).map_err(failure)?
+    let parent = ctx
+        .app
+        .store
+        .get_session(&ctx.session_id)
+        .map_err(failure)?
         .ok_or_else(|| failure("Parent session does not exist"))?;
     let mut ancestor = parent.parent_id.clone();
     let mut depth = 0;
     while let Some(id) = ancestor {
         depth += 1;
-        if depth >= 8 { return Err(failure("Subagent nesting limit (8) reached")); }
-        ancestor = ctx.app.store.get_session(&id).ok().flatten().and_then(|session| session.parent_id);
+        if depth >= 8 {
+            return Err(failure("Subagent nesting limit (8) reached"));
+        }
+        ancestor = ctx
+            .app
+            .store
+            .get_session(&id)
+            .ok()
+            .flatten()
+            .and_then(|session| session.parent_id);
     }
-    let mut model = ctx.app.store.messages(&ctx.session_id).unwrap_or_default().into_iter().rev().find_map(|message| {
-        message.info.model.or_else(|| Some(ModelRef { provider_id: message.info.provider_id?, model_id: message.info.model_id? }))
-    });
-    if let Some(selected) = ctx.app.config.lock().unwrap().agent.get(agent).and_then(|value| value["model"].as_str()) {
-        let (provider, selected) = selected.split_once('/').ok_or_else(|| failure("Subagent model must use provider/model syntax"))?;
-        if provider.is_empty() || selected.is_empty() { return Err(failure("Subagent model must use provider/model syntax")); }
-        model = Some(ModelRef { provider_id: provider.into(), model_id: selected.into() });
+    let mut model = ctx
+        .app
+        .store
+        .messages(&ctx.session_id)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .find_map(|message| {
+            message.info.model.or_else(|| {
+                Some(ModelRef {
+                    provider_id: message.info.provider_id?,
+                    model_id: message.info.model_id?,
+                })
+            })
+        });
+    if let Some(selected) = ctx
+        .app
+        .config
+        .lock()
+        .unwrap()
+        .agent
+        .get(agent)
+        .and_then(|value| value["model"].as_str())
+    {
+        let (provider, selected) = selected
+            .split_once('/')
+            .ok_or_else(|| failure("Subagent model must use provider/model syntax"))?;
+        if provider.is_empty() || selected.is_empty() {
+            return Err(failure("Subagent model must use provider/model syntax"));
+        }
+        model = Some(ModelRef {
+            provider_id: provider.into(),
+            model_id: selected.into(),
+        });
     }
     let child = if let Some(id) = input["task_id"].as_str() {
-        let child = ctx.app.store.get_session(id).map_err(failure)?
+        let child = ctx
+            .app
+            .store
+            .get_session(id)
+            .map_err(failure)?
             .ok_or_else(|| failure(format!("Task session {id:?} does not exist")))?;
-        if child.parent_id.as_deref() != Some(ctx.session_id.as_str()) { return Err(failure("task_id must identify a child of the current session")); }
+        if child.parent_id.as_deref() != Some(ctx.session_id.as_str()) {
+            return Err(failure(
+                "task_id must identify a child of the current session",
+            ));
+        }
         child
     } else {
         let mut child = parent.clone();
@@ -235,7 +447,11 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
         child.parent_id = Some(parent.id.clone());
         child.cost = 0.0;
         child.tokens = Default::default();
-        child.time = crate::types::Time { created: crate::types::now_ms(), updated: Some(crate::types::now_ms()), ..Default::default() };
+        child.time = crate::types::Time {
+            created: crate::types::now_ms(),
+            updated: Some(crate::types::now_ms()),
+            ..Default::default()
+        };
         child.extra.clear();
         ctx.app.store.create_session(&child).map_err(failure)?;
         bus().emit("session.created", json!({"info":child}));
@@ -243,24 +459,51 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
     };
     {
         let mut grants = ctx.app.always.lock().unwrap();
-        if let Some(inherited) = grants.get(&ctx.session_id).cloned() { grants.insert(child.id.clone(), inherited); }
+        if let Some(inherited) = grants.get(&ctx.session_id).cloned() {
+            grants.insert(child.id.clone(), inherited);
+        }
     }
     ctx.update_metadata(json!({"sessionId":child.id,"model":model,"agent":agent}))?;
-    let request = PromptRequest { model: model.clone(), parts: vec![json!({"type":"text","text":prompt})], agent: Some(agent.into()), ..Default::default() };
-    let mut guard = ChildGuard { engine: ctx.engine.clone(), session_id: child.id.clone(), armed: true };
+    let request = PromptRequest {
+        model: model.clone(),
+        parts: vec![json!({"type":"text","text":prompt})],
+        agent: Some(agent.into()),
+        ..Default::default()
+    };
+    let mut guard = ChildGuard {
+        engine: ctx.engine.clone(),
+        session_id: child.id.clone(),
+        armed: true,
+    };
     let result = tokio::select! {
         result = ctx.engine.run_sync(ctx.app.clone(), child.id.clone(), request) => result.map_err(failure)?,
         _ = cancelled(ctx.cancel.clone()) => return Err(failure("Subagent cancelled")),
     };
     guard.armed = false;
-    if let Some(error) = result["info"].get("error").filter(|error| !error.is_null()) { return Err(failure(format!("Subagent failed: {error}"))); }
-    let text = result["parts"].as_array().map(|parts| parts.iter().filter(|part| part["type"] == "text").filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
-    Ok(ToolOutput { output: format!("Task session: {}\n\n{text}", child.id), title: description.into(), metadata: json!({"sessionId":child.id,"model":model,"agent":agent}) })
+    if let Some(error) = result["info"].get("error").filter(|error| !error.is_null()) {
+        return Err(failure(format!("Subagent failed: {error}")));
+    }
+    let text = result["parts"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part["type"] == "text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    Ok(ToolOutput {
+        output: format!("Task session: {}\n\n{text}", child.id),
+        title: description.into(),
+        metadata: json!({"sessionId":child.id,"model":model,"agent":agent}),
+    })
 }
 
-pub fn skill_list() -> Vec<Value> { skills::list(None, &[]) }
-pub fn skill_list_in(directory: Option<&str>) -> Vec<Value> { skills::list(directory, &[]) }
-pub fn skill_list_with_paths(directory: Option<&str>, paths: &[String]) -> Vec<Value> { skills::list(directory, paths) }
+pub fn skill_list_with_paths(directory: Option<&str>, paths: &[String]) -> Vec<Value> {
+    skills::list(directory, paths)
+}
 
 #[cfg(test)]
 mod tests {
@@ -275,14 +518,36 @@ mod tests {
     }
     #[test]
     fn paths_resolve_against_session() {
-        assert_eq!(resolve_path("/tmp/project", "src/../test"), PathBuf::from("/tmp/project/test"));
-        assert_eq!(resolve_path("/tmp/project", "/elsewhere/file"), PathBuf::from("/elsewhere/file"));
+        assert_eq!(
+            resolve_path("/tmp/project", "src/../test"),
+            PathBuf::from("/tmp/project/test")
+        );
+        assert_eq!(
+            resolve_path("/tmp/project", "/elsewhere/file"),
+            PathBuf::from("/elsewhere/file")
+        );
     }
     #[test]
     fn all_advertised_tools_have_schemas() {
         let definitions = tool_defs();
-        for name in ["apply_patch", "skill", "bash", "read", "write", "edit", "glob", "grep", "webfetch", "todowrite", "question", "task"] {
-            assert!(definitions.iter().any(|tool| tool["function"]["name"] == name && tool["function"]["parameters"]["type"] == "object"));
+        for name in [
+            "apply_patch",
+            "skill",
+            "bash",
+            "read",
+            "write",
+            "edit",
+            "glob",
+            "grep",
+            "webfetch",
+            "todowrite",
+            "question",
+            "task",
+        ] {
+            assert!(definitions
+                .iter()
+                .any(|tool| tool["function"]["name"] == name
+                    && tool["function"]["parameters"]["type"] == "object"));
         }
     }
 }

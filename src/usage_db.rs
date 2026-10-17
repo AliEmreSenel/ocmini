@@ -17,11 +17,16 @@ impl UsageDb {
         let conn = match Self::connect(&path) {
             Ok(conn) => Some(conn),
             Err(error) => {
-                eprintln!("ocmini: usage statistics unavailable at {}: {error}", path.display());
+                eprintln!(
+                    "ocmini: usage statistics unavailable at {}: {error}",
+                    path.display()
+                );
                 None
             }
         };
-        Self { conn: Mutex::new(conn) }
+        Self {
+            conn: Mutex::new(conn),
+        }
     }
 
     fn connect(path: &Path) -> Result<Connection, String> {
@@ -29,9 +34,12 @@ impl UsageDb {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        conn.busy_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| e.to_string())?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| e.to_string())?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT NOT NULL, time_created INTEGER NOT NULL);
              CREATE INDEX IF NOT EXISTS message_time_created ON message(time_created);"
@@ -49,7 +57,9 @@ impl UsageDb {
         created: i64,
     ) {
         let guard = self.conn.lock().unwrap();
-        let Some(c) = &*guard else { return; };
+        let Some(c) = &*guard else {
+            return;
+        };
         let data = serde_json::json!({
             "role": "assistant",
             "model": {"providerID": provider_id, "modelID": model_id},
@@ -72,20 +82,30 @@ mod tests {
     #[test]
     fn usage_mirror_uses_t3_schema_and_updates_without_duplicate_usage() {
         let conn = UsageDb::connect(Path::new(":memory:")).unwrap();
-        let db = UsageDb { conn: Mutex::new(Some(conn)) };
-        let mut tokens = Tokens::default();
-        tokens.input = 10;
-        tokens.output = 20;
-        tokens.reasoning = 5;
+        let db = UsageDb {
+            conn: Mutex::new(Some(conn)),
+        };
+        let mut tokens = Tokens {
+            input: 10,
+            output: 20,
+            reasoning: 5,
+            ..Default::default()
+        };
         tokens.cache.read = 7;
         db.record("msg_1", "ses_1", "custom", "model", &tokens, 123);
         tokens.output = 25;
         db.record("msg_1", "ses_1", "custom", "model", &tokens, 123);
         let guard = db.conn.lock().unwrap();
         let conn = guard.as_ref().unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 1);
-        let raw: String = conn.query_row("SELECT data FROM message WHERE id='msg_1'", [], |row| row.get(0)).unwrap();
+        let raw: String = conn
+            .query_row("SELECT data FROM message WHERE id='msg_1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(data["model"]["providerID"], "custom");
         assert_eq!(data["tokens"]["output"], 25);

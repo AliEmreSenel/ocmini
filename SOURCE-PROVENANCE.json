@@ -21,8 +21,5 @@
       "role": "Provider, tool, permission, command and MCP behavior reference"
     }
   ],
-  "runtime_build_status": "not run: Rust toolchain unavailable and toolchain downloads blocked",
-  "sql_check": "39 extracted statements and 11 invariant checks passed",
-  "rust_tests_authored": 75,
-  "rust_tests_executed": 0
+  "validation_record": "VALIDATION.md"
 }
