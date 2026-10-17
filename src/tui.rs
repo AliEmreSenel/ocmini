@@ -13,6 +13,7 @@ use futures::{poll, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::task::Poll;
 
 struct RawMode;
@@ -90,7 +91,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
+    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+V paste image · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
     print!("{BOLD}›{RESET} ");
     let _ = std::io::stdout().flush();
 }
@@ -345,6 +346,7 @@ pub(crate) enum Key {
     CtrlD,
     CtrlL,
     CtrlR,
+    CtrlV,
     /// Move by N rows; page keys report a full page.
     Up(usize),
     Down(usize),
@@ -366,6 +368,7 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => Key::CtrlD,
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => Key::CtrlL,
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => Key::CtrlR,
+            (KeyCode::Char('v'), KeyModifiers::CONTROL) => Key::CtrlV,
             (KeyCode::Enter, _) => Key::Enter,
             (KeyCode::Backspace, _) => Key::Backspace,
             (KeyCode::Esc, _) => Key::Esc,
@@ -393,6 +396,179 @@ pub(crate) fn decode_event(event: Event) -> Key {
         },
         _ => Key::Other,
     }
+}
+
+/// A prompt part waiting in the input: an existing image file or clipboard
+/// bytes copied to a temp file. The engine reads file: URLs when it builds the
+/// request, so nothing is loaded until the prompt is sent.
+struct Attachment {
+    filename: String,
+    url: String,
+    mime: &'static str,
+}
+
+const MAX_ATTACHMENT: u64 = 20 * 1024 * 1024;
+
+fn file_attachment(path: &Path) -> Result<Attachment, String> {
+    let path =
+        std::fs::canonicalize(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    if size > MAX_ATTACHMENT {
+        return Err("Image exceeds the 20 MiB attachment limit".into());
+    }
+    let mime = crate::tools::media_type(&std::fs::read(&path).map_err(|e| e.to_string())?)
+        .filter(|mime| mime.starts_with("image/"))
+        .ok_or_else(|| format!("{} is not a PNG, JPEG, GIF or WebP image", path.display()))?;
+    Ok(Attachment {
+        filename: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image".into()),
+        url: reqwest::Url::from_file_path(&path)
+            .map_err(|_| format!("{} is not an absolute path", path.display()))?
+            .to_string(),
+        mime,
+    })
+}
+
+/// Clipboard bytes become a file: attachment only when they are a supported
+/// image and fit the engine's size limit.
+fn image_attachment(bytes: Vec<u8>) -> Option<Attachment> {
+    let mime = crate::tools::media_type(&bytes).filter(|mime| mime.starts_with("image/"))?;
+    if bytes.len() as u64 > MAX_ATTACHMENT {
+        return None;
+    }
+    let ext = mime.rsplit('/').next().unwrap_or("png");
+    let path =
+        std::env::temp_dir().join(format!("ocmini-paste-{}.{}", crate::types::hex_id(""), ext));
+    std::fs::write(&path, &bytes).ok()?;
+    Some(Attachment {
+        filename: format!("clipboard.{ext}"),
+        url: reqwest::Url::from_file_path(&path).ok()?.to_string(),
+        mime,
+    })
+}
+
+/// A paste that is only a quoted, file: or ~/ path to an image file. Many
+/// terminals paste dragged or copied files as paths, so those become
+/// attachments; anything else stays plain text.
+fn pasted_image_path(text: &str) -> Option<PathBuf> {
+    let trimmed = text.trim().trim_matches('"').trim_matches('\'');
+    let path = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))?,
+        None => PathBuf::from(path),
+    };
+    is_image_file(&expanded).then_some(expanded)
+}
+
+// Sniff only the header: pasting a path to a huge file must not read it all.
+fn is_image_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut head = [0u8; 16];
+    let read = file.read(&mut head).unwrap_or(0);
+    crate::tools::media_type(&head[..read]).is_some_and(|mime| mime.starts_with("image/"))
+}
+
+fn print_attachment(attachment: &Attachment) {
+    println!(
+        "{DIM}● attached: {} · {}{RESET}",
+        attachment.filename, attachment.mime
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn clipboard_image() -> Result<Option<Attachment>, String> {
+    use std::process::Command;
+    let mut probed = false;
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        probed = true;
+        // -n keeps binary payloads byte-exact; wl-paste appends a newline without it.
+        if let Ok(out) = Command::new("wl-paste")
+            .args(["-t", "image/png", "-n"])
+            .output()
+        {
+            if out.status.success() {
+                if let Some(attachment) = image_attachment(out.stdout) {
+                    return Ok(Some(attachment));
+                }
+            }
+        }
+    }
+    if std::env::var_os("DISPLAY").is_some() {
+        probed = true;
+        if let Ok(out) = Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+            .output()
+        {
+            if out.status.success() {
+                if let Some(attachment) = image_attachment(out.stdout) {
+                    return Ok(Some(attachment));
+                }
+            }
+        }
+    }
+    if !probed {
+        return Err("Image paste needs wl-paste (Wayland) or xclip (X11)".into());
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn clipboard_image() -> Result<Option<Attachment>, String> {
+    use std::process::Command;
+    let file = std::env::temp_dir().join(format!("ocmini-clip-{}.png", crate::types::hex_id("")));
+    let out = Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "set f to open for access POSIX file \"{}\" with write permission",
+                file.display()
+            ),
+            "-e",
+            "write (the clipboard as «class PNGf») to f starting at 1",
+            "-e",
+            "close access f",
+        ])
+        .output()
+        .map_err(|e| format!("Cannot run osascript: {e}"))?;
+    let bytes = std::fs::read(&file).ok();
+    let _ = std::fs::remove_file(&file);
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(bytes.and_then(image_attachment))
+}
+
+#[cfg(windows)]
+fn clipboard_image() -> Result<Option<Attachment>, String> {
+    use std::process::Command;
+    let file = std::env::temp_dir().join(format!("ocmini-paste-{}.png", crate::types::hex_id("")));
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; if ($i = [System.Windows.Forms.Clipboard]::GetImage()) {{ $i.Save('{}') }}",
+        file.display()
+    );
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| format!("Cannot run powershell: {e}"))?;
+    let bytes = std::fs::read(&file).ok();
+    let _ = std::fs::remove_file(&file);
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(bytes.and_then(image_attachment))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn clipboard_image() -> Result<Option<Attachment>, String> {
+    Err("Image paste is not supported on this platform".into())
 }
 
 #[cfg(unix)]
@@ -510,6 +686,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     tokio::pin!(shutdown);
 
     let mut line = String::new();
+    let mut attachments: Vec<Attachment> = Vec::new();
     let mut ui = Ui {
         part_kind: HashMap::new(),
         headered: std::collections::HashSet::new(),
@@ -537,6 +714,17 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     Key::CtrlC => { engine.abort(&session.id); println!("\n{YELLOW}⏹ aborted{RESET}"); }
                     Key::CtrlL => print!("\x1b[2J\x1b[H"),
+                    Key::CtrlV => {
+                        match clipboard_image() {
+                            Ok(Some(attachment)) => {
+                                print_attachment(&attachment);
+                                attachments.push(attachment);
+                            }
+                            Ok(None) => println!("{DIM}clipboard has no image{RESET}"),
+                            Err(message) => println!("{YELLOW}{message}{RESET}"),
+                        }
+                        print_prompt(&model_display);
+                    }
                     Key::CtrlR if !pending_permission && !pending_question => {
                         print!("\x1b[J");
                         let picked = crate::picker::select(&app.store, None, &mut keys).await?;
@@ -614,24 +802,55 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     }
                     Key::Paste(_) if pending_permission => {}
                     Key::Paste(text) => {
-                        for ch in text.chars() {
-                            line.push(ch);
-                            // Continuation lines indent under "› ".
-                            if ch == '\n' { print!("\n  "); } else { print!("{ch}"); }
+                        // A pasted image file path becomes an attachment; a
+                        // pasted screenshot can never arrive as text, so the
+                        // clipboard reader above covers that case.
+                        let pasted = pasted_image_path(&text);
+                        let image = pasted.as_deref().map(file_attachment);
+                        match image {
+                            Some(Ok(attachment)) => {
+                                print_attachment(&attachment);
+                                attachments.push(attachment);
+                                print_prompt(&model_display);
+                            }
+                            Some(Err(message)) => {
+                                println!("{YELLOW}{message}{RESET}");
+                                print_prompt(&model_display);
+                            }
+                            None => {
+                                for ch in text.chars() {
+                                    line.push(ch);
+                                    // Continuation lines indent under "› ".
+                                    if ch == '\n' { print!("\n  "); } else { print!("{ch}"); }
+                                }
+                            }
                         }
                         let _ = std::io::stdout().flush();
                     }
                     Key::Enter => {
                         let text = std::mem::take(&mut line);
+                        let files = std::mem::take(&mut attachments);
                         println!();
                         if text.trim() == "/quit" { break; }
+                        let mut parts: Vec<Value> = Vec::new();
                         if !text.trim().is_empty() {
+                            parts.push(serde_json::json!({"type": "text", "text": text}));
+                        }
+                        for attachment in files {
+                            parts.push(serde_json::json!({
+                                "type": "file",
+                                "url": attachment.url,
+                                "mime": attachment.mime,
+                                "filename": attachment.filename,
+                            }));
+                        }
+                        if !parts.is_empty() {
                             let request = PromptRequest {
                                 message_id: Some(crate::types::hex_id("msg_")),
                                 model: model_ref.clone(),
                                 agent: agent.clone(),
                                 variant: variant.clone(),
-                                parts: vec![serde_json::json!({"type": "text", "text": text})],
+                                parts,
                                 ..Default::default()
                             };
                             if let Err(error) = engine.start_turn(app.clone(), session.id.clone(), request) {
@@ -661,7 +880,9 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_answer;
+    use super::{file_attachment, image_attachment, parse_answer, pasted_image_path};
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
 
     #[test]
     fn typed_numbers_answer_with_their_option_labels() {
@@ -674,5 +895,40 @@ mod tests {
         // Free text and numbers without an option stay exactly as typed.
         assert_eq!(parse_answer("keep-it-brief", &labels), ["keep-it-brief"]);
         assert_eq!(parse_answer("0 9", &labels), ["0", "9"]);
+    }
+
+    #[test]
+    fn pasted_image_paths_are_detected_and_attached() {
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("shot.png");
+        std::fs::write(&png, PNG).unwrap();
+        let notes = directory.path().join("notes.txt");
+        std::fs::write(&notes, b"plain text").unwrap();
+
+        let detected = pasted_image_path(&format!("  \"{}\"  ", png.display())).unwrap();
+        assert_eq!(detected, png.canonicalize().unwrap());
+        // Multiline pastes and non-image paths stay plain text.
+        assert!(pasted_image_path(&format!("{}\nlook", png.display())).is_none());
+        assert!(pasted_image_path(&notes.display().to_string()).is_none());
+        assert!(pasted_image_path("/no/such/image.png").is_none());
+
+        let attachment = file_attachment(&png).unwrap();
+        assert_eq!(attachment.filename, "shot.png");
+        assert_eq!(attachment.mime, "image/png");
+        assert!(attachment.url.starts_with("file://"));
+        // A text file is rejected as an attachment.
+        assert!(file_attachment(&notes).is_err());
+    }
+
+    #[test]
+    fn clipboard_bytes_attach_only_as_images() {
+        let attachment = image_attachment(PNG.to_vec()).unwrap();
+        assert_eq!(attachment.filename, "clipboard.png");
+        assert_eq!(attachment.mime, "image/png");
+        std::fs::remove_file(std::path::Path::new(
+            &attachment.url.strip_prefix("file://").unwrap(),
+        ))
+        .unwrap();
+        assert!(image_attachment(b"not an image".to_vec()).is_none());
     }
 }

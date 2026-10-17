@@ -157,7 +157,7 @@ fn read(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
     )
 }
 
-fn media_type(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn media_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if bytes.starts_with(b"\xff\xd8\xff") {

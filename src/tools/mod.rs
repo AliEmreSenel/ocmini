@@ -8,6 +8,8 @@ use std::time::Duration;
 
 mod files;
 pub mod patch;
+
+pub(crate) use files::media_type;
 mod process;
 mod skills;
 mod web;
