@@ -20,6 +20,25 @@ const PASSWORD: &str = "t3-test-pässword";
 struct Script {
     chunks: Vec<Value>,
     gate: Option<oneshot::Receiver<()>>,
+    status: Option<u16>,
+    retry_after: Option<String>,
+    terminate: bool,
+}
+
+impl Script {
+    fn ok(chunks: Vec<Value>) -> Self { Self { chunks, gate: None, status: None, retry_after: None, terminate: true } }
+    fn http_status(status: u16, retry_after: Option<&str>) -> Self {
+        Self { chunks: vec![], gate: None, status: Some(status), retry_after: retry_after.map(str::to_owned), terminate: true }
+    }
+    fn mid_stream_error(message: &str) -> Self {
+        Self::ok(vec![
+            json!({"choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": null}]}),
+            json!({"error": {"message": message}}),
+        ])
+    }
+    fn truncated() -> Self {
+        Self { chunks: vec![json!({"choices": [{"index": 0, "delta": {"content": "Incomplete response"}, "finish_reason": null}]})], gate: None, status: None, retry_after: None, terminate: false }
+    }
 }
 
 fn usage() -> Value {
@@ -29,24 +48,18 @@ fn usage() -> Value {
 }
 
 fn text_script(first: &str, second: &str) -> Script {
-    Script {
-        chunks: vec![
-            json!({"id": "completion-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": first}, "finish_reason": null}]}),
-            json!({"id": "completion-test", "choices": [{"index": 0, "delta": {"content": second}, "finish_reason": null}]}),
-            json!({"id": "completion-test", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage()}),
-        ],
-        gate: None,
-    }
+    Script::ok(vec![
+        json!({"id": "completion-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": first}, "finish_reason": null}]}),
+        json!({"id": "completion-test", "choices": [{"index": 0, "delta": {"content": second}, "finish_reason": null}]}),
+        json!({"id": "completion-test", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage()}),
+    ])
 }
 
 fn tool_script(name: &str, arguments: Value, id: &str) -> Script {
-    Script {
-        chunks: vec![
-            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": id, "type": "function", "function": {"name": name, "arguments": arguments.to_string()}}]}, "finish_reason": null}]}),
-            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": usage()}),
-        ],
-        gate: None,
-    }
+    Script::ok(vec![
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": id, "type": "function", "function": {"name": name, "arguments": arguments.to_string()}}]}, "finish_reason": null}]}),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": usage()}),
+    ])
 }
 
 #[derive(Clone)]
@@ -60,13 +73,22 @@ async fn provider_reply(State(state): State<ProviderState>, Json(request): Json<
     let Some(script) = state.scripts.lock().await.pop_front() else {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": {"message": "Unexpected extra model request"}}))).into_response();
     };
+    if let Some(status) = script.status {
+        let status = axum::http::StatusCode::from_u16(status).expect("test status");
+        let mut response = (status, Json(json!({"error": {"message": "provider is having a bad day"}}))).into_response();
+        if let Some(value) = script.retry_after {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&value) { response.headers_mut().insert("retry-after", value); }
+        }
+        return response;
+    }
+    let terminate = script.terminate;
     let stream = async_stream::stream! {
         let mut gate = script.gate;
         for (index, chunk) in script.chunks.into_iter().enumerate() {
             if index == 1 { if let Some(gate) = gate.take() { let _ = gate.await; } }
             yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
         }
-        yield Ok(Event::default().data("[DONE]"));
+        if terminate { yield Ok(Event::default().data("[DONE]")); }
     };
     Sse::new(stream).into_response()
 }
@@ -113,6 +135,7 @@ fn configured_command(root: &Path, directory: &Path) -> Command {
         .env("OPENCODE_CONFIG_CONTENT", "{}")
         .env("OPENCODE_AUTH_CONTENT", "{}")
         .env("OPENCODE_SERVER_PASSWORD", PASSWORD)
+        .env("OCMINI_RETRY_BASE_MS", "50")
         .current_dir(directory);
     command
 }
@@ -626,10 +649,7 @@ async fn no_reply_and_duplicate_admission_persist_without_a_model_call() {
 
 #[tokio::test]
 async fn truncated_provider_streams_fail_instead_of_reporting_success() {
-    let script = Script {
-        chunks: vec![json!({"choices": [{"index": 0, "delta": {"content": "Incomplete response"}, "finish_reason": null}]})],
-        gate: None,
-    };
+    let script = Script::truncated();
     let provider = Provider::start(vec![script]).await;
     let server = TestServer::start(&provider, json!({})).await;
     let id = server.session(allow()).await;
@@ -639,4 +659,47 @@ async fn truncated_provider_streams_fail_instead_of_reporting_success() {
     let terminal = events.through("session.idle").await;
     assert!(terminal.iter().any(|event| event["type"] == "session.error"));
     assert!(server.messages(&id).await.iter().any(|message| message["info"]["role"] == "assistant" && message["info"]["error"].is_object()));
+}
+
+#[tokio::test]
+async fn transient_provider_failures_are_retried_and_the_turn_completes() {
+    // Open-phase 500 with Retry-After, mid-stream transport death and a
+    // truncated stream must all be retried; the turn must still succeed.
+    let provider = Provider::start(vec![
+        Script::http_status(500, Some("0")),
+        Script::mid_stream_error("provider stream failed: error decoding response body"),
+        Script::truncated(),
+        text_script("Recovery ", "works"),
+    ]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    let response = server.post(&format!("/session/{id}/message"), &prompt("msg_retry_flaky", "hello")).send().await.unwrap();
+    assert!(response.status().is_success(), "flaky provider turn must complete: {:?}", response.text().await.unwrap());
+    let terminal = events.through("session.idle").await;
+    let retries = terminal.iter().filter(|event| event["type"] == "session.status" && event["properties"]["status"]["type"] == "retry").count();
+    assert!(retries >= 3, "retry status events must be visible, saw {retries}");
+    let messages = server.messages(&id).await;
+    let assistant = messages.iter().rev().find(|m| m["info"]["role"] == "assistant").unwrap();
+    let text: String = assistant["parts"].as_array().unwrap().iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
+    assert_eq!(text, "Recovery works");
+}
+
+#[tokio::test]
+async fn retry_exhaustion_reports_a_visible_failure() {
+    let provider = Provider::start(vec![
+        Script::http_status(500, Some("0")),
+        Script::http_status(503, Some("0")),
+        Script::http_status(429, Some("0")),
+        Script::http_status(502, Some("0")),
+    ]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    let response = server.post(&format!("/session/{id}/message"), &prompt("msg_retry_dead", "hello")).send().await.unwrap();
+    assert!(!response.status().is_success());
+    let terminal = events.through("session.idle").await;
+    assert!(terminal.iter().any(|event| event["type"] == "session.error"));
+    let retries = terminal.iter().filter(|event| event["type"] == "session.status" && event["properties"]["status"]["type"] == "retry").count();
+    assert_eq!(retries, 3, "exactly three bounded retries per step");
 }

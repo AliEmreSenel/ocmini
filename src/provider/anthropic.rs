@@ -1,4 +1,4 @@
-use super::{error_message, json_response, read_response, ChatRequest, EventStream, Settings};
+use super::{ProviderError, error_message, json_response, read_response, ChatRequest, EventStream, Settings};
 use crate::types::{ProviderEvent, Tokens};
 use async_stream::stream;
 use futures::StreamExt;
@@ -104,8 +104,8 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
     Ok(body)
 }
 
-pub(super) async fn stream(settings: Settings, req: ChatRequest) -> Result<EventStream, String> {
-    let response = settings.send("messages", &request_body(&settings, &req)?).await?;
+pub(super) async fn stream(settings: Settings, req: ChatRequest) -> Result<EventStream, ProviderError> {
+    let response = settings.send("messages", &request_body(&settings, &req).map_err(ProviderError::fatal)?).await?;
     let json = json_response(&response);
     let stream = stream! {
         let mut state = MessageState::default();
