@@ -83,6 +83,7 @@ pub fn run() {
 
         let mut rx_bus = bus().subscribe();
         let mut input = String::new();
+        let mut agent: Option<String> = None;
         let mut busy: Option<tokio::task::JoinHandle<()>> = None;
 
         out(&format!(
@@ -167,6 +168,18 @@ pub fn run() {
                         prompt();
                         continue;
                     }
+                    if text == "/plan" {
+                        agent = Some("plan".into());
+                        out("\x1b[2mplan mode: read-only\x1b[0m\n");
+                        prompt();
+                        continue;
+                    }
+                    if text == "/build" {
+                        agent = None;
+                        out("\x1b[2mbuild mode\x1b[0m\n");
+                        prompt();
+                        continue;
+                    }
                     if text == "/new" {
                         session = app.store.create_session_owned("tui", &cwd);
                         out("\x1b[2mnew session\x1b[0m\n");
@@ -198,9 +211,10 @@ pub fn run() {
                     let engine2 = engine.clone();
                     let sid = session.id.clone();
                     let (p2, m2) = (provider.clone(), model.clone());
+                    let agent = agent.clone();
                     let h = tokio::spawn(async move {
                         if let Err(e) = engine2
-                            .run_sync(app2, sid, m2, p2, text)
+                            .run_sync(app2, sid, m2, p2, text, agent.clone())
                             .await
                         {
                             out(&format!("\x1b[31m{e}\x1b[0m\n"));

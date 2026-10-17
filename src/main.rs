@@ -31,7 +31,12 @@ fn main() {
                     port = v.parse().expect("bad port");
                 }
             }
-            tokio::runtime::Runtime::new().unwrap().block_on(server::serve(hostname, port));
+            let t0 = std::time::Instant::now();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if std::env::var("OC_DEBUG_STARTUP").is_ok() {
+                eprintln!("[startup] runtime: {:?}", t0.elapsed());
+            }
+            rt.block_on(server::serve(hostname, port));
         }
         "--version" | "version" => println!("1.19.2"),
         "models" => {

@@ -79,20 +79,40 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let config = Config::load();
-        let mcp = std::sync::Arc::new(McpHub::new());
-        for (name, m) in &config.mcp {
-            if m.enabled == Some(false) {
-                continue;
+        let mut t0 = std::time::Instant::now();
+        let dbg = std::env::var("OC_DEBUG_STARTUP").is_ok();
+        let mut mark = |n: &str, t: &mut std::time::Instant| {
+            if dbg {
+                eprintln!("[startup] {n}: {:?}", t.elapsed());
+                *t = std::time::Instant::now();
             }
-            let cfg = if m.r#type == "remote" || !m.url.is_empty() {
-                serde_json::json!({"type": "remote", "url": m.url, "headers": m.headers})
-            } else {
-                serde_json::json!({"type": "local", "command": m.command})
-            };
-            let _ = mcp.add(name, cfg);
+        };
+        let config = Config::load();
+        mark("config", &mut t0);
+        let mcp = std::sync::Arc::new(McpHub::new());
+        {
+            let mcp_bg = mcp.clone();
+            let list: Vec<(String, serde_json::Value)> = config
+                .mcp
+                .iter()
+                .filter(|(_, m)| m.enabled != Some(false))
+                .map(|(name, m)| {
+                    let cfg = if m.r#type == "remote" || !m.url.is_empty() {
+                        serde_json::json!({"type": "remote", "url": m.url, "headers": m.headers})
+                    } else {
+                        serde_json::json!({"type": "local", "command": m.command})
+                    };
+                    (name.clone(), cfg)
+                })
+                .collect();
+            std::thread::spawn(move || {
+                for (name, cfg) in list {
+                    let _ = mcp_bg.add(&name, cfg);
+                }
+            });
         }
-        Self {
+        mark("mcp-queued", &mut t0);
+        let s = Self {
             store: Arc::new(Store::open(&crate::config::store_path())),
             config: Arc::new(Mutex::new(config)),
             auth: Arc::new(AuthStore::load()),
@@ -101,7 +121,9 @@ impl App {
             mcp,
             usage: Arc::new(UsageDb::open()),
             cancels: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
+        };
+        mark("dbs", &mut t0);
+        s
     }
 }
 
@@ -113,6 +135,7 @@ pub trait EngineApi: Send + Sync + 'static {
         model_id: String,
         provider_id: String,
         text: String,
+        agent: Option<String>,
     ) -> oneshot::Receiver<serde_json::Value>;
 
     fn abort(&self, session_id: &str);
@@ -124,6 +147,7 @@ pub trait EngineApi: Send + Sync + 'static {
         model_id: String,
         provider_id: String,
         text: String,
+        agent: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>>;
 
     fn summarize(&self, app: App, session_id: String) -> Result<(), String>;

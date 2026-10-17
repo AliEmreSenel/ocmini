@@ -118,7 +118,9 @@ async fn run_turn(
     model_id: String,
     provider_id: String,
     user_text: String,
+    agent: Option<String>,
 ) -> Result<Value, String> {
+    let is_plan = agent.as_deref() == Some("plan");
     let session = app.store.get_session(&session_id).ok_or("no session")?;
     app.store.set_busy(&session_id, true);
     bus().emit("session.status", json!({"sessionID": session_id, "status": "busy"}));
@@ -147,12 +149,25 @@ async fn run_turn(
     let cancel = Arc::new(AtomicBool::new(false));
     cancels().lock().unwrap().insert(session_id.clone(), cancel.clone());
 
-    let system = system_prompt(&app, &session.directory);
+    let mut system = system_prompt(&app, &session.directory);
+    if is_plan {
+        system.push_str(
+            "\n\nPLAN MODE (READ-ONLY): You must NOT modify the codebase. Analyze the code, \
+             read files, search, and produce a detailed implementation plan with file paths, \
+             function names and ordered steps. Do not run shell commands that mutate state \
+             (no installs, writes, git mutations). Only present the plan; the user will \
+             switch to build mode to execute it.",
+        );
+    }
     let adapter = {
         let cfg = app.config.lock().unwrap();
         provider::build(&provider_id, cfg.provider(&provider_id), &app.auth)
     };
-    let mut tool_defs = tools::tool_defs();
+    const PLAN_BLOCKED: [&str; 3] = ["write", "edit", "task"];
+    let mut tool_defs: Vec<Value> = tools::tool_defs()
+        .into_iter()
+        .filter(|d| !(is_plan && PLAN_BLOCKED.contains(&d["function"]["name"].as_str().unwrap_or_default())))
+        .collect();
     tool_defs.extend(app.mcp.tool_defs());
 
     for _iter in 0..100 {
@@ -275,7 +290,11 @@ async fn run_turn(
             let name = part["tool"].as_str().unwrap_or_default().to_string();
             let input = part["state"]["input"].clone();
             let start = part["state"]["time"]["start"].as_i64().unwrap_or_else(now_ms);
-            let out = tools::run_tool(&ctx, &name, &input).await;
+            let out = if is_plan && PLAN_BLOCKED.contains(&name.as_str()) {
+                Err(ToolError { message: format!("Tool '{name}' is not available in plan mode"), denied: true })
+            } else {
+                tools::run_tool(&ctx, &name, &input).await
+            };
             let end = now_ms();
             let mut updated = part.clone();
             match out {
@@ -321,12 +340,13 @@ impl EngineApi for Engine {
         model_id: String,
         provider_id: String,
         text: String,
+        agent: Option<String>,
     ) -> oneshot::Receiver<Value> {
         let (tx, rx) = oneshot::channel();
         let engine = ENGINE.get().cloned();
         tokio::spawn(async move {
             let engine = engine.unwrap_or_else(|| Arc::new(Engine::new()));
-            let res = run_turn(app, engine, session_id, model_id, provider_id, text).await;
+            let res = run_turn(app, engine, session_id, model_id, provider_id, text, agent).await;
             let _ = tx.send(res.unwrap_or(json!({"error": "turn failed"})));
         });
         rx
@@ -345,11 +365,12 @@ impl EngineApi for Engine {
         model_id: String,
         provider_id: String,
         text: String,
+        agent: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>> {
         let engine = ENGINE.get().cloned();
         Box::pin(async move {
             let engine = engine.unwrap_or_else(|| Arc::new(Engine::new()));
-            run_turn(app, engine, session_id, model_id, provider_id, text).await
+            run_turn(app, engine, session_id, model_id, provider_id, text, agent).await
         })
     }
 

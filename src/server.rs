@@ -153,7 +153,7 @@ async fn prompt_async(
     let app = st.app.clone();
     let engine = st.engine.clone();
     tokio::spawn(async move {
-        let _ = engine.start_turn(app, id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts));
+        let _ = engine.start_turn(app, id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts), req.agent);
     });
     StatusCode::OK
 }
@@ -165,7 +165,7 @@ async fn prompt_sync(
 ) -> Response {
     match st
         .engine
-        .run_sync(st.app.clone(), id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts))
+        .run_sync(st.app.clone(), id, req.model.model_id, req.model.provider_id, prompt_text(&req.parts), req.agent)
         .await
     {
         Ok(v) => Json(v).into_response(),
@@ -191,8 +191,9 @@ async fn command_run(State(st): State<AppState>, Path(id): Path<String>, Json(bo
     let full = format!("{name} {args}\n{text}");
     let app = st.app.clone();
     let engine = st.engine.clone();
+    let agent = body["agent"].as_str().map(str::to_string);
     tokio::spawn(async move {
-        let _ = engine.start_turn(app, id, model_id, provider_id, full);
+        let _ = engine.start_turn(app, id, model_id, provider_id, full, agent);
     });
     StatusCode::OK
 }

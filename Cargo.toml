@@ -31,5 +31,7 @@ name = "ocmini-fuzz"
 path = "src/bin/fuzz.rs"
 
 [profile.release]
-lto = true
+lto = "fat"
+codegen-units = 1
 strip = true
+opt-level = 3
