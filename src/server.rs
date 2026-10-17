@@ -243,6 +243,21 @@ async fn event_stream() -> Sse<impl futures::Stream<Item = Result<Event, std::co
     })
 }
 
+async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let m = req.method().clone();
+    let p = req.uri().path().to_string();
+    let q = req.uri().query().unwrap_or_default().to_string();
+    let res = next.run(req).await;
+    if std::env::var("OC_HTTP_LOG").is_ok() {
+        let line = format!("[http] {} {}{} -> {}\n", m, p, if q.is_empty() { String::new() } else { format!("?{q}") }, res.status().as_u16());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/ocmini-http.log") {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+    res
+}
+
 async fn perm_list(State(st): State<AppState>) -> Json<Value> {
     Json(serde_json::to_value(st.app.perms.list()).unwrap())
 }
@@ -404,6 +419,7 @@ pub async fn serve(hostname: String, port: u16) {
         .route("/command", get(commands))
         .layer(middleware::from_fn(auth_gate))
         .with_state(st);
+    let router = router.layer(axum::middleware::from_fn(access_log));
     let listener = tokio::net::TcpListener::bind((hostname.as_str(), port))
         .await
         .expect("bind");
