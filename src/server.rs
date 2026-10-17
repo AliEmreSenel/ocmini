@@ -247,13 +247,25 @@ async fn perm_list(State(st): State<AppState>) -> Json<Value> {
 async fn perm_reply(
     State(st): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<PermissionReply>,
+    Json(body): Json<Value>,
 ) -> StatusCode {
-    if st.app.perms.reply(&id, &body.response) {
+    let reply = body["reply"]
+        .as_str()
+        .or_else(|| body["response"].as_str())
+        .unwrap_or("reject");
+    if st.app.perms.reply(&id, reply) {
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+async fn perm_reply_session(
+    State(st): State<AppState>,
+    Path((_id, permission_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> StatusCode {
+    perm_reply(State(st), Path(permission_id), Json(body)).await
 }
 
 async fn q_list(State(st): State<AppState>) -> Json<Value> {
@@ -378,6 +390,7 @@ pub async fn serve(hostname: String, port: u16) {
         .route("/event", get(event_stream))
         .route("/permission", get(perm_list))
         .route("/permission/{id}/reply", post(perm_reply))
+        .route("/session/{id}/permissions/{permissionID}", post(perm_reply_session))
         .route("/question", get(q_list))
         .route("/question/{id}/reply", post(q_reply))
         .route("/question/{id}/reject", post(q_reject))

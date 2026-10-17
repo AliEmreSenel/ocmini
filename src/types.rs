@@ -35,8 +35,13 @@ pub struct Time {
 #[serde(rename_all = "camelCase")]
 pub struct PermissionRule {
     pub permission: String,
+    #[serde(default = "star")]
     pub pattern: String,
     pub action: String,
+}
+
+fn star() -> String {
+    "*".into()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -171,8 +176,10 @@ pub struct PermissionRequest {
     #[serde(rename = "sessionID")]
     pub session_id: String,
     pub permission: String,
-    pub pattern: String,
+    pub patterns: Vec<String>,
     pub metadata: Value,
+    pub always: Vec<String>,
+    pub time: Time,
 }
 
 #[derive(Clone, Debug, Serialize)]

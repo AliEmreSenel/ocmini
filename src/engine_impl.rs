@@ -290,8 +290,44 @@ async fn run_turn(
             let name = part["tool"].as_str().unwrap_or_default().to_string();
             let input = part["state"]["input"].clone();
             let start = part["state"]["time"]["start"].as_i64().unwrap_or_else(now_ms);
+            let (perm_name, pattern) = perm_for(&name, &input, &session.directory);
+            let action = {
+                let mut rules = crate::permission::default_rules(&app.config.lock().unwrap().permission);
+                if let Some(sp) = &session.permission {
+                    rules.extend(sp.iter().cloned());
+                }
+                if let Some(a) = app.always.lock().unwrap().get(&session_id) {
+                    rules.extend(a.iter().cloned());
+                }
+                crate::permission::decide(&rules, &perm_name, &pattern)
+            };
             let out = if is_plan && PLAN_BLOCKED.contains(&name.as_str()) {
                 Err(ToolError { message: format!("Tool '{name}' is not available in plan mode"), denied: true })
+            } else if action == "deny" {
+                Err(ToolError { message: format!("Permission '{perm_name}' denied by rules"), denied: true })
+            } else if action == "ask" {
+                let (req, rx) = app.perms.ask(
+                    &session_id,
+                    &perm_name,
+                    vec![pattern.clone()],
+                    json!({"tool": name, "input": input, "patterns": [pattern.clone()]}),
+                    vec![pattern.clone()],
+                );
+                bus().emit("permission.asked", serde_json::to_value(&req).unwrap());
+                let reply = tokio::select! {
+                    r = rx => r.unwrap_or_else(|_| "reject".into()),
+                    _ = poll_cancel(cancel.clone()) => "reject".into(),
+                };
+                if reply == "reject" {
+                    Err(ToolError { message: format!("User rejected permission '{perm_name}' ({pattern})"), denied: true })
+                } else {
+                    if reply == "always" {
+                        app.always.lock().unwrap().entry(session_id.clone()).or_default().push(
+                            PermissionRule { permission: perm_name.clone(), pattern: pattern.clone(), action: "allow".into() },
+                        );
+                    }
+                    tools::run_tool(&ctx, &name, &input).await
+                }
             } else {
                 tools::run_tool(&ctx, &name, &input).await
             };
@@ -316,6 +352,41 @@ async fn run_turn(
     bus().emit("session.idle", json!({"sessionID": session_id}));
     let msgs = app.store.messages(&session_id);
     Ok(json!({"info": msgs.last().map(|m| m.info.clone()), "parts": msgs.last().map(|m| m.parts.clone()).unwrap_or_default()}))
+}
+
+
+fn perm_for(name: &str, input: &Value, dir: &str) -> (String, String) {
+    let abs = |p: &str| -> String {
+        if p.is_empty() {
+            return "*".into();
+        }
+        if p.starts_with('/') {
+            p.to_string()
+        } else {
+            format!("{}/{}", dir.trim_end_matches('/'), p.trim_start_matches("./"))
+        }
+    };
+    match name {
+        "bash" => ("bash".into(), input["command"].as_str().unwrap_or_default().to_string()),
+        "write" | "edit" | "read" => (name.into(), abs(input["filePath"].as_str().unwrap_or_default())),
+        "glob" => ("glob".into(), abs(input["path"].as_str().unwrap_or_default())),
+        "grep" => ("grep".into(), input["pattern"].as_str().unwrap_or_default().to_string()),
+        "webfetch" => ("webfetch".into(), input["url"].as_str().unwrap_or_default().to_string()),
+        "task" => ("task".into(), input["subagent_type"].as_str().unwrap_or_default().to_string()),
+        "todowrite" => ("todowrite".into(), "*".into()),
+        "question" => ("question".into(), "*".into()),
+        _ if name.starts_with("mcp_") => ("mcp".into(), name.to_string()),
+        _ => (name.into(), "*".into()),
+    }
+}
+
+async fn poll_cancel(c: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    loop {
+        if c.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 fn assistant_info(mid: &str, sid: &str, model: &str, provider: &str, created: i64) -> MessageInfo {

@@ -238,3 +238,68 @@ async fn catalog_endpoints_ok() {
         assert_eq!(r.status(), 200, "{path}");
     }
 }
+
+#[tokio::test]
+async fn permission_routes() {
+    let s = boot().await;
+    let c = client();
+    let sid = c
+        .post(format!("{}/session", s.url))
+        .basic_auth("opencode", Some("testpw"))
+        .header("x-opencode-directory", "/tmp")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rules = json!([{"permission": "bash", "pattern": "*", "action": "ask"}, {"permission": "read", "pattern": "*", "action": "allow"}]);
+    let r = c
+        .patch(format!("{}/session/{sid}", s.url))
+        .basic_auth("opencode", Some("testpw"))
+        .json(&json!({"permission": rules}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let got = c
+        .get(format!("{}/session/{sid}", s.url))
+        .basic_auth("opencode", Some("testpw"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(got["permission"], rules);
+    let list = c
+        .get(format!("{}/permission", s.url))
+        .basic_auth("opencode", Some("testpw"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(list, json!([]));
+    let r = c
+        .post(format!("{}/permission/nope/reply", s.url))
+        .basic_auth("opencode", Some("testpw"))
+        .json(&json!({"reply": "once"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = c
+        .post(format!("{}/session/{sid}/permissions/nope", s.url))
+        .basic_auth("opencode", Some("testpw"))
+        .json(&json!({"response": "reject"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}

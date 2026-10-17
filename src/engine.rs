@@ -75,6 +75,7 @@ pub struct App {
     pub cancels: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     >,
+    pub always: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::types::PermissionRule>>>>,
 }
 
 impl App {
@@ -121,6 +122,7 @@ impl App {
             mcp,
             usage: Arc::new(UsageDb::open()),
             cancels: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            always: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         mark("dbs", &mut t0);
         s

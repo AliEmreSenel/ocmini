@@ -82,6 +82,8 @@ pub fn run() {
         });
 
         let mut rx_bus = bus().subscribe();
+        let mut shown_reason: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut pending_perm: Option<String> = None;
         let mut input = String::new();
         let mut agent: Option<String> = None;
         let mut busy: Option<tokio::task::JoinHandle<()>> = None;
@@ -106,9 +108,28 @@ pub fn run() {
                         }
                     }
                     "message.part.updated" => {
-                        if p["part"]["type"] == "tool" {
-                            print_tool(&p["part"]);
+                        let part = &p["part"];
+                        if part["type"] == "tool" {
+                            print_tool(part);
+                        } else if part["type"] == "reasoning" {
+                            let id = part["id"].as_str().unwrap_or_default().to_string();
+                            let txt = part["text"].as_str().unwrap_or_default();
+                            let seen = shown_reason.get(&id).copied().unwrap_or(0);
+                            if txt.len() > seen {
+                                out(&format!("\x1b[2m{}\x1b[0m", &txt[seen..]));
+                                *shown_reason.entry(id).or_insert(0) = txt.len();
+                            }
                         }
+                    }
+                    "permission.asked" => {
+                        let id = p["id"].as_str().unwrap_or_default().to_string();
+                        let perm = p["permission"].as_str().unwrap_or("?");
+                        let pat = p["patterns"][0].as_str().unwrap_or("");
+                        out(&format!("\n\x1b[33m⚠ {perm}: {}\x1b[0m\n\x1b[2m[y] once  [a] always  [n] reject\x1b[0m\n> ", pat.chars().take(100).collect::<String>()));
+                        pending_perm = Some(id);
+                    }
+                    "permission.replied" => {
+                        pending_perm = None;
                     }
                     "session.error" => {
                         out(&format!("\x1b[31merror: {}\x1b[0m\n", p["error"]["data"]["message"]));
@@ -144,7 +165,16 @@ pub fn run() {
                     }
                 }
                 In::Char(c) => {
-                    if busy.is_none() {
+                    if let Some(id) = pending_perm.take() {
+                        let reply = match c {
+                            'y' => "once",
+                            'a' => "always",
+                            'n' => "reject",
+                            _ => "reject",
+                        };
+                        app.perms.reply(&id, reply);
+                        out(&format!("\x1b[2m{reply}\x1b[0m\n"));
+                    } else if busy.is_none() {
                         input.push(c);
                         out(&c.to_string());
                     }

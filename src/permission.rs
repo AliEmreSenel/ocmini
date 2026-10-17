@@ -44,19 +44,47 @@ impl PermissionState {
         &self,
         session_id: &str,
         permission: &str,
-        pattern: &str,
+        patterns: Vec<String>,
         metadata: serde_json::Value,
+        always: Vec<String>,
     ) -> (PermissionRequest, oneshot::Receiver<String>) {
         let (tx, rx) = oneshot::channel();
         let req = PermissionRequest {
             id: crate::types::hex_id("per_"),
             session_id: session_id.to_string(),
             permission: permission.to_string(),
-            pattern: pattern.to_string(),
+            patterns,
             metadata,
+            always,
+            time: crate::types::Time {
+                created: crate::types::now_ms(),
+                updated: None,
+            },
         };
         self.pending.lock().unwrap().push((req.clone(), tx));
         (req, rx)
+    }
+
+    pub fn reject_all(&self, session_id: &str) {
+        let mut p = self.pending.lock().unwrap();
+        let mut drained = Vec::new();
+        let mut keep = Vec::new();
+        while let Some(item) = p.pop() {
+            if item.0.session_id == session_id {
+                drained.push((item.0.id.clone(), item.1));
+            } else {
+                keep.push(item);
+            }
+        }
+        p.extend(keep);
+        drop(p);
+        for (id, tx) in drained {
+            let _ = tx.send("reject".to_string());
+            crate::engine::GLOBAL_BUS.emit(
+                "permission.replied",
+                serde_json::json!({"sessionID": session_id, "requestID": id, "reply": "reject"}),
+            );
+        }
     }
 
     pub fn reply(&self, id: &str, response: &str) -> bool {
