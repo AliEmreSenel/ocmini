@@ -18,10 +18,9 @@ pub const OPENCODE_COMPAT_VERSION: &str = "1.19.2-ocmini.0.2.0";
 const HELP: &str = "ocmini — a compact OpenCode-compatible coding runtime
 
 Usage:
-  ocmini                                  Show this help
+  ocmini [tui] [--model provider/model] [--directory DIR]
+                                           Start the interactive terminal chat
   ocmini serve [--hostname HOST] [--port N] Start the HTTP/SSE server
-  ocmini tui [--model provider/model] [--directory DIR]
-                                           Minimal interactive terminal chat
   ocmini models [PROVIDER] [--verbose]      List available models
   ocmini agent list                       List available agents
   ocmini debug skill                      Print discovered skills as JSON
@@ -36,10 +35,38 @@ The 1.19.2-ocmini version identifies the OpenCode 1.x wire contract.
 ocmini is an independent implementation; it does not implement OpenCode 2.x /api.
 ";
 
+fn run_tui(args: &[String]) -> Result<(), String> {
+    let mut model = None;
+    let mut directory = None;
+    let mut index = 0;
+    while index < args.len() {
+        let (option, inline) = args[index]
+            .split_once('=')
+            .map(|(name, value)| (name, Some(value)))
+            .unwrap_or((args[index].as_str(), None));
+        let value = match inline {
+            Some(value) => value,
+            None => {
+                index += 1;
+                args.get(index).map(String::as_str).ok_or_else(|| format!("{option} requires a value"))?
+            }
+        };
+        match option {
+            "--model" => model = Some(value.to_owned()),
+            "--directory" => directory = Some(value.to_owned()),
+            "--help" | "-h" => { println!("{HELP}"); return Ok(()); }
+            other => return Err(format!("Unknown option: {other}")),
+        }
+        index += 1;
+    }
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| format!("Cannot start runtime: {error}"))?;
+    runtime.block_on(tui::run(model, directory))
+}
+
 fn run(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        println!("{HELP}");
-        return Ok(());
+        return run_tui(&[]);
     }
     match args[0].as_str() {
         "--help" | "-h" | "help" => {
@@ -50,33 +77,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             println!("{OPENCODE_COMPAT_VERSION}");
             Ok(())
         }
-        "tui" => {
-            let mut model = None;
-            let mut directory = None;
-            let mut index = 1;
-            while index < args.len() {
-                let (option, inline) = args[index]
-                    .split_once('=')
-                    .map(|(name, value)| (name, Some(value)))
-                    .unwrap_or((args[index].as_str(), None));
-                let value = match inline {
-                    Some(value) => value,
-                    None => {
-                        index += 1;
-                        args.get(index).map(String::as_str).ok_or_else(|| format!("{option} requires a value"))?
-                    }
-                };
-                match option {
-                    "--model" => model = Some(value.to_owned()),
-                    "--directory" => directory = Some(value.to_owned()),
-                    other => return Err(format!("Unknown tui option: {other}")),
-                }
-                index += 1;
-            }
-            let runtime = tokio::runtime::Runtime::new()
-                .map_err(|error| format!("Cannot start runtime: {error}"))?;
-            runtime.block_on(tui::run(model, directory))
-        }
+        "tui" => run_tui(&args[1..]),
         "serve" => {
             let mut hostname = "127.0.0.1".to_owned();
             let mut port = 4096;
