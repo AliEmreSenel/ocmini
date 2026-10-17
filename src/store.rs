@@ -28,10 +28,6 @@ impl Store {
     /// at once, so opening is fallible: contention must surface as a clean
     /// startup error, never as a panic.
     pub fn open(path: &Path, instance: &str) -> Result<Self, String> {
-        Self::try_open(path, instance)
-    }
-
-    pub fn try_open(path: &Path, instance: &str) -> Result<Self, String> {
         if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(sql_error)?;
         }
@@ -270,18 +266,20 @@ impl Store {
     pub fn list_sessions(&self, dir: Option<&str>) -> Result<Vec<Session>, String> {
         self.with_read(|c| {
             let mut stmt = c
-                .prepare("SELECT json FROM session ORDER BY time_updated DESC,rowid")
+                .prepare("SELECT json FROM session ORDER BY time_updated DESC,rowid DESC")
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map([], |r| r.get::<_, String>(0))
                 .map_err(sql_error)?;
-            rows.map(|r| serde_json::from_str::<Session>(&r.map_err(sql_error)?).map_err(sql_error))
-                .filter(|s| {
-                    s.as_ref().is_ok_and(|session| {
-                        dir.is_none_or(|d| Path::new(&session.directory) == Path::new(d))
-                    })
+            let sessions = rows
+                .map(|row| {
+                    serde_json::from_str::<Session>(&row.map_err(sql_error)?).map_err(sql_error)
                 })
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(sessions
+                .into_iter()
+                .filter(|session| dir.is_none_or(|d| Path::new(&session.directory) == Path::new(d)))
+                .collect())
         })
     }
 
@@ -1046,5 +1044,24 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn session_listing_reports_corrupt_records() {
+        let store = Store::open(Path::new(":memory:"), "test").unwrap();
+        let session = store.create_session_owned("corrupt", "/work");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE session SET json='{}' WHERE id=?1",
+                params![session.id],
+            )
+            .unwrap();
+        assert!(store
+            .list_sessions(None)
+            .unwrap_err()
+            .contains("Session database"));
     }
 }

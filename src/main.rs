@@ -7,6 +7,7 @@ mod mcp;
 mod permission;
 mod provider;
 mod server;
+mod sessions;
 mod store;
 mod tools;
 mod tui;
@@ -28,16 +29,27 @@ struct Cli {
 
 #[derive(Args, Default)]
 struct TuiArgs {
-    #[arg(long, value_name = "PROVIDER/MODEL")]
-    model: Option<String>,
+    #[arg(long, value_name = "PROVIDER/MODEL", value_parser = parse_model)]
+    model: Option<types::ModelRef>,
     #[arg(long, value_name = "DIR")]
     directory: Option<String>,
+    /// Resume the latest top-level session in this directory
+    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
+    continue_last: bool,
+    /// Resume a session by ID, using its saved directory
+    #[arg(short = 's', long, value_name = "ID")]
+    session: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Start the interactive terminal chat (also the default)
     Tui(TuiArgs),
+    /// Inspect saved sessions
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Start the HTTP/SSE server
     Serve {
         #[arg(long, default_value = "127.0.0.1", value_parser = parse_hostname)]
@@ -75,6 +87,26 @@ enum DebugCommand {
     Skill,
 }
 
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// List saved sessions, newest first
+    List {
+        #[arg(long, value_name = "DIR")]
+        directory: Option<String>,
+    },
+}
+
+fn parse_model(value: &str) -> Result<types::ModelRef, String> {
+    let (provider, model) = value
+        .split_once('/')
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .ok_or("model must be provider/model")?;
+    Ok(types::ModelRef {
+        provider_id: provider.into(),
+        model_id: model.into(),
+    })
+}
+
 fn parse_hostname(value: &str) -> Result<String, String> {
     let hostname = value.trim_start_matches('[').trim_end_matches(']');
     if hostname.is_empty() {
@@ -85,7 +117,17 @@ fn parse_hostname(value: &str) -> Result<String, String> {
 
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command.unwrap_or(Command::Tui(cli.tui)) {
-        Command::Tui(args) => tui::run(args.model, args.directory).await,
+        Command::Tui(args) => tui::run(args).await,
+        Command::Session {
+            command: SessionCommand::List { directory },
+        } => {
+            let directory = directory.as_deref().map(sessions::directory).transpose()?;
+            let store = store::Store::open(&config::store_path(), &types::hex_id("ocm_"))?;
+            for session in store.list_sessions(directory.as_deref())? {
+                println!("{}\t{}\t{}", session.id, session.title, session.directory);
+            }
+            Ok(())
+        }
         Command::Serve { hostname, port } => server::serve(hostname, port).await,
         Command::Version => {
             println!("{OPENCODE_COMPAT_VERSION}");

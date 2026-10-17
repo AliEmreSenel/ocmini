@@ -14,10 +14,7 @@ pub fn hex_id(prefix: &str) -> String {
     let mut s = String::with_capacity(prefix.len() + 26);
     s.push_str(prefix);
     use rand::Rng;
-    let bytes: Vec<u8> = (0..26)
-        .map(|_| CH[rand::rng().random_range(0..CH.len())])
-        .collect();
-    s.push_str(&String::from_utf8(bytes).unwrap());
+    s.extend((0..26).map(|_| CH[rand::rng().random_range(0..CH.len())] as char));
     s
 }
 
