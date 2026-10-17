@@ -106,7 +106,21 @@ impl Config {
         Self::load_for(&directory.to_string_lossy())
     }
 
+    /// Configs are loaded from disk per request scope. With many concurrent
+    /// sessions this is a hot disk path, so entries are cached briefly; T3
+    /// config overlays take effect within the TTL.
     pub fn load_for(directory: &str) -> Result<Config, String> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Config)>>> = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Some((created, config)) = cache.lock().unwrap().get(directory) {
+            if created.elapsed() < std::time::Duration::from_secs(3) { return Ok(config.clone()); }
+        }
+        let config = Self::load_uncached(directory)?;
+        cache.lock().unwrap().insert(directory.to_string(), (std::time::Instant::now(), config.clone()));
+        Ok(config)
+    }
+
+    fn load_uncached(directory: &str) -> Result<Config, String> {
         let directory = absolute_path(Path::new(directory), &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let global = PathBuf::from(config_home()).join("opencode");
         let mut value = json!({});

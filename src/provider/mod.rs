@@ -47,6 +47,17 @@ impl std::fmt::Display for ProviderError {
 }
 
 /// Status codes that are safe to re-request: the request never completed.
+/// One pooled HTTP client for the whole process: connection reuse matters
+/// when many sessions request providers at the same time.
+pub fn client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build().expect("process HTTP client"))
+}
+
 pub fn status_retryable(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
 }
@@ -285,8 +296,7 @@ impl Settings {
         }
         let suffix = format!("/{endpoint}");
         let url = if self.base_url.ends_with(&suffix) { self.base_url.clone() } else { format!("{}{suffix}", self.base_url.trim_end_matches('/')) };
-        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build().map_err(|e| ProviderError::fatal(e.to_string()))?;
-        let mut request = client.post(url).headers(headers).json(body);
+        let mut request = client().post(url).headers(headers).json(body);
         if let Some(timeout) = self.total_timeout { request = request.timeout(timeout); }
         let response = if let Some(timeout) = self.header_timeout {
             tokio::time::timeout(timeout, request.send()).await

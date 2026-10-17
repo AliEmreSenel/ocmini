@@ -19,11 +19,9 @@ pub(super) async fn fetch(input: &Value, cancel: Arc<AtomicBool>) -> Result<Tool
         None | Some(Value::Null) => 30,
         Some(value) => value.as_u64().filter(|v| *v > 0 && *v <= 120).ok_or_else(|| failure("webfetch timeout must be 1..120 seconds"))?,
     };
-    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(timeout))
-        .redirect(reqwest::redirect::Policy::limited(10)).user_agent(concat!("ocmini/", env!("CARGO_PKG_VERSION")))
-        .build().map_err(|e| failure(format!("HTTP client failed: {e}")))?;
+    let client = crate::provider::client();
     let operation = async {
-        let response = client.get(parsed).header(reqwest::header::ACCEPT, "text/markdown, text/html, text/plain, application/json;q=0.9, */*;q=0.1").send().await
+        let response = client.get(parsed).timeout(Duration::from_secs(timeout)).header(reqwest::header::ACCEPT, "text/markdown, text/html, text/plain, application/json;q=0.9, */*;q=0.1").send().await
             .map_err(|e| failure(format!("Fetch failed: {}", e.without_url())))?;
         let status = response.status();
         if !status.is_success() { return Err(failure(format!("HTTP {} {}", status.as_u16(), status.canonical_reason().unwrap_or("request failed")))); }

@@ -161,7 +161,11 @@ fn directory_for(headers: &HeaderMap, query: &ScopeQuery) -> Result<String, ApiE
 }
 
 fn matches_directory(session: &Session, directory: Option<&str>) -> bool {
-    directory.is_none_or(|directory| normalized_directory(&session.directory).is_ok_and(|stored| stored == directory))
+    matches_directory_str(&session.directory, directory)
+}
+
+fn matches_directory_str(stored: &str, directory: Option<&str>) -> bool {
+    directory.is_none_or(|directory| normalized_directory(stored).is_ok_and(|stored| stored == directory))
 }
 
 fn scoped_session(st: &AppState, id: &str, headers: &HeaderMap, query: &ScopeQuery) -> Result<Session, ApiError> {
@@ -182,7 +186,8 @@ fn decode_rules(value: &Value) -> Result<Vec<PermissionRule>, ApiError> {
 
 async fn list_sessions(State(st): State<AppState>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Vec<Session>>, ApiError> {
     let directory = requested_directory(&headers, &query)?;
-    let mut sessions = st.app.store.list_sessions(None).map_err(ApiError::runtime)?;
+    let store = st.app.store.clone();
+    let mut sessions = tokio::task::spawn_blocking(move || store.list_sessions(None)).await.map_err(|e| ApiError::runtime(e.to_string()))?.map_err(ApiError::runtime)?;
     sessions.retain(|session| matches_directory(session, directory.as_deref())
         && (!query.roots.unwrap_or(false) || session.parent_id.is_none())
         && query.search.as_ref().is_none_or(|search| session.title.to_lowercase().contains(&search.to_lowercase())));
@@ -256,7 +261,9 @@ async fn session_status(State(st): State<AppState>, headers: HeaderMap, Query(qu
 
 async fn session_messages(State(st): State<AppState>, Path(id): Path<String>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Json<Vec<MessageWithParts>>, ApiError> {
     scoped_session(&st, &id, &headers, &query)?;
-    let mut messages = st.app.store.messages(&id).map_err(ApiError::runtime)?;
+    let store = st.app.store.clone();
+    let session_id = id.clone();
+    let mut messages = tokio::task::spawn_blocking(move || store.messages(&session_id)).await.map_err(|e| ApiError::runtime(e.to_string()))?.map_err(ApiError::runtime)?;
     if let Some(limit) = query.limit { let remove = messages.len().saturating_sub(limit); messages.drain(..remove); }
     Ok(Json(messages))
 }
@@ -395,7 +402,7 @@ fn event_in_directory(event: &BusEvent, app: &App, directory: Option<&str>) -> b
     let session_id = event.properties.get("sessionID").and_then(Value::as_str)
         .or_else(|| event.properties.get("info").and_then(|info| info.get("sessionID")).and_then(Value::as_str))
         .or_else(|| event.properties.get("part").and_then(|part| part.get("sessionID")).and_then(Value::as_str));
-    session_id.is_none_or(|id| app.store.get_session(id).ok().flatten().is_some_and(|session| matches_directory(&session, Some(directory))))
+    session_id.is_none_or(|id| app.store.directory_of(id).is_some_and(|stored| matches_directory_str(&stored, Some(directory))))
 }
 
 async fn event_stream(State(st): State<AppState>, headers: HeaderMap, Query(query): Query<ScopeQuery>) -> Result<Response, ApiError> {
