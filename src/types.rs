@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0)
 }
 
 pub fn hex_id(prefix: &str) -> String {
@@ -23,12 +24,14 @@ pub fn slug() -> String {
     format!("{}-{}", A[rand::rng().random_range(0..A.len())], B[rand::rng().random_range(0..B.len())])
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Time {
     pub created: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated: Option<i64>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -65,6 +68,8 @@ pub struct Session {
     pub parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<Vec<PermissionRule>>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -87,7 +92,7 @@ pub struct Cache {
     pub write: i64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageInfo {
     pub id: String,
@@ -105,9 +110,29 @@ pub struct MessageInfo {
     pub tokens: Option<Tokens>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish: Option<String>,
+    #[serde(rename = "parentID", default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MessageTime {
     pub created: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,14 +152,7 @@ pub struct BusEvent {
     pub properties: Value,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct PromptPart {
-    pub r#type: String,
-    #[serde(default)]
-    pub text: String,
-}
-
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelRef {
     #[serde(rename = "providerID")]
     pub provider_id: String,
@@ -142,14 +160,27 @@ pub struct ModelRef {
     pub model_id: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptRequest {
-    pub model: ModelRef,
-    pub parts: Vec<PromptPart>,
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+    #[serde(default)]
+    pub parts: Vec<Value>,
+    #[serde(rename = "messageID", default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub system: Option<String>,
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
     pub variant: Option<String>,
+    #[serde(default)]
+    pub no_reply: bool,
+    #[serde(default)]
+    pub tools: Option<HashMap<String, bool>>,
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,12 +189,8 @@ pub enum ProviderEvent {
     ReasoningDelta(String),
     ToolCallStart { call_id: String, name: String, args: String },
     Finished { finish: String, usage: Tokens },
+    Metadata(Value),
     Error(String),
-}
-
-#[derive(Deserialize, Debug)]
-pub struct PermissionReply {
-    pub response: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -182,6 +209,8 @@ pub struct PermissionRequest {
     pub metadata: Value,
     pub always: Vec<String>,
     pub time: Time,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -191,19 +220,19 @@ pub struct QuestionRequest {
     #[serde(rename = "sessionID")]
     pub session_id: String,
     pub questions: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<Value>,
 }
 
+#[derive(Debug)]
 pub struct ToolOutput {
     pub output: String,
     pub title: String,
+    pub metadata: Value,
 }
 
+#[derive(Debug)]
 pub struct ToolError {
     pub message: String,
     pub denied: bool,
-}
-
-#[derive(Default, Debug)]
-pub struct Usage {
-    pub per_model: HashMap<String, (i64, i64)>,
 }

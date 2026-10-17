@@ -9,80 +9,148 @@ mod provider;
 mod server;
 mod store;
 mod tools;
-mod tui;
 mod types;
 mod usage_db;
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+pub const OPENCODE_COMPAT_VERSION: &str = "1.19.2-ocmini.0.2.0";
+
+const HELP: &str = "ocmini — a compact OpenCode-compatible coding runtime
+
+Usage:
+  ocmini                                  Show this help
+  ocmini serve [--hostname HOST] [--port N] Start the HTTP/SSE server
+  ocmini models [PROVIDER] [--verbose]      List available models
+  ocmini agent list                       List available agents
+  ocmini debug skill                      Print discovered skills as JSON
+  ocmini --version                        Print the compatibility version
+
+serve defaults to 127.0.0.1:4096. Port 0 selects an available port.
+Both --option=value and --option value are accepted.
+Set OPENCODE_SERVER_PASSWORD to require HTTP Basic authentication.
+OCMINI_MAX_REQUEST_BYTES sets the JSON body limit (default 128 MiB).
+
+The 1.19.2-ocmini version identifies the OpenCode 1.x wire contract.
+ocmini is an independent implementation; it does not implement OpenCode 2.x /api.
+";
+
+fn run(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        tui::run();
-        return;
+        println!("{HELP}");
+        return Ok(());
     }
-    let cmd = args.first().map(String::as_str).unwrap_or("--help");
-    match cmd {
+    match args[0].as_str() {
+        "--help" | "-h" | "help" => {
+            println!("{HELP}");
+            Ok(())
+        }
+        "--version" | "-V" | "version" if args.len() == 1 => {
+            println!("{OPENCODE_COMPAT_VERSION}");
+            Ok(())
+        }
         "serve" => {
-            let mut hostname = "127.0.0.1".to_string();
-            let mut port: u16 = 4096;
-            for a in args.iter().skip(1) {
-                if let Some(v) = a.strip_prefix("--hostname=") {
-                    hostname = v.to_string();
-                } else if let Some(v) = a.strip_prefix("--port=") {
-                    port = v.parse().expect("bad port");
+            let mut hostname = "127.0.0.1".to_owned();
+            let mut port = 4096;
+            let mut index = 1;
+            while index < args.len() {
+                if args[index] == "--help" || args[index] == "-h" {
+                    println!("{HELP}");
+                    return Ok(());
                 }
+                let (option, inline) = args[index]
+                    .split_once('=')
+                    .map(|(name, value)| (name, Some(value)))
+                    .unwrap_or((args[index].as_str(), None));
+                if option != "--hostname" && option != "--port" {
+                    return Err(format!("Unknown serve option: {}", args[index]));
+                }
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        index += 1;
+                        args.get(index)
+                            .map(String::as_str)
+                            .ok_or_else(|| format!("{option} requires a value"))?
+                    }
+                };
+                if option == "--hostname" {
+                    if value.is_empty() {
+                        return Err("--hostname must not be empty".into());
+                    }
+                    hostname = value.trim_start_matches('[').trim_end_matches(']').to_owned();
+                } else {
+                    port = value.parse::<u16>()
+                        .map_err(|_| "--port must be an integer between 0 and 65535".to_owned())?;
+                }
+                index += 1;
             }
-            let t0 = std::time::Instant::now();
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            if std::env::var("OC_DEBUG_STARTUP").is_ok() {
-                eprintln!("[startup] runtime: {:?}", t0.elapsed());
-            }
-            rt.block_on(server::serve(hostname, port));
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|error| format!("Cannot start runtime: {error}"))?;
+            runtime.block_on(server::serve(hostname, port))
         }
-        "--version" | "version" => println!("1.19.2"),
         "models" => {
-            let cfg = config::Config::load();
-            for m in cfg.catalog() {
-                println!(
-                    "{}/{}",
-                    m["providerID"].as_str().unwrap_or_default(),
-                    m["modelID"].as_str().unwrap_or_default()
-                );
-                let mut body = m.clone();
-                if let Some(o) = body.as_object_mut() {
-                    let pid = o.remove("providerID").unwrap_or(serde_json::json!(""));
-                    let mid = o.remove("modelID").unwrap_or(serde_json::json!(""));
-                    o.insert("id".into(), mid.clone());
-                    o.insert("providerID".into(), pid);
+            let mut verbose = false;
+            let mut provider = None;
+            for argument in &args[1..] {
+                match argument.as_str() {
+                    "--verbose" => verbose = true,
+                    "--help" | "-h" => {
+                        println!("Usage: ocmini models [PROVIDER] [--verbose]");
+                        return Ok(());
+                    }
+                    value if value.starts_with('-') => return Err(format!("Unknown models option: {value}")),
+                    value if provider.is_none() => provider = Some(value),
+                    value => return Err(format!("Unexpected models argument: {value}")),
                 }
-                println!("{}", serde_json::to_string_pretty(&body).unwrap());
             }
+            let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+            let config = config::Config::load_for(&directory.to_string_lossy())?;
+            let auth = auth::AuthStore::load();
+            let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+            let (config, errors) = runtime.block_on(provider::discover_models(&config, &auth));
+            if !errors.is_empty() && config.catalog().is_empty() { return Err(errors.join("; ")); }
+            for error in errors { eprintln!("ocmini: model discovery: {error}"); }
+            let inventory = server::provider_inventory(&config, &auth);
+            let connected = inventory["connected"].as_array().cloned().unwrap_or_default();
+            for item in inventory["all"].as_array().into_iter().flatten() {
+                let id = item["id"].as_str().unwrap_or_default();
+                if provider.is_some_and(|filter| filter != id)
+                    || !connected.iter().any(|value| value.as_str() == Some(id)) {
+                    continue;
+                }
+                if let Some(models) = item["models"].as_object() {
+                    for (model_id, model) in models {
+                        println!("{id}/{model_id}");
+                        if verbose {
+                            println!("{}", serde_json::to_string(model).map_err(|error| error.to_string())?);
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
-        "agent" => {
-            println!("build (primary)");
-            println!(r#"[{{"permission":"*","pattern":"*","action":"allow"}},{{"permission":"doom_loop","pattern":"*","action":"ask"}},{{"permission":"external_directory","pattern":"*","action":"ask"}},{{"permission":"question","pattern":"*","action":"deny"}},{{"permission":"plan_enter","pattern":"*","action":"deny"}},{{"permission":"plan_exit","pattern":"*","action":"deny"}},{{"permission":"read","pattern":"*","action":"allow"}},{{"permission":"read","pattern":"*.env","action":"ask"}},{{"permission":"read","pattern":"*.env.*","action":"ask"}}]"#);
-            println!("plan (primary)");
-            println!(r#"[{{"permission":"*","pattern":"*","action":"allow"}},{{"permission":"doom_loop","pattern":"*","action":"ask"}},{{"permission":"external_directory","pattern":"*","action":"ask"}}]"#);
-            println!("general (subagent)");
-            println!(r#"[{{"permission":"*","pattern":"*","action":"allow"}},{{"permission":"doom_loop","pattern":"*","action":"ask"}}]"#);
-            println!("subagent (subagent)");
-            println!(r#"[{{"permission":"*","pattern":"*","action":"allow"}},{{"permission":"doom_loop","pattern":"*","action":"ask"}}]"#);
+        "agent" if args.len() == 2 && args[1] == "list" => {
+            let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+            let config = config::Config::load_for(&directory.to_string_lossy())?;
+            let agents = server::agents_json(&config);
+            for agent in agents.as_array().into_iter().flatten() {
+                println!("{} ({})", agent["name"].as_str().unwrap_or_default(), agent["mode"].as_str().unwrap_or("all"));
+                println!("{}", agent["permission"]);
+            }
+            Ok(())
         }
-        "debug" => {
-            let skills: Vec<serde_json::Value> = server::skills_json()
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "name": s["name"],
-                        "description": s["description"],
-                        "location": s["location"],
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string(&skills).unwrap());
+        "debug" if args.len() == 2 && args[1] == "skill" => {
+            let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+            let config = config::Config::load_for(&directory.to_string_lossy())?;
+            println!("{}", server::skills_json_for(&directory.to_string_lossy(), &config));
+            Ok(())
         }
-        _ => eprintln!("ocmini: usage: serve --hostname=H --port=P | --version | models --verbose | agent list | debug skill"),
+        command => Err(format!("Unknown command or arguments: {command}. Run ocmini --help for usage.")),
+    }
+}
+
+fn main() {
+    if let Err(error) = run(std::env::args().skip(1).collect()) {
+        eprintln!("ocmini: {error}");
+        std::process::exit(1);
     }
 }

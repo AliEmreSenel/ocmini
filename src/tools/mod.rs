@@ -1,335 +1,286 @@
 use crate::engine::{bus, App, EngineApi};
-use crate::types::{hex_id, ToolError, ToolOutput};
+use crate::types::{hex_id, ModelRef, PromptRequest, ToolError, ToolOutput};
 use serde_json::{json, Value};
-use std::sync::atomic::AtomicBool;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+mod files;
+pub mod patch;
+mod process;
+mod skills;
+mod web;
 
 pub struct ToolCtx {
     pub dir: String,
     pub app: App,
     pub session_id: String,
+    pub message_id: String,
+    pub call_id: String,
+    pub part_id: String,
     pub engine: Arc<dyn EngineApi>,
     pub cancel: Arc<AtomicBool>,
 }
 
+impl ToolCtx {
+    pub fn update_metadata(&self, metadata: Value) -> Result<(), ToolError> {
+        let message = self.app.store.message(&self.session_id, &self.message_id)
+            .ok_or_else(|| failure("Tool message no longer exists"))?;
+        let mut part = message.parts.into_iter().find(|part| part["id"].as_str() == Some(self.part_id.as_str()))
+            .ok_or_else(|| failure("Tool part no longer exists"))?;
+        part["state"]["metadata"] = metadata;
+        self.app.store.update_part(&self.session_id, &part).map_err(failure)?;
+        bus().emit("message.part.updated", json!({"part":part}));
+        Ok(())
+    }
+}
+
 pub fn tool_defs() -> Vec<Value> {
     vec![
-        fn_def("bash", "Run a shell command in the working directory", json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number"}},"required":["command"]})),
-        fn_def("read", "Read a file. Returns lines prefixed with line numbers.", json!({"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["filePath"]})),
-        fn_def("write", "Write a file, creating parent directories.", json!({"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]})),
-        fn_def("edit", "Exact string replacement in a file.", json!({"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}},"required":["filePath","oldString","newString"]})),
-        fn_def("glob", "Find files by glob pattern, sorted by mtime.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})),
-        fn_def("grep", "Search file contents by regex.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})),
-        fn_def("webfetch", "Fetch a URL and return its text content.", json!({"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["text","markdown","html"]}},"required":["url"]})),
-        fn_def("todowrite", "Replace the todo list.", json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status","priority"]}}},"required":["todos"]})),
-        fn_def("question", "Ask the user a question and wait for the answer.", json!({"type":"object","properties":{"questions":{"type":"array","items":{"type":"object"}}},"required":["questions"]})),
-        fn_def("task", "Delegate a task to a subagent session and return its result.", json!({"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"},"subagent_type":{"type":"string"}},"required":["description","prompt","subagent_type"]})),
+        fn_def("bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000, maximum 600000). Commands are cancelled with the turn. Background processes are stopped when the command exits.", json!({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":600000},"description":{"type":"string"}},"required":["command"]})),
+        fn_def("read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", json!({"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["filePath"]})),
+        fn_def("write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", json!({"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]})),
+        fn_def("edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", json!({"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string","minLength":1},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}},"required":["filePath","oldString","newString"]})),
+        fn_def("apply_patch", "Apply a patch using *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, optional *** Move to:, @@ context hunks, and *** End Patch. All files are validated before any are changed.", json!({"type":"object","properties":{"patchText":{"type":"string"}},"required":["patchText"]})),
+        fn_def("glob", "Find files by glob pattern (including ** and {a,b}), honoring gitignore. Returns up to 100 files newest first. Relative path uses the session directory.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})),
+        fn_def("grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})),
+        fn_def("webfetch", "Fetch an HTTP(S) text resource. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds, maximum 120.", json!({"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["text","markdown","html"]},"timeout":{"type":"integer","minimum":1,"maximum":120}},"required":["url"]})),
+        fn_def("todowrite", "Replace and persist the session's todo list.", json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status","priority"]}}},"required":["todos"]})),
+        fn_def("question", "Ask one or more questions, with options, and wait for the user's answers.", json!({"type":"object","properties":{"questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"multiple":{"type":"boolean"},"custom":{"type":"boolean"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label","description"]}}},"required":["question","header","options"]}}},"required":["questions"]})),
+        fn_def("task", "Delegate to a subagent session. subagent_type selects an available subagent; task_id resumes a child from this session. Returns the child's session ID and result.", json!({"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"},"subagent_type":{"type":"string"},"task_id":{"type":"string"}},"required":["description","prompt","subagent_type"]})),
+        fn_def("skill", "Load the complete instructions and resource directory of an available skill by name.", json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]})),
     ]
 }
 
-fn fn_def(name: &str, desc: &str, params: Value) -> Value {
-    json!({"type": "function", "function": {"name": name, "description": desc, "parameters": params}})
+fn fn_def(name: &str, description: &str, parameters: Value) -> Value {
+    json!({"type":"function","function":{"name":name,"description":description,"parameters":parameters}})
 }
 
-fn cap_out(s: &str, max: usize) -> String {
-    let bytes = s.as_bytes();
-    if bytes.len() <= max {
-        return s.to_string();
+fn failure(message: impl Into<String>) -> ToolError {
+    ToolError { message: message.into(), denied: false }
+}
+
+fn required<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
+    input.get(key).and_then(Value::as_str).ok_or_else(|| failure(format!("{key} must be a string")))
+}
+
+pub fn resolve_path(directory: &str, path: &str) -> PathBuf {
+    let expanded = if path == "~" || path.starts_with("~/") {
+        std::env::var("HOME").map(|home| PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or(""))).unwrap_or_else(|_| PathBuf::from(path))
+    } else { PathBuf::from(path) };
+    let absolute = if expanded.is_absolute() { expanded } else { Path::new(directory).join(expanded) };
+    let absolute = if absolute.is_absolute() { absolute } else { std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(absolute) };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {},
+            Component::ParentDir => { normalized.pop(); },
+            other => normalized.push(other.as_os_str()),
+        }
     }
-    let half = max / 2;
-    let mut head = half;
-    while head > 0 && !s.is_char_boundary(head) {
-        head -= 1;
+    normalized
+}
+
+fn cap_out(value: &str, max: usize) -> String {
+    if value.len() <= max { return value.into(); }
+    let mut head = max / 2;
+    while head > 0 && !value.is_char_boundary(head) { head -= 1; }
+    let mut tail = value.len() - max / 2;
+    while tail < value.len() && !value.is_char_boundary(tail) { tail += 1; }
+    format!("{}\n\n[... {} bytes truncated ...]\n{}", &value[..head], tail - head, &value[tail..])
+}
+
+async fn cancelled(flag: Arc<AtomicBool>) {
+    while !flag.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let mut tail = bytes.len() - half;
-    while tail < bytes.len() && !s.is_char_boundary(tail) {
-        tail += 1;
-    }
-    format!("{}\n\n[... {} bytes truncated ...]\n{}", &s[..head], tail - head, &s[tail..])
 }
 
 pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOutput, ToolError> {
-    let err = |m: String| ToolError { message: m, denied: false };
+    if !input.is_object() { return Err(failure("Tool input must be an object")); }
+    if ctx.cancel.load(Ordering::Acquire) { return Err(failure("Tool cancelled")); }
     match name {
         "bash" => {
-            let cmd = input["command"].as_str().ok_or_else(|| err("no command".into()))?;
-            let timeout = input["timeout"].as_u64().unwrap_or(120);
-            let out = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout),
-                tokio::process::Command::new("bash")
-                    .arg("-c")
-                    .arg(cmd)
-                    .current_dir(&ctx.dir)
-                    .output(),
-            )
-            .await
-            .map_err(|_| err(format!("command timed out after {timeout}s")))?
-            .map_err(|e| err(format!("spawn failed: {e}")))?;
-            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-            let se = String::from_utf8_lossy(&out.stderr).to_string();
-            if !se.is_empty() {
-                text.push_str(&format!("\n[stderr]\n{se}"));
-            }
-            if !out.status.success() {
-                text.push_str(&format!("\n[exit code: {}]", out.status.code().unwrap_or(-1)));
-            }
-            Ok(ToolOutput { output: cap_out(&text, 50 * 1024), title: cmd.chars().take(60).collect() })
-        }
-        "read" => {
-            let path = input["filePath"].as_str().ok_or_else(|| err("no filePath".into()))?;
-            let content = std::fs::read_to_string(path).map_err(|e| err(format!("read failed: {e}")))?;
-            let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
-            let limit = input["limit"].as_u64().unwrap_or(2000) as usize;
-            let lines: Vec<&str> = content.lines().collect();
-            let mut text = lines
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(i, _)| *i + 1 >= offset && *i + 1 < offset + limit)
-                .map(|(i, l)| format!("{}: {}", i + 1, l))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let remaining = lines.len().saturating_sub(offset + limit - 1);
-            if remaining > 0 {
-                text.push_str(&format!("\n[truncated: {remaining} more lines]"));
-            }
-            Ok(ToolOutput { output: cap_out(&text, 200 * 1024), title: path.to_string() })
-        }
-        "write" => {
-            let path = input["filePath"].as_str().ok_or_else(|| err("no filePath".into()))?;
-            let content = input["content"].as_str().ok_or_else(|| err("no content".into()))?;
-            if let Some(p) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(p).ok();
-            }
-            std::fs::write(path, content).map_err(|e| err(format!("write failed: {e}")))?;
-            Ok(ToolOutput { output: format!("wrote {path}"), title: path.to_string() })
-        }
-        "edit" => {
-            let path = input["filePath"].as_str().ok_or_else(|| err("no filePath".into()))?;
-            let old = input["oldString"].as_str().ok_or_else(|| err("no oldString".into()))?;
-            let new = input["newString"].as_str().ok_or_else(|| err("no newString".into()))?;
-            let all = input["replaceAll"].as_bool().unwrap_or(false);
-            let raw = std::fs::read_to_string(path).map_err(|e| err(format!("read failed: {e}")))?;
-            let crlf = raw.contains("\r\n");
-            let content = if crlf { raw.replace("\r\n", "\n") } else { raw.clone() };
-            let old_n = old.replace("\r\n", "\n");
-            let new_n = new.replace("\r\n", "\n");
-            let count = content.matches(old_n.as_str()).count();
-            if count == 0 {
-                return Err(err("oldString not found in file".into()));
-            }
-            if count > 1 && !all {
-                return Err(err(format!("found {count} matches for oldString, not unique")));
-            }
-            let updated = if all {
-                content.replace(old_n.as_str(), new_n.as_str())
-            } else {
-                content.replacen(old_n.as_str(), new_n.as_str(), 1)
+            let command = required(input, "command")?;
+            let timeout = match input.get("timeout") {
+                None | Some(Value::Null) => 120_000,
+                Some(value) => value.as_u64().filter(|v| *v > 0 && *v <= 600_000).ok_or_else(|| failure("timeout must be 1..600000 milliseconds"))?,
             };
-            let out = if crlf { updated.replace("\n", "\r\n") } else { updated };
-            std::fs::write(path, out).map_err(|e| err(format!("write failed: {e}")))?;
-            Ok(ToolOutput { output: format!("edited {path}"), title: path.to_string() })
+            let directory = resolve_path(&ctx.dir, input["workdir"].as_str().or_else(|| input["cwd"].as_str()).unwrap_or("."));
+            process::shell(command, &directory, Duration::from_millis(timeout), ctx.cancel.clone()).await
         }
-        "glob" => {
-            let pattern = input["pattern"].as_str().ok_or_else(|| err("no pattern".into()))?;
-            let base = input["path"].as_str().unwrap_or(&ctx.dir);
-            let mut files: Vec<(std::time::SystemTime, String)> = Vec::new();
-            for entry in glob::glob(&format!("{base}/{pattern}")).map_err(|e| err(e.to_string()))? {
-                if let Ok(p) = entry {
-                    if !p.is_file() {
-                        continue;
-                    }
-                    if p.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
-                        continue;
-                    }
-                    let mt = p.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    files.push((mt, p.to_string_lossy().to_string()));
-                }
-            }
-            files.sort_by(|a, b| b.0.cmp(&a.0));
-            let out = files.into_iter().take(100).map(|(_, p)| p).collect::<Vec<_>>().join("\n");
-            Ok(ToolOutput { output: out, title: pattern.to_string() })
+        "read" | "write" | "edit" | "glob" | "grep" => {
+            let directory = ctx.dir.clone();
+            let name = name.to_owned();
+            let input = input.clone();
+            let cancel = ctx.cancel.clone();
+            tokio::task::spawn_blocking(move || files::run(&directory, &name, &input, &cancel)).await.map_err(|e| failure(format!("File operation failed: {e}")))?
         }
-        "grep" => {
-            const SKIP_DIRS: [&str; 3] = [".git", "node_modules", "target"];
-            let pattern = input["pattern"].as_str().ok_or_else(|| err("no pattern".into()))?;
-            let base = input["path"].as_str().unwrap_or(&ctx.dir).to_string();
-            let include = input["include"].as_str().unwrap_or("").to_string();
-            let re = regex::Regex::new(pattern).map_err(|e| err(format!("bad regex: {e}")))?;
-            let mut out = String::new();
-            let mut hits = 0usize;
-            for entry in walkdir::WalkDir::new(&base).into_iter().filter_map(|e| e.ok()) {
-                if hits >= 100 {
-                    break;
-                }
-                let p = entry.path();
-                if !p.is_file() {
-                    continue;
-                }
-                if p.components().any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref())) {
-                    continue;
-                }
-                if !include.is_empty()
-                    && !p.file_name().map(|n| glob::Pattern::new(&include).map(|g| g.matches(&n.to_string_lossy())).unwrap_or(false)).unwrap_or(false)
-                {
-                    continue;
-                }
-                let raw = match std::fs::read(p) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if raw.contains(&0) {
-                    continue;
-                }
-                let content = String::from_utf8_lossy(&raw);
-                for (i, line) in content.lines().enumerate() {
-                    if re.is_match(line) {
-                        out.push_str(&format!("{}:{}:{}\n", p.display(), i + 1, line));
-                        hits += 1;
-                        if hits >= 100 {
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(ToolOutput { output: out, title: pattern.to_string() })
+        "apply_patch" | "patch" => {
+            let text = input["patchText"].as_str().or_else(|| input["patch"].as_str()).ok_or_else(|| failure("patchText must be a string"))?.to_owned();
+            let directory = ctx.dir.clone();
+            let cancel = ctx.cancel.clone();
+            tokio::task::spawn_blocking(move || patch::apply(&directory, &text, &cancel)).await.map_err(|e| failure(format!("Patch operation failed: {e}")))?
         }
-        "webfetch" => {
-            let url = input["url"].as_str().ok_or_else(|| err("no url".into()))?;
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| err(format!("client failed: {e}")))?;
-            let resp = client.get(url).send().await.map_err(|e| err(format!("fetch failed: {e}")))?;
-            let body = resp.text().await.map_err(|e| err(format!("read failed: {e}")))?;
-            Ok(ToolOutput { output: cap_out(&body, 200 * 1024), title: url.to_string() })
-        }
+        "webfetch" => web::fetch(input, ctx.cancel.clone()).await,
         "todowrite" => {
-            let todos = input["todos"].clone();
-            let out = todos
-                .as_array()
-                .map(|a| a.iter().map(|t| format!("[{}] {}", t["status"], t["content"])).collect::<Vec<_>>().join("\n"))
-                .unwrap_or_default();
-            Ok(ToolOutput { output: out, title: "todos".into() })
+            let todos = input["todos"].as_array().ok_or_else(|| failure("todos must be an array"))?;
+            for todo in todos {
+                if !todo["content"].as_str().is_some_and(|text| !text.trim().is_empty()) || !matches!(todo["status"].as_str(), Some("pending" | "in_progress" | "completed" | "cancelled")) || !matches!(todo["priority"].as_str(), Some("high" | "medium" | "low")) {
+                    return Err(failure("Each todo needs nonempty content, a valid status, and high/medium/low priority"));
+                }
+            }
+            ctx.app.store.set_todos(&ctx.session_id, &input["todos"]).map_err(failure)?;
+            bus().emit("todo.updated", json!({"sessionID":ctx.session_id,"todos":todos}));
+            Ok(ToolOutput {
+                output: serde_json::to_string_pretty(todos).map_err(|e| failure(e.to_string()))?,
+                title: format!("{} todos", todos.len()), metadata: json!({"todos":todos}),
+            })
         }
-        "question" => {
-            let qs = input["questions"].as_array().cloned().unwrap_or_default();
-            let first = qs.first().cloned().unwrap_or(json!([]));
-            let (req, rx) = ctx.app.questions.ask(&ctx.session_id, first);
-            bus().emit("question.asked", json!({"id": req.id, "sessionID": req.session_id, "questions": req.questions}));
-            let answers = rx.await.map_err(|_| ToolError { message: "question cancelled".into(), denied: false })?;
-            let text = answers
-                .map(|a| a.iter().map(|v| v.join(", ")).collect::<Vec<_>>().join("\n"))
-                .unwrap_or_else(|| "user dismissed".into());
-            Ok(ToolOutput { output: text, title: "question".into() })
-        }
-        "task" => {
-            let prompt = input["prompt"].as_str().ok_or_else(|| err("no prompt".into()))?;
-            let desc = input["description"].as_str().unwrap_or("task");
-            let parent = ctx
-                .app
-                .store
-                .get_session(&ctx.session_id)
-                .ok_or_else(|| err("no session".into()))?;
-            let (provider, model) = ctx
-                .app
-                .store
-                .messages(&ctx.session_id)
-                .into_iter()
-                .rev()
-                .find_map(|m| {
-                    if m.info.role == "user" {
-                        Some((m.info.provider_id?, m.info.model_id?))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-            let child = crate::types::Session {
-                id: hex_id("ses_"),
-                slug: crate::types::slug(),
-                project_id: parent.project_id.clone(),
-                directory: parent.directory.clone(),
-                path: parent.path.clone(),
-                cost: 0.0,
-                tokens: crate::types::Tokens::default(),
-                title: format!("[{desc}]"),
-                version: parent.version.clone(),
-                time: crate::types::Time { created: crate::types::now_ms(), updated: None },
-                parent_id: Some(parent.id.clone()),
-                permission: None,
-            };
-            ctx.app.store.create_session(&child);
-            bus().emit("session.created", json!({"info": child}));
-            let res = ctx
-                .engine
-                .run_sync(ctx.app.clone(), child.id.clone(), model, provider, prompt.to_string(), Some("general".into()), None)
-                .await
-                .map_err(|e| ToolError { message: e, denied: false })?;
-            let text = res["parts"]
-                .as_array()
-                .map(|ps| ps.iter().filter(|p| p["type"] == "text").map(|p| p["text"].as_str().unwrap_or_default()).collect::<Vec<_>>().join(""))
-                .unwrap_or_else(|| res.to_string());
-            Ok(ToolOutput { output: text, title: desc.to_string() })
+        "question" => question(ctx, input).await,
+        "task" => task(ctx, input).await,
+        "skill" => {
+            let name = input["name"].as_str().or_else(|| input["id"].as_str()).ok_or_else(|| failure("name must be a string"))?;
+            let paths = ctx.app.config.lock().unwrap().skill_paths();
+            skills::load(&ctx.dir, &paths, name)
         }
         _ => {
-            if let Some((server, tool)) = ctx.app.mcp.route(name) {
-                return ctx
-                    .app
-                    .mcp
-                    .call(&server, &tool, input.clone())
-                    .map(|output| ToolOutput { output, title: format!("{server}/{tool}") })
-                    .map_err(|e| ToolError { message: e, denied: false });
-            }
-            Err(err(format!("unknown tool: {name}")))
+            let (server, tool) = ctx.app.mcp.route(name).ok_or_else(|| failure(format!("Unknown tool {name:?}")))?;
+            let result = ctx.app.mcp.call_result_async(&server, &tool, input.clone(), ctx.cancel.clone()).await.map_err(failure)?;
+            let output = crate::mcp::render_result(&result);
+            let attachments: Vec<Value> = result["content"].as_array().map(|items| items.iter().filter(|item| {
+                matches!(item["type"].as_str(), Some("image" | "audio")) || item["type"] == "resource" && item["resource"]["blob"].is_string()
+            }).cloned().collect()).unwrap_or_default();
+            let truncated = output.len() > 200 * 1024;
+            Ok(ToolOutput { output: cap_out(&output, 200 * 1024), title: format!("{server}/{tool}"), metadata: json!({"server":server,"tool":tool,"truncated":truncated,"attachments":attachments}) })
         }
     }
 }
 
-pub fn skill_list() -> Vec<Value> {
-    skill_list_in(None)
+struct QuestionGuard {
+    state: crate::engine::question::QuestionState,
+    id: String,
+}
+impl Drop for QuestionGuard {
+    fn drop(&mut self) { self.state.reject(&self.id); }
 }
 
-pub fn skill_list_in(dir: Option<&str>) -> Vec<Value> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut roots = vec![
-        format!("{home}/.config/opencode/skill"),
-        format!("{home}/.config/opencode/skills"),
-    ];
-    if let Some(d) = dir {
-        roots.push(format!("{d}/.opencode/skill"));
-        roots.push(format!("{d}/.opencode/skills"));
-    }
-    let mut out: Vec<Value> = Vec::new();
-    for root in roots {
-        let Ok(rd) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in rd.filter_map(|e| e.ok()) {
-            let dir_name = entry.file_name().to_string_lossy().to_string();
-            let skill_md = entry.path().join("SKILL.md");
-            let Ok(content) = std::fs::read_to_string(&skill_md) else {
-                continue;
-            };
-            let mut name = dir_name.clone();
-            let mut description = String::new();
-            if let Some(rest) = content.strip_prefix("---") {
-                if let Some(end) = rest.find("\n---") {
-                    for line in rest[..end].lines() {
-                        if let Some(v) = line.strip_prefix("name:") {
-                            name = v.trim().trim_matches('"').to_string();
-                        }
-                        if let Some(v) = line.strip_prefix("description:") {
-                            description = v.trim().trim_matches('"').to_string();
-                        }
-                    }
-                }
-            }
-            if out.iter().any(|s| s["name"].as_str() == Some(name.as_str())) {
-                continue;
-            }
-            out.push(json!({"name": name, "description": description, "location": skill_md.to_string_lossy()}));
+async fn question(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
+    let questions = input["questions"].as_array().filter(|questions| !questions.is_empty()).ok_or_else(|| failure("questions must be a nonempty array"))?;
+    for question in questions {
+        if !question["question"].is_string() || !question["header"].is_string() || !question["options"].as_array().is_some_and(|options| options.iter().all(|option| option["label"].is_string() && option["description"].is_string())) {
+            return Err(failure("Every question needs question/header strings and an options array containing label/description strings"));
         }
     }
-    out
+    let (request, receiver) = ctx.app.questions.ask_for_tool(&ctx.session_id, Value::Array(questions.clone()), Some(json!({"messageID":ctx.message_id,"callID":ctx.call_id})));
+    let _guard = QuestionGuard { state: ctx.app.questions.clone(), id: request.id.clone() };
+    bus().emit("question.asked", serde_json::to_value(&request).map_err(|e| failure(e.to_string()))?);
+    let answers = tokio::select! {
+        answers = receiver => answers.map_err(|_| failure("Question cancelled"))?,
+        _ = cancelled(ctx.cancel.clone()) => return Err(failure("Question cancelled")),
+    }.ok_or_else(|| ToolError { message: "User dismissed the question".into(), denied: true })?;
+    let text = questions.iter().zip(&answers).map(|(question, answer)| format!("{}: {}", question["question"].as_str().unwrap_or_default(), answer.join(", "))).collect::<Vec<_>>().join("\n");
+    Ok(ToolOutput { output: text, title: "User answered".into(), metadata: json!({"questions":questions,"answers":answers}) })
+}
+
+struct ChildGuard {
+    engine: Arc<dyn EngineApi>,
+    session_id: String,
+    armed: bool,
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) { if self.armed { self.engine.abort(&self.session_id); } }
+}
+
+async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
+    let prompt = required(input, "prompt")?;
+    let description = required(input, "description")?;
+    let agent = required(input, "subagent_type")?;
+    if prompt.trim().is_empty() { return Err(failure("prompt must not be empty")); }
+    {
+        let config = ctx.app.config.lock().unwrap();
+        if !matches!(agent, "general" | "explore") && !config.agent.contains_key(agent) { return Err(failure(format!("Unknown subagent {agent:?}"))); }
+        if let Some(config) = config.agent.get(agent) {
+            if config["disable"] == true || config["mode"] == "primary" { return Err(failure(format!("Agent {agent:?} is unavailable as a subagent"))); }
+        }
+    }
+    let parent = ctx.app.store.get_session(&ctx.session_id).ok_or_else(|| failure("Parent session does not exist"))?;
+    let mut ancestor = parent.parent_id.clone();
+    let mut depth = 0;
+    while let Some(id) = ancestor {
+        depth += 1;
+        if depth >= 8 { return Err(failure("Subagent nesting limit (8) reached")); }
+        ancestor = ctx.app.store.get_session(&id).and_then(|session| session.parent_id);
+    }
+    let mut model = ctx.app.store.messages(&ctx.session_id).into_iter().rev().find_map(|message| {
+        message.info.model.or_else(|| Some(ModelRef { provider_id: message.info.provider_id?, model_id: message.info.model_id? }))
+    });
+    if let Some(selected) = ctx.app.config.lock().unwrap().agent.get(agent).and_then(|value| value["model"].as_str()) {
+        let (provider, selected) = selected.split_once('/').ok_or_else(|| failure("Subagent model must use provider/model syntax"))?;
+        if provider.is_empty() || selected.is_empty() { return Err(failure("Subagent model must use provider/model syntax")); }
+        model = Some(ModelRef { provider_id: provider.into(), model_id: selected.into() });
+    }
+    let child = if let Some(id) = input["task_id"].as_str() {
+        let child = ctx.app.store.get_session(id).ok_or_else(|| failure(format!("Task session {id:?} does not exist")))?;
+        if child.parent_id.as_deref() != Some(ctx.session_id.as_str()) { return Err(failure("task_id must identify a child of the current session")); }
+        child
+    } else {
+        let mut child = parent.clone();
+        child.id = hex_id("ses_");
+        child.slug = crate::types::slug();
+        child.title = description.chars().take(160).collect();
+        child.parent_id = Some(parent.id.clone());
+        child.cost = 0.0;
+        child.tokens = Default::default();
+        child.time = crate::types::Time { created: crate::types::now_ms(), updated: Some(crate::types::now_ms()), ..Default::default() };
+        child.extra.clear();
+        ctx.app.store.create_session(&child).map_err(failure)?;
+        bus().emit("session.created", json!({"info":child}));
+        child
+    };
+    {
+        let mut grants = ctx.app.always.lock().unwrap();
+        if let Some(inherited) = grants.get(&ctx.session_id).cloned() { grants.insert(child.id.clone(), inherited); }
+    }
+    ctx.update_metadata(json!({"sessionId":child.id,"model":model,"agent":agent}))?;
+    let request = PromptRequest { model: model.clone(), parts: vec![json!({"type":"text","text":prompt})], agent: Some(agent.into()), ..Default::default() };
+    let mut guard = ChildGuard { engine: ctx.engine.clone(), session_id: child.id.clone(), armed: true };
+    let result = tokio::select! {
+        result = ctx.engine.run_sync(ctx.app.clone(), child.id.clone(), request) => result.map_err(failure)?,
+        _ = cancelled(ctx.cancel.clone()) => return Err(failure("Subagent cancelled")),
+    };
+    guard.armed = false;
+    if let Some(error) = result["info"].get("error").filter(|error| !error.is_null()) { return Err(failure(format!("Subagent failed: {error}"))); }
+    let text = result["parts"].as_array().map(|parts| parts.iter().filter(|part| part["type"] == "text").filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    Ok(ToolOutput { output: format!("Task session: {}\n\n{text}", child.id), title: description.into(), metadata: json!({"sessionId":child.id,"model":model,"agent":agent}) })
+}
+
+pub fn skill_list() -> Vec<Value> { skills::list(None, &[]) }
+pub fn skill_list_in(directory: Option<&str>) -> Vec<Value> { skills::list(directory, &[]) }
+pub fn skill_list_with_paths(directory: Option<&str>, paths: &[String]) -> Vec<Value> { skills::list(directory, paths) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn truncation_preserves_unicode_boundaries() {
+        let text = "🙂".repeat(50_000);
+        let output = cap_out(&text, 101);
+        assert!(output.contains("truncated"));
+        assert!(output.starts_with('🙂'));
+        assert!(output.ends_with('🙂'));
+    }
+    #[test]
+    fn paths_resolve_against_session() {
+        assert_eq!(resolve_path("/tmp/project", "src/../test"), PathBuf::from("/tmp/project/test"));
+        assert_eq!(resolve_path("/tmp/project", "/elsewhere/file"), PathBuf::from("/elsewhere/file"));
+    }
+    #[test]
+    fn all_advertised_tools_have_schemas() {
+        let definitions = tool_defs();
+        for name in ["apply_patch", "skill", "bash", "read", "write", "edit", "glob", "grep", "webfetch", "todowrite", "question", "task"] {
+            assert!(definitions.iter().any(|tool| tool["function"]["name"] == name && tool["function"]["parameters"]["type"] == "object"));
+        }
+    }
 }

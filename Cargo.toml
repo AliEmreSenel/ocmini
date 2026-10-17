@@ -1,6 +1,6 @@
 [package]
 name = "ocmini"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -8,10 +8,10 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 futures = "0.3"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 rand = "0.9"
 base64 = "0.22"
 glob = "0.3"
@@ -19,16 +19,14 @@ walkdir = "2"
 regex = "1"
 async-trait = "0.1"
 async-stream = "0.3"
-crossterm = "0.28"
-chrono = "0.4"
+libc = "0.2"
+ignore = "0.4"
+serde_yaml = "0.9"
+html2text = { version = "0.17", default-features = false }
 
 [[bin]]
 name = "ocmini"
 path = "src/main.rs"
-
-[[bin]]
-name = "ocmini-fuzz"
-path = "src/bin/fuzz.rs"
 
 [profile.release]
 lto = "fat"

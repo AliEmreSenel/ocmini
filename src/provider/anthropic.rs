@@ -1,224 +1,274 @@
-use super::{ChatRequest, ProviderAdapter};
-use crate::auth::{AuthEntry, AuthStore};
-use crate::config::ProviderCfg;
+use super::{error_message, json_response, read_response, ChatRequest, EventStream, Settings};
 use crate::types::{ProviderEvent, Tokens};
 use async_stream::stream;
-use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub struct AnthropicAdapter {
-    pub base_url: String,
-    pub api_key: String,
+fn source(url: &str, mime: &str) -> Result<Value, String> {
+    if let Some(data) = url.strip_prefix("data:") {
+        let (header, data) = data.split_once(',').ok_or("malformed data URL attachment")?;
+        if !header.ends_with(";base64") { return Err("Anthropic attachments must use base64 data URLs".into()); }
+        return Ok(json!({"type":"base64","media_type":header.trim_end_matches(";base64"),"data":data}));
+    }
+    if url.starts_with("https://") || url.starts_with("http://") { return Ok(json!({"type":"url","url":url})); }
+    Err(format!("unsupported {mime} attachment source; use a data URL or HTTPS URL"))
 }
 
-impl AnthropicAdapter {
-    pub fn new(_provider_id: &str, cfg: Option<&ProviderCfg>, auth: &AuthStore) -> Self {
-        let mut base_url = cfg.map(|c| c.options.base_url.clone()).unwrap_or_default();
-        if base_url.is_empty() {
-            base_url = "https://api.anthropic.com/v1".to_string();
-        }
-        let mut api_key = cfg.map(|c| c.options.api_key.clone()).unwrap_or_default();
-        if api_key.is_empty() {
-            if let Some(AuthEntry::Api { key }) = auth.get("anthropic") {
-                api_key = key.clone();
-            } else if let Some(AuthEntry::Oauth { access, .. }) = auth.get("anthropic") {
-                api_key = access.clone();
+fn content_blocks(content: &Value) -> Result<Vec<Value>, String> {
+    if let Some(text) = content.as_str() { return Ok(if text.is_empty() { Vec::new() } else { vec![json!({"type":"text","text":text})] }); }
+    if content.is_null() { return Ok(Vec::new()); }
+    let parts = content.as_array().ok_or("message content must be text or an array of parts")?;
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part["type"].as_str().unwrap_or_default() {
+            "text" | "input_text" | "output_text" => {
+                let text = part["text"].as_str().ok_or("text attachment is missing text")?;
+                if !text.is_empty() { blocks.push(json!({"type":"text","text":text})); }
             }
-        }
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
+            "image_url" | "input_image" => {
+                let url = part["image_url"]["url"].as_str().or_else(|| part["image_url"].as_str()).ok_or("image attachment is missing its URL")?;
+                blocks.push(json!({"type":"image","source":source(url, "image")?}));
+            }
+            "file" | "input_file" => {
+                let file = part.get("file").unwrap_or(part);
+                let url = file["file_data"].as_str().or_else(|| file["file_url"].as_str()).ok_or("file attachment is missing file_data/file_url")?;
+                let mut block = json!({"type":"document","source":source(url, "document")?});
+                if let Some(title) = file["filename"].as_str() { block["title"] = json!(title); }
+                blocks.push(block);
+            }
+            "image" | "document" => blocks.push(part.clone()),
+            other => return Err(format!("Anthropic does not support message part type {other}")),
         }
     }
+    Ok(blocks)
 }
 
-fn openai_to_anthropic(req: &ChatRequest) -> Value {
+fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String> {
     let mut messages: Vec<Value> = Vec::new();
-    for m in &req.messages {
-        let role = m["role"].as_str().unwrap_or("user");
-        let content = &m["content"];
-        if role == "tool" {
-            let call_id = m["tool_call_id"].as_str().unwrap_or_default();
-            messages.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id, "content": content}]}));
-        } else if let Some(tcs) = m["tool_calls"].as_array() {
-            let mut blocks: Vec<Value> = Vec::new();
-            if let Some(txt) = content.as_str() {
-                if !txt.is_empty() {
-                    blocks.push(json!({"type": "text", "text": txt}));
-                }
-            }
-            for tc in tcs {
-                blocks.push(json!({
-                    "type": "tool_use",
-                    "id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "input": serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
-                }));
-            }
-            messages.push(json!({"role": "assistant", "content": blocks}));
+    for message in &req.messages {
+        let role = message["role"].as_str().ok_or("message has no role")?;
+        if role == "system" || role == "developer" { continue; }
+        let mut blocks = if role == "tool" {
+            vec![json!({"type":"tool_result","tool_use_id":message["tool_call_id"],"content":content_blocks(&message["content"])?,"is_error":message["is_error"].as_bool().unwrap_or(false)})]
+        } else if role == "assistant" && message["providerMetadata"]["provider"] == "anthropic" {
+            message["providerMetadata"]["content"].as_array().cloned().ok_or("invalid stored Anthropic message metadata")?
         } else {
-            messages.push(json!({"role": role, "content": content}));
+            let mut blocks = content_blocks(&message["content"])?;
+            if let Some(calls) = message["tool_calls"].as_array() {
+                for call in calls {
+                    let input: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}")).map_err(|e| format!("invalid stored tool arguments: {e}"))?;
+                    blocks.push(json!({"type":"tool_use","id":call["id"],"name":call["function"]["name"],"input":input}));
+                }
+            }
+            blocks
+        };
+        if blocks.is_empty() { continue; }
+        let role = if role == "tool" { "user" } else { role };
+        if !["user", "assistant"].contains(&role) { return Err(format!("unsupported Anthropic message role {role}")); }
+        if let Some(previous) = messages.last_mut().filter(|m| m["role"] == role) {
+            previous["content"].as_array_mut().unwrap().append(&mut blocks);
+        } else { messages.push(json!({"role":role,"content":blocks})); }
+    }
+    let max_output = settings.options["maxTokens"].as_u64().or_else(|| settings.options["maxOutputTokens"].as_u64()).or(settings.max_output).unwrap_or(16_000).max(1);
+    let mut body = json!({"model":settings.api_model,"max_tokens":max_output,"stream":true,"messages":messages});
+    if !req.system.is_empty() { body["system"] = json!(req.system); }
+    if settings.tools_supported && !req.tools.is_empty() {
+        body["tools"] = json!(req.tools.iter().map(|tool| json!({"name":tool["function"]["name"],"description":tool["function"]["description"],"input_schema":tool["function"]["parameters"]})).collect::<Vec<_>>());
+    }
+    for (key, wire) in [("temperature", "temperature"), ("topP", "top_p"), ("topK", "top_k"), ("stopSequences", "stop_sequences"), ("thinking", "thinking"), ("output_config", "output_config"), ("tool_choice", "tool_choice"), ("metadata", "metadata")] {
+        if let Some(value) = settings.options.get(key) { body[wire] = value.clone(); }
+    }
+    if let Some(budget) = body["thinking"]["budgetTokens"].as_u64() {
+        body["thinking"].as_object_mut().unwrap().remove("budgetTokens");
+        body["thinking"]["budget_tokens"] = json!(budget);
+    }
+    if body.get("thinking").is_none() {
+        if let Some(variant) = super::reasoning_effort(settings, req).filter(|variant| *variant != "none") {
+            let budget = match variant { "minimal" | "low" => 1024, "medium" => 4096, "high" => 8192, "xhigh" => 16384, _ => 24576 };
+            let max = max_output.max(budget + 1024);
+            body["max_tokens"] = json!(max);
+            body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
         }
     }
-    let mut body = json!({
-        "model": req.model,
-        "max_tokens": 16000,
-        "stream": true,
-        "system": req.system,
-        "messages": messages,
-        "tools": req.tools.iter().map(|t| json!({
-            "name": t["function"]["name"],
-            "description": t["function"]["description"],
-            "input_schema": t["function"]["parameters"],
-        })).collect::<Vec<_>>(),
-    });
-    if let Some(v) = req.variant.as_deref().filter(|v| *v != "none") {
-        let budget = match v {
-            "low" => 1024,
-            "medium" => 4096,
-            "high" => 10240,
-            _ => 24576,
-        };
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    if body["thinking"]["type"] == "enabled" {
         body["temperature"] = json!(1);
-    }
-    body
-}
-
-fn map_stop_reason(r: &str) -> String {
-    match r {
-        "tool_use" => "tool_calls".to_string(),
-        "max_tokens" => "length".to_string(),
-        "end_turn" | "stop_sequence" => "stop".to_string(),
-        other => other.to_string(),
-    }
-}
-
-#[async_trait]
-impl ProviderAdapter for AnthropicAdapter {
-    async fn stream(
-        &self,
-        req: ChatRequest,
-    ) -> Result<Box<dyn futures::Stream<Item = ProviderEvent> + Send + Unpin>, String> {
-        let resp = reqwest::Client::new()
-            .post(format!("{}/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&openai_to_anthropic(&req))
-            .send()
-            .await
-            .map_err(|e| format!("anthropic request failed: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("anthropic {status}: {text}"));
+        if body["thinking"]["budget_tokens"].as_u64().unwrap_or(0) >= body["max_tokens"].as_u64().unwrap_or(0) {
+            return Err("Anthropic thinking budget_tokens must be smaller than max_tokens".into());
         }
-        let bytes = resp.bytes_stream();
-        let s = stream! {
-            let mut bytes = bytes;
-            let mut buf = String::new();
-            let mut usage = Tokens::default();
-            let mut tool_blocks: BTreeMap<u64, (String, String, String)> = Default::default();
-            let mut finish = String::new();
-            let mut done = false;
-            while let Some(chunk) = bytes.next().await {
-                match chunk {
-                    Ok(c) => buf.push_str(&String::from_utf8_lossy(&c)),
-                    Err(e) => {
-                        yield ProviderEvent::Error(format!("stream error: {e}"));
-                        done = true;
-                        break;
-                    }
-                }
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf[..nl].trim().to_string();
-                    buf.drain(..=nl);
-                    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                        continue;
-                    };
-                    let Ok(v) = serde_json::from_str::<Value>(data) else {
-                        continue;
-                    };
-                    match v["type"].as_str().unwrap_or_default() {
-                        "content_block_delta" => match &v["delta"] {
-                            d if d["type"] == "text_delta" => {
-                                let t = d["text"].as_str().unwrap_or_default();
-                                if !t.is_empty() {
-                                    yield ProviderEvent::TextDelta(t.to_string());
-                                }
-                            }
-                            d if d["type"] == "thinking_delta" => {
-                                let t = d["thinking"].as_str().unwrap_or_default();
-                                if !t.is_empty() {
-                                    yield ProviderEvent::ReasoningDelta(t.to_string());
-                                }
-                            }
-                            d if d["type"] == "input_json_delta" => {
-                                let idx = v["index"].as_u64().unwrap_or(0);
-                                let e = tool_blocks
-                                    .entry(idx)
-                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
-                                e.2.push_str(d["partial_json"].as_str().unwrap_or_default());
-                            }
-                            _ => {}
-                        },
-                        "content_block_start" => {
-                            if v["content_block"]["type"] == "tool_use" {
-                                let idx = v["index"].as_u64().unwrap_or(0);
-                                tool_blocks.insert(
-                                    idx,
-                                    (
-                                        v["content_block"]["id"].as_str().unwrap_or_default().to_string(),
-                                        v["content_block"]["name"].as_str().unwrap_or_default().to_string(),
-                                        String::new(),
-                                    ),
-                                );
-                            }
-                        }
-                        "message_start" => {
-                            let u = &v["message"]["usage"];
-                            usage.input = u["input_tokens"].as_i64().unwrap_or(0);
-                            usage.cache.read = u["cache_read_input_tokens"].as_i64().unwrap_or(0);
-                            usage.cache.write = u["cache_creation_input_tokens"].as_i64().unwrap_or(0);
-                        }
-                        "message_delta" => {
-                            usage.output = v["usage"]["output_tokens"].as_i64().unwrap_or(usage.output);
-                            if let Some(sr) = v["delta"]["stop_reason"].as_str() {
-                                finish = sr.to_string();
-                            }
-                        }
-                        "message_stop" => {
-                            done = true;
-                            break;
-                        }
-                        "error" => {
-                            yield ProviderEvent::Error(
-                                v["error"]["message"].as_str().unwrap_or("anthropic error").to_string(),
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                if done {
-                    break;
-                }
-            }
-            for (_, (id, name, args)) in tool_blocks {
-                if !name.is_empty() {
-                    yield ProviderEvent::ToolCallStart {
-                        call_id: id,
-                        name,
-                        args: if args.is_empty() { "{}".into() } else { args },
-                    };
-                }
-            }
-            yield ProviderEvent::Finished {
-                finish: if finish.is_empty() { "stop".to_string() } else { map_stop_reason(&finish) },
-                usage,
+    }
+    settings.overlay_body(&mut body);
+    body["model"] = json!(settings.api_model);
+    body["stream"] = json!(true);
+    if !settings.tools_supported { body.as_object_mut().unwrap().remove("tools"); body.as_object_mut().unwrap().remove("tool_choice"); }
+    Ok(body)
+}
+
+pub(super) async fn stream(settings: Settings, req: ChatRequest) -> Result<EventStream, String> {
+    let response = settings.send("messages", &request_body(&settings, &req)?).await?;
+    let json = json_response(&response);
+    let stream = stream! {
+        let mut state = MessageState::default();
+        if json {
+            let value = match read_response(response, settings.chunk_timeout, 16 * 1024 * 1024).await.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("invalid Anthropic JSON response: {e}"))) {
+                Ok(value) => value,
+                Err(error) => { yield ProviderEvent::Error(error); return; }
             };
-        };
-        { let boxed: Box<dyn futures::Stream<Item = ProviderEvent> + Send + Unpin> = Box::new(Box::pin(s)); Ok(boxed) }
+            if value.get("error").is_some_and(|error| !error.is_null()) { yield ProviderEvent::Error(error_message(&value)); return; }
+            if !value["content"].is_array() || !value["stop_reason"].is_string() { yield ProviderEvent::Error("Anthropic JSON response is not a completed message".into()); return; }
+            state.update_usage(&value["usage"]);
+            state.finish = value["stop_reason"].as_str().map(String::from);
+            if let Some(blocks) = value["content"].as_array() {
+                for (index, block) in blocks.iter().enumerate() {
+                    match state.consume(&json!({"type":"content_block_start","index":index,"content_block":block})) {
+                        Ok(events) => { for event in events { yield event; } }
+                        Err(error) => { yield ProviderEvent::Error(error); return; }
+                    }
+                }
+            }
+            state.terminal = true;
+        } else {
+            let mut frames = super::sse::frames(response, settings.chunk_timeout);
+            while let Some(frame) = frames.next().await {
+                let frame = match frame { Ok(frame) => frame, Err(error) => { yield ProviderEvent::Error(error); return; } };
+                if frame.data.trim().is_empty() { continue; }
+                let mut value: Value = match serde_json::from_str(&frame.data) {
+                    Ok(value) => value,
+                    Err(error) => { yield ProviderEvent::Error(format!("invalid Anthropic SSE JSON: {error}")); return; }
+                };
+                if value.get("type").is_none() { value["type"] = json!(frame.event); }
+                match state.consume(&value) {
+                    Ok(events) => { for event in events { yield event; } }
+                    Err(error) => { yield ProviderEvent::Error(error); return; }
+                }
+                if state.terminal { break; }
+            }
+        }
+        match state.finish(&settings.api_model) {
+            Ok(events) => { for event in events { yield event; } }
+            Err(error) => yield ProviderEvent::Error(error),
+        }
+    };
+    Ok(Box::new(Box::pin(stream)))
+}
+
+#[derive(Default)]
+struct MessageState {
+    blocks: BTreeMap<u64, Value>,
+    arguments: BTreeMap<u64, String>,
+    usage: Tokens,
+    finish: Option<String>,
+    terminal: bool,
+}
+
+impl MessageState {
+    fn update_usage(&mut self, usage: &Value) {
+        if let Some(value) = usage["input_tokens"].as_i64() { self.usage.input = value.max(0); }
+        if let Some(value) = usage["output_tokens"].as_i64() { self.usage.output = value.max(0); }
+        if let Some(value) = usage["cache_read_input_tokens"].as_i64() { self.usage.cache.read = value.max(0); }
+        if let Some(value) = usage["cache_creation_input_tokens"].as_i64() { self.usage.cache.write = value.max(0); }
+        if let Some(value) = usage["output_tokens_details"]["thinking_tokens"].as_i64() { self.usage.reasoning = value.max(0); }
+    }
+
+    fn consume(&mut self, value: &Value) -> Result<Vec<ProviderEvent>, String> {
+        let index = value["index"].as_u64().unwrap_or(0);
+        if index > 4096 { return Err("Anthropic content block index exceeds limit".into()); }
+        let mut events = Vec::new();
+        match value["type"].as_str().unwrap_or_default() {
+            "error" => return Err(error_message(value)),
+            "message_start" => self.update_usage(&value["message"]["usage"]),
+            "content_block_start" => {
+                let block = value["content_block"].clone();
+                if !block.is_object() { return Err("Anthropic returned an invalid content block".into()); }
+                if let Some(text) = block["text"].as_str().filter(|text| !text.is_empty()) { events.push(ProviderEvent::TextDelta(text.into())); }
+                if let Some(thinking) = block["thinking"].as_str().filter(|text| !text.is_empty()) { events.push(ProviderEvent::ReasoningDelta(thinking.into())); }
+                self.blocks.insert(index, block);
+            }
+            "content_block_delta" => {
+                let block = self.blocks.get_mut(&index).ok_or("Anthropic delta refers to an unknown content block")?;
+                let delta = &value["delta"];
+                let key = match delta["type"].as_str().unwrap_or_default() {
+                    "text_delta" => Some("text"),
+                    "thinking_delta" => Some("thinking"),
+                    "signature_delta" => Some("signature"),
+                    "input_json_delta" => {
+                        let args = self.arguments.entry(index).or_default();
+                        args.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                        if args.len() > 16 * 1024 * 1024 { return Err("Anthropic tool arguments exceed 16 MiB".into()); }
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    let text = delta[key].as_str().unwrap_or_default();
+                    let mut combined = block[key].as_str().unwrap_or_default().to_string();
+                    combined.push_str(text);
+                    block[key] = json!(combined);
+                    if key == "text" && !text.is_empty() { events.push(ProviderEvent::TextDelta(text.into())); }
+                    if key == "thinking" && !text.is_empty() { events.push(ProviderEvent::ReasoningDelta(text.into())); }
+                }
+            }
+            "content_block_stop" => self.finish_arguments(index)?,
+            "message_delta" => {
+                self.update_usage(&value["usage"]);
+                if let Some(reason) = value["delta"]["stop_reason"].as_str() { self.finish = Some(reason.into()); }
+            }
+            "message_stop" => self.terminal = true,
+            _ => {}
+        }
+        Ok(events)
+    }
+
+    fn finish_arguments(&mut self, index: u64) -> Result<(), String> {
+        if let Some(arguments) = self.arguments.remove(&index) {
+            let arguments: Value = serde_json::from_str(&arguments).map_err(|e| format!("Anthropic tool arguments are incomplete or invalid: {e}"))?;
+            if !arguments.is_object() { return Err("Anthropic tool arguments must be a JSON object".into()); }
+            self.blocks.get_mut(&index).ok_or("Anthropic tool block is missing")?["input"] = arguments;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, model: &str) -> Result<Vec<ProviderEvent>, String> {
+        if !self.terminal { return Err("Anthropic stream ended before message_stop".into()); }
+        let pending: Vec<_> = self.arguments.keys().copied().collect();
+        for index in pending { self.finish_arguments(index)?; }
+        let mut events = Vec::new();
+        for block in self.blocks.values() {
+            if block["type"] == "tool_use" {
+                let id = block["id"].as_str().filter(|id| !id.is_empty()).ok_or("Anthropic tool call has no ID")?;
+                let name = block["name"].as_str().filter(|name| !name.is_empty()).ok_or("Anthropic tool call has no name")?;
+                if !block["input"].is_object() { return Err("Anthropic tool call input is not an object".into()); }
+                events.push(ProviderEvent::ToolCallStart { call_id: id.into(), name: name.into(), args: block["input"].to_string() });
+            }
+        }
+        let finish = match self.finish.as_deref().unwrap_or("end_turn") {
+            "tool_use" => "tool-calls", "max_tokens" => "length", "end_turn" | "stop_sequence" => "stop", "refusal" => "content-filter", other => other,
+        }.to_string();
+        self.usage.reasoning = self.usage.reasoning.min(self.usage.output);
+        self.usage.output -= self.usage.reasoning;
+        events.push(ProviderEvent::Metadata(json!({"provider":"anthropic","model":model,"content":self.blocks.into_values().collect::<Vec<_>>()})));
+        events.push(ProviderEvent::Finished { finish, usage: self.usage });
+        Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preserves_signed_thinking_and_split_tool_input() {
+        let mut state = MessageState::default();
+        for event in [json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}), json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"consider"}}), json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque"}}), json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call","name":"read","input":{}}}), json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"filePath\":\"a\"}"}}), json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}), json!({"type":"message_stop"})] { state.consume(&event).unwrap(); }
+        let events = state.finish("model").unwrap();
+        assert!(matches!(&events[0], ProviderEvent::ToolCallStart { args, .. } if args == "{\"filePath\":\"a\"}"));
+        assert!(matches!(&events[1], ProviderEvent::Metadata(value) if value["content"][0]["signature"] == "opaque"));
+    }
+    #[test]
+    fn maps_pdf_and_image_attachments() {
+        let blocks = content_blocks(&json!([{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"file","file":{"file_data":"data:application/pdf;base64,BBBB","filename":"spec.pdf"}}])).unwrap();
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["type"], "document");
+        assert_eq!(blocks[1]["source"]["media_type"], "application/pdf");
+        assert!(MessageState::default().finish("m").is_err());
     }
 }

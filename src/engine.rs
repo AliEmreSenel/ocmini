@@ -3,62 +3,77 @@ use crate::bus::Bus;
 use crate::config::Config;
 use crate::mcp::McpHub;
 use crate::permission::PermissionState;
-use self::question::QuestionState;
 use crate::store::Store;
+use crate::types::{ModelRef, PromptRequest};
 use crate::usage_db::UsageDb;
+use self::question::QuestionState;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 
 pub mod question {
     use crate::types::QuestionRequest;
+    use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
 
+    type Answer = Option<Vec<Vec<String>>>;
+    type Pending = (QuestionRequest, oneshot::Sender<Answer>);
+
     #[derive(Clone, Default)]
     pub struct QuestionState {
-        pending: Arc<Mutex<Vec<(QuestionRequest, oneshot::Sender<Option<Vec<Vec<String>>>>)>>>,
+        pending: Arc<Mutex<Vec<Pending>>>,
     }
 
     impl QuestionState {
-        pub fn ask(
-            &self,
-            session_id: &str,
-            questions: serde_json::Value,
-        ) -> (QuestionRequest, oneshot::Receiver<Option<Vec<Vec<String>>>>) {
-            let (tx, rx) = oneshot::channel();
+        pub fn ask(&self, session_id: &str, questions: Value) -> (QuestionRequest, oneshot::Receiver<Answer>) {
+            self.ask_for_tool(session_id, questions, None)
+        }
+
+        pub fn ask_for_tool(&self, session_id: &str, questions: Value, tool: Option<Value>) -> (QuestionRequest, oneshot::Receiver<Answer>) {
+            let (tx,rx) = oneshot::channel();
             let req = QuestionRequest {
-                id: crate::types::hex_id("que_"),
-                session_id: session_id.to_string(),
-                questions: vec![questions],
+                id: crate::types::hex_id("que_"), session_id:session_id.into(),
+                questions: questions.as_array().cloned().unwrap_or_else(|| vec![questions]), tool,
             };
             self.pending.lock().unwrap().push((req.clone(), tx));
-            (req, rx)
+            (req,rx)
         }
 
         pub fn reply(&self, id: &str, answers: Vec<Vec<String>>) -> bool {
-            self.finish(id, Some(answers), "question.replied")
-        }
-
-        pub fn reject(&self, id: &str) -> bool {
-            self.finish(id, None, "question.rejected")
-        }
-
-        fn finish(&self, id: &str, answers: Option<Vec<Vec<String>>>, ev: &str) -> bool {
-            let mut p = self.pending.lock().unwrap();
-            if let Some(i) = p.iter().position(|(r, _)| r.id == id) {
-                let (req, tx) = p.remove(i);
-                let _ = tx.send(answers.clone());
-                crate::engine::GLOBAL_BUS.emit(
-                    ev,
-                    serde_json::json!({"sessionID": req.session_id, "requestID": req.id, "answers": answers}),
-                );
-                return true;
+            let pending = self.pending.lock().unwrap();
+            let Some((req,_)) = pending.iter().find(|(r,_)| r.id==id) else { return false; };
+            if answers.len()!=req.questions.len() { return false; }
+            for (answer,question) in answers.iter().zip(&req.questions) {
+                if question["multiple"] != true && answer.len()>1 { return false; }
             }
-            false
+            drop(pending);
+            self.finish(id,Some(answers))
+        }
+
+        pub fn reject(&self, id: &str) -> bool { self.finish(id,None) }
+
+        fn finish(&self, id: &str, answers: Answer) -> bool {
+            let mut p=self.pending.lock().unwrap();
+            let Some(i)=p.iter().position(|(r,_)| r.id==id) else { return false; };
+            let (req,tx)=p.remove(i);
+            drop(p);
+            let (event,properties)=match &answers {
+                Some(a)=>("question.replied",json!({"sessionID":req.session_id,"requestID":req.id,"answers":a})),
+                None=>("question.rejected",json!({"sessionID":req.session_id,"requestID":req.id})),
+            };
+            crate::engine::bus().emit(event,properties);
+            let _=tx.send(answers);
+            true
+        }
+
+        pub fn reject_all(&self, sid: &str) {
+            let ids: Vec<String>=self.list().into_iter().filter(|r| r.session_id==sid).map(|r| r.id).collect();
+            for id in ids { self.reject(&id); }
         }
 
         pub fn list(&self) -> Vec<QuestionRequest> {
-            self.pending.lock().unwrap().iter().map(|(r, _)| r.clone()).collect()
+            self.pending.lock().unwrap().iter().map(|(r,_)| r.clone()).collect()
         }
     }
 }
@@ -71,104 +86,82 @@ pub struct App {
     pub perms: PermissionState,
     pub questions: QuestionState,
     pub mcp: Arc<McpHub>,
+    mcp_ready: Arc<AtomicBool>,
+    mcp_scopes: Arc<Mutex<std::collections::HashMap<String,(Arc<McpHub>,Arc<AtomicBool>)>>>,
     pub usage: Arc<UsageDb>,
-    pub cancels: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
-    >,
-    pub always: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::types::PermissionRule>>>>,
+    pub always: Arc<Mutex<std::collections::HashMap<String,Vec<crate::types::PermissionRule>>>>,
+    pub statuses: Arc<Mutex<std::collections::HashMap<String,serde_json::Value>>>,
 }
 
 impl App {
     pub fn new() -> Self {
-        let mut t0 = std::time::Instant::now();
-        let dbg = std::env::var("OC_DEBUG_STARTUP").is_ok();
-        let mut mark = |n: &str, t: &mut std::time::Instant| {
-            if dbg {
-                eprintln!("[startup] {n}: {:?}", t.elapsed());
-                *t = std::time::Instant::now();
-            }
-        };
-        let config = Config::load();
-        mark("config", &mut t0);
-        let mcp = std::sync::Arc::new(McpHub::new());
-        {
-            let mcp_bg = mcp.clone();
-            let list: Vec<(String, serde_json::Value)> = config
-                .mcp
-                .iter()
-                .filter(|(_, m)| m.enabled != Some(false))
-                .map(|(name, m)| {
-                    let cfg = if m.r#type == "remote" || !m.url.is_empty() {
-                        serde_json::json!({"type": "remote", "url": m.url, "headers": m.headers})
-                    } else {
-                        serde_json::json!({"type": "local", "command": m.command})
-                    };
-                    (name.clone(), cfg)
-                })
-                .collect();
-            std::thread::spawn(move || {
-                for (name, cfg) in list {
-                    let _ = mcp_bg.add(&name, cfg);
-                }
-            });
+        let config=Config::load();
+        let directory=std::env::current_dir().unwrap_or_default();
+        let directory=directory.to_string_lossy().into_owned();
+        let (mcp,mcp_ready)=start_mcp(&config,&directory);
+        let mcp_scopes=Arc::new(Mutex::new(std::collections::HashMap::from([(directory,(mcp.clone(),mcp_ready.clone()))])));
+        Self {
+            store:Arc::new(Store::open(&crate::config::store_path())), config:Arc::new(Mutex::new(config)),
+            auth:Arc::new(AuthStore::load()), perms:PermissionState::default(), questions:QuestionState::default(),
+            mcp, mcp_ready, mcp_scopes, usage:Arc::new(UsageDb::open()), always:Arc::new(Mutex::new(Default::default())),
+            statuses:Arc::new(Mutex::new(Default::default())),
         }
-        mark("mcp-queued", &mut t0);
-        let s = Self {
-            store: Arc::new(Store::open(&crate::config::store_path())),
-            config: Arc::new(Mutex::new(config)),
-            auth: Arc::new(AuthStore::load()),
-            perms: PermissionState::default(),
-            questions: QuestionState::default(),
-            mcp,
-            usage: Arc::new(UsageDb::open()),
-            cancels: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            always: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        };
-        mark("dbs", &mut t0);
-        s
     }
+
+    pub fn for_directory(&self,directory:&str)->Result<Self,String> {
+        let config=Config::load_for(directory)?;
+        let mut scopes=self.mcp_scopes.lock().unwrap();
+        let (mcp,ready)=scopes.entry(directory.to_string()).or_insert_with(|| start_mcp(&config,directory)).clone();
+        let mut scoped=self.clone();
+        scoped.mcp=mcp;
+        scoped.mcp_ready=ready;
+        scoped.config=Arc::new(Mutex::new(config));
+        Ok(scoped)
+    }
+
+    pub async fn wait_mcp_ready(&self) {
+        while !self.mcp_ready.load(Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+fn start_mcp(config:&Config,directory:&str)->(Arc<McpHub>,Arc<AtomicBool>) {
+    let hub=Arc::new(McpHub::new());
+    let ready=Arc::new(AtomicBool::new(config.mcp.is_empty()));
+    if config.mcp.is_empty() { return (hub,ready); }
+    let entries=config.mcp.clone();
+    let directory=directory.to_string();
+    let background=hub.clone();
+    let done=ready.clone();
+    std::thread::spawn(move || {
+        for (name,entry) in entries {
+            let mut value=serde_json::to_value(entry).expect("MCP config JSON");
+            if value["cwd"].as_str().is_none_or(str::is_empty) { value["cwd"]=serde_json::json!(directory); }
+            let _=background.add(&name,value);
+        }
+        done.store(true,Ordering::Release);
+    });
+    (hub,ready)
 }
 
 pub trait EngineApi: Send + Sync + 'static {
-    fn start_turn(
-        &self,
-        app: App,
-        session_id: String,
-        model_id: String,
-        provider_id: String,
-        text: String,
-        agent: Option<String>,
-        variant: Option<String>,
-    ) -> oneshot::Receiver<serde_json::Value>;
-
-    fn abort(&self, session_id: &str);
-
-    fn run_sync(
-        &self,
-        app: App,
-        session_id: String,
-        model_id: String,
-        provider_id: String,
-        text: String,
-        agent: Option<String>,
-        variant: Option<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>>;
-
-    fn summarize(&self, app: App, session_id: String) -> Result<(), String>;
+    fn start_turn(&self, app:App, session_id:String, request:PromptRequest) -> Result<oneshot::Receiver<serde_json::Value>,String>;
+    fn abort(&self, session_id:&str);
+    fn run_sync(&self, app:App, session_id:String, request:PromptRequest)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output=Result<serde_json::Value,String>>+Send>>;
+    fn summarize(&self, app:App, session_id:String, model:Option<ModelRef>) -> Result<oneshot::Receiver<serde_json::Value>,String>;
+    fn recover(&self, app:App);
 }
 
 pub fn bus() -> &'static Bus {
-    static BUS: OnceLock<Bus> = OnceLock::new();
+    static BUS:OnceLock<Bus>=OnceLock::new();
     BUS.get_or_init(Bus::new)
 }
 
-pub static GLOBAL_BUS: LazyBus = LazyBus;
-
+pub static GLOBAL_BUS:LazyBus=LazyBus;
 pub struct LazyBus;
-
 impl std::ops::Deref for LazyBus {
-    type Target = Bus;
-    fn deref(&self) -> &Bus {
-        bus()
-    }
+    type Target=Bus;
+    fn deref(&self)->&Bus { bus() }
 }

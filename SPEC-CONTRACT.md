@@ -1,84 +1,228 @@
-# ocmini contract — minimal opencode-serve drop-in (targets opencode v1.19.2, T3 Code @3b99fb2d)
+# ocmini compatibility contract
 
-Ground truth sources (read-only):
-- /home/aliemre/.t3/scratch/2026-10-16-why-is-my-t3code-using-e76a83d5/src/opencode (tag v1.19.2)
-- /home/aliemre/.t3/scratch/2026-10-16-why-is-my-t3code-using-e76a83d5/src/t3code (packages/provider-opencode)
-- openapi.json in the same scratch dir (162 paths; we implement the 22-endpoint subset)
+ocmini is a headless coding runtime implementing the OpenCode **1.x HTTP/SSE contract used by the supplied T3 Code snapshot**. Its compatibility version is `1.19.2-ocmini.0.2.0`; its package version is separate. This is an independent implementation, not an OpenCode release. The supplied `opencode-dev` archive contains a newer 2.x architecture, so copying its `/api` endpoints into a 1.x shim would select the wrong T3 adapter.
 
-## CLI (PATH shim for `opencode`)
-- `ocmini serve --hostname=H --port=P` → bind H:P, print exactly `opencode server listening on http://H:P` to stdout, flush, run forever.
-- `ocmini --version` → `1.19.2` (T3 version gate parses semver; keep 1.x so T3 uses the v1 SDK client).
-- `ocmini models --verbose` → JSON array of catalog models (from config providers + auth + models.dev subset).
-- `ocmini agent list` → JSON array. `ocmini debug skill` → JSON array.
+This document specifies observable behavior. Tests are in `tests/contract.rs` and module tests. The presence of a test or an implementation is not evidence that it has been executed in every deployment environment.
 
-## HTTP
-- Auth: if env OPENCODE_SERVER_PASSWORD set → require `Authorization: Basic base64("opencode:"+pw)` on ALL routes (401 otherwise, constant-time compare).
-- Header `x-opencode-directory`: absolute dir for the request's project scope (session.directory source).
-- `GET /api/info` → 404 (forces T3 v1 routing). `GET /global/health` → `{"healthy":true,"version":"1.19.2"}`.
+## Sources and protocol selection
 
-## Endpoints (v1 SDK subset; JSON keys camelCase, ids: ses_/msg_/prt_/evt_ + hex)
-Session JSON: `{"id","slug","projectID":"global","directory","title","version":"0.0.0","time":{"created","updated"},"parentID"?,"permission"?}` (time = epoch ms).
-- `POST /session` {title?,parentID?,permission?} → Session
-- `GET /session/:id`, `PATCH /session/:id` {title?,permission?} → Session, `DELETE /session/:id`
-- `GET /session/:id/children` → [Session]
-- `GET /session/status` → `{"<sessionID>":"busy"}` (busy sessions map)
-- `POST /session/:id/prompt_async` {modelID,providerID,parts:[{type:"text",text}],agent?,messageID?} → `{}`; runs turn, streams events.
-- `POST /session/:id/message` (sync) → `{info:Message,parts:[Part]}` (used for title-gen; must complete).
-- `POST /session/:id/abort` → `{}` (cancel running turn → session.idle)
-- `POST /session/:id/command` {command,arguments,modelID,providerID,parts} → like prompt_async
-- `POST /session/:id/summarize` {providerID,modelID} → `{}` (compact: add compaction marker; emit session.compacted)
-- `POST /session/:id/fork` {messageID?} → Session (copy messages up to messageID)
-- `GET /session/:id/message` → `[{"info":Message,"parts":[Part]}]`, newest-last.
-Message.info: `{"id","sessionID","role":"user"|"assistant","time":{"created","completed"?},"modelID"?,"providerID"?,"cost"?,"tokens"?:{"input","output","reasoning","cache":{"read","write"}},"finish"?}`
-Part union (keep JSON `type`): `text{id,sessionID,messageID,text}`, `reasoning{...text}`, `tool{id,sessionID,messageID,tool,callID,state:{"status":"pending|running|completed|error","input","output"?,"title"?,"time":{"start","end"?},"error"?}}`, `step-start`, `step-finish{cost,tokens}`, `todo{todos:[{content,status,priority}]}`, `patch{...}`, `compaction{}`, `retry{}`, `subtask{...}`.
+Paths in this section are relative to the supplied `t3code-main` archive:
 
-## Events (SSE `GET /event`, `data: {"id":"evt_…","type":T,"properties":P}\n\n`)
-First: `server.connected {}`. Heartbeat event `server.heartbeat {}` every 10s. During turns emit:
-`message.updated {info}`, `message.part.updated {part}`, `message.part.delta {partID,messageID,sessionID,delta,field:"text"}`, `session.status {sessionID,status:"busy"|"idle"}`, `session.idle {sessionID}`, `session.error {sessionID,error}`, `todo.updated {sessionID,todos}`, `permission.asked {id,sessionID,permission,pattern,metadata}`, `permission.replied {sessionID,requestID,reply}`, `question.asked {id,sessionID,questions:[{question,header,options:[{label,description}]}]}`, `question.replied {sessionID,requestID,answers}`, `question.rejected {sessionID,requestID}`, `session.compacted {sessionID}`.
-- `POST /permission/:id/reply` {response:"once"|"always"|"reject"} → true
-- `GET /permission` → pending [PermissionRequest]
-- `POST /question/:id/reply` {answers:[[string]]} → true; `POST /question/:id/reject` → true; `GET /question` → pending list
-- `GET /mcp` → `{"<name>":{"status":"connected"}}` map; `POST /mcp` {name,config:{type:"remote",url,headers?,oauth:false} | {type:"local",command:[..],enabled}} → true (register + connect, expose tools as `name_tool`).
-- `GET /provider` → `{"all":[Provider],"default":{},"connected":[ids]}`; Provider: `{"id","name","env":[],"source":"config","options":{"baseURL"?},"models":{"<id>":{"id","name","limit":{"context","output"},"modalities"?}}}`.
-- `GET /agent` → `[{"id","description","mode":"primary"|"subagent","prompt"?}]` (built-ins: build, general + config `agent` entries + markdown agents dir)
-- `GET /skill` → `[{"name","description"}]` (from ~/.config/opencode/skills/*/SKILL.md frontmatter + config skills paths)
-- `GET /command` → `[{"name","description","template","hints"}]` (config `command` entries)
+- `packages/provider-opencode/src/server/versionProbe.ts`: `--version` selects the adapter generation by major version; external servers are probed at `/api/info`, then `/global/health`.
+- `packages/provider-opencode/src/server/OpenCodeRuntime.ts`: server launch, Basic auth, health/version gate, CLI inventory parsers, file attachments, permission rules and answer conversion. The minimum accepted OpenCode compatibility version is 1.14.19.
+- `packages/provider-opencode/src/server/adapter.ts`: the actual session, prompt, event, steering, approval, question, compaction, child-session, rewind and fork behavior. It targets T3's orchestration V2 while speaking OpenCode 1.x through `@opencode-ai/sdk/v2`.
+- `packages/provider-opencode/src/server/textGeneration.ts`: synchronous model requests used for title generation and other structured text operations.
+- `packages/provider-opencode/src/server/status.ts`: model/variant/agent inventory and skill discovery.
+- `packages/provider-opencode/src/server/usage.ts`: SQLite usage-file discovery and message parsing.
+- `packages/shared/src/semver.ts`: version parsing and compatibility comparisons.
 
-## Config / auth (file-compatible; enables lossless revert to real opencode)
-- Read `$XDG_CONFIG_HOME/opencode/opencode.json` (default ~/.config/opencode), overlay env `OPENCODE_CONFIG_CONTENT` (JSON, deep-merge, env wins). Keys used: `provider` (custom), `model` ("prov/mid"), `permission` (map name→allow|ask|deny), `instructions` (AGENTS.md files, cwd+global), `mcp`, `agent`, `command`, `skills`.
-- auth: `$XDG_DATA_HOME/opencode/auth.json` (default ~/.local/share), env `OPENCODE_AUTH_CONTENT` overrides. Entries: `{"type":"api","key","metadata"?}`, `{"type":"oauth","refresh","access","expires","accountId"?,"enterpriseUrl"?}`, `{"type":"wellknown","key","token"}`.
+The distinct OpenCode 2.x implementation lives under `packages/provider-opencode/src/server/v2/`. ocmini does not advertise that protocol. An authenticated `GET /api/info` therefore returns 404. `GET /global/health` returns JSON with `healthy: true` and the compatibility version. The prerelease suffix is accepted by the supplied T3 semver parser; a `+build` suffix is not.
 
-## Providers (HTTP, no npm)
-- `npm:"@ai-sdk/openai-compatible"` + openrouter + github-copilot: OpenAI `/chat/completions` stream SSE. baseURL precedence: options.baseURL > auth wellknown token url > openrouter `https://openrouter.ai/api/v1` > copilot `https://api.githubcopilot.com` (Bearer = oauth.access; refresh via device-flow plugin when expired) > vllm localhost:8000/v1.
-- anthropic: `/v1/messages`, headers x-api-key/anthropic-version: 2023-06-01, system prompt top-level, SSE stream events (content_block_delta etc).
-- OpenAI-compat tool calling: map tools → `tools:[{type:"function",function:{name,description,parameters}}]`, stream `tool_calls` deltas.
+## Process and CLI contract
 
-## Permission engine
-Rules list `[{permission,pattern,action:"allow"|"ask"|"deny"}]`, wildcard `*` matches prefix/glob. Names: `bash`,`edit`,`webfetch`,`websearch`,`codesearch`,`external_directory`,`doom_loop`,`task`,`todowrite`,`question`,`skill`,`read`,`glob`,`grep`. Tool→name: bash→bash; write/edit/apply_patch→edit; webfetch→webfetch; task→task; read/glob/grep→read (always allow). Config `permission` map seeds default rules. `ask` → permission.asked + block on reply (once/always/reject).
-`external_directory`: bash/read/write outside session.directory → name external_directory.
+T3 launches:
 
-## Tools (schemas mirror opencode tool/*.txt; params camelCase)
-bash{command,cwd?,timeout?}, read{filePath,offset?,limit?}, write{filePath,content}, edit{filePath,oldString,newString,replaceAll?}, apply_patch{patch}, glob{pattern,path?}, grep{pattern,path?,include?}, webfetch{url,format?}, todowrite{todos}, question{questions}, task{description,prompt,subagent_type}, skill{name}. bash: `sh -lc`, 120s timeout, 50KB output truncate. edit: exact unique match (error if 0/multiple).
+```text
+<binary> serve --hostname=127.0.0.1 --port=<chosen-port>
+```
 
-## Agent loop
-system prompt: base (concise coding agent) + AGENTS.md/instructions files + skills list + tool list. Loop: provider → text/reasoning parts (delta events) → tool calls (tool part pending→running→completed, permission gate) → follow-up turns until no tool calls; max 100; doom_loop guard: same tool+args 3x → permission.asked doom_loop. Token usage from provider usage obj → tokens{input,output,reasoning,cache}. Compact/summarize: replace old messages with summary text part, keep last N, emit session.compacted.
+After a successful bind, stdout contains one flushed line:
 
-## Storage (anti-bloat)
-SQLite WAL at `$XDG_DATA_HOME/ocmini/ocmini.db`: sessions(id PK, json, time_created, time_updated, parent_id, busy), messages(id PK, session_id, json, time_created), parts(id PK, message_id, session_id, json, time_created), indexes on session_id. WAL + synchronous=NORMAL, busy_timeout=5000. Retention: on startup delete sessions idle > 30d (T3 keeps authoritative copy).
-Usage widget compat: ALSO write `~/.local/share/opencode/opencode-ocmini.db` (matches T3 scan regex) with table `message(id, session_id, data TEXT, time_created INTEGER)` — data JSON: `{"role":"assistant","tokens":{"input","output","reasoning","cache":{"read","write"}},"model":{"providerID","modelID"}}`. Never touch real opencode.db.
+```text
+opencode server listening on http://<bound-address>:<actual-port>
+```
 
-## Ownership (subagent boundaries — edit ONLY your files)
-- CORE (parent): Cargo.toml, SPEC, types.rs, bus.rs, store.rs, config.rs, auth.rs, permission.rs, usage_db.rs, server.rs, main.rs, engine.rs (traits), questions/permissions queues.
-- QWEN: provider/mod.rs, provider/openai_compat.rs, provider/anthropic.rs, engine_impl.rs, tools/* (all tool impls).
-- GEMINI: mcp/mod.rs (stdio+remote client, JSON-RPC 2.0, tools/list), src/bin/fuzz.rs (differential shape fuzzer per SPEC §Endpoints: replay GETs + prompt sequences vs oracle, normalize ids/times), tests/contract.rs (axum-test-free: spawn server on ephemeral port, assert 21-endpoint shapes).
+Port zero chooses an available port and the banner reports the actual port. IPv6 literals are bracketed. Diagnostics go to stderr. Both `--option=value` and `--option value` are supported. Invalid options or port values exit unsuccessfully instead of silently using defaults. No arguments display help. There is no separate terminal UI.
 
-Rules: no new deps (request via report), no `cargo build` (parent builds), idiomatic Rust, no comments, match SPEC JSON exactly (serde rename).
+T3's other probes are:
 
-## Verified facts (2026-10-17 smoke test, live machine)
-- User `opencode.json` is JSONC (comments + trailing commas) → config.rs `strip_jsonc` handles it. Providers: vllm, pllm5 (`http://<your-llm-proxy>:32401/v1`, apiKey in options), EvAI, ollama. Options key is `apiKey` (serde rename).
-- prompt body: `{"model":{"providerID","modelID"},"parts":[...]}` nested (types.rs ModelRef).
-- axum 0.8 routes use `{id}` syntax. Binary lands in shared /mnt/data/cargo-target/debug/ocmini (global cargo config).
-- Verified working: banner stdout, health, /api/info 404, Basic auth, session CRUD, prompt_async → pllm5 → PONG, events (server.connected/heartbeat, session.status busy→idle, session.idle, message.updated, message.part.updated/delta), usage sidecar.
-- T3 config interface (docs/user/providers-opencode.md + OpenCodeRuntime.ts): T3 never writes opencode config; passes OPENCODE_CONFIG_CONTENT (default `{}`) + OPENCODE_SERVER_PASSWORD env only; external-server mode exists (Server URL+password in Settings). Plan mode uses agent id `plan`. Revert = restore real binary at /usr/bin/opencode; zero file changes.
-- Live opencode remote connections: self-hosted provider proxy only; GitHub HTTPS seen only via agent bash `gh` calls. ocmini replicates exactly: providers + MCP stdio children.
-- Skill dirs to scan: ~/.config/opencode/skill(s)/, project/.opencode/skill(s)/ (+config `skills` paths).
+| Command | Required output |
+| --- | --- |
+| `--version` | A parseable 1.x compatibility version |
+| `models --verbose` | A bare `provider/model` line followed by one JSON model object for each model |
+| `agent list` | A `name (mode)` line followed by a JSON permission-rule array for each agent |
+| `debug skill` | One JSON array of discovered skills, including their absolute `location` |
+
+The model and agent CLI formats are **not** JSON arrays. Their parser behavior is covered by T3's `OpenCodeRuntime.cliParsers.test.ts`. Model IDs containing additional slashes are preserved after the first provider separator. Model data includes configured variants and limits; it is not reduced to names alone.
+
+T3 supplies `OPENCODE_CONFIG_CONTENT` and, when applicable, `OPENCODE_SERVER_PASSWORD`. An empty `{}` config overlay must retain the user's file configuration. T3 does not need ocmini to rewrite OpenCode's config or credential files.
+
+## HTTP transport and directory scope
+
+If `OPENCODE_SERVER_PASSWORD` is nonempty, every route, including probes and unknown routes, requires HTTP Basic authentication for user `opencode`. The password is UTF-8; wrong or missing credentials return 401. Credentials are not written to access logs.
+
+Requests are scoped by `directory` query parameter or `x-opencode-directory` header. The SDK may percent-encode the entire header. Decode it once, preserve Unicode, normalize path components and use the same scope for session access, lists, catalogs, pending requests, events and MCP registrations. The query parameter takes precedence. Requests without a scope use the process working directory for creation/catalogs; direct ID reads remain available without an explicit scope. A sibling path is not a prefix match for another project.
+
+Failed lookups return 404. Invalid bodies or invalid identifiers return a client error. Storage/provider failures must not be converted into successful empty responses. JSON errors carry `name` and `data.message` so T3 can display a useful error.
+
+The JSON request-body limit defaults to 128 MiB and can be set with `OCMINI_MAX_REQUEST_BYTES`. This bounds an individual HTTP body, not the combined size of local attachment files. T3 sends file URLs, so multiple native attachments do not become large inline JSON bodies. The supplied T3 contracts allow 100 attachments, 10 MiB per image and 80 MiB of images per turn; its OpenCode adapter forwards supported native files only up to 20 MiB each, with other attachments represented through prompt paths.
+
+## Session and prompt operations
+
+| HTTP operation | Behavior used by T3 |
+| --- | --- |
+| `POST /session` | Create a durable session with optional `title`, `parentID` and ordered `permission` rules; return the session |
+| `GET /session/{id}` | Return session metadata for resume and snapshots |
+| `PATCH /session/{id}` | Update title and permissions; permission changes apply to subsequent tool decisions |
+| `DELETE /session/{id}` | Delete session data and return JSON `true`; an active session must be stopped first |
+| `GET /session/{id}/children` | Return actual task child sessions |
+| `GET /session/status` | Return object statuses for active sessions, such as `{sessionID: {type: "busy"}}` or a retry object with attempt/message/next; omit idle sessions |
+| `GET /session/{id}/message` | Return chronological `{info, parts}` records; stable order is required even for matching timestamps |
+| `POST /session/{id}/prompt_async` | Validate and durably admit the prompt before returning 204; model work continues through SSE |
+| `POST /session/{id}/message` | Run a prompt and return its completed `{info, parts}` result; T3 reads text parts and `info.error` |
+| `POST /session/{id}/command` | Expand and execute a configured command; return the completed result, with prompt admission visible on SSE |
+| `POST /session/{id}/abort` | Cancel active/queued work and unblock pending requests; return JSON `true` |
+| `POST /session/{id}/summarize` | Run real model summarization, persist the summary and compaction boundary, emit `session.compacted`; return JSON `true` after completion |
+| `POST /session/{id}/fork` | Copy retained history into an independent session; optional `messageID` is the first **excluded** message |
+
+The implementation additionally provides `GET /session`, `GET /session/{id}/message/{messageID}`, pending-request lists, and MCP connect/disconnect operations for diagnostics and management.
+
+A prompt body uses a nested model reference:
+
+```json
+{
+  "messageID": "msg_client_generated_id",
+  "model": { "providerID": "provider", "modelID": "model" },
+  "agent": "build",
+  "variant": "high",
+  "system": "T3 runtime and orchestration instructions",
+  "parts": [
+    { "type": "text", "text": "User request" },
+    { "type": "file", "mime": "text/plain", "filename": "notes.txt", "url": "file:///workspace/notes.txt" }
+  ]
+}
+```
+
+The full request must reach the engine. Preserve the client `messageID`, system instructions, agent, variant, individual part data, optional `noReply`, and optional tool overrides. Omitted model selections resolve from session/agent/config defaults or fail clearly if none can be resolved.
+
+T3 turns and command admission are correlated using the client-supplied user message ID. Regenerating that ID breaks admission, usage ownership and rewind boundaries. A command's user `message.updated` is its receipt; T3 allows ten seconds for it even though generation may continue longer.
+
+Repeating the same user `messageID` within a session is idempotent: attach to the admitted execution or return its recorded result without a second provider call. An ID owned by another session or by an assistant message is rejected. `noReply` persists user context and returns the user record without starting model work.
+
+### Steering and interruption
+
+T3 sends another `prompt_async` while the session is busy to steer an active turn. Admit and persist that message without starting a second concurrent loop for the same session. Drain queued messages before emitting terminal idle. Do not silently drop a prompt, overwrite a cancellation handle, or acknowledge work that was not admitted.
+
+Cancellation must interrupt a stalled provider stream, a subprocess and a permission/question wait. It cannot depend on the provider sending another token. T3 treats `MessageAbortedError` as interruption rather than failure. A root abort and child cleanup are separate operations in the T3 adapter; child sessions remain discoverable through `/children`.
+
+### Commands
+
+T3 sends `model` as a **string** on command requests, for example `provider/model`, plus `command`, `arguments`, `messageID`, optional `agent` and `variant`, and file `parts`. It does not send top-level `providerID` and `modelID` on this route.
+
+Commands come from configuration and Markdown command files. Argument expansion follows the supplied upstream `packages/core/src/config/plugin/command.ts`:
+
+- `$ARGUMENTS` receives the literal complete argument string.
+- `$1`, `$2`, etc. use quoted argument grouping. The largest numbered placeholder receives the remaining arguments joined with spaces.
+- Arguments are appended after a blank line when a template has no placeholders.
+- Shell markers of the form `!` followed by a backtick-delimited command are evaluated by the engine in the session directory, using the same tool permission and cancellation machinery as bash.
+
+Argument substitution must not interpret replacement metacharacters in values such as `$&`, `$$` or `$'`.
+
+### Fork and rewind
+
+T3's 1.x adapter implements rewind using `/fork`, not `/revert`. It finds the first removed message and verifies that the fork contains exactly the number of records preceding that boundary. Including the boundary is an error. A full fork without a boundary copies all retained history.
+
+Every copied message and part needs a new ID, the fork's `sessionID`, and remapped internal message references, including assistant `parentID`. The original session remains unchanged. A fork is an independent conversation; it is not a running task child and does not acquire `parentID` merely because it was forked. Filesystem checkpoint restoration belongs to T3's checkpoint service.
+
+## Message and SSE contract
+
+`GET /event` returns `text/event-stream` with complete JSON values in `data:` frames. The first event is `server.connected`; periodic `server.heartbeat` events keep idle connections alive. There is no `/api/event` wrapper in the 1.x protocol.
+
+Events are scoped to the requested directory. A subscriber that falls behind must receive a visible error and reconnect, rather than silently omit data and later report a successful turn. Persisted message history remains available for resumption; SSE does not advertise replay semantics it cannot provide.
+
+| Event type | Properties required by T3 |
+| --- | --- |
+| `message.updated` | `sessionID`, `info` |
+| `message.part.updated` | `part`, including its `id`, `sessionID`, `messageID` and discriminated `type` |
+| `message.part.delta` | `sessionID`, `messageID`, `partID`, `field: "text"`, `delta` |
+| `session.status` | `sessionID`, `status: {type: "busy"}` or `{type: "idle"}`; retry status is also an object |
+| `session.idle` | `sessionID` |
+| `session.error` | `sessionID`, `error: {name, data: {message}}` |
+| `session.created`, `session.updated`, `session.deleted` | `info` session metadata |
+| `session.compacted` | `sessionID` |
+| `todo.updated` | `sessionID`, `todos` |
+| `permission.asked`, `question.asked` | The corresponding pending request object |
+| `permission.replied` | `sessionID`, `requestID`, `reply` |
+| `question.replied` | `sessionID`, `requestID`, `answers` |
+| `question.rejected` | `sessionID`, `requestID` |
+
+The event and status-map values are objects, never the strings `"busy"` or `"idle"` alone.
+
+### Ordering and live text
+
+Persist and emit the user message before its parts. Emit assistant message metadata before its parts. Emit an initial empty text/reasoning `message.part.updated` before any delta for that part: T3 discards deltas for unknown part IDs. Subsequent delta events append text; full updates replace it. Final persisted parts must match the assembled text.
+
+Tool parts progress through pending/running/completed/error states and retain their `callID`, input, timestamps and relevant metadata. For completed bash tools, `metadata.exit` supplies T3's exit-code display. For file changes, `metadata.diff` or `metadata.patch` supplies the change preview. Error states carry the actual failure and produce a tool result visible to the next model request.
+
+Each assistant message records `parentID` equal to the owning user prompt ID. Each model step emits a `step-finish` part with `reason`, `cost` and `tokens`. T3 attributes usage using the assistant's parent ID and step parts; assistant token totals alone are insufficient. Finish the message with `time.completed` and its provider finish reason before the session becomes idle.
+
+Malformed or prematurely terminated provider streams produce a recorded assistant error and `session.error`, followed by idle. Partial text must not turn into a successful completion solely because the transport closed.
+
+Token shape:
+
+```json
+{
+  "input": 0,
+  "output": 0,
+  "reasoning": 0,
+  "cache": { "read": 0, "write": 0 }
+}
+```
+
+Counts must come from provider responses with explicit handling of cached and reasoning tokens. Unknown usage must not be represented as invented measured usage.
+
+## Permissions, questions and child sessions
+
+Permission rules are ordered `{permission, pattern, action}` records. The last matching rule wins, including a later allow overriding a broader deny. T3 supplies full-access, supervised and auto-accept-edits rules on session creation and may update child-session rules later. Read-only agent restrictions remain enforced by the runtime. File edits use the `edit` permission family, and operations outside the workspace also require `external_directory` permission.
+
+Permission request shape:
+
+```json
+{
+  "id": "per_request",
+  "sessionID": "ses_session",
+  "permission": "bash",
+  "patterns": ["the shell command"],
+  "always": ["an approved pattern"],
+  "metadata": {},
+  "tool": { "messageID": "msg_assistant", "callID": "call_tool" }
+}
+```
+
+`tool` is an object, not a tool-name string. `POST /permission/{requestID}/reply` accepts `{reply: "once" | "always" | "reject"}` and returns JSON `true`. The legacy session-scoped route accepts the response spelling and checks that the request belongs to that session. Invalid or already-resolved requests do not succeed.
+
+Question requests use a flat `questions` array of `{question, header, options, multiple?, custom?}` objects. `POST /question/{requestID}/reply` accepts `{answers: string[][]}` with one answer array per question; `/reject` cancels it. Replies and cancellation remove the pending entry and emit the matching settlement event. Aborting a session also settles its outstanding requests.
+
+Real task tools create child sessions and publish `session.created` with `parentID` before dependent child events. Their running and completed tool metadata contains `sessionId` and, when known, `model: {providerID, modelID}`. T3 uses these fields to create child threads, route child approval requests, update child permissions and discover background work. Writing a fabricated task-result string without running a child is not compatible behavior.
+
+## Models, agents, commands, skills and MCP
+
+`GET /provider` returns `{all, connected, default}`. Every advertised model has a nonempty `id` and `name`; configured variants, limits and capability metadata are preserved. `connected` reflects usable configuration/credentials, not every known provider name. T3 builds its model picker only from connected providers. Unsupported provider SDKs fail explicitly rather than being sent through an unrelated API format.
+
+`GET /agent` returns agent objects with `name`, `mode`, `permission`, `options`, and relevant description/prompt/hidden metadata. Built-in and configured agents use the same catalog as CLI probes. Disabled agents are omitted. T3 exposes primary/all agents and hides subagent-only or hidden entries.
+
+`GET /command` returns configured names, descriptions, `source`, templates and placeholder `hints`. `GET /skill` returns discovered skills with nonempty `name` and absolute `location`; T3 drops skills lacking either field. Read configured and project/global OpenCode skill directories, and preserve the actual skill content for the engine.
+
+T3 registers its tool bridge through:
+
+```json
+{
+  "name": "t3-code",
+  "config": {
+    "type": "remote",
+    "url": "http://t3-server/mcp-endpoint",
+    "headers": { "Authorization": "the supplied credential" },
+    "oauth": false
+  }
+}
+```
+
+MCP registration must complete its initialization and tool discovery, propagate supplied headers, and expose the discovered tool definitions to subsequent model requests. `GET /mcp` and the add result report real connection status. A dead endpoint never becomes `connected` merely because it was registered, and an explicit reconnect returns an error if the handshake fails. Remote JSON/streamable-HTTP and local stdio peers require request/response ID correlation, timeouts, cancellation, and error handling; a peer's `isError` is a tool error, not successful output. Directory-scoped registrations must not overwrite another directory's tool bridge.
+
+## Storage and deliberate exclusions
+
+Session state and transcripts live in the ocmini SQLite database under the XDG data directory. Writes that admit work or fork a transcript are transactional. Message/part ordering is stable. Deleting a session removes dependent data. Restart recovery distinguishes admitted work from interrupted execution; it must not silently rerun already-started shell mutations. There is no automatic 30-day transcript deletion: T3 resumes provider sessions by their native IDs and needs their history.
+
+For T3's usage widget, a separate `opencode-ocmini.db` sidecar under the OpenCode XDG data directory contains a compatible `message` table with `id`, `session_id`, `data`, and `time_created`. Do not overwrite the real `opencode.db` or duplicate billed usage when copying history during a fork.
+
+The headless runtime intentionally does not include OpenCode's desktop/web/TUI applications, hosted account/billing services, plugin marketplace, automatic plugin/package installation, updater, LSP fleet or OpenCode 2.x background-service protocol. These are not required by the supplied T3 1.x adapter. Authentication mechanisms and provider formats that require those omitted integrations must fail honestly; the compatibility version is not a promise of support for every OpenCode distribution feature.

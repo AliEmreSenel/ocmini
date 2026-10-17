@@ -1,0 +1,23 @@
+name: Rust runtime checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Unit and contract tests
+        run: cargo +stable test --all-targets
+      - name: Build release executable
+        run: cargo +stable build --release
+      - name: Check SQL persistence invariants
+        run: python3 scripts/verify_store_sql.py

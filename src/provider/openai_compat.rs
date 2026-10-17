@@ -1,189 +1,220 @@
-use super::{ChatRequest, ProviderAdapter};
-use crate::auth::{AuthEntry, AuthStore};
-use crate::config::ProviderCfg;
+use super::{error_message, json_response, read_response, usage_openai, ChatRequest, EventStream, Settings};
 use crate::types::{ProviderEvent, Tokens};
 use async_stream::stream;
-use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub struct OpenAiCompatAdapter {
-    pub provider_id: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub extra_headers: Vec<(String, String)>,
-}
-
-impl OpenAiCompatAdapter {
-    pub fn new(provider_id: &str, cfg: Option<&ProviderCfg>, auth: &AuthStore) -> Self {
-        let mut base_url = cfg.map(|c| c.options.base_url.clone()).unwrap_or_default();
-        let mut api_key = cfg.map(|c| c.options.api_key.clone()).unwrap_or_default();
-        if base_url.is_empty() {
-            base_url = match provider_id {
-                "openrouter" => "https://openrouter.ai/api/v1".to_string(),
-                "github-copilot" => "https://api.githubcopilot.com".to_string(),
-                _ => "https://api.openai.com/v1".to_string(),
-            };
+fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String> {
+    let mut messages = Vec::new();
+    if !req.system.is_empty() { messages.push(json!({"role":"system","content":req.system})); }
+    for message in &req.messages {
+        if message["content"].as_array().is_some_and(|parts| parts.iter().any(|part| part["type"] == "file" && part["file"]["file_data"].as_str().is_some_and(|url| url.starts_with("https://") || url.starts_with("http://")))) {
+            return Err("Chat Completions file attachments require a base64 data URL or file ID. Use a local/data attachment, or select a Responses or Anthropic endpoint for remote files.".into());
         }
-        if api_key.is_empty() {
-            match auth.get(provider_id) {
-                Some(AuthEntry::Api { key }) => api_key = key.clone(),
-                Some(AuthEntry::Oauth { access, .. }) => api_key = access.clone(),
-                Some(AuthEntry::WellKnown { key, .. }) => api_key = key.clone(),
-                None => {}
-            }
-        }
-        let mut extra_headers: Vec<(String, String)> = Vec::new();
-        if provider_id == "github-copilot" {
-            if api_key.is_empty() {
-                if let Some(AuthEntry::Oauth { access, .. }) = auth.get(provider_id) {
-                    api_key = access.clone();
+        let mut message = message.clone();
+        if let Some(map) = message.as_object_mut() {
+            map.remove("is_error");
+            if let Some(metadata) = map.remove("providerMetadata") {
+                if metadata["provider"] == "openai-chat" {
+                    for key in ["reasoning_content", "reasoning", "reasoning_text", "reasoning_details"] {
+                        if let Some(value) = metadata["message"].get(key) { map.insert(key.into(), value.clone()); }
+                    }
                 }
             }
-            extra_headers.push(("OpenAI-Intent".into(), "agent".into()));
-            extra_headers.push(("x-initiator".into(), "agent".into()));
-            extra_headers.push(("User-Agent".into(), "ocmini".into()));
         }
-        Self {
-            provider_id: provider_id.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
-            extra_headers,
+        messages.push(message);
+    }
+    let mut body = json!({"model":settings.api_model,"stream":true,"stream_options":{"include_usage":true},"messages":messages});
+    if settings.tools_supported && !req.tools.is_empty() { body["tools"] = json!(req.tools); }
+    for (input, output) in [("temperature", "temperature"), ("topP", "top_p"), ("frequencyPenalty", "frequency_penalty"), ("presencePenalty", "presence_penalty"), ("seed", "seed"), ("stopSequences", "stop"), ("parallelToolCalls", "parallel_tool_calls"), ("user", "user"), ("reasoningEffort", "reasoning_effort")] {
+        if let Some(value) = settings.options.get(input) { body[output] = value.clone(); }
+    }
+    let max_tokens = settings.options["maxTokens"].as_u64().or_else(|| settings.options["maxOutputTokens"].as_u64());
+    if let Some(max_tokens) = max_tokens {
+        let key = if settings.provider_id == "openai" { "max_completion_tokens" } else { "max_tokens" };
+        body[key] = json!(max_tokens);
+    }
+    if body.get("reasoning_effort").is_none() {
+        if let Some(effort) = super::reasoning_effort(settings, req) { body["reasoning_effort"] = json!(effort); }
+    }
+    if settings.options["includeUsage"] == false { body.as_object_mut().unwrap().remove("stream_options"); }
+    for key in ["reasoning_effort", "max_tokens", "max_completion_tokens", "enable_thinking", "chat_template_kwargs", "min_p", "top_k", "repetition_penalty", "response_format", "tool_choice", "stream_options", "reasoning", "provider", "plugins", "transforms"] {
+        if let Some(value) = settings.options.get(key) { body[key] = value.clone(); }
+    }
+    if let Some(options) = settings.options.as_object() {
+        for (key, value) in options {
+            if !["baseURL", "apiKey", "authToken", "accessToken", "headers", "body", "extraBody", "timeout", "headerTimeout", "chunkTimeout", "endpoint", "api", "transport", "encoding", "disabled", "includeUsage", "reasoningEffort", "textVerbosity", "reasoningSummary", "maxTokens", "maxOutputTokens", "topP", "frequencyPenalty", "presencePenalty", "stopSequences", "parallelToolCalls", "setCacheKey", "enterpriseUrl", "thinking"].contains(&key.as_str()) {
+                body[key] = value.clone();
+            }
         }
+    }
+    settings.overlay_body(&mut body);
+    body["model"] = json!(settings.api_model);
+    body["stream"] = json!(true);
+    if !settings.tools_supported { body.as_object_mut().unwrap().remove("tools"); body.as_object_mut().unwrap().remove("tool_choice"); }
+    Ok(body)
+}
+
+pub(super) async fn stream(settings: Settings, req: ChatRequest) -> Result<EventStream, String> {
+    let response = settings.send("chat/completions", &request_body(&settings, &req)?).await?;
+    let json = json_response(&response);
+    let stream = stream! {
+        let mut state = ChatState::default();
+        if json {
+            let value = match read_response(response, settings.chunk_timeout, 16 * 1024 * 1024).await.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("invalid provider JSON response: {e}"))) {
+                Ok(value) => value,
+                Err(error) => { yield ProviderEvent::Error(error); return; }
+            };
+            match state.consume(&value) {
+                Ok(events) => { for event in events { yield event; } }
+                Err(error) => { yield ProviderEvent::Error(error); return; }
+            }
+            state.terminal = true;
+        } else {
+            let mut frames = super::sse::frames(response, settings.chunk_timeout);
+            while let Some(frame) = frames.next().await {
+                let frame = match frame { Ok(frame) => frame, Err(error) => { yield ProviderEvent::Error(error); return; } };
+                if frame.data.trim() == "[DONE]" {
+                    if state.finish.is_none() { yield ProviderEvent::Error("provider stream ended before a finish reason".into()); return; }
+                    state.terminal = true; break;
+                }
+                if frame.data.trim().is_empty() { continue; }
+                let value: Value = match serde_json::from_str(&frame.data) {
+                    Ok(value) => value,
+                    Err(error) => { yield ProviderEvent::Error(format!("invalid chat completion SSE JSON: {error}")); return; }
+                };
+                match state.consume(&value) {
+                    Ok(events) => { for event in events { yield event; } }
+                    Err(error) => { yield ProviderEvent::Error(error); return; }
+                }
+            }
+        }
+        match state.finish() {
+            Ok(events) => { for event in events { yield event; } }
+            Err(error) => yield ProviderEvent::Error(error),
+        }
+    };
+    Ok(Box::new(Box::pin(stream)))
+}
+
+#[derive(Default)]
+struct Call { id: String, name: String, arguments: String }
+
+#[derive(Default)]
+struct ChatState {
+    calls: BTreeMap<u64, Call>,
+    usage: Tokens,
+    finish: Option<String>,
+    terminal: bool,
+    text: String,
+    reasoning: String,
+    reasoning_key: String,
+    reasoning_details: Vec<Value>,
+    seen: bool,
+}
+
+impl ChatState {
+    fn consume(&mut self, value: &Value) -> Result<Vec<ProviderEvent>, String> {
+        if value.get("error").filter(|value| !value.is_null()).is_some() { return Err(error_message(value)); }
+        if value["usage"].is_object() { self.usage = usage_openai(&value["usage"], false); }
+        let Some(choice) = value["choices"].as_array().and_then(|choices| choices.iter().find(|choice| choice["index"].as_u64().unwrap_or(0) == 0)) else { return Ok(Vec::new()); };
+        self.seen = true;
+        let delta = choice.get("delta").or_else(|| choice.get("message")).unwrap_or(&Value::Null);
+        let mut events = Vec::new();
+        for key in ["content", "refusal"] {
+            if let Some(text) = delta[key].as_str().filter(|text| !text.is_empty()) {
+                self.text.push_str(text);
+                events.push(ProviderEvent::TextDelta(text.into()));
+            }
+        }
+        for key in ["reasoning_content", "reasoning", "reasoning_text"] {
+            if let Some(text) = delta[key].as_str().filter(|text| !text.is_empty()) {
+                self.reasoning_key = key.to_string();
+                self.reasoning.push_str(text);
+                events.push(ProviderEvent::ReasoningDelta(text.into()));
+                break;
+            }
+        }
+        if let Some(details) = delta["reasoning_details"].as_array() {
+            for detail in details {
+                let index = detail["index"].as_u64().unwrap_or(self.reasoning_details.len() as u64) as usize;
+                if index > 1024 { return Err("provider returned an invalid reasoning detail index".into()); }
+                if self.reasoning_details.len() <= index { self.reasoning_details.resize(index + 1, json!({})); }
+                if let Some(map) = detail.as_object() {
+                    for (key, value) in map {
+                        if ["text", "data", "signature"].contains(&key.as_str()) {
+                            if let Some(text) = value.as_str() {
+                                let mut joined = self.reasoning_details[index][key].as_str().unwrap_or_default().to_string();
+                                joined.push_str(text);
+                                self.reasoning_details[index][key] = json!(joined);
+                                continue;
+                            }
+                        }
+                        self.reasoning_details[index][key] = value.clone();
+                    }
+                }
+            }
+        }
+        if let Some(calls) = delta["tool_calls"].as_array() {
+            for (position, call) in calls.iter().enumerate() {
+                let index = call["index"].as_u64().unwrap_or(position as u64);
+                if index > 1024 { return Err("provider returned an invalid tool call index".into()); }
+                let entry = self.calls.entry(index).or_default();
+                if let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) { entry.id = id.into(); }
+                if let Some(name) = call["function"]["name"].as_str() { entry.name.push_str(name); }
+                if let Some(arguments) = call["function"]["arguments"].as_str() { entry.arguments.push_str(arguments); }
+                if entry.arguments.len() > 16 * 1024 * 1024 { return Err("provider tool arguments exceed 16 MiB".into()); }
+            }
+        }
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            self.finish = Some(match reason { "tool_calls" | "function_call" => "tool-calls", "content_filter" => "content-filter", other => other }.into());
+        }
+        Ok(events)
+    }
+
+    fn finish(mut self) -> Result<Vec<ProviderEvent>, String> {
+        if !self.terminal && self.finish.is_none() { return Err("provider stream ended before a finish reason or [DONE] marker".into()); }
+        if !self.seen { return Err("provider returned no completion choice".into()); }
+        let mut events = Vec::new();
+        let mut calls = Vec::new();
+        for (_, mut call) in self.calls {
+            if call.name.is_empty() { return Err("provider returned a tool call without a name".into()); }
+            if call.id.is_empty() { call.id = crate::types::hex_id("call_"); }
+            if call.arguments.is_empty() { call.arguments = "{}".into(); }
+            let input: Value = serde_json::from_str(&call.arguments).map_err(|e| format!("invalid arguments for tool {}: {e}", call.name))?;
+            if !input.is_object() { return Err(format!("arguments for tool {} must be a JSON object", call.name)); }
+            calls.push(json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}}));
+            events.push(ProviderEvent::ToolCallStart { call_id: call.id, name: call.name, args: call.arguments });
+        }
+        let mut message = json!({"role":"assistant","content":self.text});
+        if !calls.is_empty() { message["tool_calls"] = json!(calls); }
+        if !self.reasoning.is_empty() { message[if self.reasoning_key.is_empty() { "reasoning_content" } else { &self.reasoning_key }] = json!(self.reasoning); }
+        if !self.reasoning_details.is_empty() { message["reasoning_details"] = json!(self.reasoning_details); }
+        events.push(ProviderEvent::Metadata(json!({"provider":"openai-chat","message":message})));
+        events.push(ProviderEvent::Finished { finish: self.finish.take().unwrap_or_else(|| if calls.is_empty() { "stop".into() } else { "tool-calls".into() }), usage: self.usage });
+        Ok(events)
     }
 }
 
-#[async_trait]
-impl ProviderAdapter for OpenAiCompatAdapter {
-    async fn stream(
-        &self,
-        req: ChatRequest,
-    ) -> Result<Box<dyn futures::Stream<Item = ProviderEvent> + Send + Unpin>, String> {
-        let mut all_messages = vec![json!({"role": "system", "content": req.system})];
-        all_messages.extend(req.messages);
-        let mut body = json!({
-            "model": req.model,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-            "messages": all_messages,
-        });
-        if !req.tools.is_empty() {
-            body["tools"] = Value::Array(req.tools);
-        }
-        if let Some(v) = req.variant.as_deref().filter(|v| *v != "none") {
-            body["reasoning_effort"] = json!(v);
-        }
-        let mut request = reqwest::Client::new()
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body);
-        for (k, v) in &self.extra_headers {
-            request = request.header(k.as_str(), v.as_str());
-        }
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| format!("provider request failed: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("provider {status}: {text}"));
-        }
-        let bytes = resp.bytes_stream();
-        let s = stream! {
-            let mut bytes = bytes;
-            let mut buf = String::new();
-            let mut acc: BTreeMap<usize, (String, String, String)> = Default::default();
-            let mut usage = Tokens::default();
-            let mut finish = String::new();
-            let mut done = false;
-            while let Some(chunk) = bytes.next().await {
-                match chunk {
-                    Ok(c) => buf.push_str(&String::from_utf8_lossy(&c)),
-                    Err(e) => {
-                        yield ProviderEvent::Error(format!("stream error: {e}"));
-                        done = true;
-                        break;
-                    }
-                }
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf[..nl].trim().to_string();
-                    buf.drain(..=nl);
-                    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                        continue;
-                    };
-                    if data == "[DONE]" {
-                        done = true;
-                        break;
-                    }
-                    let Ok(v) = serde_json::from_str::<Value>(data) else {
-                        continue;
-                    };
-                    if let Some(u) = v.get("usage") {
-                        usage.input = u["prompt_tokens"].as_i64().unwrap_or(usage.input);
-                        usage.output = u["completion_tokens"].as_i64().unwrap_or(usage.output);
-                        usage.reasoning = u["completion_tokens_details"]["reasoning_tokens"]
-                            .as_i64()
-                            .unwrap_or(usage.reasoning);
-                        usage.cache.read = u["prompt_tokens_details"]["cached_tokens"]
-                            .as_i64()
-                            .unwrap_or(usage.cache.read);
-                    }
-                    let Some(choice) = v["choices"].get(0) else {
-                        continue;
-                    };
-                    if let Some(d) = choice["delta"]["content"].as_str() {
-                        if !d.is_empty() {
-                            yield ProviderEvent::TextDelta(d.to_string());
-                        }
-                    }
-                    if let Some(d) = choice["delta"]["reasoning_content"].as_str() {
-                        if !d.is_empty() {
-                            yield ProviderEvent::ReasoningDelta(d.to_string());
-                        }
-                    }
-                    if let Some(calls) = choice["delta"]["tool_calls"].as_array() {
-                        for c in calls {
-                            let idx = c["index"].as_u64().unwrap_or(0) as usize;
-                            let e = acc
-                                .entry(idx)
-                                .or_insert_with(|| (String::new(), String::new(), String::new()));
-                            if let Some(id) = c["id"].as_str() {
-                                if !id.is_empty() {
-                                    e.0 = id.to_string();
-                                }
-                            }
-                            if let Some(n) = c["function"]["name"].as_str() {
-                                e.1.push_str(n);
-                            }
-                            if let Some(a) = c["function"]["arguments"].as_str() {
-                                e.2.push_str(a);
-                            }
-                        }
-                    }
-                    if let Some(fr) = choice["finish_reason"].as_str() {
-                        finish = fr.to_string();
-                    }
-                }
-                if done {
-                    break;
-                }
-            }
-            for (_, (id, name, args)) in acc {
-                if !name.is_empty() {
-                    yield ProviderEvent::ToolCallStart {
-                        call_id: id,
-                        name,
-                        args,
-                    };
-                }
-            }
-            yield ProviderEvent::Finished {
-                finish: if finish.is_empty() { "stop".to_string() } else { finish },
-                usage,
-            };
-        };
-        { let boxed: Box<dyn futures::Stream<Item = ProviderEvent> + Send + Unpin> = Box::new(Box::pin(s)); Ok(boxed) }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn assembles_parallel_calls_and_does_not_finish_truncated_streams() {
+        let mut state = ChatState::default();
+        state.consume(&json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"two","function":{"name":"read","arguments":"{\"file"}},{"index":0,"id":"one","function":{"name":"glob","arguments":"{}"}}]}}]})).unwrap();
+        state.consume(&json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"Path\":\"a\"}"}}]},"finish_reason":"tool_calls"}]})).unwrap();
+        let events = state.finish().unwrap();
+        assert!(matches!(&events[0], ProviderEvent::ToolCallStart { call_id, .. } if call_id == "one"));
+        assert!(matches!(&events[1], ProviderEvent::ToolCallStart { call_id, args, .. } if call_id == "two" && args == "{\"filePath\":\"a\"}"));
+        assert!(ChatState::default().finish().is_err());
+    }
+    #[test]
+    fn api_errors_and_bad_arguments_never_become_success() {
+        assert!(ChatState::default().consume(&json!({"error":{"message":"denied"}})).is_err());
+        let mut state = ChatState::default();
+        state.consume(&json!({"choices":[{"delta":{"tool_calls":[{"function":{"name":"write","arguments":"{"}}]},"finish_reason":"tool_calls"}]})).unwrap();
+        assert!(state.finish().is_err());
     }
 }
