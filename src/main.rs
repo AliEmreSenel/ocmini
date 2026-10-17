@@ -49,10 +49,12 @@ fn main() {
                 );
                 let mut body = m.clone();
                 if let Some(o) = body.as_object_mut() {
-                    o.remove("providerID");
-                    o.remove("modelID");
+                    let pid = o.remove("providerID").unwrap_or(serde_json::json!(""));
+                    let mid = o.remove("modelID").unwrap_or(serde_json::json!(""));
+                    o.insert("id".into(), mid.clone());
+                    o.insert("providerID".into(), pid);
                 }
-                println!("{}", body);
+                println!("{}", serde_json::to_string_pretty(&body).unwrap());
             }
         }
         "agent" => {
