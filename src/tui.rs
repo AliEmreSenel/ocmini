@@ -16,6 +16,12 @@ struct RawMode {
     saved: libc::termios,
 }
 
+// Bracketed paste mode (DEC 2004): while on, terminals wrap pasted text in
+// ESC [ 200 ~ … ESC [ 201 ~ so its newlines can be inserted as text instead
+// of arriving as Enter keystrokes that send the prompt line by line.
+const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
+const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
+
 /// Raw mode must survive being killed: T3 terminates the TUI with signals,
 /// and a terminal left in raw mode is broken for the user's shell.
 #[cfg(unix)]
@@ -25,6 +31,8 @@ fn install_terminal_restore(saved: &libc::termios) {
         if let Some(saved) = SAVED.get() {
             unsafe { libc::tcsetattr(0, libc::TCSANOW, saved) };
         }
+        // write() is async-signal-safe; leave no paste brackets on a dead TUI.
+        unsafe { libc::write(1, BRACKETED_PASTE_OFF.as_ptr() as *const libc::c_void, BRACKETED_PASTE_OFF.len()) };
         unsafe { libc::_exit(128 + sig) };
     }
     let _ = SAVED.set(*saved);
@@ -45,6 +53,8 @@ impl RawMode {
         // processing on; input stays fully raw.
         raw.c_oflag |= libc::OPOST | libc::ONLCR;
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 { return None; }
+        let _ = std::io::stdout().write_all(BRACKETED_PASTE_ON);
+        let _ = std::io::stdout().flush();
         install_terminal_restore(&saved);
         Some(Self { saved })
     }
@@ -53,6 +63,8 @@ impl RawMode {
 #[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
+        let _ = std::io::stdout().write_all(BRACKETED_PASTE_OFF);
+        let _ = std::io::stdout().flush();
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.saved) };
         println!();
     }
@@ -101,7 +113,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · agent build · Enter send · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear{RESET}");
+    println!("{DIM}┌ model {model} · agent build · Enter send · paste inserts all lines · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear{RESET}");
     print!("{BOLD}›{RESET} ");
     let _ = std::io::stdout().flush();
 }
@@ -229,7 +241,29 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
     }
 }
 
-enum Key { Char(char), Enter, Backspace, Esc, CtrlC, CtrlD, CtrlL, Other }
+enum Key { Char(char), Enter, Backspace, Esc, CtrlC, CtrlD, CtrlL, Paste(String), Other }
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// When `body` contains the closing paste marker, return the payload with
+/// CRLF/CR normalized to LF. Lone escapes that merely prefix the terminator
+/// (e.g. "\x1b[0m" typed into a paste) stay part of the text.
+fn finished_paste(body: &[u8]) -> Option<String> {
+    let end = body.windows(PASTE_END.len()).position(|w| w == PASTE_END)?;
+    let text = String::from_utf8_lossy(&body[..end]).into_owned();
+    Some(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+fn read_paste(stdin: &mut std::io::Stdin) -> Option<String> {
+    let mut body: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if std::io::Read::read(stdin, &mut byte).is_err() { return None; }
+        body.push(byte[0]);
+        if let Some(text) = finished_paste(&body) { return Some(text); }
+    }
+}
 
 fn decode_key(byte: u8) -> Key {
     match byte {
@@ -267,9 +301,18 @@ fn read_stdin_keys(tx: mpsc::UnboundedSender<Key>) {
                 if !stdin_readable(30) { let _ = tx.send(Key::Esc); continue; }
                 if std::io::Read::read(&mut stdin, &mut byte).is_err() { continue; }
                 if matches!(byte[0], b'[' | b'O') {
+                    let mut seq = vec![27u8, byte[0]];
                     for _ in 0..8 {
                         if std::io::Read::read(&mut stdin, &mut byte).is_err() { break; }
+                        seq.push(byte[0]);
                         if (0x40..=0x7e).contains(&byte[0]) { break; }
+                    }
+                    if seq == PASTE_START {
+                        // A whole paste arrives as one Key: its newlines are
+                        // text, never Enter keystrokes that send early.
+                        if let Some(text) = read_paste(&mut stdin) {
+                            let _ = tx.send(Key::Paste(text));
+                        }
                     }
                 } else {
                     let _ = tx.send(Key::Esc);
@@ -338,6 +381,23 @@ pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(),
                             }
                         }
                     }
+                    Key::Paste(text) if pending_question => {
+                        if let Some(PendingPrompt::Question { line, .. }) = ui.prompt.as_mut() {
+                            let flat = text.replace('\n', " ");
+                            line.push_str(&flat);
+                            print!("{flat}");
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                    Key::Paste(_) if pending_permission => {}
+                    Key::Paste(text) => {
+                        for ch in text.chars() {
+                            line.push(ch);
+                            // Continuation lines indent under "› ".
+                            if ch == '\n' { print!("\n  "); } else { print!("{ch}"); }
+                        }
+                        let _ = std::io::stdout().flush();
+                    }
                     Key::Enter => {
                         let text = std::mem::take(&mut line);
                         println!();
@@ -375,4 +435,29 @@ pub async fn run(model: Option<String>, directory: Option<String>) -> Result<(),
     }
     drop(raw);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finished_paste;
+
+    #[test]
+    fn paste_payload_stops_at_the_closing_bracket_and_normalizes_newlines() {
+        // The trailing bytes belong to later keystrokes, not the payload.
+        assert_eq!(
+            finished_paste(b"first\r\nsecond\rthird\x1b[201~\x1b[3~").as_deref(),
+            Some("first\nsecond\nthird")
+        );
+    }
+
+    #[test]
+    fn paste_is_incomplete_until_the_closing_bracket_arrives() {
+        assert_eq!(finished_paste(b"first\r"), None);
+        assert_eq!(finished_paste(b"a\x1b[201"), None);
+    }
+
+    #[test]
+    fn lone_escapes_inside_a_paste_stay_in_the_payload() {
+        assert_eq!(finished_paste(b"a\x1b[0mb\x1b[201~").as_deref(), Some("a\x1b[0mb"));
+    }
 }
