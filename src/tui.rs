@@ -1,0 +1,231 @@
+use crate::engine::{bus, App, EngineApi};
+use crate::engine_impl::Engine;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use serde_json::Value;
+use std::io::{stdout, Write};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+enum In {
+    Char(char),
+    Enter,
+    Backspace,
+    CtrlC,
+}
+
+fn prompt() {
+    out("\x1b[36m> \x1b[0m");
+}
+
+fn out(s: &str) {
+    let mut o = stdout();
+    let _ = o.write_all(s.as_bytes());
+    let _ = o.flush();
+}
+
+fn print_tool(part: &Value) {
+    let tool = part["tool"].as_str().unwrap_or("?");
+    let st = part["state"]["status"].as_str().unwrap_or("");
+    let icon = match st {
+        "running" => "⚙",
+        "completed" => "✔",
+        "error" => "✖",
+        _ => "•",
+    };
+    let mut detail = String::new();
+    if let Some(cmd) = part["state"]["input"]["command"].as_str() {
+        detail = cmd.chars().take(60).collect();
+    } else if let Some(f) = part["state"]["input"]["filePath"].as_str() {
+        detail = f.to_string();
+    }
+    out(&format!("\x1b[2m  {icon} {tool} {st} {detail}\x1b[0m\n"));
+}
+
+pub fn run() {
+    setup();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let app = App::new();
+        let engine: Arc<dyn EngineApi> = Arc::new(Engine::new());
+
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into());
+        let mut session = app.store.create_session_owned(&format!("tui"), &cwd);
+        let default_model = {
+            let cfg = app.config.lock().unwrap();
+            cfg.model.clone()
+        };
+        let (mut provider, mut model) = match default_model.split_once('/') {
+            Some((p, m)) => (p.to_string(), m.to_string()),
+            None => ("pllm5".to_string(), default_model.clone()),
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<In>();
+        std::thread::spawn(move || loop {
+            if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
+                if let Ok(Event::Key(KeyEvent { code, kind, modifiers, .. })) = event::read() {
+                    if kind == KeyEventKind::Press {
+                        let i = match code {
+                            KeyCode::Enter => In::Enter,
+                            KeyCode::Backspace => In::Backspace,
+                            KeyCode::Char('c') if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => In::CtrlC,
+                            KeyCode::Char(c) => In::Char(c),
+                            _ => continue,
+                        };
+                        if tx.send(i).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut rx_bus = bus().subscribe();
+        let mut input = String::new();
+        let mut busy: Option<tokio::task::JoinHandle<()>> = None;
+
+        out(&format!(
+            "\x1b[1mocmini\x1b[0m 1.19.2 · {provider}/{model} · {cwd}\n\x1b[2m/quit /model <prov/id> /new /abort · Enter sends\x1b[0m\n"
+        ));
+        out("\x1b[36m> \x1b[0m");
+
+        loop {
+            while let Ok(ev) = rx_bus.try_recv() {
+                let p = &ev.properties;
+                if p["sessionID"].as_str().unwrap_or_default() != session.id {
+                    continue;
+                }
+                match ev.r#type.as_str() {
+                    "message.part.delta" => {
+                        if p["field"] == "text" {
+                            if let Some(d) = p["delta"].as_str() {
+                                out(d);
+                            }
+                        }
+                    }
+                    "message.part.updated" => {
+                        if p["part"]["type"] == "tool" {
+                            print_tool(&p["part"]);
+                        }
+                    }
+                    "session.error" => {
+                        out(&format!("\x1b[31merror: {}\x1b[0m\n", p["error"]["data"]["message"]));
+                    }
+                    "session.idle" => {
+                        out("\n");
+                    }
+                    _ => {}
+                }
+            }
+
+            let ev = match rx.try_recv() {
+                Ok(e) => Some(e),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(_) => None,
+            };
+            let Some(ev) = ev else { break };
+
+            match ev {
+                In::CtrlC => {
+                    if busy.is_some() {
+                        engine.abort(&session.id);
+                        out("\x1b[2m(aborting…)\x1b[0m");
+                        prompt();
+                    }
+                }
+                In::Backspace => {
+                    if busy.is_none() && input.pop().is_some() {
+                        out("\u{8} \u{8}");
+                    }
+                }
+                In::Char(c) => {
+                    if busy.is_none() {
+                        input.push(c);
+                        out(&c.to_string());
+                    }
+                }
+                In::Enter => {
+                    if busy.is_some() {
+                        continue;
+                    }
+                    let text = std::mem::take(&mut input);
+                    out("\n");
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        prompt();
+                        continue;
+                    }
+                    if text == "/quit" || text == "/exit" {
+                        break;
+                    }
+                    if text == "/abort" {
+                        engine.abort(&session.id);
+                        prompt();
+                        continue;
+                    }
+                    if text == "/new" {
+                        session = app.store.create_session_owned("tui", &cwd);
+                        out("\x1b[2mnew session\x1b[0m\n");
+                        prompt();
+                        continue;
+                    }
+                    if let Some(rest) = text.strip_prefix("/model ") {
+                        match rest.trim().split_once('/') {
+                            Some((p, m)) => {
+                                provider = p.to_string();
+                                model = m.to_string();
+                                out(&format!("\x1b[2mmodel: {provider}/{model}\x1b[0m\n"));
+                                prompt();
+                            }
+                            None => {
+                                out("\x1b[2musage: /model provider/modelID\x1b[0m\n");
+                                prompt()
+                            },
+                        }
+                        continue;
+                    }
+                    if let Some(rest) = text.strip_prefix('/').map(str::to_string) {
+                        out(&format!("\x1b[2munknown: /{rest}\x1b[0m\n"));
+                        prompt();
+                        continue;
+                    }
+
+                    let app2 = app.clone();
+                    let engine2 = engine.clone();
+                    let sid = session.id.clone();
+                    let (p2, m2) = (provider.clone(), model.clone());
+                    let h = tokio::spawn(async move {
+                        if let Err(e) = engine2
+                            .run_sync(app2, sid, m2, p2, text)
+                            .await
+                        {
+                            out(&format!("\x1b[31m{e}\x1b[0m\n"));
+                        }
+                    });
+                    busy = Some(h);
+                }
+            }
+
+            if let Some(h) = &busy {
+                if h.is_finished() {
+                    busy = None;
+                    out("\x1b[36m> \x1b[0m");
+                }
+            }
+        }
+        cleanup();
+    });
+}
+
+pub fn setup() {
+    enable_raw_mode().ok();
+}
+
+pub fn cleanup() {
+    disable_raw_mode().ok();
+    out("\x1b[0m\n");
+}
