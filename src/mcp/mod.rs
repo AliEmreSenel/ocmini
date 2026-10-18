@@ -104,12 +104,7 @@ impl Server {
     }
 
     fn timeout(&self) -> Duration {
-        Duration::from_millis(
-            self.config["timeout"]
-                .as_u64()
-                .unwrap_or(30_000)
-                .clamp(1, 600_000),
-        )
+        Duration::from_millis(self.config["timeout"].as_u64().unwrap_or(30_000).max(1))
     }
 
     fn stop(&self) {
@@ -431,8 +426,8 @@ fn validate_config(name: &str, config: &Value) -> Result<(), String> {
         other => return Err(format!("Unsupported MCP transport {other:?}")),
     }
     if let Some(timeout) = config.get("timeout").filter(|v| !v.is_null()) {
-        if !timeout.as_u64().is_some_and(|v| v > 0 && v <= 600_000) {
-            return Err("MCP timeout must be 1..600000 milliseconds".into());
+        if timeout.as_u64().is_none_or(|value| value == 0) {
+            return Err("MCP timeout must be a positive integer in milliseconds".into());
         }
     }
     Ok(())

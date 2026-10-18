@@ -1,6 +1,161 @@
 use super::*;
 
 #[tokio::test]
+async fn one_tool_turn_can_compact_proactively_repeatedly() {
+    let mut scripts = Vec::new();
+    for step in 0..4 {
+        let mut script = tool_script(
+            "todowrite",
+            json!({"todos": [{"content": format!("Progress {step}"), "status": "in_progress", "priority": "medium"}]}),
+            &format!("call_{step}"),
+        );
+        script.chunks.last_mut().unwrap()["usage"] =
+            json!({"prompt_tokens": 31000, "completion_tokens": 100});
+        scripts.push(script);
+        scripts.push(text_script(&format!("CHECKPOINT_{step}"), ""));
+    }
+    scripts.push(text_script("Finished repeated compactions", ""));
+    let mut provider = Provider::start(scripts).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_repeated", "ORIGINAL_GOAL"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let terminal = events.through("session.idle").await;
+    assert!(!terminal
+        .iter()
+        .any(|event| event["type"] == "session.error"));
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| event["type"] == "session.compacted")
+            .count(),
+        4
+    );
+    let requests: Vec<_> = std::iter::from_fn(|| provider.requests.try_recv().ok()).collect();
+    assert_eq!(requests.len(), 9);
+    let final_request = requests.last().unwrap().to_string();
+    assert!(final_request.contains("CHECKPOINT_3"));
+    assert!(!final_request.contains("CHECKPOINT_0"));
+    assert!(final_request.contains("ORIGINAL_GOAL"));
+    let messages = server.messages(&id).await;
+    assert!(messages.last().unwrap()["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|part| part["text"] == "Finished repeated compactions"));
+}
+
+#[tokio::test]
+async fn independent_context_overflows_recover_throughout_one_tool_turn() {
+    let mut scripts = Vec::new();
+    for step in 0..4 {
+        scripts.push(Script::http_status_body(
+            400,
+            "maximum context length is 32000 tokens",
+        ));
+        scripts.push(text_script(&format!("RECOVERED_{step}"), ""));
+        scripts.push(tool_script(
+            "todowrite",
+            json!({"todos": [{"content": format!("Progress {step}"), "status": "in_progress", "priority": "medium"}]}),
+            &format!("call_{step}"),
+        ));
+    }
+    scripts.push(text_script("Finished overflow recoveries", ""));
+    let mut provider = Provider::start(scripts).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_overflows", "ORIGINAL_GOAL"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let terminal = events.through("session.idle").await;
+    assert!(!terminal
+        .iter()
+        .any(|event| event["type"] == "session.error"));
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| event["type"] == "session.compacted")
+            .count(),
+        4
+    );
+    let requests: Vec<_> = std::iter::from_fn(|| provider.requests.try_recv().ok()).collect();
+    assert_eq!(requests.len(), 13);
+    let final_request = requests.last().unwrap();
+    let tool_results: Vec<_> = final_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(
+        tool_results.len(),
+        4,
+        "recovered responses must survive later compactions exactly once"
+    );
+    assert!(final_request.to_string().contains("ORIGINAL_GOAL"));
+    assert!(server.messages(&id).await.last().unwrap()["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|part| part["text"] == "Finished overflow recoveries"));
+}
+
+#[tokio::test]
+async fn irreducible_context_overflow_stops_retrying_the_same_step() {
+    let mut provider = Provider::start(vec![
+        Script::http_status_body(400, "maximum context length is 32000 tokens"),
+        text_script("First recovery", ""),
+        Script::http_status_body(400, "maximum context length is 32000 tokens"),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_irreducible", "Too large"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let terminal = events.through("session.idle").await;
+    assert!(terminal
+        .iter()
+        .any(|event| event["type"] == "session.error"));
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| event["type"] == "session.compacted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::iter::from_fn(|| provider.requests.try_recv().ok()).count(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn repeated_compactions_use_the_latest_summary_and_preserve_recent_history_verbatim() {
     let mut provider = Provider::start(vec![
         text_script("ORIGINAL_REPLY", ""),

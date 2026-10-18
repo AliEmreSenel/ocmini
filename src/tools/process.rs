@@ -11,8 +11,8 @@ use std::time::Duration;
 
 const MAX_CAPTURE: usize = 64 * 1024;
 
-struct ProcessGroup {
-    id: u32,
+pub(super) struct ProcessGroup {
+    pub(super) id: u32,
 }
 
 impl Drop for ProcessGroup {

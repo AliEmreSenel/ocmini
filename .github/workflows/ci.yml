@@ -18,6 +18,8 @@ jobs:
         rust: ["1.85.0", stable]
     steps:
       - uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Install Rust
         run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt --component clippy
       - name: Check formatting

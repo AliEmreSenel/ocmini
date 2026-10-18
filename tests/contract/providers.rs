@@ -89,6 +89,8 @@ async fn retry_exhaustion_reports_a_visible_failure() {
         Script::http_status(503, Some("0")),
         Script::http_status(429, Some("0")),
         Script::http_status(502, Some("0")),
+        Script::http_status(500, Some("0")),
+        Script::http_status(503, Some("0")),
     ])
     .await;
     let server = TestServer::start(&provider, json!({})).await;
@@ -113,5 +115,5 @@ async fn retry_exhaustion_reports_a_visible_failure() {
             event["type"] == "session.status" && event["properties"]["status"]["type"] == "retry"
         })
         .count();
-    assert_eq!(retries, 3, "exactly three bounded retries per step");
+    assert_eq!(retries, 5, "exactly five bounded retries per step");
 }

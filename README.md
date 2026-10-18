@@ -4,7 +4,7 @@ A minimal OpenCode replica in Rust. One binary for terminal chat, coding tools, 
 
 ## Quick start
 
-Requires Rust 1.85+ and a C compiler for bundled SQLite.
+Building requires Rust 1.85+ and a C compiler for bundled SQLite. Search tools require ripgrep (`rg`) on `PATH`.
 
 ```sh
 cargo install --path . --locked
@@ -45,9 +45,11 @@ The selector lists saved sessions with live search (title, ID, directory), a cyc
 - **MCP:** stdio and Streamable HTTP servers.
 - **API:** OpenCode 1.x HTTP/SSE, model inventory and usage reporting.
 
-Tool text over 50 KiB is saved under `$XDG_DATA_HOME/ocmini/tool-output` (default `~/.local/share/ocmini/tool-output`). The conversation keeps a preview of the beginning and end plus the saved path, so omitted content can be read or searched later. Large shell output is captured to disk with bounded memory. Existing file-read/search paging and media limits still apply. Saved output files older than seven days are removed at startup; they are temporary supporting files, separate from session history.
+Tool text over 50 KiB is saved under `$XDG_DATA_HOME/ocmini/tool-output` (default `~/.local/share/ocmini/tool-output`). The conversation keeps a preview of the beginning and end plus the saved path, so omitted content can be read or searched later. Large shell output is captured to disk with bounded memory. Existing file-read/search paging and media limits still apply. Full output files are retained by default so resumed sessions can still read them. Set `OCMINI_TOOL_OUTPUT_RETENTION_DAYS` to a positive integer to remove expired output files at startup; unset or `0` retains them. These files use disk space separately from session history.
 
-Compaction can be requested manually, runs automatically near 95% of a configured context window, and recovers from provider context-overflow errors. Subsequent requests use the latest valid summary, recent messages kept verbatim, and newer messages; the original history remains saved. The recent-message target is roughly 15,000 tokens, reduced for smaller windows, with the latest user message taking priority. Complete tool call/result groups are retained when they fit. Summaries use a rough text budget and may omit older context when the conversation is too large. Unknown context windows rely on manual compaction or provider overflow recovery.
+Compaction can be requested manually, runs automatically with room reserved for model output, and recovers from provider context-overflow errors. It can repeat throughout a task, including within one model step while each checkpoint reduces the overflowing request. Recovery stops when compaction fails or no longer reduces that request. Subsequent requests use the latest valid summary, recent messages kept verbatim, and newer messages; the original history remains saved. The default recent-message budget is roughly a quarter of usable context, between 2,000 and 15,000 tokens. Complete tool call/result groups are retained when they fit, with the latest user message taking priority. Budgets use approximate token estimates. Unknown context windows rely on manual compaction or provider overflow recovery.
+
+`grep` and `glob` stream ripgrep results, return up to 100 matches, and use ripgrep's ignore and glob rules. Explicit globs can override ignore rules. Search has no additional candidate-file ceiling. Text reads accept files of any size and default to 2,000 lines; `offset` and `limit` page through them without a separate 20,000-line ceiling. Each line is capped at 2,000 characters and each file page at 50 KiB of text. Reads validate UTF-8 and binary content while retaining a bounded line preview. Media attachment limits still apply.
 
 ## What gets cut
 
@@ -58,6 +60,20 @@ Provider support is limited to the three HTTP protocols above. Native Gemini, Ve
 ## Configuration
 
 Uses OpenCode-shaped `opencode.json` or `opencode.jsonc`. Global configuration lives in `$XDG_CONFIG_HOME/opencode`; project configuration lives in the project or `.opencode` directory. Environment overrides include `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG_CONTENT`.
+
+Agent turns have no step limit by default. To cap model/tool rounds explicitly, set `agent.<name>.steps` (or the legacy `maxSteps`) to a positive integer. Ctrl+C or the abort endpoint stops an active turn.
+
+`subagent_depth` sets the maximum nesting depth and defaults to **8**; `0` disables child tasks. The `compaction` object supports OpenCode's settings:
+
+- `auto`: automatic proactive and overflow-triggered compaction, default `true`. Manual summaries remain available when disabled.
+- `prune`: clear older completed tool results from model context, default `false`. The latest two user turns, roughly 40,000 tokens of tool results and skill outputs are protected; pruning runs when more than 20,000 older tokens can be cleared. Original results remain browsable.
+- `reserved`: override the token reserve when the model supplies a separate `limit.input`; otherwise usable context is `limit.context` minus the output allowance.
+- `preserve_recent_tokens`: override the adaptive verbatim-tail budget; `0` keeps only the summary.
+- `tail_turns`: limit the number of recent user turns retained verbatim; `0` disables the verbatim tail. When omitted, only the token budget limits the tail.
+
+Shell tools default to a 120,000 ms timeout and MCP operations to 30,000 ms; larger explicit positive timeouts are allowed. Web fetches default to 30 seconds, clamp larger requested timeouts to 120 seconds, and accept responses up to 5 MiB. Shell and web timeouts are tool arguments; MCP timeouts are set in each server's configuration. Transient provider failures allow five retries per model step.
+
+To enable seven-day full-output expiry, start ocmini with `OCMINI_TOOL_OUTPUT_RETENTION_DAYS=7`. Expiry runs at startup; unset or `0` keeps outputs indefinitely.
 
 Example for a local compatible server:
 

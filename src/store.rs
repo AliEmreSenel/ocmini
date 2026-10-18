@@ -3,7 +3,7 @@ use crate::types::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -433,6 +433,61 @@ impl Store {
         self.messages_limited(session_id, None)
     }
 
+    /// Opt-in context pruning keeps the latest two user turns and 40k tokens
+    /// of completed tool output, and marks older output only when at least
+    /// another 20k tokens can be removed. Original output stays browsable.
+    pub fn prune_tool_outputs(&self, sid: &str, through: &str) -> Result<Vec<Value>, String> {
+        let messages = self.context_messages(sid, through)?;
+        let mut turns = 0;
+        let mut total = 0usize;
+        let mut pruned = 0usize;
+        let mut parts = Vec::new();
+        'history: for message in messages.into_iter().rev() {
+            if message.info.role == "user" {
+                turns += 1;
+            }
+            if turns < 2 {
+                continue;
+            }
+            if message.info.summary == Some(true) {
+                break;
+            }
+            for mut part in message.parts.into_iter().rev() {
+                if part["type"] != "tool"
+                    || part["state"]["status"] != "completed"
+                    || part["tool"] == "skill"
+                {
+                    continue;
+                }
+                if part["state"]["time"]["compacted"].is_number() {
+                    break 'history;
+                }
+                let tokens = part["state"]["output"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .len()
+                    .div_ceil(4);
+                total = total.saturating_add(tokens);
+                if total <= 40_000 {
+                    continue;
+                }
+                pruned = pruned.saturating_add(tokens);
+                part["state"]["time"]["compacted"] = json!(now_ms());
+                parts.push(part);
+            }
+        }
+        if pruned <= 20_000 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = self.write_tx(&mut conn)?;
+        for part in &parts {
+            save_part(&tx, sid, part, now_ms())?;
+        }
+        tx.commit().map_err(sql_error)?;
+        Ok(parts)
+    }
+
     pub fn messages_limited(
         &self,
         session_id: &str,
@@ -494,51 +549,73 @@ impl Store {
             role: String,
             parent: Option<String>,
             summary: bool,
+            created: i64,
+            ordinal: i64,
         }
+        fn header(row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
+            Ok(Header {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                parent: row.get(2)?,
+                summary: row.get(3)?,
+                created: row.get(4)?,
+                ordinal: row.get(5)?,
+            })
+        }
+        const FIELDS: &str = "id,json_extract(json,'$.role'),json_extract(json,'$.parentID'),json_extract(json,'$.summary') IS 1 AND json_extract(json,'$.time.completed') IS NOT NULL AND json_extract(json,'$.error') IS NULL,time_created,rowid";
         self.with_read(|c| {
             let tx = c.unchecked_transaction().map_err(sql_error)?;
-            let mut headers: Vec<Header> = {
-                let mut stmt = tx.prepare("SELECT id,json_extract(json,'$.role'),json_extract(json,'$.parentID'),json_extract(json,'$.summary') IS 1 AND json_extract(json,'$.time.completed') IS NOT NULL AND json_extract(json,'$.error') IS NULL FROM message WHERE session_id=?1 ORDER BY time_created,rowid").map_err(sql_error)?;
-                let rows = stmt.query_map(params![sid], |row| Ok(Header {
-                    id: row.get(0)?, role: row.get(1)?, parent: row.get(2)?, summary: row.get(3)?,
-                })).map_err(sql_error)?;
-                rows.collect::<Result<_, _>>().map_err(sql_error)?
+            let boundary: Option<(i64, i64)> = tx.query_row(
+                "SELECT time_created,rowid FROM message WHERE session_id=?1 AND id=?2",
+                params![sid, through], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(sql_error)?;
+            let mut users = HashMap::new();
+            let mut eligible = |h: &Header| -> Result<bool, String> {
+                if h.role == "user" {
+                    return Ok(boundary.is_none_or(|end| (h.created, h.ordinal) <= end));
+                }
+                let Some(parent) = &h.parent else { return Ok(true); };
+                if let Some(eligible) = users.get(parent) {
+                    return Ok(*eligible);
+                }
+                let position: Option<(i64, i64)> = tx.query_row(
+                    "SELECT time_created,rowid FROM message WHERE session_id=?1 AND id=?2 AND json_extract(json,'$.role')='user'",
+                    params![sid, parent], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional().map_err(sql_error)?;
+                let eligible = position.is_some_and(|position| boundary.is_none_or(|end| position <= end));
+                users.insert(parent.clone(), eligible);
+                Ok(eligible)
             };
-            let mut users = HashSet::new();
-            for header in &headers {
-                if header.role == "user" {
-                    users.insert(header.id.clone());
-                }
-                if header.id == through {
-                    break;
-                }
-            }
-            headers.retain(|header| {
-                if header.role == "user" {
-                    users.contains(&header.id)
-                } else {
-                    header.parent.as_ref().is_none_or(|id| users.contains(id))
-                }
-            });
-            let mut start = 0;
+            // Walk the session index backwards and stop at the newest usable
+            // checkpoint. Archived headers need not be decoded on every round.
+            let mut stmt = tx.prepare(&format!("SELECT {FIELDS} FROM message WHERE session_id=?1 ORDER BY time_created DESC,rowid DESC")).map_err(sql_error)?;
+            let rows = stmt.query_map(params![sid], header).map_err(sql_error)?;
+            let mut tail = Vec::new();
             let mut messages = Vec::new();
-            for (index, header) in headers.iter().enumerate().rev().filter(|(_, h)| h.summary) {
-                let message = read_message(&tx, sid, &header.id)?.ok_or("Message not found")?;
-                if message.parts.iter().any(|part| part["type"] == "text" && part["text"].as_str().is_some_and(|text| !text.trim().is_empty())) {
-                    let pending = message.parts.iter()
-                        .find_map(|part| part["compactionPending"].as_str())
-                        .filter(|id| headers[..index].iter().any(|header| header.id == *id))
-                        .map(|id| read_message(&tx, sid, id)).transpose()?.flatten();
-                    messages.push(message);
-                    if let Some(pending) = pending {
-                        messages.push(pending);
+            for h in rows {
+                let h = h.map_err(sql_error)?;
+                if !eligible(&h)? { continue; }
+                if h.summary {
+                    let message = read_message(&tx, sid, &h.id)?.ok_or("Message not found")?;
+                    if message.parts.iter().any(|part| part["type"] == "text" && part["text"].as_str().is_some_and(|text| !text.trim().is_empty())) {
+                        let pending = message.parts.iter().find_map(|part| part["compactionPending"].as_str());
+                        if let Some(pending) = pending {
+                            let pending = tx.query_row(&format!("SELECT {FIELDS} FROM message WHERE session_id=?1 AND id=?2"), params![sid, pending], header).optional().map_err(sql_error)?;
+                            if let Some(pending) = pending.filter(|p| (p.created, p.ordinal) < (h.created, h.ordinal)) {
+                                if eligible(&pending)? {
+                                    messages.push(read_message(&tx, sid, &pending.id)?.ok_or("Message not found")?);
+                                }
+                            }
+                        }
+                        messages.insert(0, message);
+                        break;
                     }
-                    start = index + 1;
-                    break;
                 }
+                tail.push(h);
             }
-            for header in headers.into_iter().skip(start) {
-                messages.push(read_message(&tx, sid, &header.id)?.ok_or("Message not found")?);
+            drop(stmt);
+            for h in tail.into_iter().rev() {
+                messages.push(read_message(&tx, sid, &h.id)?.ok_or("Message not found")?);
             }
             tx.commit().map_err(sql_error)?;
             Ok(messages)
@@ -1426,6 +1503,17 @@ mod tests {
             .execute("UPDATE part SET json='invalid' WHERE message_id='a1'", [])
             .unwrap();
         assert!(db.messages(&session.id).is_err());
+        assert_eq!(
+            ids(db.context_messages(&session.id, "u2").unwrap())[0],
+            "summary"
+        );
+        // Stop the reverse scan at the checkpoint: even archived headers are
+        // outside the active context, not just their potentially huge parts.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE message SET json='invalid' WHERE id='a1'", [])
+            .unwrap();
         assert_eq!(
             ids(db.context_messages(&session.id, "u2").unwrap())[0],
             "summary"

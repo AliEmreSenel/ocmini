@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub(super) const MAX_OUTPUT: usize = 50 * 1024;
-const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub(super) fn directory() -> PathBuf {
     Path::new(&crate::config::data_home())
@@ -55,7 +54,7 @@ pub(super) async fn limit(
     .map_err(|e| failure(format!("Cannot save tool output: {e}")))?
 }
 
-pub(super) fn cleanup(directory: &Path) {
+pub(super) fn cleanup(directory: &Path, retention: Duration) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
@@ -71,7 +70,7 @@ pub(super) fn cleanup(directory: &Path) {
                     .modified()
                     .ok()
                     .and_then(|time| SystemTime::now().duration_since(time).ok())
-                    .is_some_and(|age| age > RETENTION)
+                    .is_some_and(|age| age > retention)
         });
         if expired {
             let _ = std::fs::remove_file(entry.path());
@@ -124,15 +123,16 @@ mod tests {
 
     #[test]
     fn cleanup_removes_only_expired_output_files() {
+        let retention = Duration::from_secs(7 * 24 * 60 * 60);
         let root = tempfile::tempdir().unwrap();
         for name in ["tool_old.txt", "tool_new.txt", "unrelated.txt"] {
             let file = std::fs::File::create(root.path().join(name)).unwrap();
             if name != "tool_new.txt" {
-                file.set_modified(SystemTime::now() - RETENTION - Duration::from_secs(1))
+                file.set_modified(SystemTime::now() - retention - Duration::from_secs(1))
                     .unwrap();
             }
         }
-        cleanup(root.path());
+        cleanup(root.path(), retention);
         assert!(!root.path().join("tool_old.txt").exists());
         assert!(root.path().join("tool_new.txt").exists());
         assert!(root.path().join("unrelated.txt").exists());

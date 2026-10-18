@@ -132,7 +132,7 @@ pub struct App {
 impl App {
     pub fn new() -> Result<Self, String> {
         let config = Config::load()?;
-        crate::tools::cleanup_outputs();
+        crate::tools::cleanup_outputs()?;
         let directory = std::env::current_dir().unwrap_or_default();
         let directory = directory.to_string_lossy().into_owned();
         let (mcp, mcp_ready) = start_mcp(&config, &directory);
