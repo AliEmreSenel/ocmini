@@ -8,6 +8,18 @@ use std::time::Duration;
 
 const MAX_BODY: usize = 5 * 1024 * 1024;
 
+fn request_timeout(input: &Value) -> Result<Duration, ToolError> {
+    let seconds = match input.get("timeout") {
+        None | Some(Value::Null) => 30,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| failure("webfetch timeout must be a positive integer in seconds"))?
+            .min(120),
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
 pub(super) async fn fetch(input: &Value, cancel: Arc<AtomicBool>) -> Result<ToolOutput, ToolError> {
     let url = super::required(input, "url")?;
     let parsed = reqwest::Url::parse(url).map_err(|e| failure(format!("Invalid URL: {e}")))?;
@@ -21,18 +33,12 @@ pub(super) async fn fetch(input: &Value, cancel: Arc<AtomicBool>) -> Result<Tool
     if !matches!(format, "text" | "markdown" | "html") {
         return Err(failure("format must be text, markdown, or html"));
     }
-    let timeout = match input.get("timeout") {
-        None | Some(Value::Null) => 30,
-        Some(value) => value
-            .as_u64()
-            .filter(|v| *v > 0 && *v <= 120)
-            .ok_or_else(|| failure("webfetch timeout must be 1..120 seconds"))?,
-    };
+    let timeout = request_timeout(input)?;
     let client = crate::provider::client();
     let operation = async {
         let response = client
             .get(parsed)
-            .timeout(Duration::from_secs(timeout))
+            .timeout(timeout)
             .header(
                 reqwest::header::ACCEPT,
                 "text/markdown, text/html, text/plain, application/json;q=0.9, */*;q=0.1",
@@ -113,6 +119,23 @@ fn render_html(bytes: &[u8], format: &str) -> Result<String, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_timeout_defaults_and_ceiling_match_opencode() {
+        assert_eq!(
+            request_timeout(&json!({})).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            request_timeout(&json!({"timeout":120})).unwrap(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            request_timeout(&json!({"timeout":3600})).unwrap(),
+            Duration::from_secs(120)
+        );
+        assert!(request_timeout(&json!({"timeout":0})).is_err());
+    }
 
     #[test]
     fn html_formats_decode_entities_omit_scripts_and_keep_links() {

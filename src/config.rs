@@ -73,6 +73,45 @@ pub struct McpLocal {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
+pub struct CompactionCfg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_recent_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_turns: Option<u64>,
+}
+
+impl CompactionCfg {
+    pub fn automatic(&self) -> bool {
+        self.auto.unwrap_or(true)
+    }
+
+    pub fn usable(&self, context: Option<u64>, input: Option<u64>, output: u64) -> Option<u64> {
+        context.filter(|context| *context > 0).map(|context| {
+            if let Some(input) = input.filter(|input| *input > 0) {
+                input.saturating_sub(self.reserved.unwrap_or(output.min(20_000)))
+            } else {
+                context.saturating_sub(output)
+            }
+        })
+    }
+
+    pub fn recent_bytes(&self, usable: Option<u64>) -> usize {
+        let tokens = self.preserve_recent_tokens.unwrap_or_else(|| {
+            usable
+                .map(|usable| (usable / 4).clamp(2_000, 15_000))
+                .unwrap_or(15_000)
+        });
+        usize::try_from(tokens.saturating_mul(4)).unwrap_or(usize::MAX)
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Config {
     #[serde(default)]
     pub provider: HashMap<String, ProviderCfg>,
@@ -92,6 +131,10 @@ pub struct Config {
     pub command: HashMap<String, Value>,
     #[serde(default)]
     pub skills: Value,
+    #[serde(default)]
+    pub compaction: CompactionCfg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_depth: Option<u64>,
     #[serde(default)]
     pub disabled_providers: Vec<String>,
     #[serde(default)]
@@ -560,6 +603,38 @@ pub fn absolute_path(path: &Path, base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compaction_configuration_controls_headroom_and_retention() {
+        let cfg: Config = serde_json::from_value(json!({"compaction": {
+            "auto":false,"prune":true,"reserved":500,"tail_turns":1,"preserve_recent_tokens":1000
+        },"subagent_depth":12}))
+        .unwrap();
+        assert!(!cfg.compaction.automatic());
+        assert_eq!(cfg.compaction.prune, Some(true));
+        assert_eq!(
+            cfg.compaction.usable(Some(10_000), Some(9_000), 2_000),
+            Some(8_500)
+        );
+        assert_eq!(
+            cfg.compaction.usable(Some(10_000), None, 2_000),
+            Some(8_000)
+        );
+        assert_eq!(cfg.compaction.recent_bytes(Some(8_500)), 4_000);
+        assert_eq!(cfg.subagent_depth, Some(12));
+        let defaults = Config::default();
+        assert!(defaults.compaction.automatic());
+        assert_eq!(defaults.compaction.prune, None);
+        assert_eq!(defaults.compaction.recent_bytes(Some(128_000)), 60_000);
+        assert_eq!(defaults.compaction.recent_bytes(Some(4_000)), 8_000);
+        assert_eq!(defaults.compaction.usable(Some(0), None, 2_000), None);
+        for config in [
+            json!({"subagent_depth":-1}),
+            json!({"compaction":{"reserved":-1}}),
+            json!({"compaction":{"auto":"yes"}}),
+        ] {
+            assert!(serde_json::from_value::<Config>(config).is_err());
+        }
+    }
     #[test]
     fn jsonc_rejects_json5_and_malformed_input() {
         for text in [

@@ -91,6 +91,12 @@ T3 sends another `prompt_async` while the session is busy to steer an active tur
 
 Cancellation must interrupt a stalled provider stream, a subprocess and a permission/question wait. It cannot depend on the provider sending another token. T3 treats `MessageAbortedError` as interruption rather than failure. A root abort and child cleanup are separate operations in the T3 adapter; child sessions remain discoverable through `/children`.
 
+Agent turns have no implicit step budget: continue model/tool rounds until completion, steering, cancellation or an execution error. An explicitly configured `agent.<name>.steps` (legacy `maxSteps`) limits the number of rounds; exhausting it preserves completed tool results for the next prompt.
+
+Automatic compaction may repeat within a turn and within an overflowing model step while the checkpoint reduces the request. A failed compaction or non-shrinking overflowing request terminates recovery; there is no fixed compaction count. `compaction.auto` defaults to true and controls proactive and overflow recovery; manual summaries remain available when false. Headroom accounts for the model's input/output limits. `compaction.reserved`, `preserve_recent_tokens`, `tail_turns` and opt-in `prune` control the reserve, verbatim tail and old-tool context pruning. Pruning marks parts as compacted without deleting their stored results. Zero token/turn budgets disable the verbatim tail. Transient provider failures permit five retries per model step.
+
+Shell and MCP operations honor larger explicit positive timeouts. Web fetches use a 30-second default and clamp requested timeouts to 120 seconds, with a 5 MiB response limit. All remain cancellable. `grep` and `glob` require `rg` on PATH and stream at most 100 results with ripgrep's native glob/ignore rules, without a candidate-file ceiling. Text reads have no whole-file size ceiling: pages default to 2,000 lines, allow larger explicit limits, and retain at most 2,000 characters per line and 50 KiB of text. Existing media limits remain.
+
 ### Commands
 
 T3 sends `model` as a **string** on command requests, for example `provider/model`, plus `command`, `arguments`, `messageID`, optional `agent` and `variant`, and file `parts`. It does not send top-level `providerID` and `modelID` on this route.
@@ -181,6 +187,8 @@ Question requests use a flat `questions` array of `{question, header, options, m
 
 Real task tools create child sessions and publish `session.created` with `parentID` before dependent child events. Their running and completed tool metadata contains `sessionId` and, when known, `model: {providerID, modelID}`. T3 uses these fields to create child threads, route child approval requests, update child permissions and discover background work. Writing a fabricated task-result string without running a child is not compatible behavior.
 
+`subagent_depth` configures the nesting ceiling, defaulting to 8. Zero prevents child-task creation; larger values permit deeper nesting. Invalid or cyclic ancestor records produce tool errors.
+
 ## Models, agents, commands, skills and MCP
 
 `GET /provider` returns `{all, connected, default}`. Every advertised model has a nonempty `id` and `name`; configured variants, limits and capability metadata are preserved. `connected` reflects usable configuration/credentials, not every known provider name. T3 builds its model picker only from connected providers. Unsupported provider SDKs fail explicitly rather than being sent through an unrelated API format.
@@ -212,3 +220,5 @@ Session state and transcripts live in the ocmini SQLite database under the XDG d
 For T3's usage widget, a separate `opencode-ocmini.db` sidecar under the OpenCode XDG data directory contains a compatible `message` table with `id`, `session_id`, `data`, and `time_created`. Do not overwrite the real `opencode.db` or duplicate billed usage when copying history during a fork.
 
 The headless runtime intentionally does not include OpenCode's desktop/web/TUI applications, hosted account/billing services, plugin marketplace, automatic plugin/package installation, updater, LSP fleet or OpenCode 2.x background-service protocol. Authentication mechanisms and provider formats that require those omitted integrations must fail honestly; the compatibility version is not a promise of support for every OpenCode distribution feature.
+
+Full tool outputs saved separately from transcript previews are retained by default. `OCMINI_TOOL_OUTPUT_RETENTION_DAYS` enables optional startup expiry; `0` disables it. Transcript pruning remains separately controlled by `OCMINI_RETENTION_DAYS`.

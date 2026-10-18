@@ -92,6 +92,54 @@ Three fresh-process runs of the 20-operation long-session fixture, each completi
 
 A final live PLLM5/Qwen run completed 12 turns, two explicit compactions, 37 model calls and 29 tool executions across 11 tool types, with two SSE subscribers. Peak RSS was 15.7 MiB with two threads; health-request p95 was 1.14 ms and no stream or health request failed. The intended missing-file error was the only tool error. Final project tests and file checks passed, and the answer retained the earlier guide rule across compaction and recalled the later question choice.
 
+## Runtime limits and longer conversations
+
+This initial audit stage preceded the requested OpenCode parity follow-up below; its counts and measurements describe that earlier build.
+
+On 2026-10-18, an audit found that proactive compaction could run only once per turn and overflow recovery only twice over the whole turn. Both counters prevented otherwise successful tasks from continuing as their context filled repeatedly. Proactive compaction can now repeat, and the overflow recovery budget resets after a successful model step. Two failed overflow recoveries of the same step still terminate an irreducibly large request. Contract tests reproduce both former failures, verify repeated recovery and retained tool results, and verify that an irreducible overflow stops.
+
+Explicit shell, web and MCP timeouts no longer have additional upper ceilings of ten minutes, two minutes and ten minutes respectively. Defaults and cancellation remain. Tests execute tools with longer budgets, check MCP configuration, and retain the existing timeout/cancellation checks. Full saved tool outputs also no longer expire after seven days by default: that broke references when resuming an old conversation. Expiry is now opt-in through `OCMINI_TOOL_OUTPUT_RETENTION_DAYS`. Tests resume with an eight-day-old full output and cover optional expiry and invalid settings.
+
+Context loading now scans the existing session index backwards to the latest usable checkpoint instead of decoding every archived message header on each round. Eligibility still excludes queued user prompts and their descendants, includes parentless messages, skips empty/failed summaries, and retains the response that finishes after an overflow checkpoint. Existing context, compaction, fork and restart tests cover those rules; an additional check verifies that archived headers are not read. Subagent model selection also now uses the existing metadata-only model lookup instead of loading the parent's complete transcript.
+
+The repeatable local fixture is `tests/stress_conversations.py`. It requires Python 3 on Linux, uses temporary isolated databases and a localhost SSE provider, and needs no credentials. It checks the current user prompt and goal marker in active requests, complete tool call/result pairing, expected persisted message/tool counts, and continuation after restarting the process. The synthetic provider reports an 8,192-token context window. These are runtime and context-transport checks, not measurements of a real model's recall or summarization quality.
+
+```sh
+python3 tests/stress_conversations.py /path/to/ocmini --mode turns --sizes 100 500 1000 2000 5000 10000
+python3 tests/stress_conversations.py /path/to/ocmini --mode steps --sizes 100 500 2000 5000
+python3 tests/stress_conversations.py /path/to/ocmini --mode archive --sizes 1000 10000 100000
+```
+
+The corrected release build completed 10,000 turns in one session, saving 20,555 messages including 555 summaries, and completed a single task with 5,000 tool rounds and 312 summaries. Both resumed after restart; all original messages remained saved. Request sizes stayed below 32 KiB in these fixtures, with zero context overflows. The prior build, with only the implicit 100-step cutoff already removed, failed the single-task fixture after 67 model/tool rounds because it exhausted the turn-wide overflow recovery budget.
+
+Three fresh processes per build and archive size each sent 20 new turns after a checkpoint, with 3,072-byte archived text parts. Median per-request latency at 1,000, 10,000 and 100,000 archived messages changed from 4.15, 17.09 and 142.24 ms to 2.55, 2.42 and 2.69 ms. At 100,000 archived messages, median peak RSS fell from 32.70 to 13.60 MiB; CPU for the 20 turns fell from 2.92 to 0.10 seconds. At 1,000 archived messages the new build used more memory, 13.34 versus 11.66 MiB, so this is not a universal memory reduction. All 100,000 archived records remained present, and their payloads were excluded from requests. The tool definitions differ slightly because timeout ceilings were removed; active conversation content is unchanged. Timing includes local HTTP/provider fixture work; CPU and memory cover ocmini, excluding the Python fixture and remote inference.
+
+Full measurements and baseline details are saved in [validation/long-conversation-audit.json](validation/long-conversation-audit.json). The release build, formatting, Clippy and all 141 Rust tests pass on the current compiler. No new context cache, database index, connection pool or global allocator setting was added.
+
+The original audit left 32 MiB text-file and 100,000-candidate search ceilings and a 20,000-line read-page clamp; the parity follow-up removes all three. Media and transport bounds remain: 20 MiB native attachments, 16 MiB read-media attachments, 5 MiB web responses and 16 MiB MCP messages. Search results remain capped at 100. Nesting now has a configurable depth defaulting to eight, and provider retries increase to five. Skill resource listings still stop at 100 entries; instructions are loaded in full.
+
+The existing 50 KiB previews with full output files, buffered scans, 250 ms stream-persistence batching and configurable single-worker default retain their measured benefits. Their tradeoffs remain: saved output consumes disk, stream persistence can lag live deltas until flush, unknown context windows rely on overflow/manual compaction, and high concurrency or many distinct project directories need separate load testing. Automatic cleanup of output files no longer referenced by any retained or forked session would improve disk use without breaking resumed conversations.
+
+## OpenCode parity follow-up
+
+The requested follow-up implements `compaction.auto`, `prune`, `reserved`, `preserve_recent_tokens` and `tail_turns`. Usable context reserves model output, using the upstream input-limit reserve when provided; the default verbatim tail is a quarter of usable context, clamped to roughly 2,000–15,000 tokens. Zero token/turn budgets disable the tail. Explicitly disabled automatic compaction also disables overflow-triggered summaries but leaves manual compaction available. Repeated overflow compaction has no fixed counter; it continues while checkpoints shrink the overflowing request and stops on a failed summary or no progress. Tests complete four recoveries in one model step and cover the irreducible case.
+
+Opt-in pruning follows the upstream protection/minimum thresholds: the latest two user turns, roughly 40,000 tokens of tool results and skill output are protected; older output is marked compacted only when more than 20,000 tokens can be cleared. Context then contains a placeholder, while saved original outputs remain browsable. Contract tests compare enabled/disabled pruning and verify both model context and archived results.
+
+Search now streams the external `rg` process, uses native ripgrep ignore/glob semantics and stops after 100 results plus a lookahead. No candidate-file ceiling remains. Explicit globs may override ignore rules; unignored `node_modules` and `target` directories are no longer forcibly excluded. Parsing retains at most 64 KiB per ripgrep record and 8 KiB of error output, following upstream bounds, and cancellation terminates/reaps the process. CI installs ripgrep explicitly. Unused in-process ignore/globset dependencies were removed without changing remaining dependency versions.
+
+Text operations no longer reject files at 32 MiB. Read pages default to 2,000 lines without a separate maximum requested page, cap each line at 2,000 Unicode scalar characters and each file page at 50 KiB of text, and report the next offset. A reused bounded line buffer validates split UTF-8, CRLF and binary content without retaining an arbitrarily long line. Upstream JavaScript counts UTF-16 code units for line slicing; ocmini preserves complete Unicode scalar characters. Tests cover a paged read beyond a 33 MiB line, a 20,001-entry directory page, byte-page continuity, zero limits and Unicode boundaries.
+
+Web fetch timeouts again default to 30 seconds and clamp larger requests to 120 seconds; the 5 MiB body bound remains. Provider retries now allow five attempts after the initial request, including recovery on the fifth retry. `subagent_depth` defaults to eight, accepts zero to disable children and accepts larger values. Tests run nested tasks at the default depth, zero, two and ten levels. Optional seven-day full-output expiry remains available through `OCMINI_TOOL_OUTPUT_RETENTION_DAYS=7`; unset or zero retains files. Tests check expiry, retention and malformed settings.
+
+Formatting, the release build, Clippy and all 155 tests (114 unit and 41 contract) pass. Both Rust 1.85.0 and the current compiler pass all tests and Clippy with warnings denied. The updated local fixture completed 10,000 turns with 624 compactions and a single task with 5,000 tool rounds and 357 compactions, with no overflows or lost prompts/tool results; both resumed after restart. These counts differ from the initial audit because compaction now reserves output headroom.
+
+The search stress case completed across 100,005 files, returned one grep match and 100 glob results with truncation, and read the final line of a 33 MiB text file. ocmini peak RSS was 13.39 MiB in that case; this excludes the ripgrep child and Python fixture. Archive checks through 100,000 saved messages retained every seeded record, allowed new compaction checkpoints during 20 new turns, and resumed after restart. Full measurements are in [validation/opencode-parity-stress.json](validation/opencode-parity-stress.json); the pinned source comparison is [validation/opencode-limit-comparison.md](validation/opencode-limit-comparison.md).
+
+```sh
+python3 tests/stress_conversations.py /path/to/ocmini --mode search --sizes 1000 100005
+```
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.

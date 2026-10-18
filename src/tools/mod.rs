@@ -12,6 +12,7 @@ pub mod patch;
 
 pub(crate) use files::media_type;
 mod process;
+mod search;
 mod skills;
 mod web;
 
@@ -51,14 +52,14 @@ impl ToolCtx {
 
 pub fn tool_defs() -> Vec<Value> {
     vec![
-        fn_def("bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000, maximum 600000). Commands are cancelled with the turn. Background processes are stopped when the command exits.", json!({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":600000},"description":{"type":"string"}},"required":["command"]})),
+        fn_def("bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn. Background processes are stopped when the command exits.", json!({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"},"timeout":{"type":"integer","minimum":1},"description":{"type":"string"}},"required":["command"]})),
         fn_def("read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", json!({"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["filePath"]})),
         fn_def("write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", json!({"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]})),
         fn_def("edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", json!({"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string","minLength":1},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}},"required":["filePath","oldString","newString"]})),
         fn_def("apply_patch", "Apply a patch using *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, optional *** Move to:, @@ context hunks, and *** End Patch. All files are validated before any are changed.", json!({"type":"object","properties":{"patchText":{"type":"string"}},"required":["patchText"]})),
-        fn_def("glob", "Find files by glob pattern (including ** and {a,b}), honoring gitignore. Returns up to 100 files newest first. Relative path uses the session directory.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})),
+        fn_def("glob", "Find files using ripgrep and glob patterns (including ** and {a,b}), honoring gitignore. Returns up to 100 files. Relative path uses the session directory.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})),
         fn_def("grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})),
-        fn_def("webfetch", "Fetch an HTTP(S) text resource. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds, maximum 120.", json!({"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["text","markdown","html"]},"timeout":{"type":"integer","minimum":1,"maximum":120}},"required":["url"]})),
+        fn_def("webfetch", "Fetch an HTTP(S) text resource up to 5 MiB. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds (default 30, maximum 120).", json!({"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["text","markdown","html"]},"timeout":{"type":"integer","minimum":1,"maximum":120}},"required":["url"]})),
         fn_def("todowrite", "Replace and persist the session's todo list.", json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status","priority"]}}},"required":["todos"]})),
         fn_def("question", "Ask one or more questions, with options, and wait for the user's answers.", json!({"type":"object","properties":{"questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"multiple":{"type":"boolean"},"custom":{"type":"boolean"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label","description"]}}},"required":["question","header","options"]}}},"required":["questions"]})),
         fn_def("task", "Delegate to a subagent session. subagent_type selects an available subagent; task_id resumes a child from this session. Returns the child's session ID and result.", json!({"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"},"subagent_type":{"type":"string"},"task_id":{"type":"string"}},"required":["description","prompt","subagent_type"]})),
@@ -156,8 +157,8 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                 None | Some(Value::Null) => 120_000,
                 Some(value) => value
                     .as_u64()
-                    .filter(|v| *v > 0 && *v <= 600_000)
-                    .ok_or_else(|| failure("timeout must be 1..600000 milliseconds"))?,
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| failure("timeout must be a positive integer in milliseconds"))?,
             };
             let directory = resolve_path(
                 &ctx.dir,
@@ -175,7 +176,8 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
             )
             .await
         }
-        "read" | "write" | "edit" | "glob" | "grep" => {
+        "glob" | "grep" => search::run(&ctx.dir, name, input, ctx.cancel.clone()).await,
+        "read" | "write" | "edit" => {
             let directory = ctx.dir.clone();
             let name = name.to_owned();
             let input = input.clone();
@@ -275,8 +277,21 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
     output::limit(result, output::directory()).await
 }
 
-pub fn cleanup_outputs() {
-    output::cleanup(&output::directory());
+pub fn cleanup_outputs() -> Result<(), String> {
+    let Some(value) = std::env::var_os("OCMINI_TOOL_OUTPUT_RETENTION_DAYS") else {
+        return Ok(());
+    };
+    let days = value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("OCMINI_TOOL_OUTPUT_RETENTION_DAYS must be a nonnegative integer")?;
+    if days > 0 {
+        output::cleanup(
+            &output::directory(),
+            Duration::from_secs(days.saturating_mul(86_400)),
+        );
+    }
+    Ok(())
 }
 
 struct QuestionGuard {
@@ -385,35 +400,26 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
         .map_err(failure)?
         .ok_or_else(|| failure("Parent session does not exist"))?;
     let mut ancestor = parent.parent_id.clone();
-    let mut depth = 0;
+    let max_depth = ctx.app.config.lock().unwrap().subagent_depth.unwrap_or(8);
+    let mut depth = 0u64;
+    let mut ancestors = std::collections::HashSet::from([parent.id.clone()]);
     while let Some(id) = ancestor {
-        depth += 1;
-        if depth >= 8 {
-            return Err(failure("Subagent nesting limit (8) reached"));
+        if !ancestors.insert(id.clone()) {
+            return Err(failure("Subagent session ancestry contains a cycle"));
         }
+        depth += 1;
         ancestor = ctx
             .app
             .store
             .get_session(&id)
-            .ok()
-            .flatten()
-            .and_then(|session| session.parent_id);
+            .map_err(failure)?
+            .ok_or_else(|| failure(format!("Ancestor session {id} does not exist")))?
+            .parent_id;
     }
-    let mut model = ctx
-        .app
-        .store
-        .messages(&ctx.session_id)
-        .unwrap_or_default()
-        .into_iter()
-        .rev()
-        .find_map(|message| {
-            message.info.model.or_else(|| {
-                Some(ModelRef {
-                    provider_id: message.info.provider_id?,
-                    model_id: message.info.model_id?,
-                })
-            })
-        });
+    if depth >= max_depth {
+        return Err(failure(format!("Subagent nesting limit ({max_depth}) reached. Increase subagent_depth to allow more levels.")));
+    }
+    let mut model = ctx.app.store.last_model(&ctx.session_id).map_err(failure)?;
     if let Some(selected) = ctx
         .app
         .config

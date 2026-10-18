@@ -25,6 +25,8 @@ mod cli;
 mod commands;
 #[path = "contract/compaction.rs"]
 mod compaction;
+#[path = "contract/limits.rs"]
+mod limits;
 #[path = "contract/mcp.rs"]
 mod mcp;
 #[path = "contract/permissions.rs"]
@@ -33,6 +35,8 @@ mod permissions;
 mod providers;
 #[path = "contract/sessions.rs"]
 mod sessions;
+#[path = "contract/steps.rs"]
+mod steps;
 #[path = "contract/streaming.rs"]
 mod streaming;
 

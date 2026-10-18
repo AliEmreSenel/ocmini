@@ -21,11 +21,17 @@ done
 #[cfg(unix)]
 async fn stdio_connects_discovers_routes_and_calls_with_environment() {
     let hub = McpHub::new();
+    let mut config = stdio_config();
+    config["timeout"] = json!(3_600_000);
     let status = hub
-        .add_async("server_with_underscores", stdio_config())
+        .add_async("server_with_underscores", config)
         .await
         .unwrap();
     assert_eq!(status["status"], "connected", "{status}");
+    assert_eq!(
+        hub.servers.lock().unwrap()["server_with_underscores"].timeout(),
+        Duration::from_secs(3600)
+    );
     let definitions = hub.tool_defs();
     let name = definitions[0]["function"]["name"].as_str().unwrap();
     assert_eq!(name, "server_with_underscores_echo_value");
