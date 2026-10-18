@@ -40,6 +40,8 @@ impl UsageDb {
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "journal_size_limit", 1024 * 1024)
+            .map_err(|e| e.to_string())?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT NOT NULL, time_created INTEGER NOT NULL);
              CREATE INDEX IF NOT EXISTS message_time_created ON message(time_created);"

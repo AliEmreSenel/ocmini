@@ -1,6 +1,80 @@
 use super::*;
 
 #[tokio::test]
+async fn session_list_limits_apply_after_directory_root_and_unicode_search_filters() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let mut created = Vec::new();
+    for title in ["CAFÉ older", "café recent", "unrelated newest"] {
+        let session: Value = server
+            .post("/session", &json!({"title":title}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        created.push(session);
+    }
+    let child: Value = server
+        .post(
+            "/session",
+            &json!({"title":"café child","parentID":created[0]["id"]}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let other = server.root.path().join("other-project");
+    std::fs::create_dir(&other).unwrap();
+    server
+        .post("/session", &json!({"title":"café other","directory":other}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let directory = server
+        .directory
+        .join("unused/..")
+        .to_string_lossy()
+        .into_owned();
+    for limit in [0usize, 1, 2, 10] {
+        let rows: Vec<Value> = server
+            .get("/session")
+            .query(&[
+                ("directory", directory.as_str()),
+                ("search", "CAFÉ"),
+                ("roots", "true"),
+            ])
+            .query(&[("limit", limit)])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let expected = [&created[1]["id"], &created[0]["id"]];
+        assert_eq!(
+            rows.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
+            expected[..limit.min(2)]
+        );
+    }
+    let rows: Vec<Value> = server
+        .get("/session")
+        .query(&[("search", "CAFÉ"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rows[0]["id"], child["id"]);
+}
+
+#[tokio::test]
 async fn session_scoping_and_validation_are_consistent() {
     let provider = Provider::start(vec![]).await;
     let server = TestServer::start(&provider, json!({})).await;

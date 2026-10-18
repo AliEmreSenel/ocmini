@@ -35,3 +35,6 @@ mod providers;
 mod sessions;
 #[path = "contract/streaming.rs"]
 mod streaming;
+
+#[path = "contract/tool_output.rs"]
+mod tool_output;

@@ -272,23 +272,19 @@ async fn list_sessions(
 ) -> Result<Json<Vec<Session>>, ApiError> {
     let directory = requested_directory(&headers, &query)?;
     let store = st.app.store.clone();
-    let mut sessions = tokio::task::spawn_blocking(move || store.list_sessions(None))
-        .await
-        .map_err(|e| ApiError::runtime(e.to_string()))?
-        .map_err(ApiError::runtime)?;
-    sessions.retain(|session| {
-        matches_directory(session, directory.as_deref())
-            && (!query.roots.unwrap_or(false) || session.parent_id.is_none())
-            && query.search.as_ref().is_none_or(|search| {
-                session
-                    .title
-                    .to_lowercase()
-                    .contains(&search.to_lowercase())
-            })
-    });
-    if let Some(limit) = query.limit {
-        sessions.truncate(limit);
-    }
+    let sessions = tokio::task::spawn_blocking(move || {
+        let search = query.search.as_ref().map(|search| search.to_lowercase());
+        store.list_sessions_filtered(query.limit, |session| {
+            matches_directory(session, directory.as_deref())
+                && (!query.roots.unwrap_or(false) || session.parent_id.is_none())
+                && search
+                    .as_ref()
+                    .is_none_or(|search| session.title.to_lowercase().contains(search))
+        })
+    })
+    .await
+    .map_err(|e| ApiError::runtime(e.to_string()))?
+    .map_err(ApiError::runtime)?;
     Ok(Json(sessions))
 }
 
@@ -456,15 +452,10 @@ async fn session_messages(
 ) -> Result<Json<Vec<MessageWithParts>>, ApiError> {
     scoped_session(&st, &id, &headers, &query)?;
     let store = st.app.store.clone();
-    let session_id = id.clone();
-    let mut messages = tokio::task::spawn_blocking(move || store.messages(&session_id))
+    let messages = tokio::task::spawn_blocking(move || store.messages_limited(&id, query.limit))
         .await
         .map_err(|e| ApiError::runtime(e.to_string()))?
         .map_err(ApiError::runtime)?;
-    if let Some(limit) = query.limit {
-        let remove = messages.len().saturating_sub(limit);
-        messages.drain(..remove);
-    }
     Ok(Json(messages))
 }
 
@@ -477,10 +468,8 @@ async fn session_message(
     scoped_session(&st, &id, &headers, &query)?;
     st.app
         .store
-        .messages(&id)
+        .message(&id, &message_id)
         .map_err(ApiError::runtime)?
-        .into_iter()
-        .find(|message| message.info.id == message_id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("Message not found"))
 }
@@ -843,7 +832,7 @@ async fn event_stream(
             tokio::select! {
                 _ = st.shutdown.cancelled() => break,
                 event = receiver.recv() => match event {
-                    Ok(event) => if event_in_directory(&event, &st.app, directory.as_deref()) { yield Ok(Event::default().data(serde_json::to_string(&event).expect("serializable event"))); },
+                    Ok(event) => if event_in_directory(&event, &st.app, directory.as_deref()) { yield Ok(Event::default().data(serde_json::to_string(&*event).expect("serializable event"))); },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                         // Losing text or tool events must fail visibly instead of completing a partial turn.
                         for id in st.app.store.busy_sessions().unwrap_or_default() {

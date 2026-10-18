@@ -1,4 +1,4 @@
-use super::{cancelled, cap_out, failure};
+use super::{cancelled, failure};
 use crate::types::{ToolError, ToolOutput};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -91,8 +91,8 @@ pub(super) async fn fetch(input: &Value, cancel: Arc<AtomicBool>) -> Result<Tool
         };
         Ok(ToolOutput {
             title: final_url.clone(),
-            output: cap_out(&body, 200 * 1024),
-            metadata: json!({"url":final_url,"contentType":content_type,"format":format,"truncated":body.len()>200*1024,"status":status.as_u16()}),
+            output: body,
+            metadata: json!({"url":final_url,"contentType":content_type,"format":format,"status":status.as_u16()}),
         })
     };
     tokio::select! {

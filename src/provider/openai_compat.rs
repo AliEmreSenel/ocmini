@@ -44,7 +44,8 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         }
         messages.push(message);
     }
-    let mut body = json!({"model":settings.api_model,"stream":true,"stream_options":{"include_usage":true},"messages":messages});
+    let mut body = json!({"model":settings.api_model,"stream":true,"stream_options":{"include_usage":true},"messages":null});
+    body["messages"] = Value::Array(messages);
     if settings.tools_supported && !req.tools.is_empty() {
         body["tools"] = json!(req.tools);
     }
@@ -154,12 +155,12 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
 
 pub(super) async fn stream(
     settings: Settings,
-    req: ChatRequest,
+    req: &ChatRequest,
 ) -> Result<EventStream, ProviderError> {
     let response = settings
         .send(
             "chat/completions",
-            &request_body(&settings, &req).map_err(ProviderError::fatal)?,
+            &request_body(&settings, req).map_err(ProviderError::fatal)?,
         )
         .await?;
     let json = json_response(&response);

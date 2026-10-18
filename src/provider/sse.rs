@@ -52,8 +52,19 @@ impl Decoder {
 
     fn finish_line(&mut self) -> Result<Option<Frame>, String> {
         let bytes = std::mem::take(&mut self.line);
-        let line = std::str::from_utf8(&bytes)
-            .map_err(|_| "provider SSE stream contains invalid UTF-8")?;
+        let result = self.parse_line(&bytes);
+        // Reuse typical event buffers without retaining a large outlier for
+        // the rest of a long-lived stream.
+        if bytes.capacity() <= 64 * 1024 {
+            self.line = bytes;
+            self.line.clear();
+        }
+        result
+    }
+
+    fn parse_line(&mut self, bytes: &[u8]) -> Result<Option<Frame>, String> {
+        let line =
+            std::str::from_utf8(bytes).map_err(|_| "provider SSE stream contains invalid UTF-8")?;
         let line = if self.first_line {
             self.first_line = false;
             line.trim_start_matches('\u{feff}')

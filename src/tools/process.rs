@@ -1,12 +1,13 @@
-use super::{cancelled, cap_out, failure};
+use super::{cancelled, failure, output};
 use crate::types::{ToolError, ToolOutput};
 use serde_json::json;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 const MAX_CAPTURE: usize = 64 * 1024;
 
@@ -23,23 +24,76 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn capture(mut stream: impl AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, usize)> {
-    let mut output = Vec::new();
-    let mut total = 0;
-    let mut chunk = [0u8; 8192];
-    loop {
-        let count = stream.read(&mut chunk).await?;
-        if count == 0 {
-            break;
-        }
-        total += count;
-        output.extend_from_slice(&chunk[..count]);
-        if output.len() > MAX_CAPTURE {
-            let excess = output.len() - MAX_CAPTURE;
-            output.drain(MAX_CAPTURE / 2..MAX_CAPTURE / 2 + excess);
-        }
+fn preview(file: &mut File) -> std::io::Result<(Vec<u8>, u64)> {
+    let total = file.metadata()?.len();
+    file.rewind()?;
+    let mut bytes = Vec::new();
+    let head = if total > MAX_CAPTURE as u64 {
+        MAX_CAPTURE / 2
+    } else {
+        MAX_CAPTURE
+    };
+    Read::by_ref(file)
+        .take(head as u64)
+        .read_to_end(&mut bytes)?;
+    if total > MAX_CAPTURE as u64 {
+        file.seek(SeekFrom::End(-(MAX_CAPTURE as i64 / 2)))?;
+        Read::by_ref(file)
+            .take(MAX_CAPTURE as u64 / 2)
+            .read_to_end(&mut bytes)?;
     }
-    Ok((output, total))
+    file.rewind()?;
+    Ok((bytes, total))
+}
+
+fn finish(
+    mut stdout: File,
+    mut stderr: File,
+    status: ExitStatus,
+    title: String,
+    directory: &Path,
+) -> std::io::Result<ToolOutput> {
+    let (out, stdout_total) = preview(&mut stdout)?;
+    let (err, stderr_total) = preview(&mut stderr)?;
+    let mut text = String::from_utf8_lossy(&out).into_owned();
+    if !err.is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(&String::from_utf8_lossy(&err));
+    }
+    if stdout_total + stderr_total > (out.len() + err.len()) as u64 {
+        text.push_str(&format!(
+            "\n[{} bytes omitted from captured process output]",
+            stdout_total + stderr_total - (out.len() + err.len()) as u64
+        ));
+    }
+    let exit = if status.success() {
+        String::new()
+    } else {
+        format!(
+            "\n[exit code: {}]",
+            status
+                .code()
+                .map_or_else(|| "terminated by signal".into(), |v| v.to_string())
+        )
+    };
+    text.push_str(&exit);
+    let result = ToolOutput {
+        title,
+        output: text,
+        metadata: json!({"exit":status.code(),"truncated":false,"outputBytes":stdout_total+stderr_total}),
+    };
+    if result.output.len() <= output::MAX_OUTPUT {
+        return Ok(result);
+    }
+    let mut file = output::create(directory)?;
+    std::io::copy(&mut stdout.take(stdout_total), &mut file)?;
+    if stderr_total > 0 {
+        file.write_all(b"\n[stderr]\n")?;
+        std::io::copy(&mut stderr.take(stderr_total), &mut file)?;
+    }
+    file.write_all(exit.as_bytes())?;
+    let path = file.into_temp_path().keep().map_err(std::io::Error::from)?;
+    Ok(output::with_file(result, &path))
 }
 
 pub async fn shell(
@@ -47,7 +101,19 @@ pub async fn shell(
     directory: &Path,
     timeout: Duration,
     cancel: Arc<AtomicBool>,
+    output_directory: &Path,
 ) -> Result<ToolOutput, ToolError> {
+    // Let the OS capture output directly; only bounded previews enter memory.
+    std::fs::create_dir_all(output_directory)
+        .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+    let capture = || -> std::io::Result<_> {
+        Ok((
+            tempfile::tempfile_in(output_directory)?,
+            tempfile::tempfile_in(output_directory)?,
+        ))
+    };
+    let (stdout, stderr) =
+        capture().map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
     let mut process = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "bash" });
     if cfg!(windows) {
         process.args(["/C", command]);
@@ -57,8 +123,8 @@ pub async fn shell(
     process
         .current_dir(directory)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout.try_clone().map_err(|e| failure(e.to_string()))?)
+        .stderr(stderr.try_clone().map_err(|e| failure(e.to_string()))?)
         .kill_on_drop(true);
     #[cfg(unix)]
     process.process_group(0);
@@ -73,70 +139,139 @@ pub async fn shell(
             .id()
             .ok_or_else(|| failure("Shell has no process id"))?,
     };
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| failure("Shell stdout is unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| failure("Shell stderr is unavailable"))?;
-    let stdout_task = tokio::spawn(capture(stdout));
-    let stderr_task = tokio::spawn(capture(stderr));
     let status = tokio::select! {
         result = child.wait() => result.map_err(|e| failure(format!("Shell wait failed: {e}"))),
         _ = tokio::time::sleep(timeout) => Err(failure(format!("Shell command timed out after {} milliseconds", timeout.as_millis()))),
         _ = cancelled(cancel) => Err(failure("Shell command cancelled")),
     };
-    // Kill background descendants before joining their inherited output pipes.
+    // Stop descendants before reading files they inherited from the shell.
     drop(group);
     let status = match status {
         Ok(status) => status,
         Err(error) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
             return Err(error);
         }
     };
-    let (stdout, stdout_total) = stdout_task
+    let title = command.chars().take(80).collect();
+    let directory = output_directory.to_owned();
+    tokio::task::spawn_blocking(move || finish(stdout, stderr, status, title, &directory))
         .await
-        .map_err(|e| failure(format!("Shell stdout task failed: {e}")))?
-        .map_err(|e| failure(format!("Shell stdout failed: {e}")))?;
-    let (stderr, stderr_total) = stderr_task
-        .await
-        .map_err(|e| failure(format!("Shell stderr task failed: {e}")))?
-        .map_err(|e| failure(format!("Shell stderr failed: {e}")))?;
-    let mut text = String::from_utf8_lossy(&stdout).into_owned();
-    if !stderr.is_empty() {
-        text.push_str("\n[stderr]\n");
-        text.push_str(&String::from_utf8_lossy(&stderr));
-    }
-    if stdout_total > stdout.len() || stderr_total > stderr.len() {
-        text.push_str(&format!(
-            "\n[{} bytes omitted from captured process output]",
-            stdout_total + stderr_total - stdout.len() - stderr.len()
-        ));
-    }
-    if !status.success() {
-        text.push_str(&format!(
-            "\n[exit code: {}]",
-            status
-                .code()
-                .map_or_else(|| "terminated by signal".into(), |v| v.to_string())
-        ));
-    }
-    Ok(ToolOutput {
-        title: command.chars().take(80).collect(),
-        output: cap_out(&text, 50 * 1024),
-        metadata: json!({"exit":status.code(),"truncated":stdout_total + stderr_total > 50 * 1024,"outputBytes":stdout_total+stderr_total}),
-    })
+        .map_err(|e| failure(format!("Shell output task failed: {e}")))?
+        .map_err(|e| failure(format!("Cannot read or save shell output: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn large_shell_output_preserves_the_middle_stderr_and_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let text = format!(
+            "BEGIN\n{}MIDDLE_MARKER\n{}END\n",
+            "ordinary line\n".repeat(10_000),
+            "ordinary line\n".repeat(10_000)
+        );
+        std::fs::write(root.path().join("input.txt"), &text).unwrap();
+        let result = shell(
+            "cat input.txt; cat input.txt >&2; exit 7",
+            root.path(),
+            Duration::from_secs(5),
+            Arc::new(AtomicBool::new(false)),
+            &root.path().join("output"),
+        )
+        .await
+        .unwrap();
+        assert!(result.output.starts_with("BEGIN"));
+        assert!(result.output.contains("END"));
+        assert!(result.output.contains("exit code: 7"));
+        assert!(!result.output.contains("MIDDLE_MARKER"));
+        assert!(result.output.len() < output::MAX_OUTPUT + 1024);
+        assert_eq!(result.metadata["exit"], 7);
+        assert_eq!(result.metadata["outputBytes"], text.len() * 2);
+        let path = result.metadata["outputPath"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{text}\n[stderr]\n{text}\n[exit code: 7]")
+        );
+        let read = crate::tools::files::run(
+            root.path().to_str().unwrap(),
+            "read",
+            &json!({"filePath":path,"offset":10002,"limit":1}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(read.output.contains("MIDDLE_MARKER"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shell_spill_boundaries_preserve_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        for size in [
+            output::MAX_OUTPUT,
+            output::MAX_OUTPUT + 1,
+            MAX_CAPTURE,
+            MAX_CAPTURE + 1,
+        ] {
+            let directory = root.path().join(format!("output-{size}"));
+            let mut bytes = vec![b'x'; size];
+            bytes[size / 2] = 0xff;
+            std::fs::write(root.path().join("input"), &bytes).unwrap();
+            let result = shell(
+                "cat input",
+                root.path(),
+                Duration::from_secs(5),
+                Arc::new(AtomicBool::new(false)),
+                &directory,
+            )
+            .await
+            .unwrap();
+            // Lossy UTF-8 rendering can cross the preview limit even when the
+            // raw byte count is exactly at it. The saved file must stay exact.
+            assert_eq!(
+                std::fs::read(result.metadata["outputPath"].as_str().unwrap()).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancelled_large_capture_leaves_no_saved_output() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("output");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let ready = root.path().join("ready");
+        tokio::spawn(async move {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let result = shell(
+            "head -c 1048576 /dev/zero; touch ready; sleep 30",
+            root.path(),
+            Duration::from_secs(5),
+            cancel,
+            &directory,
+        )
+        .await;
+        assert!(result.unwrap_err().message.contains("cancelled"));
+        // Anonymous capture files close and disappear without publishing an
+        // incomplete result when execution is cancelled.
+        assert!(std::fs::read_dir(directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tool_")
+        }));
+    }
 
     #[tokio::test]
     #[cfg(unix)]
@@ -147,6 +282,7 @@ mod tests {
             &directory,
             Duration::from_secs(2),
             Arc::new(AtomicBool::new(false)),
+            &directory,
         )
         .await
         .unwrap();
@@ -166,6 +302,7 @@ mod tests {
             &directory,
             Duration::from_secs(1),
             Arc::new(AtomicBool::new(false)),
+            &directory,
         )
         .await;
         assert!(result.unwrap_err().message.contains("timed out"));
@@ -196,6 +333,7 @@ mod tests {
             &std::env::temp_dir(),
             Duration::from_secs(30),
             cancel,
+            &std::env::temp_dir(),
         )
         .await;
         assert!(result.unwrap_err().message.contains("cancelled"));
@@ -212,6 +350,7 @@ mod tests {
                 &std::env::temp_dir(),
                 Duration::from_secs(30),
                 Arc::new(AtomicBool::new(false)),
+                &std::env::temp_dir(),
             )
             .await
         });

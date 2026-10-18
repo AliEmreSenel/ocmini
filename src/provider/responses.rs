@@ -101,7 +101,8 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
             }
         }
     }
-    let mut body = json!({"model":settings.api_model,"instructions":req.system,"input":input,"stream":true,"store":false,"include":["reasoning.encrypted_content"]});
+    let mut body = json!({"model":settings.api_model,"instructions":req.system,"input":null,"stream":true,"store":false,"include":["reasoning.encrypted_content"]});
+    body["input"] = Value::Array(input);
     if settings.tools_supported && !req.tools.is_empty() {
         body["tools"] = json!(req.tools.iter().map(|tool| json!({"type":"function","name":tool["function"]["name"],"description":tool["function"]["description"],"parameters":tool["function"]["parameters"],"strict":false})).collect::<Vec<_>>());
     }
@@ -168,12 +169,12 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
 
 pub(super) async fn stream(
     settings: Settings,
-    req: ChatRequest,
+    req: &ChatRequest,
 ) -> Result<EventStream, ProviderError> {
     let response = settings
         .send(
             "responses",
-            &request_body(&settings, &req).map_err(ProviderError::fatal)?,
+            &request_body(&settings, req).map_err(ProviderError::fatal)?,
         )
         .await?;
     let json = json_response(&response);

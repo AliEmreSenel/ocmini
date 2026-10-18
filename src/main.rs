@@ -218,7 +218,17 @@ fn main() {
         }
         error.exit()
     });
-    let result = tokio::runtime::Runtime::new()
+    // A single client mostly waits on providers and tools. Drive async I/O on
+    // the main thread; blocking jobs still use Tokio's separate blocking pool.
+    // Keep an explicit opt-in for instances serving CPU-heavy concurrent work.
+    let mut runtime = if std::env::var_os("TOKIO_WORKER_THREADS").is_some() {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let result = runtime
+        .enable_all()
+        .build()
         .map_err(|error| format!("Cannot start runtime: {error}"))
         .and_then(|runtime| runtime.block_on(run(cli)));
     if let Err(error) = result {

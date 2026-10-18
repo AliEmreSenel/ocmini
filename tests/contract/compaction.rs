@@ -1,6 +1,158 @@
 use super::*;
 
 #[tokio::test]
+async fn repeated_compactions_use_the_latest_summary_and_preserve_recent_history_verbatim() {
+    let mut provider = Provider::start(vec![
+        text_script("ORIGINAL_REPLY", ""),
+        text_script("FIRST_SUMMARY", ""),
+        text_script("SECOND_REPLY", ""),
+        text_script("LATEST_SUMMARY", ""),
+        text_script("Final reply", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    for (index, text) in [(1, "ORIGINAL_PROMPT"), (2, "SECOND_PROMPT")] {
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt(&format!("msg_{index}"), text),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        events.through("session.idle").await;
+        provider.request().await;
+        server
+            .post(
+                &format!("/session/{id}/summarize"),
+                &json!({"providerID":"mock","modelID":"test-model"}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        events.through("session.idle").await;
+        provider.request().await;
+    }
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_final", "Continue"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let next = provider.request().await;
+    let sent = next.to_string();
+    assert!(sent.contains("LATEST_SUMMARY"));
+    assert!(!sent.contains("FIRST_SUMMARY"));
+    for recent in [
+        "ORIGINAL_PROMPT",
+        "ORIGINAL_REPLY",
+        "SECOND_PROMPT",
+        "SECOND_REPLY",
+    ] {
+        assert!(
+            sent.matches(recent).count() == 1,
+            "recent context must be replayed exactly once: {recent}"
+        );
+    }
+    let saved = serde_json::to_string(&server.messages(&id).await).unwrap();
+    for archived in [
+        "FIRST_SUMMARY",
+        "ORIGINAL_PROMPT",
+        "ORIGINAL_REPLY",
+        "SECOND_REPLY",
+    ] {
+        assert!(
+            saved.contains(archived),
+            "lost browsable history: {archived}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_cancellation_releases_a_stalled_summary_and_allows_the_next_turn() {
+    for proactive in [true, false] {
+        let (release, gate) = oneshot::channel();
+        let mut summary = text_script("partial summary", " that must not be saved");
+        summary.gate = Some(gate);
+        let first = if proactive {
+            Script::ok(vec![
+                json!({"choices":[{"index":0,"delta":{"content":"working"},"finish_reason":"stop"}],"usage":{"prompt_tokens":31100,"completion_tokens":1}}),
+            ])
+        } else {
+            Script::http_status_body(
+                400,
+                "maximum context length is 32000 tokens; prompt contains 32001 tokens",
+            )
+        };
+        let mut provider =
+            Provider::start(vec![first, summary, text_script("Continued", "")]).await;
+        let server = TestServer::start(&provider, json!({})).await;
+        let id = server.session(allow()).await;
+        let mut events = server.events().await;
+        server
+            .post(
+                &format!("/session/{id}/prompt_async"),
+                &prompt("msg_compacting", "start"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        provider.request().await;
+        let request = provider.request().await;
+        assert!(request["tools"]
+            .as_array()
+            .is_none_or(|tools| tools.is_empty()));
+        server
+            .post(&format!("/session/{id}/abort"), &json!({}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), events.through("session.idle"))
+            .await
+            .expect("abort must not wait for the summarizer's next token");
+        assert!(!server
+            .messages(&id)
+            .await
+            .iter()
+            .any(|m| m["info"]["summary"] == true));
+        drop(release);
+        let reply: Value = server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt("msg_after_abort", "continue"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(reply["info"]["error"].is_null());
+        assert!(reply["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"] == "Continued"));
+    }
+}
+
+#[tokio::test]
 async fn compaction_calls_the_model_and_produces_a_real_summary() {
     let mut provider = Provider::start(vec![
         text_script("Prior answer", ""),
@@ -63,12 +215,12 @@ async fn compaction_calls_the_model_and_produces_a_real_summary() {
     let next = provider.request().await;
     assert!(next.to_string().contains("SUMMARY_SENTINEL"));
     assert!(
-        !next.to_string().contains("Prior answer"),
-        "compaction replayed the old conversation unchanged"
+        next.to_string().contains("Prior answer"),
+        "compaction must preserve the recent reply verbatim"
     );
     assert!(
-        !next.to_string().contains("Please inspect tests"),
-        "compaction did not replace the old user context"
+        next.to_string().contains("Please inspect tests"),
+        "compaction must preserve the recent user instruction verbatim"
     );
 }
 
@@ -80,8 +232,10 @@ async fn context_overflow_400_compacts_history_and_replays_the_step() {
         Script::http_status_body(400, "This model's maximum context length is 262144 tokens. However, you requested 0 output tokens and your prompt contains at least 262145 input tokens, for a total of at least 262145 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=262145)"),
         text_script("Compacted. ", "Carrying on"),
         text_script("Done ", "after overflow"),
+        text_script("Next turn", ""),
+        text_script("Fork turn", ""),
     ]).await;
-    let server = TestServer::start(&provider, json!({})).await;
+    let mut server = TestServer::start(&provider, json!({})).await;
     let id = server.session(allow()).await;
     let mut events = server.events().await;
     let response = server
@@ -157,6 +311,131 @@ async fn context_overflow_400_compacts_history_and_replays_the_step() {
         .filter_map(|p| p["text"].as_str())
         .collect();
     assert_eq!(text, "Done after overflow");
+    server.restart().await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_after_overflow", "Continue from that reply"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let next = provider.request().await;
+    let sent = next["messages"].as_array().unwrap();
+    assert!(sent
+        .iter()
+        .any(|message| message["role"] == "user" && message["content"] == "hello"));
+    assert!(sent.iter().any(
+        |message| message["role"] == "assistant" && message["content"] == "Done after overflow"
+    ));
+    let fork: Value = server
+        .post(&format!("/session/{id}/fork"), &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork = fork["id"].as_str().unwrap();
+    server
+        .post(
+            &format!("/session/{fork}/message"),
+            &prompt("msg_fork_after_overflow", "Continue in fork"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let next = provider.request().await;
+    assert!(next["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |message| message["role"] == "assistant" && message["content"] == "Done after overflow"
+        ));
+}
+
+#[tokio::test]
+async fn recent_tool_messages_replay_verbatim_after_manual_compaction_and_restart() {
+    let instruction =
+        "Keep this task exact: café 中文\nPreserve the public API; run the remaining tests.";
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"task.txt"}), "kept_call"),
+        text_script("Next action: run the remaining tests.", ""),
+        text_script("Checkpoint", ""),
+        text_script("Continued", ""),
+    ])
+    .await;
+    let mut server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(server.directory.join("task.txt"), "exact tool result: é\n").unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_tools", instruction),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let original = provider.request().await;
+    let expected: Vec<Value> = original["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] != "system")
+        .cloned()
+        .collect();
+    assert_eq!(expected.len(), 3);
+    server
+        .post(
+            &format!("/session/{id}/summarize"),
+            &json!({"providerID":"mock","modelID":"test-model"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    server.restart().await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_continue", "Continue"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let next = provider.request().await;
+    let messages: Vec<Value> = next["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] != "system")
+        .cloned()
+        .collect();
+    assert!(messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Checkpoint"));
+    assert_eq!(&messages[1..4], expected.as_slice());
+    assert_eq!(messages[4]["role"], "assistant");
+    assert_eq!(
+        messages[4]["content"],
+        "Next action: run the remaining tests."
+    );
+    assert_eq!(messages[5]["content"], "Continue");
 }
 
 #[tokio::test]
@@ -212,6 +491,13 @@ async fn usage_near_the_context_limit_compacts_proactively() {
     assert!(response.status().is_success());
     events.through("session.idle").await;
     let follow_up = provider.request().await;
+    let messages = follow_up["messages"].as_array().unwrap();
+    assert!(messages
+        .iter()
+        .any(|m| m["role"] == "user" && m["content"] == "first"));
+    assert!(messages
+        .iter()
+        .any(|m| m["role"] == "assistant" && m["content"] == "working"));
     assert!(
         follow_up["messages"]
             .as_array()
