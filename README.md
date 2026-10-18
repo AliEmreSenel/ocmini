@@ -41,6 +41,10 @@ The selector lists saved sessions with live search (title, ID, directory), a cyc
 - **MCP:** stdio and Streamable HTTP servers.
 - **API:** OpenCode 1.x HTTP/SSE, model inventory and usage reporting.
 
+Tool text over 50 KiB is saved under `$XDG_DATA_HOME/ocmini/tool-output` (default `~/.local/share/ocmini/tool-output`). The conversation keeps a preview of the beginning and end plus the saved path, so omitted content can be read or searched later. Large shell output is captured to disk with bounded memory. Existing file-read/search paging and media limits still apply. Saved output files older than seven days are removed at startup; they are temporary supporting files, separate from session history.
+
+Compaction can be requested manually, runs automatically near 95% of a configured context window, and recovers from provider context-overflow errors. Subsequent requests use the latest valid summary, recent messages kept verbatim, and newer messages; the original history remains saved. The recent-message target is roughly 15,000 tokens, reduced for smaller windows, with the latest user message taking priority. Complete tool call/result groups are retained when they fit. Summaries use a rough text budget and may omit older context when the conversation is too large. Unknown context windows rely on manual compaction or provider overflow recovery.
+
 ## What gets cut
 
 Desktop/web apps, hosted accounts and billing, plugin marketplaces and installers, auto-updates, telemetry, LSP management and the OpenCode 2.x service layer.
@@ -77,6 +81,8 @@ Sessions are saved in `$XDG_DATA_HOME/ocmini/ocmini.db`; refreshed credentials u
 History is kept unless `OCMINI_RETENTION_DAYS` enables pruning. Recovery marks interrupted work and preserves queued prompts without replaying potentially completed tool calls.
 
 Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.3-ocmini.0.2.0`, identifies API compatibility.
+
+Async I/O runs on the main thread by default; file operations and history loading use a separate blocking pool as needed. Set `TOKIO_WORKER_THREADS` to a positive integer to opt into a multithreaded async runtime for heavier concurrent workloads. SQLite checkpoints allow oversized journal files to shrink to 1 MiB on reuse; active transactions can temporarily exceed this size.
 
 ## Development
 

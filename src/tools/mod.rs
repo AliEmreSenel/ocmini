@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod files;
+mod output;
 pub mod patch;
 
 pub(crate) use files::media_type;
@@ -148,7 +149,7 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
     if ctx.cancel.load(Ordering::Acquire) {
         return Err(failure("Tool cancelled"));
     }
-    match name {
+    let result = match name {
         "bash" => {
             let command = required(input, "command")?;
             let timeout = match input.get("timeout") {
@@ -170,6 +171,7 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                 &directory,
                 Duration::from_millis(timeout),
                 ctx.cancel.clone(),
+                &output::directory(),
             )
             .await
         }
@@ -263,14 +265,18 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                         .collect()
                 })
                 .unwrap_or_default();
-            let truncated = output.len() > 200 * 1024;
             Ok(ToolOutput {
-                output: cap_out(&output, 200 * 1024),
+                output,
                 title: format!("{server}/{tool}"),
-                metadata: json!({"server":server,"tool":tool,"truncated":truncated,"attachments":attachments}),
+                metadata: json!({"server":server,"tool":tool,"attachments":attachments}),
             })
         }
-    }
+    }?;
+    output::limit(result, output::directory()).await
+}
+
+pub fn cleanup_outputs() {
+    output::cleanup(&output::directory());
 }
 
 struct QuestionGuard {

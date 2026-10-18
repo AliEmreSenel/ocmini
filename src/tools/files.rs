@@ -2,7 +2,7 @@ use super::{cap_out, failure, resolve_path};
 use crate::types::{ToolError, ToolOutput};
 use base64::Engine;
 use serde_json::{json, Value};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
@@ -26,7 +26,7 @@ pub(super) fn run(
     };
     check()?;
     match name {
-        "read" => read(directory, input),
+        "read" => read(directory, input, cancel),
         "write" => {
             let path = resolve_path(directory, super::required(input, "filePath")?);
             let content = super::required(input, "content")?;
@@ -51,7 +51,7 @@ pub(super) fn run(
     }
 }
 
-fn read(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
+fn read(directory: &str, input: &Value, cancel: &AtomicBool) -> Result<ToolOutput, ToolError> {
     let path = resolve_path(directory, super::required(input, "filePath")?);
     let metadata = std::fs::metadata(&path)
         .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
@@ -102,9 +102,19 @@ fn read(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
             path.display()
         )));
     }
-    let bytes = std::fs::read(&path)
+    let mut reader = text_reader(&path)?;
+    let header = reader
+        .fill_buf()
         .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
-    if let Some(mime) = media_type(&bytes) {
+    if let Some(mime) = media_type(header) {
+        if metadata.len() > 16 * 1024 * 1024 {
+            return Err(failure("Media attachment exceeds 16 MiB"));
+        }
+        let mut bytes = Vec::new();
+        reader
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
         if bytes.len() > 16 * 1024 * 1024 {
             return Err(failure("Media attachment exceeds 16 MiB"));
         }
@@ -120,28 +130,18 @@ fn read(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
             json!({"filepath":path,"attachments":[attachment]}),
         );
     }
-    if bytes.contains(&0) {
-        return Err(failure(format!(
-            "{} is binary; use a tool appropriate for its format",
-            path.display()
-        )));
-    }
-    let content = String::from_utf8(bytes)
-        .map_err(|_| failure(format!("{} is not UTF-8 text", path.display())))?;
-    let total = content.lines().count();
+    let mut text = String::new();
+    let mut returned = 0;
+    let total = scan_text(&path, reader, cancel, |index, line| {
+        if index >= offset && returned < limit && text.len() < MAX_OUTPUT {
+            text.push_str(&format!("{}: {}\n", index, cap_out(line, 16 * 1024)));
+            returned += 1;
+        }
+    })?;
     if total > 0 && offset > total {
         return Err(failure(format!(
             "Offset {offset} exceeds file length ({total} lines)"
         )));
-    }
-    let mut text = String::new();
-    let mut returned = 0;
-    for (index, line) in content.lines().enumerate().skip(offset - 1).take(limit) {
-        if text.len() >= MAX_OUTPUT {
-            break;
-        }
-        text.push_str(&format!("{}: {}\n", index + 1, cap_out(line, 16 * 1024)));
-        returned += 1;
     }
     let remaining = total.saturating_sub(offset.saturating_sub(1).saturating_add(returned));
     if remaining > 0 {
@@ -155,6 +155,67 @@ fn read(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
         &path,
         json!({"filepath":path,"totalLines":total,"truncated":remaining>0 || text.len()>MAX_OUTPUT}),
     )
+}
+
+fn text_reader(path: &Path) -> Result<BufReader<std::fs::File>, ToolError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE {
+        return Err(failure(format!(
+            "{} is not a regular text file of at most 32 MiB",
+            path.display()
+        )));
+    }
+    std::fs::File::open(path)
+        .map(BufReader::new)
+        .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))
+}
+
+/// Reuse one line buffer instead of retaining the entire file. Scan even past
+/// the requested output window to validate UTF-8/binary data and count lines.
+fn scan_text(
+    path: &Path,
+    reader: impl BufRead,
+    cancel: &AtomicBool,
+    mut visit: impl FnMut(usize, &str),
+) -> Result<usize, ToolError> {
+    let mut reader = reader.take(MAX_FILE + 1);
+    let mut line = String::new();
+    let mut total = 0;
+    let mut bytes = 0;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(failure("File scan cancelled"));
+        }
+        line.clear();
+        let count = reader.read_line(&mut line).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                failure(format!("{} is not UTF-8 text", path.display()))
+            } else {
+                failure(format!("Cannot read {}: {error}", path.display()))
+            }
+        })?;
+        if count == 0 {
+            return Ok(total);
+        }
+        bytes += count as u64;
+        if bytes > MAX_FILE {
+            return Err(failure("File grew beyond the 32 MiB text limit"));
+        }
+        if line.as_bytes().contains(&0) {
+            return Err(failure(format!(
+                "{} is binary; use a tool appropriate for its format",
+                path.display()
+            )));
+        }
+        total += 1;
+        // Match str::lines: strip CR only when it precedes a newline.
+        let line = line
+            .strip_suffix('\n')
+            .map(|s| s.strip_suffix('\r').unwrap_or(s))
+            .unwrap_or(&line);
+        visit(total, line);
+    }
 }
 
 pub(crate) fn media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -389,25 +450,39 @@ fn search(
             return Err(failure("Search cancelled"));
         }
         if let Some(expression) = &expression {
-            let content = match text_file(&path) {
-                Ok(text) => text,
+            let reader = match text_reader(&path) {
+                Ok(reader) => reader,
                 Err(_) => continue,
             };
-            for (index, line) in content.lines().enumerate() {
-                if expression.is_match(line) {
-                    if count >= MAX_RESULTS || text.len() >= MAX_OUTPUT {
-                        truncated = true;
-                        break;
+            // Commit a file's matches only after validation. A binary byte or
+            // invalid UTF-8 beyond the output limit must still skip the file.
+            let mut matches = String::new();
+            let mut matched = 0;
+            let mut file_truncated = false;
+            let scanned = scan_text(&path, reader, cancel, |index, line| {
+                if !file_truncated && expression.is_match(line) {
+                    if count + matched >= MAX_RESULTS || text.len() + matches.len() >= MAX_OUTPUT {
+                        file_truncated = true;
+                        return;
                     }
-                    text.push_str(&format!(
+                    matches.push_str(&format!(
                         "{}:{}:{}\n",
                         path.display(),
-                        index + 1,
+                        index,
                         cap_out(line, 4096)
                     ));
-                    count += 1;
+                    matched += 1;
                 }
+            });
+            if cancel.load(Ordering::Acquire) {
+                return Err(failure("Search cancelled"));
             }
+            if scanned.is_err() {
+                continue;
+            }
+            text.push_str(&matches);
+            count += matched;
+            truncated = file_truncated;
         } else {
             if count >= MAX_RESULTS {
                 truncated = true;
@@ -507,6 +582,121 @@ mod tests {
         )
         .is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "same same");
+    }
+
+    #[test]
+    fn streamed_reads_preserve_line_endings_unicode_offsets_and_counts() {
+        let directory = Directory::new();
+        let path = directory.0.path().join("lines.txt");
+        let flag = AtomicBool::new(false);
+        let content = "first\r\n\n中文 café ☕\nlast\r";
+        std::fs::write(&path, content).unwrap();
+        for offset in 1..=4 {
+            let result = run(
+                directory.dir(),
+                "read",
+                &json!({"filePath":"lines.txt","offset":offset,"limit":1}),
+                &flag,
+            )
+            .unwrap();
+            let lines: Vec<_> = content.lines().collect();
+            assert!(result
+                .output
+                .starts_with(&format!("{offset}: {}\n", lines[offset - 1])));
+            assert_eq!(result.metadata["totalLines"], 4);
+            assert_eq!(result.metadata["truncated"], offset < 4);
+        }
+        assert!(run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"lines.txt","offset":5}),
+            &flag
+        )
+        .unwrap_err()
+        .message
+        .contains("exceeds file length"));
+        std::fs::write(&path, "").unwrap();
+        let result = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"lines.txt","offset":100}),
+            &flag,
+        )
+        .unwrap();
+        assert_eq!(result.output, "");
+        assert_eq!(result.metadata["totalLines"], 0);
+    }
+
+    #[test]
+    fn scans_validate_data_beyond_the_requested_output() {
+        let directory = Directory::new();
+        let flag = AtomicBool::new(false);
+        let prefix = "needle\n".repeat(110);
+        for (name, tail) in [("binary.txt", &b"\0"[..]), ("invalid.txt", &b"\xff"[..])] {
+            let mut data = prefix.as_bytes().to_vec();
+            data.extend_from_slice(tail);
+            std::fs::write(directory.0.path().join(name), data).unwrap();
+            assert!(run(
+                directory.dir(),
+                "read",
+                &json!({"filePath":name,"limit":1}),
+                &flag
+            )
+            .is_err());
+        }
+        std::fs::write(directory.0.path().join("valid.txt"), "needle valid\n").unwrap();
+        let result = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern":"needle","include":"*.txt"}),
+            &flag,
+        )
+        .unwrap();
+        assert_eq!(result.metadata["matches"], 1);
+        assert_eq!(result.metadata["truncated"], false);
+        assert!(result.output.contains("valid.txt:1:needle valid"));
+        assert!(!result.output.contains("binary.txt"));
+        assert!(!result.output.contains("invalid.txt"));
+    }
+
+    #[test]
+    fn long_lines_keep_full_regex_matching_and_bounded_output() {
+        let directory = Directory::new();
+        let flag = AtomicBool::new(false);
+        let line = format!("START{}END", "é".repeat(20_000));
+        std::fs::write(directory.0.path().join("long.txt"), &line).unwrap();
+        let result = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"long.txt"}),
+            &flag,
+        )
+        .unwrap();
+        assert!(result.output.contains("START"));
+        assert!(result.output.contains("END"));
+        assert!(result.output.len() < 17 * 1024);
+        assert_eq!(result.metadata["totalLines"], 1);
+        let result = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern":"^STARTé+END$","include":"long.txt"}),
+            &flag,
+        )
+        .unwrap();
+        assert_eq!(result.metadata["matches"], 1);
+        assert!(result.output.len() < 5 * 1024);
+    }
+
+    #[test]
+    fn large_scans_can_be_cancelled_between_lines() {
+        let flag = AtomicBool::new(false);
+        let result = scan_text(
+            Path::new("fixture"),
+            std::io::Cursor::new(b"first\nsecond\n"),
+            &flag,
+            |_, _| flag.store(true, Ordering::Release),
+        );
+        assert!(result.unwrap_err().message.contains("cancelled"));
     }
 
     #[test]

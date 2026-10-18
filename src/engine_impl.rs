@@ -224,13 +224,7 @@ impl EngineApi for Engine {
                 });
                 return Ok(rx);
             }
-            let result = app
-                .store
-                .messages(&sid)?
-                .into_iter()
-                .rev()
-                .find(|m| m.info.parent_id.as_deref() == Some(&mid))
-                .unwrap_or(existing);
+            let result = app.store.reply_to(&sid, &mid)?.unwrap_or(existing);
             let _ = tx.send(serde_json::to_value(result).map_err(|e| e.to_string())?);
             return Ok(rx);
         }
@@ -462,16 +456,8 @@ fn resolve_model(
             model_id: model.1.into(),
         });
     }
-    for message in app.store.messages(sid)?.iter().rev() {
-        if let Some(model) = &message.info.model {
-            return Ok(model.clone());
-        }
-        if let (Some(p), Some(m)) = (&message.info.provider_id, &message.info.model_id) {
-            return Ok(ModelRef {
-                provider_id: p.clone(),
-                model_id: m.clone(),
-            });
-        }
+    if let Some(model) = app.store.last_model(sid)? {
+        return Ok(model);
     }
     let catalog = cfg.catalog();
     if catalog.len() == 1 {
@@ -513,6 +499,73 @@ pub async fn cancelled(cancel: &Arc<AtomicBool>) {
 
 const COMPACTION_PROMPT: &str = "Summarize the conversation for another coding agent to continue. Preserve the user's goal, constraints, decisions, changed files, executed commands and their results, unresolved errors, and next actions. Quote relevant identifiers and paths. Do not perform the task or call tools. Produce a substantive continuation summary.";
 
+/// Keep roughly 15k tokens verbatim (less for small windows). Budget whole
+/// messages, including tool arguments/results; never start with an orphan result.
+/// The latest user message takes priority even when it exceeds the soft budget.
+fn compaction_messages(
+    mut messages: Vec<Value>,
+    has_summary: bool,
+    limit: Option<u64>,
+) -> (Vec<Value>, Vec<Value>) {
+    let first = usize::from(has_summary);
+    let user = messages
+        .iter()
+        .enumerate()
+        .skip(first)
+        .rfind(|(_, message)| message["role"] == "user")
+        .map(|(index, _)| index);
+    let mut bytes = user.map_or(0, |index| messages[index].to_string().len());
+    let budget = limit.unwrap_or(60_000).min(60_000) as usize;
+    let mut start = messages.len();
+    for index in (first..messages.len()).rev() {
+        let size = if Some(index) == user {
+            0
+        } else {
+            messages[index].to_string().len()
+        };
+        if bytes.saturating_add(size) > budget {
+            break;
+        }
+        bytes += size;
+        if messages[index]["role"] == "user" || messages[index]["role"] == "assistant" {
+            start = index;
+        }
+    }
+    let mut recent = messages.split_off(start);
+    if let Some(index) = user.filter(|index| *index < start) {
+        recent.insert(0, messages[index].clone());
+    }
+    if messages.is_empty() {
+        // Short conversations can fit entirely in the verbatim tail. Still
+        // produce a useful checkpoint when compaction is explicitly requested.
+        messages = recent.clone();
+    }
+
+    // Leave room for the summarizer's reply, preserving the previous checkpoint
+    // and whole assistant/tool groups when older context needs to be shortened.
+    let budget = limit.unwrap_or(64_000).saturating_mul(2).max(8_000) as usize;
+    let mut total = 0usize;
+    let mut start = messages.len();
+    while start > first {
+        let size = messages[start - 1].to_string().len();
+        if start < messages.len() && total.saturating_add(size) > budget {
+            break;
+        }
+        total = total.saturating_add(size);
+        start -= 1;
+    }
+    while start > first && messages[start]["role"] == "tool" {
+        start -= 1;
+    }
+    let older = messages
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| *index >= start || has_summary && *index == 0)
+        .map(|(_, message)| message)
+        .collect();
+    (older, recent)
+}
+
 /// Compact history mid-turn: ask the model for a continuation summary and
 /// persist it as a summary message. build_messages restarts history from the
 /// newest summary, so the next request carries the summary instead of the
@@ -520,45 +573,37 @@ const COMPACTION_PROMPT: &str = "Summarize the conversation for another coding a
 async fn compact_history(
     app: &App,
     adapter: &dyn provider::ProviderAdapter,
-    model: &ModelRef,
-    sid: &str,
-    parent: &str,
+    current: &MessageInfo,
     messages: Vec<Value>,
+    has_summary: bool,
     limit: Option<u64>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    // The summarizer must not overflow the way the full transcript did: keep
-    // the freshest tail, sized in rough characters (~4 chars/token).
-    let budget = limit.unwrap_or(64_000).saturating_mul(2).max(8_000) as usize;
-    let mut total = 0usize;
-    let mut start = messages.len();
-    while start > 0 {
-        let size = messages[start - 1]["content"].to_string().len();
-        if start < messages.len() && total + size > budget {
-            break;
-        }
-        total += size;
-        start -= 1;
-    }
-    let mut request_messages: Vec<Value> = messages.into_iter().skip(start).collect();
+    let sid = &current.session_id;
+    let (mut request_messages, recent) = compaction_messages(messages, has_summary, limit);
     if request_messages.is_empty() {
         return Err("Nothing to compact".into());
     }
     request_messages
         .push(json!({"role": "user", "content": "Produce the continuation summary now."}));
     let request = ChatRequest {
-        model: model.model_id.clone(),
+        model: current.model_id.clone().ok_or("Missing compaction model")?,
         system: COMPACTION_PROMPT.into(),
         messages: request_messages,
         tools: Vec::new(),
         variant: None,
         session_id: Some(sid.into()),
     };
-    let mut stream = adapter
-        .stream(request)
-        .await
-        .map_err(|error| error.message)?;
+    let mut stream = tokio::select! {
+        result = adapter.stream(&request) => result.map_err(|error| error.message)?,
+        _ = cancelled(cancel) => return Err("Aborted".into()),
+    };
+    drop(request);
     let mut summary = String::new();
-    while let Some(event) = stream.next().await {
+    while let Some(event) = tokio::select! {
+        event = stream.next() => event,
+        _ = cancelled(cancel) => return Err("Aborted".into()),
+    } {
         match event {
             ProviderEvent::TextDelta(delta) => summary.push_str(&delta),
             ProviderEvent::Finished { .. } => break,
@@ -572,7 +617,13 @@ async fn compact_history(
     }
     let now = now_ms();
     let mid = hex_id("msg_");
-    let part = json!({"id": hex_id("prt_"), "sessionID": sid, "messageID": mid, "type": "text", "text": text, "time": {"start": now, "end": now}});
+    let mut part = json!({"id": hex_id("prt_"), "sessionID": sid, "messageID": mid, "type": "text", "text": text, "time": {"start": now, "end": now}});
+    part["compactionRecent"] = Value::Array(recent);
+    if current.time.completed.is_none() {
+        // Overflow recovery finishes this already-created response after the
+        // checkpoint. Its final text/results must remain visible on later turns.
+        part["compactionPending"] = json!(current.id);
+    }
     let info = MessageInfo {
         id: mid,
         session_id: sid.into(),
@@ -581,9 +632,9 @@ async fn compact_history(
             created: now,
             completed: Some(now),
         },
-        parent_id: Some(parent.into()),
-        model_id: Some(model.model_id.clone()),
-        provider_id: Some(model.provider_id.clone()),
+        parent_id: current.parent_id.clone(),
+        model_id: current.model_id.clone(),
+        provider_id: current.provider_id.clone(),
         agent: Some("compaction".into()),
         mode: Some("compaction".into()),
         cost: Some(0.0),
@@ -697,12 +748,14 @@ async fn run_turn(
         // History reloads can span megabytes of JSON; keep them off the async workers.
         let (blocking_store, blocking_sid, blocking_uid) =
             (app.store.clone(), sid.to_string(), uid.to_string());
-        let mut messages = tokio::task::spawn_blocking(move || {
+        let (mut messages, mut has_summary) = tokio::task::spawn_blocking(move || {
             build_messages(&blocking_store, &blocking_sid, &blocking_uid)
         })
         .await
         .map_err(|e| e.to_string())??;
+        let mut recent = Vec::new();
         if compact {
+            (messages, recent) = compaction_messages(messages, has_summary, context_limit);
             messages.push(json!({"role":"user","content":"Produce the continuation summary now."}));
         }
         let now = now_ms();
@@ -736,23 +789,23 @@ async fn run_turn(
         emit_part(&start_part);
         const MAX_RETRIES: u32 = 3;
         let mut attempt: u32 = 0;
-        let (text_part, mut tool_parts, metadata, finished) = 'attempt: loop {
+        let mut req = ChatRequest {
+            model: model.model_id.clone(),
+            system: system.clone(),
+            messages,
+            tools: defs.clone(),
+            variant: request.variant.clone(),
+            session_id: Some(sid.into()),
+        };
+        let (mut text_part, mut tool_parts, metadata, finished) = 'attempt: loop {
             let mut text_part: Option<StreamedPart> = None;
             let mut reasoning_part: Option<StreamedPart> = None;
             let mut tool_parts: Vec<Value> = Vec::new();
             let mut metadata = Value::Null;
             let mut finished = None;
             let mut failure: Option<(String, bool)> = None; // (message, mid-stream)
-            let req = ChatRequest {
-                model: model.model_id.clone(),
-                system: system.clone(),
-                messages: messages.clone(),
-                tools: defs.clone(),
-                variant: request.variant.clone(),
-                session_id: Some(sid.into()),
-            };
             let opened = tokio::select! {
-                result = adapter.stream(req) => result,
+                result = adapter.stream(&req) => result,
                 _ = cancelled(&cancel) => Err(crate::provider::ProviderError::fatal("Aborted")),
             };
             match opened {
@@ -900,11 +953,11 @@ async fn run_turn(
                         match compact_history(
                             &app,
                             adapter.as_ref(),
-                            model,
-                            sid,
-                            uid,
-                            messages.clone(),
+                            &info,
+                            std::mem::take(&mut req.messages),
+                            has_summary,
                             context_limit,
+                            &cancel,
                         )
                         .await
                         {
@@ -912,13 +965,14 @@ async fn run_turn(
                                 reactive_compactions += 1;
                                 let (store, sid_text, uid_text) =
                                     (app.store.clone(), sid.to_string(), uid.to_string());
-                                messages = tokio::task::spawn_blocking(move || {
-                                    build_messages(&store, &sid_text, &uid_text)
-                                })
-                                .await
-                                .map_err(|e| e.to_string())??;
+                                (req.messages, has_summary) =
+                                    tokio::task::spawn_blocking(move || {
+                                        build_messages(&store, &sid_text, &uid_text)
+                                    })
+                                    .await
+                                    .map_err(|e| e.to_string())??;
                                 if compact {
-                                    messages.push(json!({"role":"user","content":"Produce the continuation summary now."}));
+                                    req.messages.push(json!({"role":"user","content":"Produce the continuation summary now."}));
                                 }
                                 continue 'attempt;
                             }
@@ -937,6 +991,7 @@ async fn run_turn(
                 }
             }
         };
+        drop(req);
         let (finish, usage) = finished.ok_or("Provider stream did not complete")?;
         let cost = cost_for(&cfg, model, &usage);
         info.tokens = Some(usage.clone());
@@ -1037,6 +1092,13 @@ async fn run_turn(
         emit_part(&step_part);
         info.time.completed = Some(now_ms().max(info.time.created));
         info.finish = Some(finish);
+        if compact {
+            if let Some(part) = &mut text_part {
+                part.part["compactionRecent"] = Value::Array(recent);
+                app.store.update_part(sid, &part.part)?;
+                emit_part(&part.part);
+            }
+        }
         app.store.add_message(&MessageWithParts {
             info: info.clone(),
             parts: vec![],
@@ -1079,15 +1141,15 @@ async fn run_turn(
             match tokio::task::spawn_blocking(move || build_messages(&store, &sid_text, &uid_text))
                 .await
             {
-                Ok(Ok(history)) => {
+                Ok(Ok((history, has_summary))) => {
                     if let Err(error) = compact_history(
                         &app,
                         adapter.as_ref(),
-                        model,
-                        sid,
-                        uid,
+                        &info,
                         history,
+                        has_summary,
                         context_limit,
+                        &cancel,
                     )
                     .await
                     {
@@ -1141,11 +1203,9 @@ fn append_delta(
         });
     }
     let entry = current.as_mut().ok_or("Missing streamed part")?;
-    entry.part["text"] = json!(format!(
-        "{}{}",
-        entry.part["text"].as_str().unwrap_or_default(),
-        delta
-    ));
+    if let Value::String(text) = &mut entry.part["text"] {
+        text.push_str(delta);
+    }
     bus().emit("message.part.delta",json!({"sessionID":sid,"messageID":mid,"partID":entry.part["id"],"field":"text","delta":delta}));
     if entry.last_flush.elapsed() >= STREAM_FLUSH {
         app.store.update_part(sid, &entry.part)?;
@@ -1223,26 +1283,8 @@ fn record_session_usage(app: &App, sid: &str, usage: &Tokens, cost: f64) -> Resu
     Ok(())
 }
 
-fn build_messages(store: &Store, sid: &str, through: &str) -> Result<Vec<Value>, String> {
-    let history = store.messages(sid)?;
-    let mut users = HashSet::new();
-    for message in &history {
-        if message.info.role == "user" {
-            users.insert(message.info.id.clone());
-        }
-        if message.info.id == through {
-            break;
-        }
-    }
-    let history: Vec<_> = history
-        .iter()
-        .filter(|m| {
-            if m.info.role == "user" {
-                return users.contains(&m.info.id);
-            }
-            m.info.parent_id.as_ref().is_none_or(|p| users.contains(p))
-        })
-        .collect();
+fn build_messages(store: &Store, sid: &str, through: &str) -> Result<(Vec<Value>, bool), String> {
+    let mut history = store.context_messages(sid, through)?;
     let summary = history.iter().rposition(|m| {
         m.info.summary == Some(true)
             && m.info.time.completed.is_some()
@@ -1261,6 +1303,13 @@ fn build_messages(store: &Store, sid: &str, through: &str) -> Result<Vec<Value>,
             .collect::<Vec<_>>()
             .join("\n");
         out.push(json!({"role":"user","content":format!("Continuation summary of the earlier conversation:\n{text}")}));
+        for part in &mut history[index].parts {
+            if let Some(value) = part.get_mut("compactionRecent") {
+                if let Value::Array(recent) = value.take() {
+                    out.extend(recent);
+                }
+            }
+        }
         index + 1
     } else {
         0
@@ -1374,7 +1423,7 @@ fn build_messages(store: &Store, sid: &str, through: &str) -> Result<Vec<Value>,
             out.push(json!({"role":"user","content":attachments}));
         }
     }
-    Ok(out)
+    Ok((out, summary.is_some()))
 }
 
 fn file_content(part: &Value) -> Result<Value, String> {
@@ -1884,6 +1933,74 @@ async fn expand_shell_templates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compaction_preserves_recent_messages_and_tool_pairs_exactly() {
+        let checkpoint = json!({"role":"user","content":"previous checkpoint"});
+        let archived = json!({"role":"assistant","content":"old output".repeat(1000)});
+        let recent = vec![
+            json!({"role":"user","content":"Keep this exact task: café 中文\nDo not change the API."}),
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"file.txt\"}"}}],"providerMetadata":{"opaque":"keep"}}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"1: exact output\n","is_error":false}),
+            json!({"role":"assistant","content":"Next: verify the existing API."}),
+        ];
+        let mut messages = vec![
+            checkpoint.clone(),
+            json!({"role":"user","content":"old task"}),
+            archived.clone(),
+        ];
+        messages.extend(recent.clone());
+        let (older, kept) = compaction_messages(messages, true, Some(4096));
+        assert_eq!(kept, recent);
+        assert_eq!(older.first(), Some(&checkpoint));
+        assert!(older.contains(&archived));
+    }
+
+    #[test]
+    fn a_long_tool_turn_keeps_the_latest_user_and_complete_recent_steps() {
+        let user =
+            json!({"role":"user","content":"Finish the migration; preserve all public names."});
+        let expensive = json!({"role":"assistant","content":null,"tool_calls":[{"id":"old_call","type":"function","function":{"name":"apply_patch","arguments":"x".repeat(20_000)}}]});
+        let tool = json!({"role":"tool","tool_call_id":"old_call","content":"Done"});
+        let tail = vec![
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"new_call","type":"function","function":{"name":"read","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"new_call","content":"recent result"}),
+            json!({"role":"assistant","content":"One test remains."}),
+        ];
+        let mut messages = vec![user.clone(), expensive.clone(), tool.clone()];
+        messages.extend(tail.clone());
+        let (older, recent) = compaction_messages(messages, false, Some(2048));
+        assert_eq!(recent, [vec![user], tail].concat());
+        assert!(older.contains(&expensive));
+        assert!(older.contains(&tool));
+        assert_ne!(older.first().unwrap()["role"], "tool");
+    }
+
+    #[test]
+    fn repeated_compactions_bound_the_tail_and_prioritize_the_latest_user() {
+        let mut recent = Vec::new();
+        for turn in 0..50 {
+            let user = json!({"role":"user","content":format!("exact instruction {turn}: {}", "é".repeat(50))});
+            let mut messages = vec![json!({"role":"user","content":"prior checkpoint"})];
+            messages.append(&mut recent);
+            messages.extend([
+                user.clone(),
+                json!({"role":"assistant","content":"reply".repeat(30)}),
+            ]);
+            let (_, kept) = compaction_messages(messages, true, Some(2048));
+            assert!(kept.contains(&user));
+            assert!(!kept.iter().any(|m| m["content"] == "prior checkpoint"));
+            assert!(kept.iter().map(|m| m.to_string().len()).sum::<usize>() <= 2048);
+            recent = kept;
+        }
+        let user = json!({"role":"user","content":"important".repeat(1000)});
+        let (_, kept) = compaction_messages(
+            vec![user.clone(), json!({"role":"assistant","content":"reply"})],
+            false,
+            Some(1024),
+        );
+        assert_eq!(kept, vec![user]);
+    }
+
     #[test]
     fn text_attachment_preserves_unicode_and_decodes_content() {
         let encoded = base64::engine::general_purpose::STANDARD.encode("caffè ☕");

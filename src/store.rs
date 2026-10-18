@@ -1,7 +1,9 @@
-use crate::types::{now_ms, MessageInfo, MessageWithParts, PromptRequest, Session, Time, Tokens};
+use crate::types::{
+    now_ms, MessageInfo, MessageWithParts, ModelRef, PromptRequest, Session, Time, Tokens,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -38,6 +40,9 @@ impl Store {
             .map_err(sql_error)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(sql_error)?;
+        // Let checkpoints release an oversized WAL left by a large transcript.
+        conn.pragma_update(None, "journal_size_limit", 1024 * 1024)
+            .map_err(sql_error)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session(id TEXT PRIMARY KEY, json TEXT NOT NULL, time_created INTEGER, time_updated INTEGER, parent_id TEXT, busy INTEGER DEFAULT 0);
              CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, json TEXT NOT NULL, time_created INTEGER);
@@ -46,6 +51,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS part_sid ON part(session_id, time_created);
              CREATE INDEX IF NOT EXISTS part_mid ON part(message_id);
              CREATE INDEX IF NOT EXISTS session_parent ON session(parent_id);
+             CREATE INDEX IF NOT EXISTS session_updated ON session(time_updated);
              CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, request TEXT NOT NULL, started INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS inbox_session ON inbox(session_id, seq);
              CREATE TABLE IF NOT EXISTS todo(session_id TEXT PRIMARY KEY, json TEXT NOT NULL);
@@ -264,6 +270,21 @@ impl Store {
     }
 
     pub fn list_sessions(&self, dir: Option<&str>) -> Result<Vec<Session>, String> {
+        self.list_sessions_filtered(None, |session| {
+            dir.is_none_or(|d| Path::new(&session.directory) == Path::new(d))
+        })
+    }
+
+    /// Apply filters as rows arrive and stop after enough matches. Sorting uses
+    /// the timestamp index, so a short page does not load every saved session.
+    pub fn list_sessions_filtered(
+        &self,
+        limit: Option<usize>,
+        mut matches: impl FnMut(&Session) -> bool,
+    ) -> Result<Vec<Session>, String> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         self.with_read(|c| {
             let mut stmt = c
                 .prepare("SELECT json FROM session ORDER BY time_updated DESC,rowid DESC")
@@ -271,15 +292,17 @@ impl Store {
             let rows = stmt
                 .query_map([], |r| r.get::<_, String>(0))
                 .map_err(sql_error)?;
-            let sessions = rows
-                .map(|row| {
-                    serde_json::from_str::<Session>(&row.map_err(sql_error)?).map_err(sql_error)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(sessions
-                .into_iter()
-                .filter(|session| dir.is_none_or(|d| Path::new(&session.directory) == Path::new(d)))
-                .collect())
+            let mut sessions = Vec::new();
+            for row in rows {
+                let session = serde_json::from_str(&row.map_err(sql_error)?).map_err(sql_error)?;
+                if matches(&session) {
+                    sessions.push(session);
+                    if limit == Some(sessions.len()) {
+                        break;
+                    }
+                }
+            }
+            Ok(sessions)
         })
     }
 
@@ -346,11 +369,14 @@ impl Store {
     }
 
     pub fn children(&self, id: &str) -> Result<Vec<Session>, String> {
-        Ok(self
-            .list_sessions(None)?
-            .into_iter()
-            .filter(|s| s.parent_id.as_deref() == Some(id))
-            .collect())
+        self.with_read(|c| {
+            let mut stmt = c
+                .prepare("SELECT json FROM session WHERE parent_id=?1 ORDER BY time_updated DESC,rowid DESC")
+                .map_err(sql_error)?;
+            let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0)).map_err(sql_error)?;
+            rows.map(|row| serde_json::from_str(&row.map_err(sql_error)?).map_err(sql_error))
+                .collect()
+        })
     }
 
     pub fn set_busy(&self, id: &str, busy: bool) -> Result<bool, String> {
@@ -404,14 +430,119 @@ impl Store {
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>, String> {
-        self.with_read(|c| read_messages(c, session_id))
+        self.messages_limited(session_id, None)
+    }
+
+    pub fn messages_limited(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<MessageWithParts>, String> {
+        self.with_read(|c| {
+            // The message and part queries must see the same window even if a
+            // different process appends or deletes history between them.
+            let tx = c.unchecked_transaction().map_err(sql_error)?;
+            let messages = read_messages(&tx, session_id, limit)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(messages)
+        })
     }
 
     pub fn message(&self, session_id: &str, id: &str) -> Result<Option<MessageWithParts>, String> {
-        Ok(self
-            .messages(session_id)?
-            .into_iter()
-            .find(|m| m.info.id == id))
+        self.with_read(|c| read_message(c, session_id, id))
+    }
+
+    pub fn last_model(&self, sid: &str) -> Result<Option<ModelRef>, String> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare("SELECT json FROM message WHERE session_id=?1 ORDER BY time_created DESC,rowid DESC").map_err(sql_error)?;
+            let rows = stmt.query_map(params![sid], |row| row.get::<_, String>(0)).map_err(sql_error)?;
+            for row in rows {
+                let info: MessageInfo = serde_json::from_str(&row.map_err(sql_error)?).map_err(sql_error)?;
+                if let Some(model) = info.model {
+                    return Ok(Some(model));
+                }
+                if let (Some(provider_id), Some(model_id)) = (info.provider_id, info.model_id) {
+                    return Ok(Some(ModelRef { provider_id, model_id }));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    /// An acknowledged prompt retry needs its last response, not every part of
+    /// every message in the session.
+    pub fn reply_to(&self, sid: &str, parent: &str) -> Result<Option<MessageWithParts>, String> {
+        self.with_read(|c| {
+            let tx = c.unchecked_transaction().map_err(sql_error)?;
+            let id: Option<String> = tx.query_row("SELECT id FROM message WHERE session_id=?1 AND json_extract(json,'$.parentID')=?2 ORDER BY time_created DESC,rowid DESC LIMIT 1", params![sid, parent], |row| row.get(0)).optional().map_err(sql_error)?;
+            let message = id.map(|id| read_message(&tx, sid, &id)).transpose()?.flatten();
+            tx.commit().map_err(sql_error)?;
+            Ok(message)
+        })
+    }
+
+    /// Model context starts at the latest usable summary. Read only small
+    /// message headers until that boundary is known; archived tool results and
+    /// attachments stay in SQLite for history, forks and session browsing.
+    pub fn context_messages(
+        &self,
+        sid: &str,
+        through: &str,
+    ) -> Result<Vec<MessageWithParts>, String> {
+        struct Header {
+            id: String,
+            role: String,
+            parent: Option<String>,
+            summary: bool,
+        }
+        self.with_read(|c| {
+            let tx = c.unchecked_transaction().map_err(sql_error)?;
+            let mut headers: Vec<Header> = {
+                let mut stmt = tx.prepare("SELECT id,json_extract(json,'$.role'),json_extract(json,'$.parentID'),json_extract(json,'$.summary') IS 1 AND json_extract(json,'$.time.completed') IS NOT NULL AND json_extract(json,'$.error') IS NULL FROM message WHERE session_id=?1 ORDER BY time_created,rowid").map_err(sql_error)?;
+                let rows = stmt.query_map(params![sid], |row| Ok(Header {
+                    id: row.get(0)?, role: row.get(1)?, parent: row.get(2)?, summary: row.get(3)?,
+                })).map_err(sql_error)?;
+                rows.collect::<Result<_, _>>().map_err(sql_error)?
+            };
+            let mut users = HashSet::new();
+            for header in &headers {
+                if header.role == "user" {
+                    users.insert(header.id.clone());
+                }
+                if header.id == through {
+                    break;
+                }
+            }
+            headers.retain(|header| {
+                if header.role == "user" {
+                    users.contains(&header.id)
+                } else {
+                    header.parent.as_ref().is_none_or(|id| users.contains(id))
+                }
+            });
+            let mut start = 0;
+            let mut messages = Vec::new();
+            for (index, header) in headers.iter().enumerate().rev().filter(|(_, h)| h.summary) {
+                let message = read_message(&tx, sid, &header.id)?.ok_or("Message not found")?;
+                if message.parts.iter().any(|part| part["type"] == "text" && part["text"].as_str().is_some_and(|text| !text.trim().is_empty())) {
+                    let pending = message.parts.iter()
+                        .find_map(|part| part["compactionPending"].as_str())
+                        .filter(|id| headers[..index].iter().any(|header| header.id == *id))
+                        .map(|id| read_message(&tx, sid, id)).transpose()?.flatten();
+                    messages.push(message);
+                    if let Some(pending) = pending {
+                        messages.push(pending);
+                    }
+                    start = index + 1;
+                    break;
+                }
+            }
+            for header in headers.into_iter().skip(start) {
+                messages.push(read_message(&tx, sid, &header.id)?.ok_or("Message not found")?);
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(messages)
+        })
     }
 
     pub fn message_owner(&self, id: &str) -> Result<Option<String>, String> {
@@ -569,7 +700,7 @@ impl Store {
     pub fn try_fork(&self, source: &Session, up_to: Option<&str>) -> Result<Session, String> {
         let mut c = self.conn.lock().unwrap();
         let tx = self.write_tx(&mut c)?;
-        let history = read_messages(&tx, &source.id)?;
+        let history = read_messages(&tx, &source.id, None)?;
         if up_to.is_some_and(|id| !history.iter().any(|m| m.info.id == id)) {
             return Err("Fork boundary message not found".into());
         }
@@ -615,6 +746,9 @@ impl Store {
                 part["id"] = json!(crate::types::hex_id("prt_"));
                 part["messageID"] = json!(new_id);
                 part["sessionID"] = json!(s.id);
+                if let Some(pending) = part["compactionPending"].as_str() {
+                    part["compactionPending"] = json!(ids.get(pending));
+                }
                 // A copied task cannot point at a live child owned by the source thread.
                 if part["type"] == "tool" && part["tool"] == "task" {
                     if let Some(meta) = part["state"]["metadata"].as_object_mut() {
@@ -687,7 +821,7 @@ fn save_message(tx: &Transaction<'_>, m: &MessageWithParts) -> Result<(), String
     if !exists {
         return Err("Session not found".into());
     }
-    tx.execute("INSERT INTO message(id,session_id,role,json,time_created) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET json=excluded.json,role=excluded.role", params![m.info.id,m.info.session_id,m.info.role,serde_json::to_string(&m.info).map_err(sql_error)?,m.info.time.created]).map_err(sql_error)?;
+    tx.execute("INSERT INTO message(id,session_id,role,json,time_created) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET json=excluded.json,role=excluded.role WHERE message.json<>excluded.json OR message.role IS NOT excluded.role", params![m.info.id,m.info.session_id,m.info.role,serde_json::to_string(&m.info).map_err(sql_error)?,m.info.time.created]).map_err(sql_error)?;
     for p in &m.parts {
         save_part(tx, &m.info.session_id, p, m.info.time.created)?;
     }
@@ -727,16 +861,55 @@ fn save_part(tx: &Transaction<'_>, sid: &str, part: &Value, created: i64) -> Res
     if old.is_some_and(|(s, m)| s != sid || m != mid) {
         return Err("Part id already belongs to another message".into());
     }
-    tx.execute("INSERT INTO part(id,message_id,session_id,json,time_created) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET json=excluded.json", params![id,mid,sid,part.to_string(),created]).map_err(sql_error)?;
+    tx.execute("INSERT INTO part(id,message_id,session_id,json,time_created) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET json=excluded.json WHERE part.json<>excluded.json", params![id,mid,sid,part.to_string(),created]).map_err(sql_error)?;
     Ok(())
 }
 
-fn read_messages(c: &Connection, sid: &str) -> Result<Vec<MessageWithParts>, String> {
-    let mut ms = c
-        .prepare("SELECT json FROM message WHERE session_id=?1 ORDER BY time_created,rowid")
+fn read_message(c: &Connection, sid: &str, id: &str) -> Result<Option<MessageWithParts>, String> {
+    let raw: Option<String> = c
+        .prepare_cached("SELECT json FROM message WHERE id=?1 AND session_id=?2")
+        .map_err(sql_error)?
+        .query_row(params![id, sid], |row| row.get(0))
+        .optional()
         .map_err(sql_error)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut stmt = c
+        .prepare_cached(
+            "SELECT json FROM part WHERE message_id=?1 AND session_id=?2 ORDER BY rowid",
+        )
+        .map_err(sql_error)?;
+    let parts = stmt
+        .query_map(params![id, sid], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?
+        .map(|row| serde_json::from_str(&row.map_err(sql_error)?).map_err(sql_error))
+        .collect::<Result<_, _>>()?;
+    Ok(Some(MessageWithParts {
+        info: serde_json::from_str(&raw).map_err(sql_error)?,
+        parts,
+    }))
+}
+
+fn read_messages(
+    c: &Connection,
+    sid: &str,
+    limit: Option<usize>,
+) -> Result<Vec<MessageWithParts>, String> {
+    let message_sql = if limit.is_some() {
+        "SELECT json FROM (SELECT rowid AS ordinal,json,time_created FROM message WHERE session_id=?1 ORDER BY time_created DESC,rowid DESC LIMIT ?2) ORDER BY time_created,ordinal"
+    } else {
+        "SELECT json FROM message WHERE session_id=?1 ORDER BY time_created,rowid LIMIT ?2"
+    };
+    let part_sql = if limit.is_some() {
+        "SELECT message_id,json FROM part WHERE message_id IN (SELECT id FROM message WHERE session_id=?1 ORDER BY time_created DESC,rowid DESC LIMIT ?2) ORDER BY rowid"
+    } else {
+        "SELECT message_id,json FROM part WHERE session_id=?1 ORDER BY rowid LIMIT ?2"
+    };
+    let limit = limit.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
+    let mut ms = c.prepare(message_sql).map_err(sql_error)?;
     let rows = ms
-        .query_map(params![sid], |r| r.get::<_, String>(0))
+        .query_map(params![sid, limit], |r| r.get::<_, String>(0))
         .map_err(sql_error)?;
     let mut out = Vec::new();
     for row in rows {
@@ -750,11 +923,9 @@ fn read_messages(c: &Connection, sid: &str) -> Result<Vec<MessageWithParts>, Str
         .enumerate()
         .map(|(i, m)| (m.info.id.clone(), i))
         .collect();
-    let mut ps = c
-        .prepare("SELECT message_id,json FROM part WHERE session_id=?1 ORDER BY rowid")
-        .map_err(sql_error)?;
+    let mut ps = c.prepare(part_sql).map_err(sql_error)?;
     let rows = ps
-        .query_map(params![sid], |r| {
+        .query_map(params![sid, limit], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
         .map_err(sql_error)?;
@@ -906,6 +1077,83 @@ mod tests {
             ["m", "next"]
         );
         assert_eq!(db.messages(&s.id).unwrap()[0].parts, m.parts);
+    }
+
+    #[test]
+    fn selected_history_keeps_chronological_order_parts_and_session_scope() {
+        let db = Store::open(Path::new(":memory:"), "test").unwrap();
+        let session = db.create_session_owned("history", "/work");
+        let other = db.create_session_owned("other", "/work");
+        // Insertion order breaks timestamp ties, regardless of the message ID.
+        for (id, created) in [("last", 20), ("first", 10), ("middle", 20)] {
+            let mut message = user(&session, id, "café 中文");
+            message.info.time.created = created;
+            message.parts.push(json!({"id":format!("reason_{id}"),"messageID":id,"sessionID":session.id,"type":"reasoning","text":"thought"}));
+            db.add_message(&message).unwrap();
+        }
+        db.add_message(&user(&other, "unrelated", "other session"))
+            .unwrap();
+        let all = db.messages(&session.id).unwrap();
+        for limit in [0, 1, 2, 3, 10, usize::MAX] {
+            let selected = db.messages_limited(&session.id, Some(limit)).unwrap();
+            assert_eq!(
+                serde_json::to_value(&selected).unwrap(),
+                serde_json::to_value(&all[all.len().saturating_sub(limit)..]).unwrap(),
+            );
+        }
+        assert_eq!(
+            all.iter().map(|m| m.info.id.as_str()).collect::<Vec<_>>(),
+            ["first", "last", "middle"]
+        );
+        assert_eq!(
+            serde_json::to_value(db.message(&session.id, "last").unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&all[1]).unwrap()
+        );
+        assert!(db.message(&other.id, "last").unwrap().is_none());
+        assert!(db.message(&session.id, "missing").unwrap().is_none());
+
+        // Fetching a selected record must not decode unrelated old transcripts.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE part SET json='invalid' WHERE message_id='first'",
+                [],
+            )
+            .unwrap();
+        assert!(db.messages(&session.id).is_err());
+        assert_eq!(db.messages_limited(&session.id, Some(2)).unwrap().len(), 2);
+        assert!(db.message(&session.id, "last").unwrap().is_some());
+    }
+
+    #[test]
+    fn saving_unchanged_history_avoids_writes_and_reclaims_oversized_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ocmini.db");
+        let db = Store::open(&path, "test").unwrap();
+        let session = db.create_session_owned("history", "/work");
+        let message = user(&session, "large", &"x".repeat(2 * 1024 * 1024));
+        db.add_message(&message).unwrap();
+        let changes = db.conn.lock().unwrap().total_changes();
+        db.add_message(&message).unwrap();
+        db.update_part(&session.id, &message.parts[0]).unwrap();
+        assert_eq!(db.conn.lock().unwrap().total_changes(), changes);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(FULL)")
+            .unwrap();
+        db.add_message(&user(&session, "small", "next")).unwrap();
+        assert!(
+            std::fs::metadata(path.with_extension("db-wal"))
+                .unwrap()
+                .len()
+                <= 1024 * 1024
+        );
+        assert_eq!(
+            db.message(&session.id, "large").unwrap().unwrap().parts,
+            message.parts
+        );
     }
 
     #[test]
@@ -1063,5 +1311,191 @@ mod tests {
             .list_sessions(None)
             .unwrap_err()
             .contains("Session database"));
+    }
+
+    #[test]
+    fn limited_session_listing_does_not_decode_records_beyond_the_requested_page() {
+        let store = Store::open(Path::new(":memory:"), "test").unwrap();
+        let older = store.create_session_owned("older", "/work");
+        let newer = store.create_session_owned("newer", "/work");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE session SET time_updated=0,json='invalid' WHERE id=?1",
+                params![older.id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_sessions_filtered(Some(1), |_| true).unwrap()[0].id,
+            newer.id
+        );
+        assert!(store
+            .list_sessions_filtered(Some(0), |_| true)
+            .unwrap()
+            .is_empty());
+        assert!(store.list_sessions(None).is_err());
+    }
+
+    #[test]
+    fn context_uses_only_a_valid_summary_and_excludes_queued_prompt_descendants() {
+        let db = Store::open(Path::new(":memory:"), "test").unwrap();
+        let session = db.create_session_owned("context", "/work");
+        let add =
+            |id: &str, role: &str, parent: Option<&str>, summary: bool, text: &str, error: bool| {
+                let mut message = user(&session, id, text);
+                message.info.role = role.into();
+                message.info.parent_id = parent.map(str::to_owned);
+                message.info.summary = summary.then_some(true);
+                message.info.time.completed = (role == "assistant").then_some(123);
+                message.info.error = error.then(|| json!({"name":"failed"}));
+                db.add_message(&message).unwrap();
+            };
+        add("u1", "user", None, false, "old prompt", false);
+        add("a1", "assistant", Some("u1"), false, "old reply", false);
+        add(
+            "summary",
+            "assistant",
+            Some("u1"),
+            true,
+            "usable summary",
+            false,
+        );
+        add("u2", "user", None, false, "current prompt", false);
+        add("a2", "assistant", Some("u2"), false, "current reply", false);
+        add("empty", "assistant", Some("u2"), true, "\u{2003}", false);
+        add(
+            "failed",
+            "assistant",
+            Some("u2"),
+            true,
+            "failed summary",
+            true,
+        );
+        add(
+            "parentless",
+            "assistant",
+            None,
+            false,
+            "keep parentless",
+            false,
+        );
+        add(
+            "orphan",
+            "assistant",
+            Some("missing"),
+            false,
+            "ignore orphan",
+            false,
+        );
+        add("u3", "user", None, false, "queued prompt", false);
+        add(
+            "future",
+            "assistant",
+            Some("u3"),
+            true,
+            "future summary",
+            false,
+        );
+        let ids = |messages: Vec<MessageWithParts>| {
+            messages.into_iter().map(|m| m.info.id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(db.context_messages(&session.id, "u2").unwrap()),
+            ["summary", "u2", "a2", "empty", "failed", "parentless"]
+        );
+        assert_eq!(
+            ids(db.context_messages(&session.id, "u1").unwrap()),
+            ["summary", "parentless"]
+        );
+        assert_eq!(
+            ids(db.context_messages(&session.id, "u3").unwrap()),
+            ["future"]
+        );
+        assert_eq!(
+            ids(db.context_messages(&session.id, "unknown").unwrap()),
+            ["future"]
+        );
+        let other = db.create_session_owned("other", "/work");
+        assert!(db.context_messages(&other.id, "u2").unwrap().is_empty());
+        // Archived payloads must not be loaded even if they are unreadable.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE part SET json='invalid' WHERE message_id='a1'", [])
+            .unwrap();
+        assert!(db.messages(&session.id).is_err());
+        assert_eq!(
+            ids(db.context_messages(&session.id, "u2").unwrap())[0],
+            "summary"
+        );
+    }
+
+    #[test]
+    fn context_without_a_summary_preserves_full_eligible_history_and_part_order() {
+        let db = Store::open(Path::new(":memory:"), "test").unwrap();
+        let session = db.create_session_owned("context", "/work");
+        for id in ["first", "second", "third"] {
+            let mut message = user(&session, id, "café 中文");
+            message.parts.push(json!({"id":format!("extra_{id}"),"messageID":id,"sessionID":session.id,"type":"text","text":"more"}));
+            db.add_message(&message).unwrap();
+        }
+        let all = db.messages(&session.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(db.context_messages(&session.id, "second").unwrap()).unwrap(),
+            serde_json::to_value(&all[..2]).unwrap()
+        );
+    }
+
+    #[test]
+    fn model_and_retry_lookups_do_not_load_unrelated_history_parts() {
+        let db = Store::open(Path::new(":memory:"), "test").unwrap();
+        let session = db.create_session_owned("history", "/work");
+        let mut prompt = user(&session, "prompt", "request");
+        prompt.info.model = Some(ModelRef {
+            provider_id: "first".into(),
+            model_id: "one".into(),
+        });
+        db.add_message(&prompt).unwrap();
+        assert_eq!(db.last_model(&session.id).unwrap(), prompt.info.model);
+        for (id, model) in [("older", "two"), ("newer", "three")] {
+            let mut reply = user(&session, id, model);
+            reply.info.role = "assistant".into();
+            reply.info.parent_id = Some("prompt".into());
+            reply.info.provider_id = Some("next".into());
+            reply.info.model_id = Some(model.into());
+            db.add_message(&reply).unwrap();
+        }
+        db.add_message(&user(
+            &session,
+            "without-model",
+            "latest metadata has no model",
+        ))
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE part SET json='invalid' WHERE message_id='older'",
+                [],
+            )
+            .unwrap();
+        assert!(db.messages(&session.id).is_err());
+        assert_eq!(
+            db.last_model(&session.id).unwrap(),
+            Some(ModelRef {
+                provider_id: "next".into(),
+                model_id: "three".into()
+            })
+        );
+        assert_eq!(
+            db.reply_to(&session.id, "prompt").unwrap().unwrap().info.id,
+            "newer"
+        );
+        assert!(db.reply_to(&session.id, "missing").unwrap().is_none());
+        let other = db.create_session_owned("other", "/work");
+        assert!(db.last_model(&other.id).unwrap().is_none());
+        assert!(db.reply_to(&other.id, "prompt").unwrap().is_none());
     }
 }

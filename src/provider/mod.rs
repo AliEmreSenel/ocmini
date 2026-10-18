@@ -154,7 +154,7 @@ pub fn parse_context_limit(message: &str) -> Option<u64> {
 
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
-    async fn stream(&self, req: ChatRequest) -> Result<EventStream, ProviderError>;
+    async fn stream(&self, req: &ChatRequest) -> Result<EventStream, ProviderError>;
 }
 
 struct Adapter {
@@ -202,8 +202,8 @@ pub(super) struct Settings {
 
 #[async_trait]
 impl ProviderAdapter for Adapter {
-    async fn stream(&self, req: ChatRequest) -> Result<EventStream, ProviderError> {
-        let (protocol, settings) = self.prepare(&req).await.map_err(ProviderError::fatal)?;
+    async fn stream(&self, req: &ChatRequest) -> Result<EventStream, ProviderError> {
+        let (protocol, settings) = self.prepare(req).await.map_err(ProviderError::fatal)?;
         match protocol {
             Protocol::Chat => openai_compat::stream(settings, req).await,
             Protocol::Responses => responses::stream(settings, req).await,

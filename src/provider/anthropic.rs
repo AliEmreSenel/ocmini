@@ -133,7 +133,9 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         .or(settings.max_output)
         .unwrap_or(16_000)
         .max(1);
-    let mut body = json!({"model":settings.api_model,"max_tokens":max_output,"stream":true,"messages":messages});
+    let mut body =
+        json!({"model":settings.api_model,"max_tokens":max_output,"stream":true,"messages":null});
+    body["messages"] = Value::Array(messages);
     if !req.system.is_empty() {
         body["system"] = json!(req.system);
     }
@@ -197,12 +199,12 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
 
 pub(super) async fn stream(
     settings: Settings,
-    req: ChatRequest,
+    req: &ChatRequest,
 ) -> Result<EventStream, ProviderError> {
     let response = settings
         .send(
             "messages",
-            &request_body(&settings, &req).map_err(ProviderError::fatal)?,
+            &request_body(&settings, req).map_err(ProviderError::fatal)?,
         )
         .await?;
     let json = json_response(&response);
