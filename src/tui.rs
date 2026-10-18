@@ -2,6 +2,7 @@
 use crate::engine::{self, App, EngineApi};
 use crate::engine_impl::Engine;
 use crate::types::{MessageWithParts, PromptRequest};
+use base64::Engine as _;
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
@@ -11,8 +12,10 @@ use crossterm::{
 };
 use futures::{poll, StreamExt};
 use serde_json::Value;
+mod input;
+use input::{clean_input, pop_grapheme, terminal_width, Display, Draft};
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::task::Poll;
 
@@ -43,8 +46,8 @@ macro_rules! print {
 }
 #[macro_export]
 macro_rules! println {
-    () => { print!("\n") };
-    ($($arg:tt)*) => { print!("{}\n", format!($($arg)*)) };
+    () => { $crate::print!("\n") };
+    ($($arg:tt)*) => { $crate::print!("{}\n", format!($($arg)*)) };
 }
 
 pub(crate) const RESET: &str = "\x1b[0m";
@@ -91,9 +94,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+V paste image · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
-    print!("{BOLD}›{RESET} ");
-    let _ = std::io::stdout().flush();
+    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
 }
 
 fn summarize_input(input: &Value) -> String {
@@ -138,14 +139,22 @@ fn option_values(options: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, session_id: &str) {
+fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    macro_rules! print {
+        ($($arg:tt)*) => {{ let _ = write!(output, $($arg)*); }};
+    }
+    macro_rules! println {
+        ($($arg:tt)*) => {{ let _ = writeln!(output, $($arg)*); }};
+    }
     let properties = &event.properties;
     if properties["sessionID"]
         .as_str()
         .or_else(|| properties["part"]["sessionID"].as_str())
         .is_some_and(|id| id != session_id)
     {
-        return;
+        return output;
     }
     match event.r#type.as_str() {
         "message.part.updated" => {
@@ -201,7 +210,6 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
                 Some("reasoning") => print!("{DIM}{delta}{RESET}"),
                 _ => {}
             }
-            let _ = std::io::stdout().flush();
         }
         "permission.asked" => {
             let id = properties["id"].as_str().unwrap_or_default().to_string();
@@ -224,8 +232,6 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
                     120
                 )
             );
-            print!("{BOLD}›{RESET} ");
-            let _ = std::io::stdout().flush();
             ui.prompt = Some(PendingPrompt::Permission(id));
         }
         "question.asked" => {
@@ -248,8 +254,6 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
                 }
                 println!("{DIM}type number(s), Enter to answer, Esc to dismiss{RESET}");
             }
-            print!("{BOLD}›{RESET} ");
-            let _ = std::io::stdout().flush();
             ui.prompt = Some(PendingPrompt::Question {
                 id,
                 options,
@@ -264,11 +268,11 @@ fn render_event(ui: &mut Ui, model: &str, event: &crate::types::BusEvent, sessio
             println!("\n{RED}error:{RESET} {message}");
         }
         "session.idle" => {
-            println!("{DIM}└ idle{RESET}");
-            print_prompt(model);
+            println!("\n{DIM}└ idle{RESET}");
         }
         _ => {}
     }
+    output
 }
 
 /// One answer line for one question. A typed number selects an option, and the
@@ -318,25 +322,21 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
                 let _ = app.questions.reply(id, payload);
                 return true;
             }
-            print_prompt("");
             false
         }
         Key::Backspace => {
-            line.pop();
-            print!("\x08 \x08");
-            let _ = std::io::stdout().flush();
+            pop_grapheme(line);
             false
         }
         Key::Char(ch) => {
             line.push(ch);
-            print!("{ch}");
-            let _ = std::io::stdout().flush();
             false
         }
         _ => false,
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Key {
     Char(char),
     Enter,
@@ -347,6 +347,8 @@ pub(crate) enum Key {
     CtrlL,
     CtrlR,
     CtrlV,
+    CtrlU,
+    RemoveAttachment,
     /// Move by N rows; page keys report a full page.
     Up(usize),
     Down(usize),
@@ -368,7 +370,16 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => Key::CtrlD,
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => Key::CtrlL,
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => Key::CtrlR,
-            (KeyCode::Char('v'), KeyModifiers::CONTROL) => Key::CtrlV,
+            (KeyCode::Char('v' | 'V'), modifiers)
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+            {
+                Key::CtrlV
+            }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => Key::CtrlU,
+            (KeyCode::Backspace, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+                Key::RemoveAttachment
+            }
             (KeyCode::Enter, _) => Key::Enter,
             (KeyCode::Backspace, _) => Key::Backspace,
             (KeyCode::Esc, _) => Key::Esc,
@@ -398,9 +409,8 @@ pub(crate) fn decode_event(event: Event) -> Key {
     }
 }
 
-/// A prompt part waiting in the input: an existing image file or clipboard
-/// bytes copied to a temp file. The engine reads file: URLs when it builds the
-/// request, so nothing is loaded until the prompt is sent.
+/// A pending image. Clipboard images use data URLs so removing a draft leaves
+/// no temporary files and saved sessions can still read the image later.
 struct Attachment {
     filename: String,
     url: String,
@@ -431,20 +441,19 @@ fn file_attachment(path: &Path) -> Result<Attachment, String> {
     })
 }
 
-/// Clipboard bytes become a file: attachment only when they are a supported
-/// image and fit the engine's size limit.
+/// Retain supported clipboard images in the message itself, without temp files.
 fn image_attachment(bytes: Vec<u8>) -> Option<Attachment> {
     let mime = crate::tools::media_type(&bytes).filter(|mime| mime.starts_with("image/"))?;
     if bytes.len() as u64 > MAX_ATTACHMENT {
         return None;
     }
     let ext = mime.rsplit('/').next().unwrap_or("png");
-    let path =
-        std::env::temp_dir().join(format!("ocmini-paste-{}.{}", crate::types::hex_id(""), ext));
-    std::fs::write(&path, &bytes).ok()?;
     Some(Attachment {
         filename: format!("clipboard.{ext}"),
-        url: reqwest::Url::from_file_path(&path).ok()?.to_string(),
+        url: format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ),
         mime,
     })
 }
@@ -453,11 +462,27 @@ fn image_attachment(bytes: Vec<u8>) -> Option<Attachment> {
 /// terminals paste dragged or copied files as paths, so those become
 /// attachments; anything else stays plain text.
 fn pasted_image_path(text: &str) -> Option<PathBuf> {
-    let trimmed = text.trim().trim_matches('"').trim_matches('\'');
-    let path = trimmed.strip_prefix("file://").unwrap_or(trimmed);
-    let expanded = match path.strip_prefix("~/") {
+    let trimmed = text.trim();
+    if trimmed.contains(['\n', '\r']) {
+        return None;
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .unwrap_or(trimmed);
+    let path = if unquoted.starts_with("file:") {
+        reqwest::Url::parse(unquoted).ok()?.to_file_path().ok()?
+    } else {
+        PathBuf::from(unquoted.replace("\\ ", " "))
+    };
+    let expanded = match path.to_str()?.strip_prefix("~/") {
         Some(rest) => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))?,
-        None => PathBuf::from(path),
+        None => path,
     };
     is_image_file(&expanded).then_some(expanded)
 }
@@ -476,54 +501,97 @@ fn is_image_file(path: &Path) -> bool {
     crate::tools::media_type(&head[..read]).is_some_and(|mime| mime.starts_with("image/"))
 }
 
-fn print_attachment(attachment: &Attachment) {
-    println!(
-        "{DIM}● attached: {} · {}{RESET}",
-        attachment.filename, attachment.mime
-    );
+async fn paste_clipboard(draft: &mut Draft, display: &mut Display) {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), clipboard_image()).await;
+    let message = match result {
+        Ok(Ok(Some(attachment))) => {
+            draft.attachments.push(attachment);
+            return;
+        }
+        Ok(Ok(None)) => {
+            "Clipboard has no supported image. Paste an image file path to attach it.".into()
+        }
+        Ok(Err(message)) => message,
+        Err(_) => "Clipboard read timed out. Paste an image file path to attach it.".into(),
+    };
+    display.output(&format!("\n{YELLOW}{message}{RESET}\n"), terminal_width());
 }
 
 #[cfg(target_os = "linux")]
-fn clipboard_image() -> Result<Option<Attachment>, String> {
-    use std::process::Command;
-    let mut probed = false;
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        probed = true;
-        // -n keeps binary payloads byte-exact; wl-paste appends a newline without it.
-        if let Ok(out) = Command::new("wl-paste")
-            .args(["-t", "image/png", "-n"])
-            .output()
-        {
-            if out.status.success() {
-                if let Some(attachment) = image_attachment(out.stdout) {
-                    return Ok(Some(attachment));
+async fn clipboard_image() -> Result<Option<Attachment>, String> {
+    use tokio::process::Command;
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    if !wayland && !x11 {
+        return Err(
+            if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+            {
+                "SSH does not forward your local image clipboard. Copy the image to this host (for example with scp), then paste its remote path; X11 clipboard forwarding also works with a forwarded DISPLAY and xclip.".into()
+            } else {
+                "No desktop clipboard is available. Paste an image file path, or use wl-paste (Wayland) / xclip (X11) in a desktop session.".into()
+            },
+        );
+    }
+    let mut available = false;
+    for (program, enabled) in [("wl-paste", wayland), ("xclip", x11)] {
+        if !enabled {
+            continue;
+        }
+        for mime in [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "text/uri-list",
+        ] {
+            let mut command = Command::new(program);
+            if program == "wl-paste" {
+                // --no-newline keeps binary payloads byte-exact.
+                command.args(["--type", mime, "--no-newline"]);
+            } else {
+                command.args(["-selection", "clipboard", "-t", mime, "-o"]);
+            }
+            match command.kill_on_drop(true).output().await {
+                Ok(out) => {
+                    available = true;
+                    if out.status.success() {
+                        if mime == "text/uri-list" {
+                            if let Ok(text) = std::str::from_utf8(&out.stdout) {
+                                let paths: Vec<_> = text
+                                    .lines()
+                                    .filter(|line| {
+                                        !line.starts_with('#') && !line.trim().is_empty()
+                                    })
+                                    .collect();
+                                if let [path] = paths.as_slice() {
+                                    if let Some(path) = pasted_image_path(path) {
+                                        return file_attachment(&path).map(Some);
+                                    }
+                                }
+                            }
+                        } else if let Some(attachment) = image_attachment(out.stdout) {
+                            return Ok(Some(attachment));
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(format!("Cannot read clipboard using {program}: {error}"))
                 }
             }
         }
     }
-    if std::env::var_os("DISPLAY").is_some() {
-        probed = true;
-        if let Ok(out) = Command::new("xclip")
-            .args(["-selection", "clipboard", "-t", "image/png", "-o"])
-            .output()
-        {
-            if out.status.success() {
-                if let Some(attachment) = image_attachment(out.stdout) {
-                    return Ok(Some(attachment));
-                }
-            }
-        }
-    }
-    if !probed {
-        return Err("Image paste needs wl-paste (Wayland) or xclip (X11)".into());
+    if !available {
+        return Err("Image paste needs wl-paste (Wayland) or xclip (X11); neither helper could be started. You can also paste an image file path.".into());
     }
     Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn clipboard_image() -> Result<Option<Attachment>, String> {
-    use std::process::Command;
-    let file = std::env::temp_dir().join(format!("ocmini-clip-{}.png", crate::types::hex_id("")));
+async fn clipboard_image() -> Result<Option<Attachment>, String> {
+    use tokio::process::Command;
+    let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let file = directory.path().join("clipboard.png");
     let out = Command::new("osascript")
         .args([
             "-e",
@@ -536,7 +604,9 @@ fn clipboard_image() -> Result<Option<Attachment>, String> {
             "-e",
             "close access f",
         ])
+        .kill_on_drop(true)
         .output()
+        .await
         .map_err(|e| format!("Cannot run osascript: {e}"))?;
     let bytes = std::fs::read(&file).ok();
     let _ = std::fs::remove_file(&file);
@@ -547,16 +617,19 @@ fn clipboard_image() -> Result<Option<Attachment>, String> {
 }
 
 #[cfg(windows)]
-fn clipboard_image() -> Result<Option<Attachment>, String> {
-    use std::process::Command;
-    let file = std::env::temp_dir().join(format!("ocmini-paste-{}.png", crate::types::hex_id("")));
+async fn clipboard_image() -> Result<Option<Attachment>, String> {
+    use tokio::process::Command;
+    let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let file = directory.path().join("clipboard.png");
     let script = format!(
         "Add-Type -AssemblyName System.Windows.Forms; if ($i = [System.Windows.Forms.Clipboard]::GetImage()) {{ $i.Save('{}') }}",
         file.display()
     );
     let out = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
+        .kill_on_drop(true)
         .output()
+        .await
         .map_err(|e| format!("Cannot run powershell: {e}"))?;
     let bytes = std::fs::read(&file).ok();
     let _ = std::fs::remove_file(&file);
@@ -567,7 +640,7 @@ fn clipboard_image() -> Result<Option<Attachment>, String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn clipboard_image() -> Result<Option<Attachment>, String> {
+async fn clipboard_image() -> Result<Option<Attachment>, String> {
     Err("Image paste is not supported on this platform".into())
 }
 
@@ -685,8 +758,8 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     let mut keys = EventStream::new();
     tokio::pin!(shutdown);
 
-    let mut line = String::new();
-    let mut attachments: Vec<Attachment> = Vec::new();
+    let mut draft = Draft::default();
+    let mut display = Display::default();
     let mut ui = Ui {
         part_kind: HashMap::new(),
         headered: std::collections::HashSet::new(),
@@ -700,39 +773,45 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     println!("{DIM}session {} · {}{RESET}", session.id, session.directory);
     render_history(&history);
     print_prompt(&model_display);
+    display.draw(&ui, &draft, terminal_width());
 
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             event = keys.next() => {
                 let Some(event) = event else { break; };
-                let key = decode_event(event.map_err(|error| error.to_string())?);
+                let event = event.map_err(|error| error.to_string())?;
+                display.erase();
+                if matches!(event, Event::Resize(_, _)) {
+                    display.finish_line();
+                }
+                let key = decode_event(event);
                 let pending_permission = matches!(ui.prompt, Some(PendingPrompt::Permission(_)));
                 let pending_question = matches!(ui.prompt, Some(PendingPrompt::Question { .. }));
                 match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
-                    Key::CtrlC => { engine.abort(&session.id); println!("\n{YELLOW}⏹ aborted{RESET}"); }
-                    Key::CtrlL => print!("\x1b[2J\x1b[H"),
-                    Key::CtrlV => {
-                        match clipboard_image() {
-                            Ok(Some(attachment)) => {
-                                print_attachment(&attachment);
-                                attachments.push(attachment);
-                            }
-                            Ok(None) => println!("{DIM}clipboard has no image{RESET}"),
-                            Err(message) => println!("{YELLOW}{message}{RESET}"),
+                    Key::CtrlC => { engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
+                    Key::CtrlL => { display.finish_line(); print!("\x1b[2J\x1b[H"); print_prompt(&model_display); }
+                    Key::CtrlU => {
+                        if let Some(PendingPrompt::Question { line, .. }) = ui.prompt.as_mut() {
+                            line.clear();
+                        } else if !pending_permission {
+                            draft.clear();
                         }
-                        print_prompt(&model_display);
+                    }
+                    Key::RemoveAttachment if !pending_permission && !pending_question => { draft.attachments.pop(); }
+                    Key::CtrlV if !pending_permission && !pending_question => {
+                        paste_clipboard(&mut draft, &mut display).await;
                     }
                     Key::CtrlR if !pending_permission && !pending_question => {
-                        print!("\x1b[J");
+                        display.finish_line();
                         let picked = crate::picker::select(&app.store, None, &mut keys).await?;
                         // The picker reads stdin through this same stream; keys typed
                         // while it was open are queued here and must not reach the prompt.
                         while let Poll::Ready(Some(_)) = poll!(keys.next()) {}
                         match picked {
-                            None => print_prompt(&model_display),
+                            None => {},
                             Some(picked) => {
                                 match crate::sessions::open(
                                     &app.store,
@@ -763,7 +842,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                             model_ref.as_ref(),
                                             &app.config.lock().unwrap().model,
                                         );
-                                        line.clear();
+                                        draft.clear();
                                         println!(
                                             "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}",
                                             session.id, session.directory
@@ -778,9 +857,9 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::Char(ch) if pending_permission => {
                         if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() {
                             match ch {
-                                'o' | 'O' => { app.perms.reply(&id, "once"); println!("{DIM}once{RESET}"); }
-                                'a' | 'A' => { app.perms.reply(&id, "always"); println!("{DIM}always{RESET}"); }
-                                _ => { app.perms.reply(&id, "reject"); println!("{DIM}rejected{RESET}"); }
+                                'o' | 'O' => { app.perms.reply(&id, "once"); }
+                                'a' | 'A' => { app.perms.reply(&id, "always"); }
+                                _ => { app.perms.reply(&id, "reject"); }
                             }
                         }
                     }
@@ -788,49 +867,34 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                         if let Some(state) = ui.prompt.as_mut() {
                             if answer_question(&app, state, key) {
                                 ui.prompt = None;
-                                print_prompt(&model_display);
                             }
                         }
                     }
                     Key::Paste(text) if pending_question => {
                         if let Some(PendingPrompt::Question { line, .. }) = ui.prompt.as_mut() {
-                            let flat = text.replace('\n', " ");
-                            line.push_str(&flat);
-                            print!("{flat}");
-                            let _ = std::io::stdout().flush();
+                            line.push_str(&clean_input(&text).replace('\n', " "));
                         }
                     }
                     Key::Paste(_) if pending_permission => {}
                     Key::Paste(text) => {
-                        // A pasted image file path becomes an attachment; a
-                        // pasted screenshot can never arrive as text, so the
-                        // clipboard reader above covers that case.
-                        let pasted = pasted_image_path(&text);
-                        let image = pasted.as_deref().map(file_attachment);
-                        match image {
-                            Some(Ok(attachment)) => {
-                                print_attachment(&attachment);
-                                attachments.push(attachment);
-                                print_prompt(&model_display);
+                        if text.is_empty() {
+                            paste_clipboard(&mut draft, &mut display).await;
+                        } else if let Some(path) = pasted_image_path(&text) {
+                            match file_attachment(&path) {
+                                Ok(attachment) => draft.attachments.push(attachment),
+                                Err(message) => display.output(&format!("\n{YELLOW}{message}{RESET}\n"), terminal_width()),
                             }
-                            Some(Err(message)) => {
-                                println!("{YELLOW}{message}{RESET}");
-                                print_prompt(&model_display);
-                            }
-                            None => {
-                                for ch in text.chars() {
-                                    line.push(ch);
-                                    // Continuation lines indent under "› ".
-                                    if ch == '\n' { print!("\n  "); } else { print!("{ch}"); }
-                                }
-                            }
+                        } else {
+                            draft.text.push_str(&clean_input(&text));
                         }
-                        let _ = std::io::stdout().flush();
                     }
+                    Key::Enter if pending_permission => {},
                     Key::Enter => {
-                        let text = std::mem::take(&mut line);
-                        let files = std::mem::take(&mut attachments);
-                        println!();
+                        display.finish_line();
+                        let text = std::mem::take(&mut draft.text);
+                        let files = std::mem::take(&mut draft.attachments);
+                        if !text.is_empty() { println!("{BOLD}›{RESET} {text}"); }
+                        for file in &files { println!("{DIM}● attached: {}{RESET}", clean_input(&file.filename)); }
                         if text.trim() == "/quit" { break; }
                         let mut parts: Vec<Value> = Vec::new();
                         if !text.trim().is_empty() {
@@ -857,32 +921,81 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                 println!("{RED}error:{RESET} {error}");
                             }
                         }
-                        print_prompt(&model_display);
                     }
-                    Key::Backspace => { line.pop(); print!("\x08 \x08"); let _ = std::io::stdout().flush(); }
-                    Key::Char(ch) => { line.push(ch); print!("{ch}"); let _ = std::io::stdout().flush(); }
+                    Key::Backspace if !pending_permission => { draft.backspace(); }
+                    Key::Char(ch) => { draft.text.push(ch); }
                     Key::Esc if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     _ => {}
                 }
+                display.draw(&ui, &draft, terminal_width());
             }
             event = events.recv() => {
+                display.erase();
                 match event {
-                    Ok(event) => render_event(&mut ui, &model_display, &event, &session.id),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => println!("\n{YELLOW}⚠ some events were skipped{RESET}"),
+                    Ok(event) => {
+                        let output = render_event(&mut ui, &event, &session.id);
+                        display.output(&output, terminal_width());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => display.output(&format!("\n{YELLOW}⚠ some events were skipped{RESET}\n"), terminal_width()),
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+                display.draw(&ui, &draft, terminal_width());
             }
         }
     }
+    display.erase();
+    display.finish_line();
     engine.abort_and_wait(&session.id).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{file_attachment, image_attachment, parse_answer, pasted_image_path};
+    use super::{
+        decode_event, file_attachment, image_attachment, parse_answer, pasted_image_path, Key,
+    };
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+    pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+
+    #[test]
+    fn paste_shortcuts_accept_shift_and_uppercase_without_inserting_text() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for ch in ['v', 'V'] {
+                assert_eq!(
+                    decode_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), modifiers))),
+                    Key::CtrlV
+                );
+            }
+        }
+        assert_eq!(
+            decode_event(Event::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::ALT
+            ))),
+            Key::RemoveAttachment
+        );
+        assert_eq!(
+            decode_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL
+            ))),
+            Key::CtrlU
+        );
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(decode_event(Event::Key(release)), Key::Other);
+        assert_eq!(
+            decode_event(Event::Paste("a\r\nb\rc".into())),
+            Key::Paste("a\nb\nc".into())
+        );
+    }
 
     #[test]
     fn typed_numbers_answer_with_their_option_labels() {
@@ -921,14 +1034,32 @@ mod tests {
     }
 
     #[test]
+    fn pasted_image_paths_decode_file_urls_and_shell_escaped_spaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("screen shot #1.png");
+        std::fs::write(&path, PNG).unwrap();
+        let url = reqwest::Url::from_file_path(&path).unwrap();
+        assert_eq!(pasted_image_path(url.as_str()).unwrap(), path);
+        assert_eq!(
+            pasted_image_path(&path.to_string_lossy().replace(' ', "\\ ")).unwrap(),
+            path
+        );
+        assert!(pasted_image_path(&format!("{}\n", url)).is_some());
+        assert!(pasted_image_path(&format!("{}\n{}", url, url)).is_none());
+    }
+
+    #[test]
     fn clipboard_bytes_attach_only_as_images() {
         let attachment = image_attachment(PNG.to_vec()).unwrap();
         assert_eq!(attachment.filename, "clipboard.png");
         assert_eq!(attachment.mime, "image/png");
-        std::fs::remove_file(std::path::Path::new(
-            &attachment.url.strip_prefix("file://").unwrap(),
-        ))
-        .unwrap();
+        assert_eq!(
+            attachment.url,
+            format!(
+                "data:image/png;base64,{}",
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, PNG)
+            )
+        );
         assert!(image_attachment(b"not an image".to_vec()).is_none());
     }
 }

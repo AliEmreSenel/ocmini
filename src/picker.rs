@@ -1,9 +1,9 @@
 // Interactive session selector: live search, cycling sort order and a
 // keyboard-driven viewport over the saved sessions.
+use crate::println;
 use crate::store::Store;
 use crate::tui::{decode_event, truncate, Key, BOLD, DIM, RESET, YELLOW};
 use crate::types::{now_ms, Session};
-use crate::{print, println};
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::EventStream;
 use crossterm::terminal::{self, Clear, ClearType};
