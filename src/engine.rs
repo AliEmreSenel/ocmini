@@ -1,14 +1,14 @@
 use self::question::QuestionState;
 use crate::auth::AuthStore;
 use crate::bus::Bus;
-use crate::config::Config;
+use crate::config::{Config, McpLocal};
 use crate::mcp::McpHub;
 use crate::permission::PermissionState;
 use crate::store::Store;
 use crate::types::{ModelRef, PromptRequest};
 use crate::usage_db::UsageDb;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use tokio::sync::oneshot;
 
 pub mod question {
@@ -112,7 +112,50 @@ pub mod question {
     }
 }
 
-type McpScope = (Arc<McpHub>, Arc<AtomicBool>);
+struct McpScope {
+    hub: Arc<McpHub>,
+    entries: std::collections::HashMap<String, McpLocal>,
+    directory: String,
+    started: Once,
+    ready: Arc<AtomicBool>,
+}
+
+impl McpScope {
+    fn new(config: &Config, directory: &str) -> Self {
+        Self {
+            hub: Arc::new(McpHub::new()),
+            entries: config.mcp.clone(),
+            directory: directory.to_string(),
+            started: Once::new(),
+            ready: Arc::new(AtomicBool::new(config.mcp.is_empty())),
+        }
+    }
+
+    fn start(&self) {
+        // Selecting a directory (including the launch directory) must not
+        // start its MCP processes. Initialize once, when MCP is first used.
+        self.started.call_once(|| {
+            if self.entries.is_empty() {
+                return;
+            }
+            let entries = self.entries.clone();
+            let directory = self.directory.clone();
+            let background = self.hub.clone();
+            let done = self.ready.clone();
+            // Keep initialization alive if the first request is cancelled.
+            std::thread::spawn(move || {
+                for (name, entry) in entries {
+                    let mut value = serde_json::to_value(entry).expect("MCP config JSON");
+                    if value["cwd"].as_str().is_none_or(str::is_empty) {
+                        value["cwd"] = serde_json::json!(directory);
+                    }
+                    let _ = background.add(&name, value);
+                }
+                done.store(true, Ordering::Release);
+            });
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct App {
@@ -122,8 +165,8 @@ pub struct App {
     pub perms: PermissionState,
     pub questions: QuestionState,
     pub mcp: Arc<McpHub>,
-    mcp_ready: Arc<AtomicBool>,
-    mcp_scopes: Arc<Mutex<std::collections::HashMap<String, McpScope>>>,
+    mcp_scope: Arc<McpScope>,
+    mcp_scopes: Arc<Mutex<std::collections::HashMap<String, Arc<McpScope>>>>,
     pub usage: Arc<UsageDb>,
     pub always: Arc<Mutex<std::collections::HashMap<String, Vec<crate::types::PermissionRule>>>>,
     pub statuses: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>>,
@@ -135,10 +178,10 @@ impl App {
         crate::tools::cleanup_outputs()?;
         let directory = std::env::current_dir().unwrap_or_default();
         let directory = directory.to_string_lossy().into_owned();
-        let (mcp, mcp_ready) = start_mcp(&config, &directory);
+        let mcp_scope = Arc::new(McpScope::new(&config, &directory));
         let mcp_scopes = Arc::new(Mutex::new(std::collections::HashMap::from([(
             directory,
-            (mcp.clone(), mcp_ready.clone()),
+            mcp_scope.clone(),
         )])));
         Ok(Self {
             store: Arc::new(Store::open(
@@ -149,8 +192,8 @@ impl App {
             auth: Arc::new(AuthStore::load()),
             perms: PermissionState::default(),
             questions: QuestionState::default(),
-            mcp,
-            mcp_ready,
+            mcp: mcp_scope.hub.clone(),
+            mcp_scope,
             mcp_scopes,
             usage: Arc::new(UsageDb::open()),
             always: Arc::new(Mutex::new(Default::default())),
@@ -161,45 +204,23 @@ impl App {
     pub fn for_directory(&self, directory: &str) -> Result<Self, String> {
         let config = Config::load_for(directory)?;
         let mut scopes = self.mcp_scopes.lock().unwrap();
-        let (mcp, ready) = scopes
+        let scope = scopes
             .entry(directory.to_string())
-            .or_insert_with(|| start_mcp(&config, directory))
+            .or_insert_with(|| Arc::new(McpScope::new(&config, directory)))
             .clone();
         let mut scoped = self.clone();
-        scoped.mcp = mcp;
-        scoped.mcp_ready = ready;
+        scoped.mcp = scope.hub.clone();
+        scoped.mcp_scope = scope;
         scoped.config = Arc::new(Mutex::new(config));
         Ok(scoped)
     }
 
     pub async fn wait_mcp_ready(&self) {
-        while !self.mcp_ready.load(Ordering::Acquire) {
+        self.mcp_scope.start();
+        while !self.mcp_scope.ready.load(Ordering::Acquire) {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
-}
-
-fn start_mcp(config: &Config, directory: &str) -> (Arc<McpHub>, Arc<AtomicBool>) {
-    let hub = Arc::new(McpHub::new());
-    let ready = Arc::new(AtomicBool::new(config.mcp.is_empty()));
-    if config.mcp.is_empty() {
-        return (hub, ready);
-    }
-    let entries = config.mcp.clone();
-    let directory = directory.to_string();
-    let background = hub.clone();
-    let done = ready.clone();
-    std::thread::spawn(move || {
-        for (name, entry) in entries {
-            let mut value = serde_json::to_value(entry).expect("MCP config JSON");
-            if value["cwd"].as_str().is_none_or(str::is_empty) {
-                value["cwd"] = serde_json::json!(directory);
-            }
-            let _ = background.add(&name, value);
-        }
-        done.store(true, Ordering::Release);
-    });
-    (hub, ready)
 }
 
 pub trait EngineApi: Send + Sync + 'static {

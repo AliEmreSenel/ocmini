@@ -140,6 +140,18 @@ The search stress case completed across 100,005 files, returned one grep match a
 python3 tests/stress_conversations.py /path/to/ocmini --mode search --sizes 1000 100005
 ```
 
+## MCP startup and directory scopes
+
+On 2026-10-18, an isolated stdio fixture compared installed OpenCode 1.19.2 with ocmini before and after lazy MCP initialization. With a launch directory distinct from the requested projects, OpenCode and the fixed ocmini launched zero MCP children at boot, one after the first project's MCP request, still one after a repeated request, and two after a second directory's request. The original ocmini launched one child at boot and accumulated two and three respectively. Fixture logs recorded each child's actual working directory. No user MCP configuration or running server was changed by these checks.
+
+A second comparison used a Git repository, two subfolders, a linked worktree and an unrelated repository. OpenCode reported the same project ID for the first four directories, but created a separate MCP child for each requested directory; the unrelated repository had a different project ID. The fixed ocmini matched all five child counts and working directories. This verifies directory-scoped MCP behavior, not full project-metadata compatibility: ocmini still stores `projectID: "global"` and scopes sessions by directory. OpenCode also supports explicit instance disposal; this change does not add that API or automatic eviction to ocmini.
+
+OpenCode's v1.19.2 source confirms two separate keys: [request routing](https://github.com/anomalyco/opencode/blob/v1.19.2/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts) chooses the directory query parameter, then `x-opencode-directory`, then the process working directory; [instance state](https://github.com/anomalyco/opencode/blob/v1.19.2/packages/opencode/src/effect/instance-state.ts) caches MCP state by the resolved instance directory. [Project resolution](https://github.com/anomalyco/opencode/blob/v1.19.2/packages/core/src/project.ts) discovers the Git worktree/common directory and derives the project ID from the normalized origin remote, falling back to the cached common-directory ID or a root commit; non-Git directories use `global`. Repository project IDs therefore do not determine MCP connection sharing.
+
+Contract regressions check that metadata and `noReply` do not start MCP, twelve simultaneous first requests start only one child, launch-directory access still works on demand, project environment overrides and working directories remain isolated, disconnect stays scoped, normalized path aliases reuse a hub, and a first model turn discovers and calls MCP without a prior status request. The model-turn test also verifies reuse on a subsequent turn. Both new tests fail against the original executable: the first detects eager metadata startup, and the second records two children instead of one.
+
+After rebasing onto the current main branch, all 157 tests (114 unit, 43 contract), formatting, Clippy with warnings denied, and the locked release build passed. The three MCP contract tests also passed against the final release executable.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.
