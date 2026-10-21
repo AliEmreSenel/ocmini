@@ -206,6 +206,37 @@ redraws and Ctrl+D leaves the transcript on screen. The caret's row is now
 tracked, so a transcript row flushed above the draft shifts the block down
 instead of putting the caret one row above where it was drawn.
 
+## Startup recovery scans on a large store
+
+Startup felt slow on a real store: 656 sessions, 39,056 messages and 160,180
+parts (713 MB, `user_version` 2). Every `Store::open` ran startup recovery, and
+its two scans filtered `json_extract(json, ...)` row by row with the session
+scope driving the plan: 199 ms over messages and 546 ms over parts to match
+three unfinished messages and two unfinished tool parts. On a copy of that store
+a process measured 746–758 ms for `session list`, 750–933 ms from start to
+`/global/health`, and 758–842 ms from a tmux spawn to the first TUI frame. The
+installed opencode 1.19.3 took 4.4 s to its first frame in the same project.
+
+The recovery filters now live in plain columns mirrored at write time
+(`message.completed`, `part.kind`, `part.status`) with two partial indexes over
+unfinished work. `EXPLAIN QUERY PLAN` seeks both indexes and the scans measure
+0.1 ms; the same three commands measure 7 ms, 9–17 ms and 19–20 ms. The indexes
+occupy 8 KB on this store and add no measurable write cost (20,000 finished
+part inserts measured 2.88 µs per row with and without them, because finished
+rows keep no index entry). Recovery semantics and leases are unchanged: the
+mirrored columns are written in the same transactions as the JSON, and the
+recovery updates keep their existing guards.
+
+Migration runs once at `user_version` 3. It adds the columns, backfills from
+JSON with `json_valid` guards so a legacy malformed row cannot abort startup,
+and builds the indexes: 6.4 s for the first open of this store against 2.1 s for
+the same build at `user_version` 2, then 7 ms per open. Two unit tests pin the
+plan, requiring both scans to use the indexes, and the migration, checking
+mirrored values, an untouched corrupt legacy row and the created indexes.
+
+Formatting, Clippy with warnings denied, the locked release build, and all 176
+tests (130 unit and 46 contract) pass.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.

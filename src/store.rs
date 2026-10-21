@@ -17,6 +17,19 @@ const LEASE_MS: i64 = 60_000;
 /// that a slow start instead of a "database is locked" failure.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Startup recovery scans, as query prefixes ending in `AND `: the recovery
+/// scope is appended by [`scan_interrupted`]. They filter the mirrored
+/// `completed`/`kind`/`status` columns, which `msg_unfinished` and
+/// `part_unfinished` index for unfinished work only.
+const RECOVER_MESSAGES: &str =
+    "SELECT id,json FROM message WHERE role='assistant' AND completed IS NULL AND ";
+const RECOVER_PARTS: &str =
+    "SELECT id,json FROM part WHERE kind='tool' AND status IN ('pending','running') AND ";
+
+/// Recovery scope appended to every scan prefix: sessions no instance claimed,
+/// sessions this instance owns, and sessions whose lease expired.
+const RECOVER_SCOPE: &str = "session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)";
+
 pub struct Store {
     conn: Mutex<Connection>,
     /// WAL readers run on a dedicated connection so reads never queue behind
@@ -68,8 +81,8 @@ impl Store {
             .map_err(sql_error)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session(id TEXT PRIMARY KEY, json TEXT NOT NULL, time_created INTEGER, time_updated INTEGER, parent_id TEXT, busy INTEGER DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, json TEXT NOT NULL, time_created INTEGER);
-             CREATE TABLE IF NOT EXISTS part(id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, json TEXT NOT NULL, time_created INTEGER);
+             CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, json TEXT NOT NULL, time_created INTEGER, completed INTEGER);
+             CREATE TABLE IF NOT EXISTS part(id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, json TEXT NOT NULL, time_created INTEGER, kind TEXT, status TEXT);
              CREATE INDEX IF NOT EXISTS msg_sid ON message(session_id, time_created);
              CREATE INDEX IF NOT EXISTS part_sid ON part(session_id, time_created);
              CREATE INDEX IF NOT EXISTS part_mid ON part(message_id);
@@ -102,6 +115,34 @@ impl Store {
                  DELETE FROM inbox WHERE session_id NOT IN (SELECT id FROM session);
                  DELETE FROM todo WHERE session_id NOT IN (SELECT id FROM session);").map_err(sql_error)?;
             conn.pragma_update(None, "user_version", 2)
+                .map_err(sql_error)?;
+        }
+        if version < 3 {
+            // Startup recovery looked for unfinished work inside the JSON, so
+            // every open read every message and part row: 741 ms on a store with
+            // 38,781 messages and 159,024 parts, matching zero rows. Recovery
+            // filters on plain columns now, partially indexed on unfinished
+            // work, so a scan touches that work and nothing else.
+            for column in [
+                "ALTER TABLE message ADD COLUMN completed INTEGER",
+                "ALTER TABLE part ADD COLUMN kind TEXT",
+                "ALTER TABLE part ADD COLUMN status TEXT",
+            ] {
+                // A fresh database creates these columns with the table.
+                if let Err(error) = conn.execute(column, []) {
+                    if !error.to_string().contains("duplicate column name") {
+                        return Err(sql_error(error));
+                    }
+                }
+            }
+            // Malformed legacy rows keep NULL markers: they stay out of recovery,
+            // as they already stay out of history reads.
+            conn.execute_batch(
+                "UPDATE message SET completed=json_extract(json,'$.time.completed') WHERE json_valid(json);
+                 UPDATE part SET kind=json_extract(json,'$.type'), status=json_extract(json,'$.state.status') WHERE json_valid(json);
+                 CREATE INDEX IF NOT EXISTS msg_unfinished ON message(session_id) WHERE role='assistant' AND completed IS NULL;
+                 CREATE INDEX IF NOT EXISTS part_unfinished ON part(session_id) WHERE kind='tool' AND status IN ('pending','running');").map_err(sql_error)?;
+            conn.pragma_update(None, "user_version", 3)
                 .map_err(sql_error)?;
         }
         let read = if path.to_string_lossy() == ":memory:" {
@@ -174,19 +215,18 @@ impl Store {
         // lease, or sessions no instance has ever claimed. A sibling instance
         // that is actively streaming must not be interrupted by a restart.
         //
-        // The two scans below read every message and part row and cost seconds
-        // on a large transcript, so they run on the read connection. Holding
-        // the write lock across them makes every sibling instance queue, and a
-        // burst of instance startups pushes them past their busy timeout with
-        // "database is locked". Each update re-checks the scanned condition, so
-        // a row a sibling changed in the meantime is left alone.
+        // The two scans below run on the read connection: holding the write lock
+        // across them makes every sibling instance queue, and a burst of instance
+        // startups pushes them past their busy timeout with "database is locked".
+        // Each update re-checks the scanned condition, so a row a sibling changed
+        // in the meantime is left alone. The expression indexes below the scan
+        // prefixes keep the scans proportional to unfinished work, not to the
+        // size of the store.
         let now = now_ms();
         let (unfinished, parts) = self.with_read(|c| {
             Ok((
-                scan_interrupted(c, &self.instance, now,
-                    "SELECT id,json FROM message WHERE role='assistant' AND json_extract(json,'$.time.completed') IS NULL AND ")?,
-                scan_interrupted(c, &self.instance, now,
-                    "SELECT id,json FROM part WHERE json_extract(json,'$.type')='tool' AND json_extract(json,'$.state.status') IN ('pending','running') AND ")?,
+                scan_interrupted(c, &self.instance, now, RECOVER_MESSAGES)?,
+                scan_interrupted(c, &self.instance, now, RECOVER_PARTS)?,
             ))
         })?;
         let mut c = self.conn.lock().unwrap();
@@ -198,8 +238,12 @@ impl Store {
                 json!({"name":"MessageAbortedError","data":{"message":"Server stopped before this response completed; send a new prompt to continue."}}),
             );
             tx.execute(
-                "UPDATE message SET json=?2 WHERE id=?1 AND json_extract(json,'$.time.completed') IS NULL",
-                params![id, serde_json::to_string(&info).map_err(sql_error)?],
+                "UPDATE message SET json=?2,completed=?3 WHERE id=?1 AND completed IS NULL",
+                params![
+                    id,
+                    serde_json::to_string(&info).map_err(sql_error)?,
+                    info.time.completed
+                ],
             )
             .map_err(sql_error)?;
         }
@@ -210,7 +254,7 @@ impl Store {
                 json!("Execution interrupted by server restart; the operation was not replayed.");
             part["state"]["time"]["end"] = json!(now);
             tx.execute(
-                "UPDATE part SET json=?2 WHERE id=?1 AND json_extract(json,'$.state.status') IN ('pending','running')",
+                "UPDATE part SET json=?2,status='error' WHERE id=?1 AND status IN ('pending','running')",
                 params![id, part.to_string()],
             )
             .map_err(sql_error)?;
@@ -898,7 +942,7 @@ fn scan_interrupted(
     now: i64,
     select: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    let sql = format!("{select}session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)");
+    let sql = format!("{select}{RECOVER_SCOPE}");
     let mut s = c.prepare(&sql).map_err(sql_error)?;
     let rows = s
         .query_map(params![instance, now], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -934,7 +978,7 @@ fn save_message(tx: &Transaction<'_>, m: &MessageWithParts) -> Result<(), String
     if !exists {
         return Err("Session not found".into());
     }
-    tx.execute("INSERT INTO message(id,session_id,role,json,time_created) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET json=excluded.json,role=excluded.role WHERE message.json<>excluded.json OR message.role IS NOT excluded.role", params![m.info.id,m.info.session_id,m.info.role,serde_json::to_string(&m.info).map_err(sql_error)?,m.info.time.created]).map_err(sql_error)?;
+    tx.execute("INSERT INTO message(id,session_id,role,json,time_created,completed) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET json=excluded.json,role=excluded.role,completed=excluded.completed WHERE message.json<>excluded.json OR message.role IS NOT excluded.role", params![m.info.id,m.info.session_id,m.info.role,serde_json::to_string(&m.info).map_err(sql_error)?,m.info.time.created,m.info.time.completed]).map_err(sql_error)?;
     for p in &m.parts {
         save_part(tx, &m.info.session_id, p, m.info.time.created)?;
     }
@@ -974,7 +1018,13 @@ fn save_part(tx: &Transaction<'_>, sid: &str, part: &Value, created: i64) -> Res
     if old.is_some_and(|(s, m)| s != sid || m != mid) {
         return Err("Part id already belongs to another message".into());
     }
-    tx.execute("INSERT INTO part(id,message_id,session_id,json,time_created) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET json=excluded.json WHERE part.json<>excluded.json", params![id,mid,sid,part.to_string(),created]).map_err(sql_error)?;
+    // Recovery filters the mirrored kind/status columns, so keep them in step
+    // with the JSON the row is saved with.
+    let (kind, status) = (
+        part["type"].as_str().map(str::to_string),
+        part["state"]["status"].as_str().map(str::to_string),
+    );
+    tx.execute("INSERT INTO part(id,message_id,session_id,json,time_created,kind,status) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET json=excluded.json,kind=excluded.kind,status=excluded.status WHERE part.json<>excluded.json", params![id,mid,sid,part.to_string(),created,kind,status]).map_err(sql_error)?;
     Ok(())
 }
 
@@ -1372,6 +1422,128 @@ mod tests {
     }
 
     #[test]
+    fn recovery_scans_seek_the_indexes_on_unfinished_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ocmini.db");
+        let db = Store::open(&path, "planner").unwrap();
+        let session = db.create_session_owned("planner", "/work");
+        // Finished work is what a used store is mostly made of; scanning it on
+        // every open is what makes startup slow, so it must stay out of the scan.
+        for index in 0..50 {
+            db.add_message(&MessageWithParts {
+                info: MessageInfo {
+                    id: format!("msg{index}"),
+                    session_id: session.id.clone(),
+                    role: "assistant".into(),
+                    time: MessageTime { created: 1, completed: Some(2) },
+                    ..Default::default()
+                },
+                parts: vec![json!({"id":format!("part{index}"),"messageID":format!("msg{index}"),"sessionID":session.id,"type":"tool","state":{"status":"completed","time":{"start":1,"end":2}}})],
+            })
+            .unwrap();
+        }
+        for (label, prefix, index) in [
+            ("message", RECOVER_MESSAGES, "msg_unfinished"),
+            ("part", RECOVER_PARTS, "part_unfinished"),
+        ] {
+            let plan = db
+                .with_read(|c| {
+                    let sql = format!("EXPLAIN QUERY PLAN {prefix}{RECOVER_SCOPE}");
+                    let mut statement = c.prepare(&sql).map_err(sql_error)?;
+                    let plan = statement
+                        .query_map(params!["planner", now_ms()], |row| row.get::<_, String>(3))
+                        .map_err(sql_error)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(sql_error)?
+                        .join(" | ");
+                    Ok(plan)
+                })
+                .unwrap();
+            assert!(plan.contains(index), "{label} recovery plan: {plan}");
+        }
+    }
+
+    #[test]
+    fn migration_mirrors_recovery_columns_and_survives_a_corrupt_legacy_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ocmini.db");
+        let db = Store::open(&path, "before-migration").unwrap();
+        let session = db.create_session_owned("legacy", "/work");
+        for (id, completed, status) in
+            [("done", Some(2), "completed"), ("corrupt", None, "running")]
+        {
+            db.add_message(&MessageWithParts {
+                info: MessageInfo { id: id.into(), session_id: session.id.clone(), role: "assistant".into(), time: MessageTime { created: 1, completed }, ..Default::default() },
+                parts: vec![json!({"id":format!("tool_{id}"),"messageID":id,"sessionID":session.id,"type":"tool","state":{"status":status,"time":{"start":1}}})],
+            })
+            .unwrap();
+        }
+        {
+            let connection = db.conn.lock().unwrap();
+            // A v2 store: no mirrored columns, no recovery indexes, and one
+            // unreadable part row, which the old full-table scan decoded.
+            for statement in [
+                "DROP INDEX msg_unfinished",
+                "DROP INDEX part_unfinished",
+                "ALTER TABLE message DROP COLUMN completed",
+                "ALTER TABLE part DROP COLUMN kind",
+                "ALTER TABLE part DROP COLUMN status",
+                "UPDATE part SET json='invalid' WHERE id='tool_corrupt'",
+            ] {
+                connection.execute(statement, []).unwrap();
+            }
+            connection.pragma_update(None, "user_version", 2).unwrap();
+        }
+        drop(db);
+
+        // Opening recovers (the corrupt row is unreadable, so the old scan
+        // failed the whole open), mirrors the fields and re-indexes them.
+        let db = Store::open(&path, "after-migration").unwrap();
+        let connection = db.conn.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT completed FROM message WHERE id='done'", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        for (id, mirrored) in [("done", Some(("tool", "completed"))), ("corrupt", None)] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT kind,status FROM part WHERE id=?1",
+                        params![format!("tool_{id}")],
+                        |row| Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?
+                        )),
+                    )
+                    .unwrap(),
+                mirrored
+                    .map(|(kind, status)| (Some(kind.to_string()), Some(status.to_string())))
+                    .unwrap_or((None, None)),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT json FROM part WHERE id='tool_corrupt'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "invalid",
+            "recovery must not touch a row it cannot read"
+        );
+    }
+
+    #[test]
     fn legacy_migration_removes_orphan_todos_and_preserves_session_todos() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ocmini.db");
@@ -1403,7 +1575,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
