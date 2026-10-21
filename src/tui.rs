@@ -99,7 +99,7 @@ fn print_prompt(model: &str) {
     println!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ↑↓ history · ←→↑↓ Home End move · Alt+←→ word · Shift select · Ctrl+A/E line · Ctrl+K/W cut · Ctrl+Y yank · Ctrl+Z undo · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
 }
 
-fn summarize_input(input: &Value) -> String {
+pub(crate) fn summarize_input(input: &Value) -> String {
     let mut parts = Vec::new();
     if let Some(command) = input["command"].as_str() {
         parts.push(command.to_string());
@@ -780,7 +780,10 @@ fn session_prompts(messages: &[MessageWithParts]) -> impl Iterator<Item = String
         })
 }
 
-fn display_model(model_ref: Option<&crate::types::ModelRef>, config_model: &str) -> String {
+pub(crate) fn display_model(
+    model_ref: Option<&crate::types::ModelRef>,
+    config_model: &str,
+) -> String {
     let display = model_ref
         .map(|model| format!("{}/{}", model.provider_id, model.model_id))
         .unwrap_or_else(|| config_model.to_string());

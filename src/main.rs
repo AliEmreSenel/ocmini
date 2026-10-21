@@ -7,6 +7,7 @@ mod mcp;
 mod permission;
 mod picker;
 mod provider;
+mod run;
 mod server;
 mod sessions;
 mod store;
@@ -17,7 +18,7 @@ mod usage_db;
 
 use clap::{Args, Parser, Subcommand};
 
-pub const OPENCODE_COMPAT_VERSION: &str = "1.19.3-ocmini.0.3.0";
+pub const OPENCODE_COMPAT_VERSION: &str = "1.19.3-ocmini.0.3.1";
 
 #[derive(Parser)]
 #[command(version = OPENCODE_COMPAT_VERSION, about = "A compact OpenCode-compatible coding runtime", args_conflicts_with_subcommands = true)]
@@ -50,10 +51,57 @@ struct TuiArgs {
     resume: bool,
 }
 
+#[derive(Args, Default)]
+pub struct RunArgs {
+    /// Prompt text; piped standard input is appended (like `opencode run`)
+    message: Vec<String>,
+    /// Resume the latest top-level session in this directory
+    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
+    continue_last: bool,
+    /// Resume a session by ID, using its saved directory
+    #[arg(short = 's', long, value_name = "ID")]
+    session: Option<String>,
+    /// Fork the resumed session instead of continuing it
+    #[arg(long, requires = "session")]
+    fork: bool,
+    #[arg(short = 'm', long, value_name = "PROVIDER/MODEL", value_parser = parse_model)]
+    model: Option<types::ModelRef>,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    variant: Option<String>,
+    /// Title for a new session
+    #[arg(long)]
+    title: Option<String>,
+    /// Attach a file (repeatable)
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    file: Vec<String>,
+    /// Output format: text prints the answer, json emits JSONL events
+    #[arg(long, value_parser = ["text", "json"], default_value = "text")]
+    format: String,
+    /// Include chain of thought in the output
+    #[arg(long)]
+    thinking: bool,
+    /// Directory for a new session (defaults to the current directory)
+    #[arg(long, value_name = "DIR")]
+    dir: Option<String>,
+    /// Enter the interactive TUI after the turn
+    #[arg(short = 'i', long)]
+    interactive: bool,
+    /// Allow tool permissions without asking
+    #[arg(long)]
+    auto: bool,
+    /// Run a configured slash command with arguments
+    #[arg(long)]
+    command: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Start the interactive terminal chat (also the default)
     Tui(TuiArgs),
+    /// Send one prompt and print the answer (like `opencode run`)
+    Run(RunArgs),
     /// Inspect saved sessions
     Session {
         #[command(subcommand)]
@@ -127,6 +175,7 @@ fn parse_hostname(value: &str) -> Result<String, String> {
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command.unwrap_or(Command::Tui(cli.tui)) {
         Command::Tui(args) => tui::run(args).await,
+        Command::Run(args) => run::run(args).await,
         Command::Session {
             command: SessionCommand::List { directory },
         } => {

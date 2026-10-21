@@ -278,6 +278,37 @@ Stored reasoning parts, the SSE stream, the API and the display of "Thought"
 are unchanged. Formatting, Clippy with warnings denied, the locked release
 build, and all 179 tests (132 unit and 47 contract) pass.
 
+## One-shot prompts (`ocmini run`)
+
+Goal: `ocmini run "prompt"` prints the answer and exits, like `opencode run`
+(v1.19.3), sharing ocmini's engine, sessions, tools and permissions.
+
+The turn runs in-process: `run` resolves the session (new, `--continue`,
+`--session`, `--fork`, `--dir`, `--title`), calls the engine's `start_turn`
+and renders bus events until the turn's completion receiver fires. Text mode
+prints the `> agent · model` header, `→ tool …` lines and the answer;
+`--thinking` adds chain of thought. `--format json` emits JSONL
+(`step_start`, `text`, `step_finish`, `tool_use`, `reasoning` with
+`--thinking`). Piped stdin appends to the prompt; `-f/--file` attaches files
+as data-URL parts; `-i/--interactive` keeps prompting on the same session.
+Permissions are non-interactive-safe: `--auto` allows, a TTY prompts
+`[y]/[a]/[n]`, a non-TTY refuses so the command never hangs.
+
+Deltas from opencode: `-u/--attach` and `--port` are dropped (in-process
+engine, no server needed); JSON events are ocmini's own set, not byte-identical
+to opencode's. Rendering mirrors the TUI: the engine announces streaming parts
+by emitting the accumulated text on the bus, so the printer re-renders the
+growing part and prints only the suffix per update. Completion races the last
+events — the queue is drained before the completion receiver is reported, so
+final part events always render first.
+
+Three contract tests pin the behavior against the mock provider: text mode
+prints the answer and `-c` continuation sends the previous exchange as
+history; `--format json --thinking` produces parseable `step_start`/
+`reasoning`/`text`/`step_finish` lines; piped stdin reaches the model inside
+the prompt. Formatting, Clippy with warnings denied, and all 182 tests
+(132 unit and 50 contract) pass.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.
