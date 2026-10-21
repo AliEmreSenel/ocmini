@@ -33,6 +33,8 @@ ocmini session list --directory ~/project # filter by project
 
 The selector lists saved sessions with live search (title, ID, directory), a cycling sort order (updated/created/title, Tab) and arrow/page navigation; Enter resumes, Esc cancels. `Ctrl+R` opens it inside the chat to switch sessions.
 
+A new session is named after the first line of its first prompt, so the list shows what each conversation was about instead of `tui session`. A title you set (`ocmini run --title …`, `PATCH /session`) is kept.
+
 `--continue` and `--session` also work with `ocmini tui`. Resuming shows the saved conversation and keeps its last model and agent; `--model` overrides the model. An explicit session ID uses the saved project directory. A normal launch starts a new session.
 
 ## One-shot prompts
@@ -76,6 +78,8 @@ Provider support is limited to the three HTTP protocols above. Native Gemini, Ve
 ## Configuration
 
 Uses OpenCode-shaped `opencode.json` or `opencode.jsonc`. Global configuration lives in `$XDG_CONFIG_HOME/opencode`; project configuration lives in the project or `.opencode` directory. Environment overrides include `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG_CONTENT`.
+
+`title_model` names new sessions with a model: `provider/model` picks one, `small` starts at `small_model`, and the default `""` writes titles from the first prompt's first line with no model call. A title model that is unavailable, fails or answers with nothing usable moves to the next (`small_model`, then the session's model), and the prompt's first line remains the last resort. Terminal chat shows `◦ generating title…` while a title is written.
 
 Agent turns have no step limit by default. To cap model/tool rounds explicitly, set `agent.<name>.steps` (or the legacy `maxSteps`) to a positive integer. Ctrl+C or the abort endpoint stops an active turn.
 

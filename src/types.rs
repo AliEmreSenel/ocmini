@@ -169,6 +169,27 @@ pub struct ModelRef {
     pub model_id: String,
 }
 
+impl ModelRef {
+    /// Parse a `provider/model` reference, the shape config strings and CLI
+    /// flags use everywhere.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (provider_id, model_id) = value
+            .split_once('/')
+            .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+            .ok_or("model must be provider/model")?;
+        Ok(Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for ModelRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.provider_id, self.model_id)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptRequest {

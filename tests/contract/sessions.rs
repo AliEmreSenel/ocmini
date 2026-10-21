@@ -289,3 +289,84 @@ async fn no_reply_and_duplicate_admission_persist_without_a_model_call() {
     assert_eq!(server.messages(&id).await.len(), 1);
     assert!(provider.requests.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn the_first_prompt_names_a_session_started_without_a_title() {
+    let provider = Provider::start(vec![
+        text_script("first answer", ""),
+        text_script("second answer", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let created: Value = server
+        .post("/session", &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["title"], "New session");
+
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_title", "Fix the resume picker\nsecond line"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let turn = events.through("session.idle").await;
+    let renamed = turn
+        .iter()
+        .find(|event| event["type"] == "session.updated")
+        .expect("renaming a session publishes session.updated");
+    assert_eq!(
+        renamed["properties"]["info"]["title"],
+        "Fix the resume picker"
+    );
+    let session: Value = server
+        .get(&format!("/session/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["title"], "Fix the resume picker");
+
+    // A title the caller chose survives the prompt.
+    let named: Value = server
+        .post("/session", &json!({"title": "Chosen title"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let named_id = named["id"].as_str().unwrap().to_owned();
+    server
+        .post(
+            &format!("/session/{named_id}/prompt_async"),
+            &prompt("msg_named", "summarize the plan"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
+    let session: Value = server
+        .get(&format!("/session/{named_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["title"], "Chosen title");
+}
