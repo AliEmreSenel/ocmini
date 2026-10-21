@@ -2,6 +2,7 @@ use crate::config::{CompactionCfg, Config};
 use crate::engine::{bus, App, EngineApi};
 use crate::provider::{self, ChatRequest};
 use crate::store::Store;
+use crate::title;
 use crate::tools::{self, ToolCtx};
 use crate::types::*;
 use base64::Engine as Base64Engine;
@@ -250,29 +251,8 @@ impl EngineApi for Engine {
             return Err(format!("Agent '{agent}' is disabled"));
         }
         let model = resolve_model(&cfg, &app, &sid, request.model.as_ref(), Some(&agent))?;
-        if !cfg.provider_enabled(&model.provider_id) {
-            return Err(format!("Provider '{}' is disabled", model.provider_id));
-        }
-        if let Some(provider) = cfg.provider(&model.provider_id) {
-            if provider
-                .extra
-                .get("blacklist")
-                .and_then(Value::as_array)
-                .is_some_and(|models| models.iter().any(|id| id == &model.model_id))
-                || provider
-                    .extra
-                    .get("whitelist")
-                    .and_then(Value::as_array)
-                    .is_some_and(|models| !models.iter().any(|id| id == &model.model_id))
-                || provider.models.get(&model.model_id).is_some_and(|info| {
-                    info.extra.get("disabled").and_then(Value::as_bool) == Some(true)
-                })
-            {
-                return Err(format!(
-                    "Model '{}/{}' is disabled",
-                    model.provider_id, model.model_id
-                ));
-            }
+        if !model_available(&cfg, &model) {
+            return Err(format!("Provider or model is disabled: {model}"));
         }
         request.model = Some(model);
         if request.parts.is_empty() {
@@ -332,6 +312,12 @@ impl EngineApi for Engine {
         emit_message(&message.info);
         for part in &message.parts {
             emit_part(part);
+        }
+        // A launcher title ("tui session", "run") says nothing about the chat.
+        // Name the session after its first prompt, with the model writing the
+        // title in the background when `title_model` is configured.
+        if let Some(model) = &request.model {
+            title::launch(app.clone(), sid.clone(), &message.parts, model);
         }
         if request.no_reply {
             let _ = tx.send(serde_json::to_value(message).map_err(|e| e.to_string())?);
@@ -468,6 +454,29 @@ fn resolve_model(
         });
     }
     Err("No model selected. Set model to 'provider/model' in opencode.json or supply model.providerID and model.modelID.".into())
+}
+
+/// True when the config allows a model: provider enabled, model present and
+/// not blacklisted, whitelisted away, or disabled.
+pub(crate) fn model_available(cfg: &Config, model: &ModelRef) -> bool {
+    if !cfg.provider_enabled(&model.provider_id) {
+        return false;
+    }
+    cfg.provider(&model.provider_id).is_none_or(|provider| {
+        !(provider
+            .extra
+            .get("blacklist")
+            .and_then(Value::as_array)
+            .is_some_and(|models| models.iter().any(|id| id == &model.model_id))
+            || provider
+                .extra
+                .get("whitelist")
+                .and_then(Value::as_array)
+                .is_some_and(|models| !models.iter().any(|id| id == &model.model_id))
+            || provider.models.get(&model.model_id).is_some_and(|info| {
+                info.extra.get("disabled").and_then(Value::as_bool) == Some(true)
+            }))
+    })
 }
 
 fn emit_message(info: &MessageInfo) {

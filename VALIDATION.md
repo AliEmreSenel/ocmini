@@ -309,6 +309,41 @@ history; `--format json --thinking` produces parseable `step_start`/
 the prompt. Formatting, Clippy with warnings denied, and all 182 tests
 (132 unit and 50 contract) pass.
 
+## Session titles for resume
+
+Every launcher titled a fresh session with a fixed string — `tui session`,
+`run` or `New session` — so `--resume`, `Ctrl+R` and `session list` showed
+identical rows and gave no way to tell conversations apart. A session that
+still carries a launcher title is now renamed by the engine's shared admission
+path: the first non-empty line of the first prompt becomes the title (first 80
+characters), and the new session is published on the bus as
+`session.updated` so OpenCode clients see it live. The rule runs once because
+a real title is never a placeholder, so later prompts, `--title`,
+`PATCH /session` and task-child titles are kept; a fork of a placeholder
+session is a placeholder, and a prompt with no text (image-only, compaction)
+leaves the title alone.
+
+The prompt's first line is the safety net. With `title_model` set in
+`opencode.json` (`provider/model`, or `small` to start at `small_model`), the
+first prompt starts one tool-free title request on a background task and the
+reply's first line becomes the title; the request keeps `variant: None`, since
+a leaked session variant is a 400 on a different model. Each candidate that is
+unavailable, errors or answers with nothing usable moves to the next
+(`title_model` → `small_model` → the session's model), the deterministic title
+closes the chain, and chat-template control tokens a reasoning model leaks
+into the text channel are stripped before a title is saved. Terminal chat
+shows `◦ generating title…` and the chosen title, run mode stays silent, and
+the bus carries `session.title` start/done events.
+
+Seven unit tests cover title derivation, the placeholder rule, the once-only
+rename, control-token stripping and the model chain; two contract tests pin
+the server paths: `POST /session` starts as `New session`, the first
+`prompt_async` renames it and emits `session.updated` with the new title, and
+a session created with a title keeps it; with `title_model` set the session
+takes the model's title, the title request carries the prompt tool-free, and a
+title request that dies falls back to the first prompt line. Formatting,
+Clippy with warnings denied, and the full suite pass.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.

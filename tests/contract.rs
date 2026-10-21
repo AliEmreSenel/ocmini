@@ -39,6 +39,8 @@ mod sessions;
 mod steps;
 #[path = "contract/streaming.rs"]
 mod streaming;
+#[path = "contract/title.rs"]
+mod title;
 
 #[path = "contract/tool_output.rs"]
 mod tool_output;

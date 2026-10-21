@@ -11,6 +11,7 @@ mod run;
 mod server;
 mod sessions;
 mod store;
+mod title;
 mod tools;
 mod tui;
 mod types;
@@ -154,14 +155,7 @@ enum SessionCommand {
 }
 
 fn parse_model(value: &str) -> Result<types::ModelRef, String> {
-    let (provider, model) = value
-        .split_once('/')
-        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
-        .ok_or("model must be provider/model")?;
-    Ok(types::ModelRef {
-        provider_id: provider.into(),
-        model_id: model.into(),
-    })
+    types::ModelRef::parse(value)
 }
 
 fn parse_hostname(value: &str) -> Result<String, String> {

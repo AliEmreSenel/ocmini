@@ -119,6 +119,10 @@ pub struct Config {
     pub model: String,
     #[serde(default)]
     pub small_model: String,
+    /// Model that writes session titles: `provider/model`, `small`, or empty
+    /// (default) to name sessions from the first prompt line with no model.
+    #[serde(default)]
+    pub title_model: String,
     #[serde(default)]
     pub permission: Value,
     #[serde(default)]

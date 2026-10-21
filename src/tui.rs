@@ -272,6 +272,14 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
         "session.idle" => {
             println!("\n{DIM}└ idle{RESET}");
         }
+        "session.title" => match properties["state"].as_str() {
+            Some("start") => println!("\n{DIM}◦ generating title…{RESET}"),
+            Some("done") => println!(
+                "{DIM}◦ title: {}{RESET}",
+                truncate(properties["title"].as_str().unwrap_or_default(), 60)
+            ),
+            _ => {}
+        },
         _ => {}
     }
     output

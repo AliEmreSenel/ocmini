@@ -18,7 +18,7 @@ After a successful bind, stdout contains one flushed line:
 opencode server listening on http://<bound-address>:<actual-port>
 ```
 
-Port zero chooses an available port and the banner reports the actual port. IPv6 literals are bracketed. Diagnostics go to stderr. Both `--option=value` and `--option value` are supported. Invalid options or port values exit unsuccessfully instead of silently using defaults. No arguments start terminal chat; `--help` displays command help. Terminal chat accepts `--model provider/model`, `--directory DIR`, `--continue` (latest top-level session in that project), `--session ID` (saved directory and history) and `--resume` (interactive selector: live search over title/ID/directory, cycling sort by updated/created/title, keyboard navigation; requires a terminal and fails cleanly without one). These flags also work with `tui`. `Ctrl+R` opens the same selector inside terminal chat to switch sessions. Resuming restores the last user model, agent and variant; an explicit model overrides the saved selection. `session list` prints saved IDs, titles and directories, with an optional `--directory DIR` filter.
+Port zero chooses an available port and the banner reports the actual port. IPv6 literals are bracketed. Diagnostics go to stderr. Both `--option=value` and `--option value` are supported. Invalid options or port values exit unsuccessfully instead of silently using defaults. No arguments start terminal chat; `--help` displays command help. Terminal chat accepts `--model provider/model`, `--directory DIR`, `--continue` (latest top-level session in that project), `--session ID` (saved directory and history) and `--resume` (interactive selector: live search over title/ID/directory, cycling sort by updated/created/title, keyboard navigation; requires a terminal and fails cleanly without one). These flags also work with `tui`. `Ctrl+R` opens the same selector inside terminal chat to switch sessions. Resuming restores the last user model, agent and variant; an explicit model overrides the saved selection. `session list` prints saved IDs, titles and directories, with an optional `--directory DIR` filter. A session that still carries a launcher title (`tui session`, `run`, `New session`) takes its title from the first line of its first prompt, so the selector and `session list` show each conversation's topic; a title from `--title` or `PATCH /session` is kept. With `title_model` set in `opencode.json` (`provider/model`, or `small` for `small_model`), a model writes the title on a background task; an unavailable, failing or unusable title model falls to `small_model`, the session's model, then the prompt's first line. Unset `title_model` means no title model calls.
 
 T3's other probes are:
 
@@ -47,7 +47,7 @@ The JSON request-body limit defaults to 128 MiB and can be set with `OCMINI_MAX_
 
 | HTTP operation | Behavior used by T3 |
 | --- | --- |
-| `POST /session` | Create a durable session with optional `title`, `parentID` and ordered `permission` rules; return the session |
+| `POST /session` | Create a durable session with optional `title`, `parentID` and ordered `permission` rules; return the session. The default title is replaced by the first prompt's first line |
 | `GET /session/{id}` | Return session metadata for resume and snapshots |
 | `PATCH /session/{id}` | Update title and permissions; permission changes apply to subsequent tool decisions |
 | `DELETE /session/{id}` | Delete session data and return JSON `true`; an active session must be stopped first |
@@ -136,6 +136,7 @@ Events are scoped to the requested directory. A subscriber that falls behind mus
 | `session.error` | `sessionID`, `error: {name, data: {message}}` |
 | `session.created`, `session.updated`, `session.deleted` | `info` session metadata |
 | `session.compacted` | `sessionID` |
+| `session.title` (ocmini extension) | `sessionID`, `state: "start" \| "done"`, `title` when done; T3 ignores unknown event types |
 | `todo.updated` | `sessionID`, `todos` |
 | `permission.asked`, `question.asked` | The corresponding pending request object |
 | `permission.replied` | `sessionID`, `requestID`, `reply` |
