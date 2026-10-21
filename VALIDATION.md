@@ -188,6 +188,24 @@ the schema are unchanged.
 Formatting, Clippy with warnings denied, the locked release build, and all 163
 tests (117 unit and 46 contract) pass.
 
+## Draft erase over committed transcript rows
+
+Pressing Up in a multi-line draft made the next redraw delete lines the user
+never wrote. The redraw erases the draft block before printing it again, and it
+climbed `drawn_rows - 1` rows, which only reaches the block's first row when the
+caret sits on the block's last row. With the caret parked higher, the climb
+landed above the draft and the clear-to-end-of-screen removed the transcript
+rows printed there.
+
+Reproduced and re-checked in tmux (a real terminal emulator, 100x24, a
+three-line draft): before the change, Up, Up and a typed character removed two
+help lines above the draft, six more Up presses removed the rest of the
+transcript, and Ctrl+D left an empty pane. After the change the transcript rows
+stay intact through the same keystrokes, insertions land at the caret, Ctrl+L
+redraws and Ctrl+D leaves the transcript on screen. The caret's row is now
+tracked, so a transcript row flushed above the draft shifts the block down
+instead of putting the caret one row above where it was drawn.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.
