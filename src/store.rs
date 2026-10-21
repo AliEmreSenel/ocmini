@@ -12,6 +12,11 @@ use std::sync::Mutex;
 /// a live instance refreshes its lease continuously while draining.
 const LEASE_MS: i64 = 60_000;
 
+/// How long a writer waits for the database lock. Sibling instances recover a
+/// large transcript at startup, and several may start at once; waiting keeps
+/// that a slow start instead of a "database is locked" failure.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct Store {
     conn: Mutex<Connection>,
     /// WAL readers run on a dedicated connection so reads never queue behind
@@ -30,12 +35,30 @@ impl Store {
     /// at once, so opening is fallible: contention must surface as a clean
     /// startup error, never as a panic.
     pub fn open(path: &Path, instance: &str) -> Result<Self, String> {
+        // Startup competes with sibling instances that are recovering the same
+        // file, and SQLite answers some of those races with SQLITE_BUSY
+        // immediately, before busy_timeout applies. Opening is idempotent, so a
+        // new instance waits a bounded time instead of failing the launch.
+        let mut locked = None;
+        for attempt in 0..5 {
+            match Self::open_once(path, instance) {
+                Ok(store) => return Ok(store),
+                Err(error) if attempt < 4 && error.contains("database is locked") => {
+                    locked = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(locked.unwrap_or_else(|| "Session database: unavailable".into()))
+    }
+
+    fn open_once(path: &Path, instance: &str) -> Result<Self, String> {
         if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(sql_error)?;
         }
         let conn = Connection::open(path).map_err(sql_error)?;
-        conn.busy_timeout(std::time::Duration::from_secs(10))
-            .map_err(sql_error)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(sql_error)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(sql_error)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -150,46 +173,44 @@ impl Store {
         // Only recover sessions this process owns, sessions with an expired
         // lease, or sessions no instance has ever claimed. A sibling instance
         // that is actively streaming must not be interrupted by a restart.
+        //
+        // The two scans below read every message and part row and cost seconds
+        // on a large transcript, so they run on the read connection. Holding
+        // the write lock across them makes every sibling instance queue, and a
+        // burst of instance startups pushes them past their busy timeout with
+        // "database is locked". Each update re-checks the scanned condition, so
+        // a row a sibling changed in the meantime is left alone.
+        let now = now_ms();
+        let (unfinished, parts) = self.with_read(|c| {
+            Ok((
+                scan_interrupted(c, &self.instance, now,
+                    "SELECT id,json FROM message WHERE role='assistant' AND json_extract(json,'$.time.completed') IS NULL AND ")?,
+                scan_interrupted(c, &self.instance, now,
+                    "SELECT id,json FROM part WHERE json_extract(json,'$.type')='tool' AND json_extract(json,'$.state.status') IN ('pending','running') AND ")?,
+            ))
+        })?;
         let mut c = self.conn.lock().unwrap();
         let tx = self.write_tx(&mut c)?;
-        let now = now_ms();
-        let unfinished: Vec<String> = {
-            let mut s = tx.prepare("SELECT json FROM message WHERE role='assistant' AND json_extract(json,'$.time.completed') IS NULL AND session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)").map_err(sql_error)?;
-            let rows = s
-                .query_map(params![self.instance, now], |r| r.get(0))
-                .map_err(sql_error)?;
-            rows.collect::<Result<_, _>>().map_err(sql_error)?
-        };
-        for raw in unfinished {
+        for (id, raw) in unfinished {
             let mut info: MessageInfo = serde_json::from_str(&raw).map_err(sql_error)?;
-            if info.time.completed.is_some() {
-                continue;
-            }
-            info.time.completed = Some(now_ms().max(info.time.created));
+            info.time.completed = Some(now.max(info.time.created));
             info.error = Some(
                 json!({"name":"MessageAbortedError","data":{"message":"Server stopped before this response completed; send a new prompt to continue."}}),
             );
             tx.execute(
-                "UPDATE message SET json=?2 WHERE id=?1",
-                params![info.id, serde_json::to_string(&info).map_err(sql_error)?],
+                "UPDATE message SET json=?2 WHERE id=?1 AND json_extract(json,'$.time.completed') IS NULL",
+                params![id, serde_json::to_string(&info).map_err(sql_error)?],
             )
             .map_err(sql_error)?;
         }
-        let parts: Vec<(String, String)> = {
-            let mut s = tx.prepare("SELECT id,json FROM part WHERE json_extract(json,'$.type')='tool' AND json_extract(json,'$.state.status') IN ('pending','running') AND session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)").map_err(sql_error)?;
-            let rows = s
-                .query_map(params![self.instance, now], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(sql_error)?;
-            rows.collect::<Result<_, _>>().map_err(sql_error)?
-        };
         for (id, raw) in parts {
             let mut part: Value = serde_json::from_str(&raw).map_err(sql_error)?;
             part["state"]["status"] = json!("error");
             part["state"]["error"] =
                 json!("Execution interrupted by server restart; the operation was not replayed.");
-            part["state"]["time"]["end"] = json!(now_ms());
+            part["state"]["time"]["end"] = json!(now);
             tx.execute(
-                "UPDATE part SET json=?2 WHERE id=?1",
+                "UPDATE part SET json=?2 WHERE id=?1 AND json_extract(json,'$.state.status') IN ('pending','running')",
                 params![id, part.to_string()],
             )
             .map_err(sql_error)?;
@@ -869,10 +890,25 @@ impl Store {
     }
 }
 
+/// Interrupted rows in this instance's recovery scope, as `(id, json)` pairs.
+/// `select` is a query prefix that ends with `AND `.
+fn scan_interrupted(
+    c: &Connection,
+    instance: &str,
+    now: i64,
+    select: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let sql = format!("{select}session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)");
+    let mut s = c.prepare(&sql).map_err(sql_error)?;
+    let rows = s
+        .query_map(params![instance, now], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(sql_error)?;
+    rows.collect::<Result<_, _>>().map_err(sql_error)
+}
+
 fn open_connection(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(sql_error)?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))
-        .map_err(sql_error)?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(sql_error)?;
     Ok(conn)
 }
 
