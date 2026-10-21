@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MAX_CAPTURE: usize = 64 * 1024;
@@ -46,11 +46,25 @@ fn preview(file: &mut File) -> std::io::Result<(Vec<u8>, u64)> {
     Ok((bytes, total))
 }
 
+fn exit_annotation(status: &ExitStatus) -> String {
+    if status.success() {
+        String::new()
+    } else {
+        format!(
+            "\n[exit code: {}]",
+            status
+                .code()
+                .map_or_else(|| "terminated by signal".into(), |v| v.to_string())
+        )
+    }
+}
+
 fn finish(
     mut stdout: File,
     mut stderr: File,
-    status: ExitStatus,
     title: String,
+    exit: Option<i32>,
+    annotation: String,
     directory: &Path,
 ) -> std::io::Result<ToolOutput> {
     let (out, stdout_total) = preview(&mut stdout)?;
@@ -66,21 +80,11 @@ fn finish(
             stdout_total + stderr_total - (out.len() + err.len()) as u64
         ));
     }
-    let exit = if status.success() {
-        String::new()
-    } else {
-        format!(
-            "\n[exit code: {}]",
-            status
-                .code()
-                .map_or_else(|| "terminated by signal".into(), |v| v.to_string())
-        )
-    };
-    text.push_str(&exit);
+    text.push_str(&annotation);
     let result = ToolOutput {
         title,
         output: text,
-        metadata: json!({"exit":status.code(),"truncated":false,"outputBytes":stdout_total+stderr_total}),
+        metadata: json!({"exit":exit,"truncated":false,"outputBytes":stdout_total+stderr_total}),
     };
     if result.output.len() <= output::MAX_OUTPUT {
         return Ok(result);
@@ -91,9 +95,38 @@ fn finish(
         file.write_all(b"\n[stderr]\n")?;
         std::io::copy(&mut stderr.take(stderr_total), &mut file)?;
     }
-    file.write_all(exit.as_bytes())?;
+    file.write_all(annotation.as_bytes())?;
     let path = file.into_temp_path().keep().map_err(std::io::Error::from)?;
     Ok(output::with_file(result, &path))
+}
+
+fn shell_command(command: &str, directory: &Path) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "bash" });
+    if cfg!(windows) {
+        process.args(["/C", command]);
+    } else {
+        process.args(["-c", command]);
+    }
+    process.current_dir(directory);
+    process
+}
+
+fn spawn_failure(directory: &Path, error: std::io::Error) -> ToolError {
+    failure(format!(
+        "Could not start shell in {}: {error}",
+        directory.display()
+    ))
+}
+
+async fn stop(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+enum Outcome {
+    Exited(ExitStatus),
+    TimedOut,
+    Cancelled,
 }
 
 pub async fn shell(
@@ -114,52 +147,142 @@ pub async fn shell(
     };
     let (stdout, stderr) =
         capture().map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
-    let mut process = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "bash" });
-    if cfg!(windows) {
-        process.args(["/C", command]);
-    } else {
-        process.args(["-c", command]);
-    }
+    let mut process = shell_command(command, directory);
     process
-        .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(stdout.try_clone().map_err(|e| failure(e.to_string()))?)
         .stderr(stderr.try_clone().map_err(|e| failure(e.to_string()))?)
         .kill_on_drop(true);
     #[cfg(unix)]
     process.process_group(0);
-    let mut child = process.spawn().map_err(|e| {
-        failure(format!(
-            "Could not start shell in {}: {e}",
-            directory.display()
-        ))
-    })?;
+    let mut child = process.spawn().map_err(|e| spawn_failure(directory, e))?;
     let group = ProcessGroup {
         id: child
             .id()
             .ok_or_else(|| failure("Shell has no process id"))?,
     };
-    let status = tokio::select! {
-        result = child.wait() => result.map_err(|e| failure(format!("Shell wait failed: {e}"))),
-        _ = tokio::time::sleep(timeout) => Err(failure(format!("Shell command timed out after {} milliseconds", timeout.as_millis()))),
-        _ = cancelled(cancel) => Err(failure("Shell command cancelled")),
+    let outcome = tokio::select! {
+        result = child.wait() => result.map(Outcome::Exited).map_err(|e| failure(format!("Shell wait failed: {e}")))?,
+        _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
+        _ = cancelled(cancel) => Outcome::Cancelled,
     };
     // Stop descendants before reading files they inherited from the shell.
     drop(group);
-    let status = match status {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(error);
+    let timed_out = matches!(outcome, Outcome::TimedOut);
+    let (exit, annotation) = match outcome {
+        Outcome::Exited(status) => (status.code(), exit_annotation(&status)),
+        Outcome::TimedOut => {
+            stop(&mut child).await;
+            (
+                None,
+                format!(
+                    "\n[command timed out after {} milliseconds]",
+                    timeout.as_millis()
+                ),
+            )
+        }
+        // Aborting a turn is a request to drop the work, so the anonymous
+        // captures disappear without publishing a partial result.
+        Outcome::Cancelled => {
+            stop(&mut child).await;
+            return Err(failure("Shell command cancelled"));
         }
     };
     let title = command.chars().take(80).collect();
     let directory = output_directory.to_owned();
-    tokio::task::spawn_blocking(move || finish(stdout, stderr, status, title, &directory))
-        .await
-        .map_err(|e| failure(format!("Shell output task failed: {e}")))?
-        .map_err(|e| failure(format!("Cannot read or save shell output: {e}")))
+    let result = tokio::task::spawn_blocking(move || {
+        finish(stdout, stderr, title, exit, annotation, &directory)
+    })
+    .await
+    .map_err(|e| failure(format!("Shell output task failed: {e}")))?
+    .map_err(|e| failure(format!("Cannot read or save shell output: {e}")))?;
+    if timed_out {
+        // The captured text is the only record of work the limit cut short.
+        return Err(failure(format!(
+            "Shell command timed out after {} milliseconds\n{}",
+            timeout.as_millis(),
+            result.output
+        )));
+    }
+    Ok(result)
+}
+
+/// Commands started with `background: true` outlive their tool call. The
+/// runtime stops them when it exits so a session cannot leak processes.
+#[cfg(unix)]
+static BACKGROUND: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+pub fn stop_background_jobs() {
+    #[cfg(unix)]
+    for pid in BACKGROUND
+        .lock()
+        .map(|mut jobs| std::mem::take(&mut *jobs))
+        .unwrap_or_default()
+    {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+pub async fn shell_background(
+    command: &str,
+    directory: &Path,
+    output_directory: &Path,
+) -> Result<ToolOutput, ToolError> {
+    std::fs::create_dir_all(output_directory)
+        .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+    // The log lives with the other tool-output files so existing retention
+    // rules remove it. Unlike captured shell output it is not size-bounded.
+    // keep() leaves the log on disk; into_file() would unlink it.
+    let (file, log) = output::create(output_directory)
+        .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?
+        .keep()
+        .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
+    let mut process = shell_command(command, directory);
+    process
+        .stdin(Stdio::null())
+        .stdout(file.try_clone().map_err(|e| failure(e.to_string()))?)
+        .stderr(file);
+    #[cfg(unix)]
+    // A new session keeps the job outside every process group the harness kills
+    // when a command exits, and outside the terminal's own signals.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = process.spawn().map_err(|e| spawn_failure(directory, e))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| failure("Shell has no process id"))?;
+    #[cfg(unix)]
+    BACKGROUND
+        .lock()
+        .map_err(|e| failure(e.to_string()))?
+        .push(pid);
+    // Reap the job so an exited command never becomes a zombie.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+        #[cfg(unix)]
+        if let Ok(mut jobs) = BACKGROUND.lock() {
+            jobs.retain(|job| *job != pid);
+        }
+    });
+    Ok(ToolOutput {
+        title: format!(
+            "background {}",
+            command.chars().take(60).collect::<String>()
+        ),
+        output: format!(
+            "Started in the background as pid {pid}.\nOutput: {}\nRead that file for progress; `kill {pid}` stops it. It keeps running across tool calls and is stopped when ocmini exits.",
+            log.display()
+        ),
+        metadata: json!({"background":true,"pid":pid,"outputPath":log.to_string_lossy()}),
+    })
 }
 
 #[cfg(test)]
@@ -368,6 +491,54 @@ mod tests {
         task.abort();
         let _ = task.await;
         let _ = std::fs::remove_file(pidfile);
+        assert_process_stopped(pid).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn timeout_reports_the_output_captured_before_the_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let result = shell(
+            "echo BEFORE_LIMIT; echo BEFORE_STDERR >&2; sleep 30",
+            root.path(),
+            Duration::from_millis(500),
+            Arc::new(AtomicBool::new(false)),
+            &root.path().join("output"),
+        )
+        .await;
+        let error = result.unwrap_err().message;
+        assert!(error.contains("timed out"), "{error}");
+        assert!(error.contains("BEFORE_LIMIT"), "{error}");
+        assert!(error.contains("BEFORE_STDERR"), "{error}");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn background_commands_survive_the_tool_call_and_stop_with_the_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let result = shell_background(
+            "for i in 1 2 3 4 5 6; do echo tick $i; sleep 0.2; done",
+            root.path(),
+            &root.path().join("output"),
+        )
+        .await
+        .unwrap();
+        let pid = result.metadata["pid"].as_u64().unwrap() as i32;
+        let log = std::path::PathBuf::from(result.metadata["outputPath"].as_str().unwrap());
+        for _ in 0..100 {
+            if std::fs::read_to_string(&log).is_ok_and(|text| text.contains("tick 3")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The tool call returned long before the job finished its later ticks.
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("tick 3"), "{text}");
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "background job was stopped with the command"
+        );
+        stop_background_jobs();
         assert_process_stopped(pid).await;
     }
 

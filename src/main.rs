@@ -231,6 +231,8 @@ fn main() {
         .build()
         .map_err(|error| format!("Cannot start runtime: {error}"))
         .and_then(|runtime| runtime.block_on(run(cli)));
+    // Background shell jobs outlive their tool call; they end with the runtime.
+    tools::stop_background_jobs();
     if let Err(error) = result {
         eprintln!("ocmini: {error}");
         std::process::exit(1);
