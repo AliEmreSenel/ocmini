@@ -764,6 +764,21 @@ async fn run_turn(
         cfg.provider(&model.provider_id),
         &app.auth,
     );
+    // Chat adapters replay chain of thought once per turn, so history is
+    // merged per turn there. Responses and Anthropic rebuild each step from
+    // their own opaque payloads and need the per-step shape kept.
+    let protocol_probe = ChatRequest {
+        model: model.model_id.clone(),
+        system: String::new(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+        variant: request.variant.clone(),
+        session_id: Some(sid.into()),
+    };
+    let chat = tokio::select! {
+        result = adapter.protocol_of(&protocol_probe) => matches!(result, Ok(provider::Protocol::Chat)),
+        _ = cancelled(&cancel) => return Err("Aborted".into()),
+    };
     let mut defs = tools::tool_defs();
     defs.extend(tokio::select! {
         value = app.mcp.tool_defs_async() => value,
@@ -795,10 +810,10 @@ async fn run_turn(
             return Err("Aborted".into());
         }
         // History reloads can span megabytes of JSON; keep them off the async workers.
-        let (blocking_store, blocking_sid, blocking_uid) =
-            (app.store.clone(), sid.to_string(), uid.to_string());
+        let (blocking_store, blocking_sid, blocking_uid, blocking_chat) =
+            (app.store.clone(), sid.to_string(), uid.to_string(), chat);
         let (mut messages, mut has_summary) = tokio::task::spawn_blocking(move || {
-            build_messages(&blocking_store, &blocking_sid, &blocking_uid)
+            build_messages(&blocking_store, &blocking_sid, &blocking_uid, blocking_chat)
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -1028,7 +1043,7 @@ async fn run_turn(
                                     (app.store.clone(), sid.to_string(), uid.to_string());
                                 (req.messages, has_summary) =
                                     tokio::task::spawn_blocking(move || {
-                                        build_messages(&store, &sid_text, &uid_text)
+                                        build_messages(&store, &sid_text, &uid_text, chat)
                                     })
                                     .await
                                     .map_err(|e| e.to_string())??;
@@ -1200,8 +1215,10 @@ async fn run_turn(
                 .is_some_and(|limit| u64::try_from(used).unwrap_or(0) >= limit)
         {
             let (store, sid_text, uid_text) = (app.store.clone(), sid.to_string(), uid.to_string());
-            match tokio::task::spawn_blocking(move || build_messages(&store, &sid_text, &uid_text))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                build_messages(&store, &sid_text, &uid_text, chat)
+            })
+            .await
             {
                 Ok(Ok((history, has_summary))) => {
                     if let Err(error) = compact_history(
@@ -1361,7 +1378,62 @@ fn record_session_usage(app: &App, sid: &str, usage: &Tokens, cost: f64) -> Resu
     Ok(())
 }
 
-fn build_messages(store: &Store, sid: &str, through: &str) -> Result<(Vec<Value>, bool), String> {
+/// One turn of assistant output, merged into the single assistant message
+/// OpenCode's Chat Completions converter sends: every step's chain of thought
+/// in order, every step's tool calls, then the tool results.
+#[derive(Default)]
+struct ChatRun {
+    texts: Vec<String>,
+    calls: Vec<Value>,
+    reasoning: Vec<(String, String)>,
+    details: Vec<Value>,
+    tail: Vec<Value>,
+}
+
+fn flush_chat_run(out: &mut Vec<Value>, run: Option<ChatRun>) {
+    let Some(run) = run else { return };
+    let mut message = json!({"role":"assistant"});
+    let content = run.texts.join("\n");
+    if !content.is_empty() {
+        message["content"] = json!(content);
+    }
+    if !run.calls.is_empty() {
+        message["tool_calls"] = json!(run.calls);
+    }
+    if !run.reasoning.is_empty() || !run.details.is_empty() {
+        let mut meta_message = json!({"role":"assistant"});
+        let mut keys: Vec<String> = Vec::new();
+        let mut joined: HashMap<String, Vec<String>> = HashMap::new();
+        for (key, text) in run.reasoning {
+            if !joined.contains_key(&key) {
+                keys.push(key.clone());
+            }
+            joined.entry(key).or_default().push(text);
+        }
+        for key in keys {
+            meta_message[&key] = json!(joined[&key].join("\n"));
+        }
+        if !run.details.is_empty() {
+            meta_message["reasoning_details"] = json!(run.details);
+        }
+        message["providerMetadata"] = json!({"provider":"openai-chat","message":meta_message});
+    }
+    if message.get("content").is_none()
+        && message.get("tool_calls").is_none()
+        && message.get("providerMetadata").is_none()
+    {
+        return;
+    }
+    out.push(message);
+    out.extend(run.tail);
+}
+
+fn build_messages(
+    store: &Store,
+    sid: &str,
+    through: &str,
+    chat: bool,
+) -> Result<(Vec<Value>, bool), String> {
     let mut history = store.context_messages(sid, through)?;
     let summary = history.iter().rposition(|m| {
         m.info.summary == Some(true)
@@ -1372,6 +1444,7 @@ fn build_messages(store: &Store, sid: &str, through: &str) -> Result<(Vec<Value>
             })
     });
     let mut out = Vec::new();
+    let mut run: Option<ChatRun> = None;
     let start = if let Some(index) = summary {
         let text = history[index]
             .parts
@@ -1394,6 +1467,7 @@ fn build_messages(store: &Store, sid: &str, through: &str) -> Result<(Vec<Value>
     };
     for message in history.into_iter().skip(start) {
         if message.info.role == "user" {
+            flush_chat_run(&mut out, run.take());
             let mut content = Vec::new();
             for part in &message.parts {
                 if part["ignored"] == true {
@@ -1442,21 +1516,11 @@ fn build_messages(store: &Store, sid: &str, through: &str) -> Result<(Vec<Value>
             .rev()
             .find_map(|p| p.get("providerMetadata"))
             .or_else(|| message.info.extra.get("providerMetadata"))
-            .filter(|value| !value.is_null());
-        if text.is_empty() && calls.is_empty() && metadata.is_none() {
-            continue;
-        }
-        let mut value =
-            json!({"role":"assistant","content":if text.is_empty(){Value::Null}else{json!(text)}});
-        if !calls.is_empty() {
-            value["tool_calls"]=json!(calls.iter().map(|p|json!({"id":p["callID"],"type":"function","function":{"name":p["tool"],"arguments":p["state"]["input"].to_string()}})).collect::<Vec<_>>());
-        }
-        if let Some(metadata) = metadata {
-            value["providerMetadata"] = metadata.clone();
-        }
-        out.push(value);
+            .filter(|value| !value.is_null())
+            .cloned();
         let mut attachments = Vec::new();
-        for part in calls {
+        let mut tail: Vec<Value> = Vec::new();
+        for part in &calls {
             let content = match part["state"]["status"].as_str() {
                 Some("completed") if part["state"]["time"]["compacted"].is_number() => {
                     "[Old tool result content cleared]".into()
@@ -1473,7 +1537,7 @@ fn build_messages(store: &Store, sid: &str, through: &str) -> Result<(Vec<Value>
                 ),
                 _ => "Tool execution was interrupted before a result was recorded.".into(),
             };
-            out.push(json!({"role":"tool","tool_call_id":part["callID"],"content":content,"is_error":part["state"]["status"]!="completed"}));
+            tail.push(json!({"role":"tool","tool_call_id":part["callID"],"content":content,"is_error":part["state"]["status"]!="completed"}));
             if let Some(blocks) = part["state"]["metadata"]["attachments"]
                 .as_array()
                 .filter(|_| !part["state"]["time"]["compacted"].is_number())
@@ -1504,9 +1568,50 @@ fn build_messages(store: &Store, sid: &str, through: &str) -> Result<(Vec<Value>
             }
         }
         if !attachments.is_empty() {
-            out.push(json!({"role":"user","content":attachments}));
+            tail.push(json!({"role":"user","content":attachments}));
         }
+        if chat {
+            let run = run.get_or_insert_with(ChatRun::default);
+            if !text.is_empty() {
+                run.texts.push(text);
+            }
+            for part in &calls {
+                run.calls.push(json!({"id":part["callID"],"type":"function","function":{"name":part["tool"],"arguments":part["state"]["input"].to_string()}}));
+            }
+            if let Some(meta) = metadata
+                .as_ref()
+                .filter(|m| m["provider"] == "openai-chat")
+                .and_then(|m| m.get("message"))
+            {
+                for key in ["reasoning_content", "reasoning", "reasoning_text"] {
+                    if let Some(value) = meta[key].as_str() {
+                        if !value.is_empty() {
+                            run.reasoning.push((key.to_string(), value.to_string()));
+                        }
+                    }
+                }
+                if let Some(list) = meta["reasoning_details"].as_array() {
+                    run.details.extend(list.iter().cloned());
+                }
+            }
+            run.tail.extend(tail);
+            continue;
+        }
+        if text.is_empty() && calls.is_empty() && metadata.is_none() {
+            continue;
+        }
+        let mut value =
+            json!({"role":"assistant","content":if text.is_empty(){Value::Null}else{json!(text)}});
+        if !calls.is_empty() {
+            value["tool_calls"]=json!(calls.iter().map(|p|json!({"id":p["callID"],"type":"function","function":{"name":p["tool"],"arguments":p["state"]["input"].to_string()}})).collect::<Vec<_>>());
+        }
+        if let Some(metadata) = metadata {
+            value["providerMetadata"] = metadata;
+        }
+        out.push(value);
+        out.extend(tail);
     }
+    flush_chat_run(&mut out, run.take());
     Ok((out, summary.is_some()))
 }
 
@@ -2017,6 +2122,123 @@ async fn expand_shell_templates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn two_step_turn_store() -> (Store, String) {
+        let store = Store::open(std::path::Path::new(":memory:"), "test").unwrap();
+        let session = store.create_session_owned("steps", "/tmp");
+        store
+            .add_message(&MessageWithParts {
+                info: MessageInfo {
+                    id: "prompt".into(),
+                    session_id: session.id.clone(),
+                    role: "user".into(),
+                    ..Default::default()
+                },
+                parts: vec![
+                    json!({"id":"p1","messageID":"prompt","sessionID":session.id,
+                                   "type":"text","text":"do the work"}),
+                ],
+            })
+            .unwrap();
+        // Step 1 answers with a tool call and its own chain of thought.
+        store
+            .add_message(&MessageWithParts {
+                info: MessageInfo {
+                    id: "step-1".into(),
+                    session_id: session.id.clone(),
+                    role: "assistant".into(),
+                    ..Default::default()
+                },
+                parts: vec![
+                    json!({"id":"t1","messageID":"step-1","sessionID":session.id,
+                           "type":"tool","tool":"read","callID":"call_1",
+                           "state":{"status":"completed","input":{"filePath":"note.txt"},
+                                    "output":"the note"}}),
+                    json!({"id":"f1","messageID":"step-1","sessionID":session.id,
+                           "type":"step-finish",
+                           "providerMetadata":{"provider":"openai-chat","message":{
+                               "role":"assistant","content":null,
+                               "reasoning_content":"first thinking",
+                               "reasoning_details":[{"id":"rs_1","data":"one"}]}}}),
+                ],
+            })
+            .unwrap();
+        // Step 2 answers with the final text and its own chain of thought.
+        store
+            .add_message(&MessageWithParts {
+                info: MessageInfo {
+                    id: "step-2".into(),
+                    session_id: session.id.clone(),
+                    role: "assistant".into(),
+                    ..Default::default()
+                },
+                parts: vec![
+                    json!({"id":"x2","messageID":"step-2","sessionID":session.id,
+                           "type":"text","text":"done"}),
+                    json!({"id":"f2","messageID":"step-2","sessionID":session.id,
+                           "type":"step-finish",
+                           "providerMetadata":{"provider":"openai-chat","message":{
+                               "role":"assistant","content":"done",
+                               "reasoning_content":"second thinking",
+                               "reasoning_details":[{"id":"rs_2","data":"two"}]}}}),
+                ],
+            })
+            .unwrap();
+        (store, session.id)
+    }
+
+    #[test]
+    fn chat_requests_merge_the_turn_into_one_assistant_message() {
+        let (store, sid) = two_step_turn_store();
+        let (messages, _) = build_messages(&store, &sid, "prompt", true).unwrap();
+        let assistants: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 1, "every step of the turn merges");
+        let assistant = assistants[0];
+        assert_eq!(assistant["content"], "done");
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            assistant["providerMetadata"]["message"]["reasoning_content"],
+            "first thinking\nsecond thinking"
+        );
+        assert_eq!(
+            assistant["providerMetadata"]["message"]["reasoning_details"],
+            json!([{"id":"rs_1","data":"one"},{"id":"rs_2","data":"two"}])
+        );
+        let assistant_index = messages
+            .iter()
+            .position(|m| m["role"] == "assistant")
+            .unwrap();
+        let tool_index = messages.iter().position(|m| m["role"] == "tool").unwrap();
+        assert!(
+            assistant_index < tool_index,
+            "tool results follow the merged assistant message"
+        );
+        assert_eq!(messages[tool_index]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn responses_history_keeps_one_assistant_message_per_step() {
+        let (store, sid) = two_step_turn_store();
+        let (messages, _) = build_messages(&store, &sid, "prompt", false).unwrap();
+        let assistants: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 2, "one message per step is kept");
+        assert_eq!(
+            assistants[0]["providerMetadata"]["message"]["reasoning_content"],
+            "first thinking"
+        );
+        assert_eq!(
+            assistants[1]["providerMetadata"]["message"]["reasoning_content"],
+            "second thinking"
+        );
+        assert_eq!(assistants[1]["content"], "done");
+    }
+
     fn retention(bytes: u64) -> CompactionPolicy {
         CompactionPolicy {
             context: Some(bytes),
