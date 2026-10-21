@@ -14,7 +14,7 @@ async fn startup_auth_and_cli_inventory_match_t3() {
         .await
         .unwrap();
     assert_eq!(health["healthy"], true);
-    assert_eq!(health["version"], "1.19.3-ocmini.0.2.1");
+    assert_eq!(health["version"], "1.19.3-ocmini.0.3.0");
     assert_eq!(server.get("/api/info").send().await.unwrap().status(), 404);
     for path in ["/global/health", "/api/info", "/event", "/session"] {
         assert_eq!(
@@ -103,7 +103,7 @@ async fn cli_help_version_and_invalid_arguments_do_not_start_the_runtime() {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
-            "1.19.3-ocmini.0.2.1"
+            "1.19.3-ocmini.0.3.0"
         );
     }
     for arguments in [
