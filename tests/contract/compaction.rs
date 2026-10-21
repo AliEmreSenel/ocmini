@@ -584,13 +584,23 @@ async fn recent_tool_messages_replay_verbatim_after_manual_compaction_and_restar
         .as_str()
         .unwrap()
         .contains("Checkpoint"));
-    assert_eq!(&messages[1..4], expected.as_slice());
-    assert_eq!(messages[4]["role"], "assistant");
+    // Chat providers receive one merged assistant message per turn, so the
+    // replayed checkpoint merges the turn's steps: the tool call keeps its
+    // identifier, the final text rides on the same message, and the exact
+    // (unicode) tool result is replayed verbatim.
+    assert_eq!(messages[1], expected[0]);
+    assert_eq!(messages[2]["role"], "assistant");
     assert_eq!(
-        messages[4]["content"],
+        messages[2]["tool_calls"], expected[1]["tool_calls"],
+        "tool call identifiers replay verbatim"
+    );
+    assert_eq!(
+        messages[2]["content"],
         "Next action: run the remaining tests."
     );
-    assert_eq!(messages[5]["content"], "Continue");
+    assert_eq!(messages[3], expected[2], "tool result replays verbatim");
+    assert_eq!(messages[4]["role"], "user");
+    assert_eq!(messages[4]["content"], "Continue");
 }
 
 #[tokio::test]

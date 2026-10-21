@@ -237,6 +237,47 @@ mirrored values, an untouched corrupt legacy row and the created indexes.
 Formatting, Clippy with warnings denied, the locked release build, and all 176
 tests (130 unit and 46 contract) pass.
 
+## Chain-of-thought replay follows OpenCode per turn
+
+Reasoning models on Chat Completions endpoints showed every step's "Thought"
+as the same boilerplate ("There is no previous thinking to reproduce...") and
+kept answering their own chain of thought. The round trip landed on 10-17 with
+the Responses API compatibility pass (506b44c), which began attaching the
+provider's assistant payload to each step as `providerMetadata` and replaying
+it into later requests. The session store pins the onset: zero boilerplate
+reasoning parts before 10-17, the first at 10-18 14:42, then 170 inside one
+hour in a chat-protocol session on 10-21. The earlier builds (the v2 releases)
+have no round trip and show none, matching memory.
+
+OpenCode's `@ai-sdk/openai-compatible` converter replays chain of thought too;
+the difference is shape. OpenCode has one assistant message per prompt and
+sends one `{role:"assistant", content, reasoning_content, tool_calls}` per
+turn. ocmini creates one assistant message per step, so a multi-step turn sent
+N assistant messages whose reasoning the model treated as unfinished thinking
+to continue. Chat requests now merge a turn's steps into a single assistant
+message, OpenCode's shape: every step's chain of thought concatenated in step
+order (whichever key the provider used: `reasoning_content`, `reasoning` or
+`reasoning_text`), all `reasoning_details` and tool calls appended in order,
+with tool results following. The merge happens only for Chat protocol
+providers, resolved through the adapter's own protocol selection. Responses
+item replay and signed Anthropic thinking are untouched: both need their
+per-step opaque payloads intact.
+
+A unit pair pins both shapes (merged for chat, one message per step for
+Responses). The contract test asserts the wire shape at every step: step two
+sends exactly one assistant message carrying step one's reasoning and call,
+and step three carries both steps' reasoning concatenated with both calls and
+their results. The compaction contract keeps its verbatim guarantees under the
+merged shape (tool-call identifiers, Unicode tool results). A live run
+against a Chat Completions reasoning model through a request-logging proxy
+shows the second step's request carrying exactly one assistant message with
+the first step's `reasoning` and tool call, the final answer reproducing the
+file content, and no boilerplate reasoning.
+
+Stored reasoning parts, the SSE stream, the API and the display of "Thought"
+are unchanged. Formatting, Clippy with warnings denied, the locked release
+build, and all 179 tests (132 unit and 47 contract) pass.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.

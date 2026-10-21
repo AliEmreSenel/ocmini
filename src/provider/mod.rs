@@ -155,6 +155,9 @@ pub fn parse_context_limit(message: &str) -> Option<u64> {
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
     async fn stream(&self, req: &ChatRequest) -> Result<EventStream, ProviderError>;
+    /// Protocol `prepare` will select for this request, without building
+    /// settings. Context assembly needs it before the request exists.
+    async fn protocol_of(&self, req: &ChatRequest) -> Result<Protocol, String>;
 }
 
 struct Adapter {
@@ -178,7 +181,7 @@ pub fn build(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Protocol {
+pub enum Protocol {
     Chat,
     Responses,
     Anthropic,
@@ -209,6 +212,12 @@ impl ProviderAdapter for Adapter {
             Protocol::Responses => responses::stream(settings, req).await,
             Protocol::Anthropic => anthropic::stream(settings, req).await,
         }
+    }
+
+    /// Protocol `prepare` will select for this request, without building
+    /// settings. Context assembly needs it before the request exists.
+    async fn protocol_of(&self, req: &ChatRequest) -> Result<Protocol, String> {
+        self.prepare(req).await.map(|(protocol, _)| protocol)
     }
 }
 
