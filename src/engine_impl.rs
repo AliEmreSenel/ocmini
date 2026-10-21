@@ -358,6 +358,7 @@ impl EngineApi for Engine {
             if !visited.insert(id.clone()) {
                 continue;
             }
+            crate::tools::cancel_background_jobs(&id);
             if let Some(state) = running.get(&id) {
                 state.cancel.store(true, Ordering::Release);
                 state.app.perms.reject_all(&id);

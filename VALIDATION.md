@@ -152,6 +152,42 @@ Contract regressions check that metadata and `noReply` do not start MCP, twelve 
 
 After rebasing onto the current main branch, all 157 tests (114 unit, 43 contract), formatting, Clippy with warnings denied, and the locked release build passed. The three MCP contract tests also passed against the final release executable.
 
+## Shell background jobs and database startup contention
+
+Two harness defects were reproduced, fixed, and checked against OpenCode v1.19.2 (`packages/opencode/src/tool/shell.ts`, `packages/core/src/tool/bash.ts`, `packages/core/src/background-job.ts`, `packages/opencode/src/session/run-state.ts`).
+
+`bash` killed its whole process group when a command exited, so ordinary backgrounding did not survive the tool call. Measured in this repository's own shell tool: `cmd &`, `nohup cmd & disown` and a backgrounded subshell loop all stopped when the call returned, leaving no log lines. A shell tool `background: true` parameter now starts the command in a new session (`setsid` in `pre_exec`), sends stdout and stderr to one log in the tool-output directory, and returns the pid and log path at once.
+
+Upstream v1.19.2 has no model-facing background launch: the V2 core bash tool lists it as planned work "only with owner-bound get/wait/cancel tools and completion delivery", and its background-job registry serves task children. So `background: true` is recorded as an ocmini extension, not parity. Ownership follows that registry, which is process-local and documented as not durable: a background job belongs to the session that started it, and `SessionRunState.cancel` plus session deletion end a session's jobs. ocmini matches that by ending the starting session's jobs on turn abort and on session delete, and every job on runtime exit. The get/wait/cancel tools, completion delivery and durable status upstream requires for this feature are not implemented; there is no live progress stream, only the log file.
+
+Upstream also keeps captured output on timeout: the V1 shell tool returns a completed call whose output is what the command printed, ending with a `<shell_metadata>` notice, and leaves `metadata.exit` null (V2 core is stricter and returns only a timeout message). ocmini previously discarded everything captured before the limit. It now returns the upstream V1 shape, with `metadata.timeout: true` added, so a cancelled build stays visible.
+
+Unit checks cover the timeout preview, the silent-command `(no output)` marker, the process-group kill on timeout, background survival with session-scoped and runtime-exit cancellation; contract checks drive the real server, require the background tool's `metadata.pid` and `metadata.outputPath`, verify the job keeps writing after the turn ends, verify `POST /session/:id/abort` ends the job, and confirm a timed-out command completes and its captured output reaches the next model request with the `exceeding timeout 700 ms` notice.
+
+The reported `Session database: database is locked` came from startup recovery.
+`recover_interrupted` ran its two full-table `json_extract` scans inside its
+write transaction, so every instance start held the write lock while scanning.
+Measurements used a `VACUUM INTO` snapshot of the live session database (645 MB,
+38,324 messages, 157,172 parts, 625 sessions); the scans cost 0.18 s and 0.49 s.
+A writer probing lock acquisition saw a median of 0.3 ms and a maximum of
+3,632 ms during twelve sequential instance starts. Eight concurrent starts plus
+a concurrent writer drove the writer's slowest write to 6,334 ms, and the same
+burst against the pre-fix executable produced 60 failed starts and one writer
+failure, both reading `Session database: database is locked` — the reported
+error. Recovery scans now run on the read connection and only the guarded
+updates use the write transaction, which re-checks each scanned condition so a
+row a sibling changed in the meantime is left alone. The write busy timeout is
+30 seconds, and `Store::open` retries a locked open five times over about three
+seconds, since opening is idempotent. After the change the same probe measured a
+1 ms maximum lock hold (median 0.3 ms, p95 0.5 ms), eight concurrent recoveries
+finished with a slowest start of 1,255 ms instead of 5,630 ms, and 120 starts in
+six bursts of twenty with a concurrent writer produced no failed start, no
+failed write and a 3 ms slowest write. Startup recovery semantics, leases and
+the schema are unchanged.
+
+Formatting, Clippy with warnings denied, the locked release build, and all 163
+tests (117 unit and 46 contract) pass.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.

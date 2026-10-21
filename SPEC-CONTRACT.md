@@ -97,6 +97,10 @@ Automatic compaction may repeat within a turn and within an overflowing model st
 
 Shell and MCP operations honor larger explicit positive timeouts. Web fetches use a 30-second default and clamp requested timeouts to 120 seconds, with a 5 MiB response limit. All remain cancellable. `grep` and `glob` require `rg` on PATH and stream at most 100 results with ripgrep's native glob/ignore rules, without a candidate-file ceiling. Text reads have no whole-file size ceiling: pages default to 2,000 lines, allow larger explicit limits, and retain at most 2,000 characters per line and 50 KiB of text. Existing media limits remain.
 
+A shell command that reaches its timeout is a completed tool call carrying the output captured before the limit, with a `shell_metadata` notice and `metadata.timeout`, matching OpenCode's shell contract; `metadata.exit` stays null. An aborted turn publishes no partial shell result.
+
+`bash` also accepts `background: true`. This is an ocmini extension: OpenCode 1.19.x has no model-facing background launch, and its background-job registry serves task children. The command starts in a new session and the tool returns its pid and log path at once, so progress is read through the existing file tools. Ownership follows the upstream registry: jobs are process-local, non-durable, and belong to the session that started them, so aborting that turn, deleting that session, or exiting the runtime ends them. The owner-bound get/wait/cancel tools, completion delivery and durable status that upstream requires for this feature are not implemented; a background job has no live progress stream and does not survive a restart.
+
 ### Commands
 
 T3 sends `model` as a **string** on command requests, for example `provider/model`, plus `command`, `arguments`, `messageID`, optional `agent` and `variant`, and file `parts`. It does not send top-level `providerID` and `modelID` on this route.
@@ -218,6 +222,8 @@ MCP initialization is lazy per normalized request/session directory. Starting th
 ## Storage and deliberate exclusions
 
 Session state and transcripts live in the ocmini SQLite database under the XDG data directory. Writes that admit work or fork a transcript are transactional. Message/part ordering is stable. Deleting a session removes dependent data. Restart recovery distinguishes admitted work from interrupted execution; it must not silently rerun already-started shell mutations. There is no automatic 30-day transcript deletion: T3 resumes provider sessions by their native IDs and needs their history.
+
+Several ocmini processes share the database file. Recovery scans run outside the write transaction, so starting an instance does not make sibling writers wait for a full-table scan; a writer that meets a locked database waits on the busy timeout and a contended open is retried, so a burst of instance starts stays a slow start rather than a `database is locked` failure.
 
 For T3's usage widget, a separate `opencode-ocmini.db` sidecar under the OpenCode XDG data directory contains a compatible `message` table with `id`, `session_id`, `data`, and `time_created`. Do not overwrite the real `opencode.db` or duplicate billed usage when copying history during a fork.
 
