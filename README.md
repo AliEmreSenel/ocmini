@@ -35,6 +35,20 @@ The selector lists saved sessions with live search (title, ID, directory), a cyc
 
 `--continue` and `--session` also work with `ocmini tui`. Resuming shows the saved conversation and keeps its last model and agent; `--model` overrides the model. An explicit session ID uses the saved project directory. A normal launch starts a new session.
 
+## One-shot prompts
+
+```sh
+ocmini run "explain this project"            # new session, prints the answer
+git diff | ocmini run "review this diff"     # piped stdin appends to the prompt
+ocmini run --continue "and the tests?"       # keep the latest session here
+ocmini run -s ses_… --fork "try another way" # fork a session by ID
+ocmini run --format json "summarize"         # JSONL: step_start, text, step_finish
+ocmini run -f screenshot.png "what changed?" # attach files (repeatable)
+ocmini run --auto -m provider/model "…"      # allow tools without asking
+```
+
+`run` drives the same engine as the TUI: sessions, agents, models, tools, permissions and questions all behave the same. Text mode prints the agent/model header, tool lines and the streamed answer. `--thinking` also prints chain of thought. `--format json` emits one JSON object per line (`step_start`, `text`, `step_finish`, `tool_use`, and `reasoning` with `--thinking`) for scripts. Tool permissions follow one policy: `--auto` allows them, a TTY prompts for `[y]es/[a]lways/[n]o`, and a non-TTY run refuses them so the command never hangs. `--interactive` (`-i`) keeps prompting after the first answer (exit with `/exit` or Ctrl+D); `ocmini` without `run` is the full TUI. Flags: `--agent`, `--variant`, `--title`, `--dir`, `--command`, `--model`.
+
 ## What stays
 
 - **Coding loop:** streaming replies and reasoning, file attachments, cancellation, steering, permissions and questions.
