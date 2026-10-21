@@ -57,12 +57,98 @@ impl Draft {
         self.cursor = (self.cursor + 1).min(graphemes(&self.text));
     }
 
-    pub fn home(&mut self) {
-        self.cursor = 0;
+    fn clamped(&self) -> usize {
+        self.cursor.min(graphemes(&self.text))
     }
 
+    fn word_chars(&self) -> Vec<&str> {
+        self.text.graphemes(true).collect()
+    }
+
+    /// Start of the current line; 0 for the first line.
+    pub fn home(&mut self) {
+        let bytes = byte_index(&self.text, self.clamped());
+        let start = self.text[..bytes].rfind('\n').map_or(0, |i| i + 1);
+        self.cursor = graphemes(&self.text[..start]);
+    }
+
+    /// End of the current line; the text end for the last line.
     pub fn end(&mut self) {
-        self.cursor = graphemes(&self.text);
+        let bytes = byte_index(&self.text, self.clamped());
+        let end = self.text[bytes..]
+            .find('\n')
+            .map_or(self.text.len(), |i| bytes + i);
+        self.cursor = graphemes(&self.text[..end]);
+    }
+
+    pub fn word_left(&mut self) {
+        let chars = self.word_chars();
+        let mut i = self.clamped();
+        while i > 0 && !word_char(chars[i - 1]) {
+            i -= 1;
+        }
+        while i > 0 && word_char(chars[i - 1]) {
+            i -= 1;
+        }
+        self.cursor = i;
+    }
+
+    pub fn word_right(&mut self) {
+        let chars = self.word_chars();
+        let mut i = self.clamped();
+        while i < chars.len() && !word_char(chars[i]) {
+            i += 1;
+        }
+        while i < chars.len() && word_char(chars[i]) {
+            i += 1;
+        }
+        self.cursor = i;
+    }
+
+    /// Move the caret to the same column on the row above (negative) or
+    /// below, using the same wrapped layout the preview draws.
+    pub fn move_row(&mut self, prefix: &str, width: usize, delta: isize) {
+        let l = layout(prefix, &self.text, self.cursor, width);
+        let total = l.positions.len() - 1;
+        let (row, col, _) = l.positions[(l.prefix_len + self.clamped()).min(total)];
+        let Some(target) = row.checked_add_signed(delta) else {
+            return;
+        };
+        if target >= l.rows.len() {
+            return;
+        }
+        // The grapheme on the target row closest to the current column; a
+        // line-break grapheme's caret stays before it, ending the row.
+        let mut caret = None;
+        for (index, (r, c, w)) in l.positions.iter().enumerate() {
+            if *r == target && *c <= col {
+                caret = Some(if index >= total {
+                    total
+                } else if *w > 0 && c + w <= col {
+                    index + 1
+                } else {
+                    index
+                });
+            }
+        }
+        if let Some(caret) = caret {
+            self.cursor = caret
+                .saturating_sub(l.prefix_len)
+                .min(graphemes(&self.text));
+        }
+    }
+
+    /// Delete the grapheme at the caret (forward delete).
+    pub fn delete(&mut self) {
+        let count = graphemes(&self.text);
+        self.cursor = self.cursor.min(count);
+        if self.cursor == count {
+            return;
+        }
+        self.text.replace_range(
+            byte_index(&self.text, self.cursor)..byte_index(&self.text, self.cursor + 1),
+            "",
+        );
     }
 
     pub fn backspace(&mut self) {
@@ -86,70 +172,87 @@ impl Draft {
     }
 }
 
+fn word_char(grapheme: &str) -> bool {
+    grapheme
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
+pub(super) fn attachment_prefix(draft: &Draft) -> String {
+    draft
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| format!("[{}: {}] ", index + 1, attachment.filename))
+        .collect()
+}
+
 pub(super) struct Layout {
     pub rows: Vec<String>,
     /// Cursor position as (row, terminal column) among `rows`.
     pub cursor: (usize, usize),
+    /// (row, column, cells) of every prefix+text grapheme, plus a final
+    /// sentinel entry for the caret position after the last grapheme.
+    positions: Vec<(usize, usize, usize)>,
+    prefix_len: usize,
 }
 
-/// Lay the draft out across wrapped rows: the first row carries the prompt and
-/// continuation rows indent to align under the text. Control characters show as
-/// cells (↵, spaces), so the cursor grapheme maps to a cell even when the text
-/// is multiline. `cursor` counts prefix graphemes too; usize::MAX means the end.
+/// Lay the draft out across display rows: a hard newline starts a new row,
+/// long rows soft-wrap, the first row carries the prompt and continuation rows
+/// indent to align under the text. Tabs show as spaces. `cursor` counts prefix
+/// graphemes too; usize::MAX means the end.
 fn layout(prefix: &str, text: &str, cursor: usize, width: usize) -> Layout {
     // terminal_width() keeps the last column free, so a cell below width never
     // triggers the terminal's own autowrap.
     let capacity = width.saturating_sub(2).max(1);
-    let prefix = clean_input(prefix);
+    let prefix = clean_input(prefix).replace('\n', " ");
     let clean = clean_input(text);
-    let prefix_len = graphemes(&prefix);
-    let target = (prefix_len + cursor).min(prefix_len + graphemes(&clean));
-    let mut cells: Vec<(String, usize)> = Vec::new();
-    let mut cursor_cell = 0;
-    let mut used = 0;
-    for (index, grapheme) in prefix
-        .graphemes(true)
-        .chain(clean.graphemes(true))
-        .enumerate()
-    {
-        if index == target {
-            cursor_cell = used;
-        }
-        let shown = match grapheme {
-            "\n" => "↵".to_string(),
-            "\t" => "    ".to_string(),
-            _ => grapheme.to_string(),
-        };
-        let w = shown.width();
-        used += w;
-        cells.push((shown, w));
-    }
-    if target >= cells.len() {
-        cursor_cell = used;
-    }
-
     let mut rows: Vec<String> = Vec::new();
     let mut row = String::new();
-    let (mut col, mut cell) = (0usize, 0usize);
-    let mut cursor_pos = (0usize, 2usize);
-    let mut placed = false;
-    for (shown, w) in cells {
-        if !placed && cell == cursor_cell {
-            cursor_pos = (rows.len(), 2 + col);
-            placed = true;
+    let mut col = 0usize;
+    let mut positions: Vec<(usize, usize, usize)> = Vec::new();
+    let place = |shown: String,
+                 rows: &mut Vec<String>,
+                 row: &mut String,
+                 col: &mut usize,
+                 positions: &mut Vec<(usize, usize, usize)>| {
+        let w = shown.width();
+        if *col + w > capacity && *col > 0 {
+            rows.push(std::mem::take(row));
+            *col = 0;
         }
-        if col + w > capacity && col > 0 {
+        positions.push((rows.len(), 2 + *col, w));
+        row.push_str(&shown);
+        *col += w;
+    };
+    for grapheme in prefix.graphemes(true) {
+        place(
+            grapheme.to_string(),
+            &mut rows,
+            &mut row,
+            &mut col,
+            &mut positions,
+        );
+    }
+    for grapheme in clean.graphemes(true) {
+        if grapheme == "\n" {
+            positions.push((rows.len(), 2 + col, 0));
             rows.push(std::mem::take(&mut row));
             col = 0;
+            continue;
         }
-        row.push_str(&shown);
-        col += w;
-        cell += w;
+        let shown = if grapheme == "\t" {
+            "    ".to_string()
+        } else {
+            grapheme.to_string()
+        };
+        place(shown, &mut rows, &mut row, &mut col, &mut positions);
     }
+    positions.push((rows.len(), 2 + col, 0));
     rows.push(row);
-    if !placed {
-        cursor_pos = (rows.len() - 1, 2 + col);
-    }
+    let prefix_len = graphemes(&prefix);
+    let (crow, ccol, _) = positions[(prefix_len + cursor).min(prefix_len + graphemes(&clean))];
     let rows = rows
         .iter()
         .enumerate()
@@ -163,7 +266,9 @@ fn layout(prefix: &str, text: &str, cursor: usize, width: usize) -> Layout {
         .collect();
     Layout {
         rows,
-        cursor: cursor_pos,
+        cursor: (crow, ccol),
+        positions,
+        prefix_len,
     }
 }
 
@@ -252,13 +357,7 @@ impl Display {
             Some(PendingPrompt::Permission(_)) => {
                 (String::new(), "[o]nce [a]lways [r]eject".into(), usize::MAX)
             }
-            None => {
-                let mut prefix = String::new();
-                for (index, attachment) in draft.attachments.iter().enumerate() {
-                    prefix.push_str(&format!("[{}: {}] ", index + 1, attachment.filename));
-                }
-                (prefix, draft.text.clone(), draft.cursor)
-            }
+            None => (attachment_prefix(draft), draft.text.clone(), draft.cursor),
         };
         let layout = layout(&prefix, &text, cursor, width);
         self.drawn_rows = 0;
@@ -347,6 +446,75 @@ mod tests {
     }
 
     #[test]
+    fn home_end_and_word_motion_work_line_by_line() {
+        // Index: 0..8 = "let x = 1", 9 = newline, 10..22 = "let y = foo()".
+        let mut draft = Draft::default();
+        draft.insert_str("let x = 1\nlet y = foo()");
+        assert_eq!(draft.cursor, 23);
+        draft.home();
+        assert_eq!(draft.cursor, 10); // start of the second line
+        draft.home();
+        assert_eq!(draft.cursor, 10); // Home is per line, so it stays
+        draft.end();
+        assert_eq!(draft.cursor, 23); // end of the second line
+        draft.cursor = 0;
+        draft.end();
+        assert_eq!(draft.cursor, 9); // per-line End: first line's end
+        draft.end();
+        assert_eq!(draft.cursor, 9);
+        // Word motion across the whole draft.
+        draft.cursor = 0;
+        draft.word_right();
+        assert_eq!(draft.cursor, 3); // over "let"
+        draft.word_right();
+        draft.word_right();
+        draft.word_right();
+        assert_eq!(draft.cursor, 13); // past the newline, over "let"
+        draft.word_right();
+        assert_eq!(draft.cursor, 15); // over "y"
+        draft.word_right();
+        assert_eq!(draft.cursor, 21); // over "foo"
+        draft.word_right();
+        assert_eq!(draft.cursor, 23); // trailing "( )" is one non-word run
+        draft.word_left();
+        assert_eq!(draft.cursor, 18); // start of "foo"
+                                      // Forward delete removes at the caret, backspace behind it.
+        draft.home();
+        assert_eq!(draft.cursor, 10); // second line start
+        draft.delete();
+        assert_eq!(draft.text, "let x = 1\net y = foo()");
+        draft.delete();
+        draft.delete();
+        assert_eq!(draft.text, "let x = 1\n y = foo()");
+        draft.backspace();
+        assert_eq!(draft.text, "let x = 1 y = foo()"); // caret at 10 deletes the newline
+        assert_eq!(draft.cursor, 9);
+    }
+
+    #[test]
+    fn arrow_rows_move_the_caret_across_wraps_and_newlines() {
+        // Wrapped at capacity 4: rows "abcd" / "efgh" / "ij".
+        let mut draft = Draft::default();
+        draft.insert_str("abcdefghij");
+        draft.move_row("", 6, -1);
+        assert_eq!(draft.cursor, 6); // column 4 on the middle row
+        draft.move_row("", 6, -1);
+        assert_eq!(draft.cursor, 2);
+        draft.move_row("", 6, 1);
+        assert_eq!(draft.cursor, 6);
+        // Hard newlines: caret ends the line above, never past its break.
+        let mut draft = Draft::default();
+        draft.insert_str("ab\ncd");
+        draft.move_row("", 40, -1);
+        assert_eq!(draft.cursor, 2); // end of "ab", before the newline
+        draft.insert('\n');
+        assert_eq!(draft.text, "ab\n\ncd");
+        assert_eq!(draft.cursor, 3);
+        draft.home();
+        assert_eq!(draft.cursor, 3); // the middle empty line starts at 3
+    }
+
+    #[test]
     fn attachments_are_removed_without_deleting_source_files() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shot.png");
@@ -392,8 +560,8 @@ mod tests {
         // The cursor at the very end maps to the last cell of the last row.
         let end = layout("", "abcd", usize::MAX, 6);
         assert_eq!(end.cursor, (0, 6));
-        // Multiline pastes show ↵ so rows stay one terminal row each.
-        assert_eq!(plain(&layout("", "a\nb", 0, 40).rows), ["› a↵b"]);
+        // Hard newlines start real display rows.
+        assert_eq!(plain(&layout("", "a\nb", 0, 40).rows), ["› a", "  b"]);
         // Wide characters wrap on cell widths, not grapheme counts.
         let rows = plain(&layout("", "中中中", 0, 5).rows);
         assert_eq!(rows, ["› 中", "  中", "  中"]);

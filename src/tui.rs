@@ -13,7 +13,7 @@ use crossterm::{
 use futures::{poll, StreamExt};
 use serde_json::Value;
 mod input;
-use input::{clean_input, pop_grapheme, terminal_width, Display, Draft};
+use input::{attachment_prefix, clean_input, pop_grapheme, terminal_width, Display, Draft};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -94,7 +94,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · Enter send · ←/→ Home End move · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
+    println!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ←→↑↓ Home End move · Alt+←→ word · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
 }
 
 fn summarize_input(input: &Value) -> String {
@@ -340,7 +340,10 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
 pub(crate) enum Key {
     Char(char),
     Enter,
+    /// Insert a newline into the draft instead of sending (Alt+Enter, Ctrl+J).
+    NewLine,
     Backspace,
+    Delete,
     Esc,
     CtrlC,
     CtrlD,
@@ -354,6 +357,9 @@ pub(crate) enum Key {
     Down(usize),
     Left,
     Right,
+    /// Word-wise motion with Alt or Ctrl held.
+    WordLeft,
+    WordRight,
     Home,
     End,
     Tab,
@@ -382,8 +388,12 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Backspace, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                 Key::RemoveAttachment
             }
+            // Plain Enter sends; Alt+Enter inserts a newline. Ctrl+J is reported by
+            // crossterm as a bare Enter, so it is not a distinct binding here.
+            (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::ALT) => Key::NewLine,
             (KeyCode::Enter, _) => Key::Enter,
             (KeyCode::Backspace, _) => Key::Backspace,
+            (KeyCode::Delete, _) => Key::Delete,
             (KeyCode::Esc, _) => Key::Esc,
             (KeyCode::Up, modifiers) => Key::Up(if modifiers.contains(KeyModifiers::SHIFT) {
                 PAGE
@@ -397,6 +407,16 @@ pub(crate) fn decode_event(event: Event) -> Key {
             }),
             (KeyCode::PageUp, _) => Key::Up(PAGE),
             (KeyCode::PageDown, _) => Key::Down(PAGE),
+            (KeyCode::Left, modifiers)
+                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Key::WordLeft
+            }
+            (KeyCode::Right, modifiers)
+                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Key::WordRight
+            }
             (KeyCode::Left, _) => Key::Left,
             (KeyCode::Right, _) => Key::Right,
             (KeyCode::Home, _) => Key::Home,
@@ -929,10 +949,22 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     }
                     Key::Backspace if !pending_permission => { draft.backspace(); }
                     Key::Char(ch) => { draft.insert(ch); }
+                    Key::NewLine if !pending_permission && !pending_question => {
+                        draft.insert('\n');
+                    }
+                    Key::Delete if !pending_permission && !pending_question => draft.delete(),
                     Key::Left if !pending_question => draft.left(),
                     Key::Right if !pending_question => draft.right(),
+                    Key::WordLeft if !pending_question => draft.word_left(),
+                    Key::WordRight if !pending_question => draft.word_right(),
                     Key::Home if !pending_question => draft.home(),
                     Key::End if !pending_question => draft.end(),
+                    Key::Up(n) if !pending_permission && !pending_question => {
+                        draft.move_row(&attachment_prefix(&draft), terminal_width(), -(n as isize));
+                    }
+                    Key::Down(n) if !pending_permission && !pending_question => {
+                        draft.move_row(&attachment_prefix(&draft), terminal_width(), n as isize);
+                    }
                     Key::Esc if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     _ => {}
                 }
