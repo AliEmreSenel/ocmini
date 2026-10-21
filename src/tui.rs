@@ -13,7 +13,9 @@ use crossterm::{
 use futures::{poll, StreamExt};
 use serde_json::Value;
 mod input;
-use input::{clean_input, pop_grapheme, terminal_width, Display, Draft};
+use input::{
+    attachment_prefix, clean_input, pop_grapheme, terminal_width, Display, Draft, History, KillRing,
+};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -94,7 +96,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
+    println!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ↑↓ history · ←→↑↓ Home End move · Alt+←→ word · Shift select · Ctrl+A/E line · Ctrl+K/W cut · Ctrl+Y yank · Ctrl+Z undo · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
 }
 
 fn summarize_input(input: &Value) -> String {
@@ -340,7 +342,10 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
 pub(crate) enum Key {
     Char(char),
     Enter,
+    /// Insert a newline into the draft instead of sending (Alt+Enter, Ctrl+J).
+    NewLine,
     Backspace,
+    Delete,
     Esc,
     CtrlC,
     CtrlD,
@@ -352,6 +357,23 @@ pub(crate) enum Key {
     /// Move by N rows; page keys report a full page.
     Up(usize),
     Down(usize),
+    Left,
+    Right,
+    /// Word-wise motion with Alt or Ctrl held.
+    WordLeft,
+    WordRight,
+    /// Motion with Shift held extends the selection.
+    SelectLeft,
+    SelectRight,
+    SelectHome,
+    SelectEnd,
+    SelectWordLeft,
+    SelectWordRight,
+    Undo,
+    /// Ctrl+K: caret to line end. Ctrl+W: word behind the caret. Ctrl+Y: yank.
+    KillLine,
+    KillWord,
+    Yank,
     Home,
     End,
     Tab,
@@ -377,11 +399,24 @@ pub(crate) fn decode_event(event: Event) -> Key {
                 Key::CtrlV
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => Key::CtrlU,
+            (KeyCode::Char('z'), KeyModifiers::CONTROL) => Key::Undo,
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => Key::KillLine,
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => Key::KillWord,
+            (KeyCode::Char('y'), KeyModifiers::CONTROL) => Key::Yank,
+            // Readline aliases for the line-start / line-end motion.
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Key::Home,
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => Key::End,
+            (KeyCode::Char('b'), KeyModifiers::ALT) => Key::WordLeft,
+            (KeyCode::Char('f'), KeyModifiers::ALT) => Key::WordRight,
             (KeyCode::Backspace, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                 Key::RemoveAttachment
             }
+            // Plain Enter sends; Alt+Enter inserts a newline. Ctrl+J is reported by
+            // crossterm as a bare Enter, so it is not a distinct binding here.
+            (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::ALT) => Key::NewLine,
             (KeyCode::Enter, _) => Key::Enter,
             (KeyCode::Backspace, _) => Key::Backspace,
+            (KeyCode::Delete, _) => Key::Delete,
             (KeyCode::Esc, _) => Key::Esc,
             (KeyCode::Up, modifiers) => Key::Up(if modifiers.contains(KeyModifiers::SHIFT) {
                 PAGE
@@ -395,6 +430,38 @@ pub(crate) fn decode_event(event: Event) -> Key {
             }),
             (KeyCode::PageUp, _) => Key::Up(PAGE),
             (KeyCode::PageDown, _) => Key::Down(PAGE),
+            (KeyCode::Left, modifiers)
+                if modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                Key::SelectWordLeft
+            }
+            (KeyCode::Right, modifiers)
+                if modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                Key::SelectWordRight
+            }
+            (KeyCode::Left, modifiers)
+                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Key::WordLeft
+            }
+            (KeyCode::Right, modifiers)
+                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Key::WordRight
+            }
+            (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                Key::SelectLeft
+            }
+            (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                Key::SelectRight
+            }
+            (KeyCode::Left, _) => Key::Left,
+            (KeyCode::Right, _) => Key::Right,
+            (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                Key::SelectHome
+            }
+            (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => Key::SelectEnd,
             (KeyCode::Home, _) => Key::Home,
             (KeyCode::End, _) => Key::End,
             (KeyCode::Tab, _) => Key::Tab,
@@ -698,6 +765,21 @@ fn render_history(history: &[MessageWithParts]) {
     }
 }
 
+/// The session's user prompts in order, for Up/Down recall.
+fn session_prompts(messages: &[MessageWithParts]) -> impl Iterator<Item = String> + '_ {
+    messages
+        .iter()
+        .filter(|message| message.info.role == "user")
+        .filter_map(|message| {
+            message
+                .parts
+                .iter()
+                .find(|part| part["type"].as_str() == Some("text"))
+                .and_then(|part| part["text"].as_str())
+                .map(str::to_string)
+        })
+}
+
 fn display_model(model_ref: Option<&crate::types::ModelRef>, config_model: &str) -> String {
     let display = model_ref
         .map(|model| format!("{}/{}", model.provider_id, model.model_id))
@@ -759,6 +841,9 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     tokio::pin!(shutdown);
 
     let mut draft = Draft::default();
+    let mut killring = KillRing::default();
+    let mut prompt_history = History::default();
+    prompt_history.load(session_prompts(&history));
     let mut display = Display::default();
     let mut ui = Ui {
         part_kind: HashMap::new(),
@@ -843,6 +928,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                             &app.config.lock().unwrap().model,
                                         );
                                         draft.clear();
+                                        prompt_history.load(session_prompts(&history));
                                         println!(
                                             "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}",
                                             session.id, session.directory
@@ -885,17 +971,19 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                 Err(message) => display.output(&format!("\n{YELLOW}{message}{RESET}\n"), terminal_width()),
                             }
                         } else {
-                            draft.text.push_str(&clean_input(&text));
+                            draft.insert_str(&clean_input(&text));
                         }
                     }
                     Key::Enter if pending_permission => {},
                     Key::Enter => {
                         display.finish_line();
                         let text = std::mem::take(&mut draft.text);
+                        draft.cursor = 0;
                         let files = std::mem::take(&mut draft.attachments);
                         if !text.is_empty() { println!("{BOLD}›{RESET} {text}"); }
                         for file in &files { println!("{DIM}● attached: {}{RESET}", clean_input(&file.filename)); }
                         if text.trim() == "/quit" { break; }
+                        prompt_history.remember(text.clone());
                         let mut parts: Vec<Value> = Vec::new();
                         if !text.trim().is_empty() {
                             parts.push(serde_json::json!({"type": "text", "text": text}));
@@ -923,7 +1011,51 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                         }
                     }
                     Key::Backspace if !pending_permission => { draft.backspace(); }
-                    Key::Char(ch) => { draft.text.push(ch); }
+                    Key::Char(ch) => { draft.insert(ch); }
+                    Key::NewLine if !pending_permission && !pending_question => {
+                        draft.insert('\n');
+                    }
+                    Key::Delete if !pending_permission && !pending_question => draft.delete(),
+                    Key::Undo if !pending_permission && !pending_question => draft.undo(),
+                    Key::KillLine if !pending_permission && !pending_question => {
+                        if let Some(killed) = draft.kill_line() {
+                            killring.push(killed);
+                        }
+                    }
+                    Key::KillWord if !pending_permission && !pending_question => {
+                        if let Some(killed) = draft.kill_word() {
+                            killring.push(killed);
+                        }
+                    }
+                    Key::Yank if !pending_permission && !pending_question => {
+                        if let Some(text) = killring.top() {
+                            draft.insert_str(text);
+                        }
+                    }
+                    Key::Left if !pending_question => draft.left(),
+                    Key::Right if !pending_question => draft.right(),
+                    Key::WordLeft if !pending_question => draft.word_left(),
+                    Key::WordRight if !pending_question => draft.word_right(),
+                    Key::Home if !pending_question => draft.home(),
+                    Key::End if !pending_question => draft.end(),
+                    Key::SelectLeft if !pending_question => draft.select_left(),
+                    Key::SelectRight if !pending_question => draft.select_right(),
+                    Key::SelectHome if !pending_question => draft.select_home(),
+                    Key::SelectEnd if !pending_question => draft.select_end(),
+                    Key::SelectWordLeft if !pending_question => draft.select_word_left(),
+                    Key::SelectWordRight if !pending_question => draft.select_word_right(),
+                    Key::Up(n) if !pending_permission && !pending_question => {
+                        // Up on an empty draft recalls previous prompts;
+                        // otherwise it moves the caret across display rows.
+                        if !prompt_history.select(&mut draft, -(n as isize)) {
+                            draft.move_row(&attachment_prefix(&draft), terminal_width(), -(n as isize));
+                        }
+                    }
+                    Key::Down(n) if !pending_permission && !pending_question => {
+                        if !prompt_history.select(&mut draft, n as isize) {
+                            draft.move_row(&attachment_prefix(&draft), terminal_width(), n as isize);
+                        }
+                    }
                     Key::Esc if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     _ => {}
                 }
@@ -995,6 +1127,43 @@ mod tests {
             decode_event(Event::Paste("a\r\nb\rc".into())),
             Key::Paste("a\nb\nc".into())
         );
+    }
+
+    #[test]
+    fn editing_keys_decode_with_modifiers() {
+        for (code, modifiers, key) in [
+            (KeyCode::Char('z'), KeyModifiers::CONTROL, Key::Undo),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL, Key::KillLine),
+            (KeyCode::Char('w'), KeyModifiers::CONTROL, Key::KillWord),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL, Key::Yank),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL, Key::Home),
+            (KeyCode::Char('e'), KeyModifiers::CONTROL, Key::End),
+            (KeyCode::Char('f'), KeyModifiers::ALT, Key::WordRight),
+            (KeyCode::Char('b'), KeyModifiers::ALT, Key::WordLeft),
+            (KeyCode::Left, KeyModifiers::SHIFT, Key::SelectLeft),
+            (KeyCode::Right, KeyModifiers::SHIFT, Key::SelectRight),
+            (KeyCode::Home, KeyModifiers::SHIFT, Key::SelectHome),
+            (KeyCode::End, KeyModifiers::SHIFT, Key::SelectEnd),
+            (
+                KeyCode::Left,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                Key::SelectWordLeft,
+            ),
+            (
+                KeyCode::Right,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                Key::SelectWordRight,
+            ),
+            (KeyCode::Enter, KeyModifiers::ALT, Key::NewLine),
+            (KeyCode::Enter, KeyModifiers::empty(), Key::Enter),
+            (KeyCode::Left, KeyModifiers::empty(), Key::Left),
+            (KeyCode::Delete, KeyModifiers::empty(), Key::Delete),
+        ] {
+            assert_eq!(
+                decode_event(Event::Key(KeyEvent::new(code, modifiers))),
+                key
+            );
+        }
     }
 
     #[test]
