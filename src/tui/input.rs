@@ -1,4 +1,5 @@
 use super::{Attachment, PendingPrompt, Ui, BOLD, RESET};
+use std::collections::VecDeque;
 use std::io::Write;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -9,6 +10,10 @@ pub(super) struct Draft {
     pub attachments: Vec<Attachment>,
     /// Edit position: a grapheme index into `text`, always in `0..=count`.
     pub cursor: usize,
+    /// Fixed end of the selection, when the caret is moving it.
+    anchor: Option<usize>,
+    /// Snapshot stack for Ctrl+Z.
+    undo: Vec<(String, usize)>,
 }
 
 pub(super) fn pop_grapheme(text: &mut String) -> bool {
@@ -37,43 +42,118 @@ fn byte_index(text: &str, index: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+fn word_char(grapheme: &str) -> bool {
+    grapheme
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
+fn word_start(chars: &[&str], from: usize) -> usize {
+    let mut i = from.min(chars.len());
+    while i > 0 && !word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+fn word_end(chars: &[&str], from: usize) -> usize {
+    let mut i = from.min(chars.len());
+    while i < chars.len() && !word_char(chars[i]) {
+        i += 1;
+    }
+    while i < chars.len() && word_char(chars[i]) {
+        i += 1;
+    }
+    i
+}
+
 impl Draft {
     pub fn insert(&mut self, ch: char) {
+        // delete_selection() snapshots; typing over a selection is ONE undo step.
+        if self.selection().is_none() {
+            self.snapshot();
+        }
+        self.delete_selection();
         self.text.insert(byte_index(&self.text, self.cursor), ch);
         self.cursor += 1;
     }
 
     pub fn insert_str(&mut self, text: &str) {
+        if self.selection().is_none() {
+            self.snapshot();
+        }
+        self.delete_selection();
+        let added = graphemes(text);
         self.text
             .insert_str(byte_index(&self.text, self.cursor), text);
-        self.cursor += graphemes(text);
+        self.cursor += added;
     }
 
-    pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        let (lo, hi) = (anchor.min(self.cursor), anchor.max(self.cursor));
+        (lo < hi).then_some((lo, hi))
     }
 
-    pub fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(graphemes(&self.text));
+    fn anchor_here(&mut self) {
+        self.anchor = Some(self.anchor.unwrap_or(self.cursor));
+    }
+
+    fn settle_anchor(&mut self) {
+        if self.anchor == Some(self.cursor) {
+            self.anchor = None;
+        }
+    }
+
+    /// Remove the selection, returning its text (for the kill ring).
+    fn delete_selection(&mut self) -> Option<String> {
+        let (lo, hi) = self.selection()?;
+        let text = self.text[byte_index(&self.text, lo)..byte_index(&self.text, hi)].to_string();
+        self.snapshot();
+        self.text
+            .replace_range(byte_index(&self.text, lo)..byte_index(&self.text, hi), "");
+        self.cursor = lo;
+        self.anchor = None;
+        Some(text)
+    }
+
+    fn snapshot(&mut self) {
+        self.undo.push((self.text.clone(), self.cursor));
+    }
+
+    pub fn undo(&mut self) {
+        if let Some((text, cursor)) = self.undo.pop() {
+            self.text = text;
+            self.cursor = cursor.min(graphemes(&self.text));
+            self.anchor = None;
+        }
     }
 
     fn clamped(&self) -> usize {
         self.cursor.min(graphemes(&self.text))
     }
 
-    fn word_chars(&self) -> Vec<&str> {
-        self.text.graphemes(true).collect()
+    fn left_impl(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right_impl(&mut self) {
+        self.cursor = (self.cursor + 1).min(graphemes(&self.text));
     }
 
     /// Start of the current line; 0 for the first line.
-    pub fn home(&mut self) {
+    fn home_impl(&mut self) {
         let bytes = byte_index(&self.text, self.clamped());
         let start = self.text[..bytes].rfind('\n').map_or(0, |i| i + 1);
         self.cursor = graphemes(&self.text[..start]);
     }
 
     /// End of the current line; the text end for the last line.
-    pub fn end(&mut self) {
+    fn end_impl(&mut self) {
         let bytes = byte_index(&self.text, self.clamped());
         let end = self.text[bytes..]
             .find('\n')
@@ -81,34 +161,20 @@ impl Draft {
         self.cursor = graphemes(&self.text[..end]);
     }
 
-    pub fn word_left(&mut self) {
-        let chars = self.word_chars();
-        let mut i = self.clamped();
-        while i > 0 && !word_char(chars[i - 1]) {
-            i -= 1;
-        }
-        while i > 0 && word_char(chars[i - 1]) {
-            i -= 1;
-        }
-        self.cursor = i;
+    fn word_left_impl(&mut self) {
+        let chars: Vec<&str> = self.text.graphemes(true).collect();
+        self.cursor = word_start(&chars, self.clamped());
     }
 
-    pub fn word_right(&mut self) {
-        let chars = self.word_chars();
-        let mut i = self.clamped();
-        while i < chars.len() && !word_char(chars[i]) {
-            i += 1;
-        }
-        while i < chars.len() && word_char(chars[i]) {
-            i += 1;
-        }
-        self.cursor = i;
+    fn word_right_impl(&mut self) {
+        let chars: Vec<&str> = self.text.graphemes(true).collect();
+        self.cursor = word_end(&chars, self.clamped());
     }
 
     /// Move the caret to the same column on the row above (negative) or
     /// below, using the same wrapped layout the preview draws.
-    pub fn move_row(&mut self, prefix: &str, width: usize, delta: isize) {
-        let l = layout(prefix, &self.text, self.cursor, width);
+    fn move_row_impl(&mut self, prefix: &str, width: usize, delta: isize) {
+        let l = layout(prefix, &self.text, self.cursor, width, None);
         let total = l.positions.len() - 1;
         let (row, col, _) = l.positions[(l.prefix_len + self.clamped()).min(total)];
         let Some(target) = row.checked_add_signed(delta) else {
@@ -138,13 +204,127 @@ impl Draft {
         }
     }
 
+    pub fn left(&mut self) {
+        self.anchor = None;
+        self.left_impl();
+    }
+
+    pub fn right(&mut self) {
+        self.anchor = None;
+        self.right_impl();
+    }
+
+    pub fn home(&mut self) {
+        self.anchor = None;
+        self.home_impl();
+    }
+
+    pub fn end(&mut self) {
+        self.anchor = None;
+        self.end_impl();
+    }
+
+    pub fn word_left(&mut self) {
+        self.anchor = None;
+        self.word_left_impl();
+    }
+
+    pub fn word_right(&mut self) {
+        self.anchor = None;
+        self.word_right_impl();
+    }
+
+    pub fn move_row(&mut self, prefix: &str, width: usize, delta: isize) {
+        self.anchor = None;
+        self.move_row_impl(prefix, width, delta);
+    }
+
+    pub fn select_left(&mut self) {
+        self.anchor_here();
+        self.left_impl();
+        self.settle_anchor();
+    }
+
+    pub fn select_right(&mut self) {
+        self.anchor_here();
+        self.right_impl();
+        self.settle_anchor();
+    }
+
+    pub fn select_home(&mut self) {
+        self.anchor_here();
+        self.home_impl();
+        self.settle_anchor();
+    }
+
+    pub fn select_end(&mut self) {
+        self.anchor_here();
+        self.end_impl();
+        self.settle_anchor();
+    }
+
+    pub fn select_word_left(&mut self) {
+        self.anchor_here();
+        self.word_left_impl();
+        self.settle_anchor();
+    }
+
+    pub fn select_word_right(&mut self) {
+        self.anchor_here();
+        self.word_right_impl();
+        self.settle_anchor();
+    }
+
+    /// Kill from the caret to the end of the line (the newline itself when
+    /// the rest of the line is empty), for Ctrl+K.
+    pub fn kill_line(&mut self) -> Option<String> {
+        if let Some(killed) = self.delete_selection() {
+            return Some(killed);
+        }
+        let bytes = byte_index(&self.text, self.clamped());
+        let end = match self.text[bytes..].find('\n') {
+            Some(0) => bytes + 1,
+            Some(rel) => bytes + rel,
+            None => self.text.len(),
+        };
+        if end <= bytes {
+            return None;
+        }
+        let killed = self.text[bytes..end].to_string();
+        self.snapshot();
+        self.text.replace_range(bytes..end, "");
+        Some(killed)
+    }
+
+    /// Kill the word before the caret, for Ctrl+W.
+    pub fn kill_word(&mut self) -> Option<String> {
+        if let Some(killed) = self.delete_selection() {
+            return Some(killed);
+        }
+        let chars: Vec<&str> = self.text.graphemes(true).collect();
+        let start = word_start(&chars, self.clamped());
+        if start == self.cursor {
+            return None;
+        }
+        let bytes = byte_index(&self.text, start)..byte_index(&self.text, self.cursor);
+        let killed = self.text[bytes.clone()].to_string();
+        self.snapshot();
+        self.text.replace_range(bytes, "");
+        self.cursor = start;
+        Some(killed)
+    }
+
     /// Delete the grapheme at the caret (forward delete).
     pub fn delete(&mut self) {
+        if self.delete_selection().is_some() {
+            return;
+        }
         let count = graphemes(&self.text);
         self.cursor = self.cursor.min(count);
         if self.cursor == count {
             return;
         }
+        self.snapshot();
         self.text.replace_range(
             byte_index(&self.text, self.cursor)..byte_index(&self.text, self.cursor + 1),
             "",
@@ -152,6 +332,9 @@ impl Draft {
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection().is_some() {
+            return;
+        }
         self.cursor = self.cursor.min(graphemes(&self.text));
         if self.cursor == 0 {
             if self.text.is_empty() {
@@ -159,6 +342,7 @@ impl Draft {
             }
             return;
         }
+        self.snapshot();
         let start = byte_index(&self.text, self.cursor - 1);
         let end = byte_index(&self.text, self.cursor);
         self.text.replace_range(start..end, "");
@@ -166,26 +350,107 @@ impl Draft {
     }
 
     pub fn clear(&mut self) {
+        self.snapshot();
         self.text.clear();
         self.attachments.clear();
         self.cursor = 0;
+        self.anchor = None;
     }
 }
 
-fn word_char(grapheme: &str) -> bool {
-    grapheme
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+/// Recently killed text, newest first; Ctrl+Y yanks the newest.
+#[derive(Default)]
+pub(super) struct KillRing {
+    entries: VecDeque<String>,
+}
+
+impl KillRing {
+    pub fn push(&mut self, text: String) {
+        if text.is_empty() || self.entries.front().is_some_and(|top| *top == text) {
+            return;
+        }
+        self.entries.push_front(text);
+    }
+
+    pub fn top(&self) -> Option<&str> {
+        self.entries.front().map(String::as_str)
+    }
+}
+
+/// Previous prompts of this session, recalled with Up/Down on an empty draft.
+#[derive(Default)]
+pub(super) struct History {
+    entries: Vec<String>,
+    /// Current navigation slot while walking; None outside history.
+    index: Option<usize>,
+    /// Draft text saved when entering history, restored below the newest.
+    saved: String,
+}
+
+impl History {
+    pub fn load(&mut self, prompts: impl IntoIterator<Item = String>) {
+        self.entries.clear();
+        self.index = None;
+        self.saved.clear();
+        for prompt in prompts {
+            self.remember(prompt);
+        }
+    }
+
+    pub fn remember(&mut self, prompt: String) {
+        self.index = None;
+        self.saved.clear();
+        let text = prompt.trim();
+        if text.is_empty() {
+            return;
+        }
+        let text = text.to_string();
+        if self.entries.last().is_some_and(|last| *last == text) {
+            return;
+        }
+        self.entries.push(text);
+    }
+
+    /// Navigate with Up (-n) / Down (+n). True when history consumed the
+    /// key; entering history requires an empty draft.
+    pub fn select(&mut self, draft: &mut Draft, delta: isize) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let len = self.entries.len();
+        let current = match self.index {
+            Some(index) => index,
+            None => {
+                if delta > 0 || !draft.text.is_empty() {
+                    return false;
+                }
+                self.saved = std::mem::take(&mut draft.text);
+                len
+            }
+        };
+        let next = (current as isize + delta).clamp(0, len as isize) as usize;
+        if next == current {
+            return true;
+        }
+        self.index = (next < len).then_some(next);
+        if next == len {
+            draft.text = std::mem::take(&mut self.saved);
+        } else {
+            draft.text.clone_from(&self.entries[next]);
+        }
+        draft.cursor = graphemes(&draft.text);
+        draft.anchor = None;
+        true
+    }
 }
 
 pub(super) fn attachment_prefix(draft: &Draft) -> String {
-    draft
-        .attachments
-        .iter()
-        .enumerate()
-        .map(|(index, attachment)| format!("[{}: {}] ", index + 1, attachment.filename))
-        .collect()
+    let mut prefix = String::new();
+    for (index, attachment) in draft.attachments.iter().enumerate() {
+        prefix.push_str(&format!("[{}: {}] ", index + 1, attachment.filename));
+    }
+    prefix.pop();
+    prefix
 }
 
 pub(super) struct Layout {
@@ -198,44 +463,64 @@ pub(super) struct Layout {
     prefix_len: usize,
 }
 
+fn highlight(sel: Option<(usize, usize)>, index: usize, shown: String) -> String {
+    match sel {
+        Some((lo, hi)) if index >= lo && index < hi => format!("\x1b[7m{shown}\x1b[27m"),
+        _ => shown,
+    }
+}
+
 /// Lay the draft out across display rows: a hard newline starts a new row,
 /// long rows soft-wrap, the first row carries the prompt and continuation rows
-/// indent to align under the text. Tabs show as spaces. `cursor` counts prefix
-/// graphemes too; usize::MAX means the end.
-fn layout(prefix: &str, text: &str, cursor: usize, width: usize) -> Layout {
+/// indent to align under the text. Tabs show as spaces, the selected grapheme
+/// range (text indices) is reverse-video. `cursor` counts prefix graphemes
+/// too; usize::MAX means the end.
+fn layout(
+    prefix: &str,
+    text: &str,
+    cursor: usize,
+    width: usize,
+    sel: Option<(usize, usize)>,
+) -> Layout {
     // terminal_width() keeps the last column free, so a cell below width never
     // triggers the terminal's own autowrap.
     let capacity = width.saturating_sub(2).max(1);
     let prefix = clean_input(prefix).replace('\n', " ");
     let clean = clean_input(text);
+    let prefix_len = graphemes(&prefix);
+    let text_len = graphemes(&clean);
+    let sel = sel.map(|(lo, hi)| (prefix_len + lo.min(text_len), prefix_len + hi.min(text_len)));
     let mut rows: Vec<String> = Vec::new();
     let mut row = String::new();
     let mut col = 0usize;
     let mut positions: Vec<(usize, usize, usize)> = Vec::new();
-    let place = |shown: String,
+    let place = |styled: String,
+                 w: usize,
                  rows: &mut Vec<String>,
                  row: &mut String,
                  col: &mut usize,
                  positions: &mut Vec<(usize, usize, usize)>| {
-        let w = shown.width();
         if *col + w > capacity && *col > 0 {
             rows.push(std::mem::take(row));
             *col = 0;
         }
         positions.push((rows.len(), 2 + *col, w));
-        row.push_str(&shown);
+        row.push_str(&styled);
         *col += w;
     };
-    for grapheme in prefix.graphemes(true) {
+    for (index, grapheme) in prefix.graphemes(true).enumerate() {
+        let w = grapheme.width();
         place(
-            grapheme.to_string(),
+            highlight(sel, index, grapheme.to_string()),
+            w,
             &mut rows,
             &mut row,
             &mut col,
             &mut positions,
         );
     }
-    for grapheme in clean.graphemes(true) {
+    for (offset, grapheme) in clean.graphemes(true).enumerate() {
+        let index = prefix_len + offset;
         if grapheme == "\n" {
             positions.push((rows.len(), 2 + col, 0));
             rows.push(std::mem::take(&mut row));
@@ -247,12 +532,19 @@ fn layout(prefix: &str, text: &str, cursor: usize, width: usize) -> Layout {
         } else {
             grapheme.to_string()
         };
-        place(shown, &mut rows, &mut row, &mut col, &mut positions);
+        let w = shown.width();
+        place(
+            highlight(sel, index, shown),
+            w,
+            &mut rows,
+            &mut row,
+            &mut col,
+            &mut positions,
+        );
     }
     positions.push((rows.len(), 2 + col, 0));
     rows.push(row);
-    let prefix_len = graphemes(&prefix);
-    let (crow, ccol, _) = positions[(prefix_len + cursor).min(prefix_len + graphemes(&clean))];
+    let (crow, ccol, _) = positions[(prefix_len + cursor).min(prefix_len + text_len)];
     let rows = rows
         .iter()
         .enumerate()
@@ -352,14 +644,24 @@ impl Display {
     }
 
     pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize) {
-        let (prefix, text, cursor) = match &ui.prompt {
-            Some(PendingPrompt::Question { line, .. }) => (String::new(), line.clone(), usize::MAX),
-            Some(PendingPrompt::Permission(_)) => {
-                (String::new(), "[o]nce [a]lways [r]eject".into(), usize::MAX)
+        let (prefix, text, cursor, sel) = match &ui.prompt {
+            Some(PendingPrompt::Question { line, .. }) => {
+                (String::new(), line.clone(), usize::MAX, None)
             }
-            None => (attachment_prefix(draft), draft.text.clone(), draft.cursor),
+            Some(PendingPrompt::Permission(_)) => (
+                String::new(),
+                "[o]nce [a]lways [r]eject".into(),
+                usize::MAX,
+                None,
+            ),
+            None => (
+                attachment_prefix(draft),
+                draft.text.clone(),
+                draft.cursor,
+                draft.selection(),
+            ),
         };
-        let layout = layout(&prefix, &text, cursor, width);
+        let layout = layout(&prefix, &text, cursor, width, sel);
         self.drawn_rows = 0;
         print!("\r");
         if self.columns > 0 {
@@ -515,6 +817,103 @@ mod tests {
     }
 
     #[test]
+    fn undo_steps_back_over_edits() {
+        let mut draft = Draft::default();
+        draft.insert_str("hello");
+        draft.backspace();
+        draft.insert('p');
+        draft.undo();
+        assert_eq!(draft.text, "hell");
+        draft.undo();
+        assert_eq!(draft.text, "hello");
+        assert_eq!(draft.cursor, 5);
+        draft.undo();
+        assert_eq!(draft.text, "");
+        draft.undo(); // empty stack: no-op
+        assert_eq!(draft.text, "");
+    }
+
+    #[test]
+    fn selection_is_replaced_and_deleted_as_a_unit() {
+        let mut draft = Draft::default();
+        draft.insert_str("remove this keep");
+        draft.home();
+        draft.select_word_right();
+        assert_eq!(draft.selection(), Some((0, 6)));
+        draft.insert('X'); // typing replaces the selection
+        assert_eq!(draft.text, "X this keep");
+        assert_eq!(draft.cursor, 1);
+        draft.undo(); // replacing a selection is ONE undo step
+        assert_eq!(draft.text, "remove this keep");
+        assert_eq!(draft.cursor, 6); // caret returns to where typing replaced it
+        draft.home();
+        draft.select_word_right();
+        draft.insert('X');
+        draft.select_end();
+        assert_eq!(draft.selection(), Some((1, 11)));
+        draft.backspace(); // backspace deletes the selection
+        assert_eq!(draft.text, "X");
+        assert!(draft.selection().is_none());
+        // Plain motion drops the selection that Shift starts.
+        draft.select_left();
+        assert_eq!(draft.selection(), Some((0, 1)));
+        draft.left();
+        assert!(draft.selection().is_none());
+    }
+
+    #[test]
+    fn kill_ring_collects_and_yanks() {
+        let mut ring = KillRing::default();
+        let mut draft = Draft::default();
+        draft.insert_str("keep\nchop me");
+        draft.cursor = 5; // start of "chop me"
+        ring.push(draft.kill_line().unwrap()); // kills to end of line
+        assert_eq!(draft.text, "keep\n");
+        assert_eq!(ring.top(), Some("chop me"));
+        draft.cursor = 0;
+        draft.insert_str("yanked "); // Ctrl+Y yank, at the caret
+        assert_eq!(draft.text, "yanked keep\n");
+        // Ctrl+W kills the word behind the caret (cursor 11 = after "keep").
+        draft.cursor = 11;
+        ring.push(draft.kill_word().unwrap());
+        assert_eq!(ring.top(), Some("keep"));
+        assert_eq!(draft.text, "yanked \n");
+        // Ctrl+K at a line end kills the newline itself.
+        draft.cursor = 7;
+        ring.push(draft.kill_line().unwrap());
+        assert_eq!(draft.text, "yanked ");
+        assert_eq!(ring.top(), Some("\n"));
+        // Nothing left to kill: the ring keeps its three entries.
+        draft.end();
+        assert!(draft.kill_line().is_none());
+        assert_eq!(ring.entries.len(), 3);
+    }
+
+    #[test]
+    fn prompt_history_walks_and_restores_the_draft() {
+        let mut history = History::default();
+        history.load(["first".into(), "second".into()]);
+        let mut draft = Draft::default();
+        assert!(history.select(&mut draft, -1));
+        assert_eq!(draft.text, "second");
+        assert!(history.select(&mut draft, -1));
+        assert_eq!(draft.text, "first");
+        assert!(history.select(&mut draft, -1)); // top edge: consumed, no change
+        assert_eq!(draft.text, "first");
+        assert!(history.select(&mut draft, 1));
+        assert_eq!(draft.text, "second");
+        assert!(history.select(&mut draft, 1)); // below newest: restore saved
+        assert_eq!(draft.text, "");
+        assert!(!history.select(&mut draft, 1)); // outside: Down moves rows
+        draft.insert_str("typing");
+        assert!(!history.select(&mut draft, -1)); // non-empty draft: Up moves rows
+        history.remember("typing".into());
+        history.remember("typing".into()); // duplicate of the newest: skipped
+        history.remember(" ".into()); // whitespace-only: skipped
+        assert_eq!(history.entries, ["first", "second", "typing"]);
+    }
+
+    #[test]
     fn attachments_are_removed_without_deleting_source_files() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shot.png");
@@ -523,6 +922,7 @@ mod tests {
             text: "x".into(),
             attachments: vec![super::super::file_attachment(&path).unwrap()],
             cursor: 1,
+            ..Draft::default()
         };
         draft.backspace();
         assert_eq!(draft.attachments.len(), 1);
@@ -538,33 +938,51 @@ mod tests {
 
     fn plain(rows: &[String]) -> Vec<String> {
         rows.iter()
-            .map(|row| row.replace(BOLD, "").replace(RESET, ""))
+            .map(|row| {
+                row.replace(BOLD, "")
+                    .replace(RESET, "")
+                    .replace("\x1b[7m", "")
+                    .replace("\x1b[27m", "")
+            })
             .collect()
     }
 
     #[test]
     fn draft_wraps_across_rows_without_terminal_controls() {
         assert_eq!(clean_input("a\x1b[2J\x08\r\nb"), "a[2J\nb");
-        let rows = plain(&layout("", "long\n中e\u{301}👩‍💻", usize::MAX, 10).rows);
+        let rows = plain(&layout("", "long\n中e\u{301}👩‍💻", usize::MAX, 10, None).rows);
         assert!(rows.iter().all(|row| row.width() <= 10));
         assert!(rows.iter().all(|row| !row.contains('\n')));
         assert!(rows.last().unwrap().ends_with("👩‍💻"));
         // Continuation rows indent under the text.
-        let wide = layout("", "abcdefghij", 5, 6);
+        let wide = layout("", "abcdefghij", 5, 6, None);
         assert_eq!(plain(&wide.rows), ["› abcd", "  efgh", "  ij"]);
         assert_eq!(wide.cursor, (1, 3));
         // An empty draft keeps one prompt row with the caret behind the prompt.
-        let empty = layout("", "", 0, 10);
+        let empty = layout("", "", 0, 10, None);
         assert_eq!(plain(&empty.rows), ["› "]);
         assert_eq!(empty.cursor, (0, 2));
         // The cursor at the very end maps to the last cell of the last row.
-        let end = layout("", "abcd", usize::MAX, 6);
+        let end = layout("", "abcd", usize::MAX, 6, None);
         assert_eq!(end.cursor, (0, 6));
         // Hard newlines start real display rows.
-        assert_eq!(plain(&layout("", "a\nb", 0, 40).rows), ["› a", "  b"]);
+        assert_eq!(plain(&layout("", "a\nb", 0, 40, None).rows), ["› a", "  b"]);
         // Wide characters wrap on cell widths, not grapheme counts.
-        let rows = plain(&layout("", "中中中", 0, 5).rows);
+        let rows = plain(&layout("", "中中中", 0, 5, None).rows);
         assert_eq!(rows, ["› 中", "  中", "  中"]);
+    }
+
+    #[test]
+    fn selected_graphemes_draw_inverted_and_keep_plain_text_intact() {
+        let rows = layout("", "abc", 0, 20, Some((1, 3))).rows;
+        assert!(rows[0].contains("\x1b[7mb\x1b[27m"));
+        assert!(rows[0].contains("\x1b[7mc\x1b[27m"));
+        assert!(!rows[0].contains("\x1b[7ma"));
+        assert_eq!(plain(&rows), ["› abc"]);
+        // A selection across rows highlights on each row.
+        let rows = layout("", "ab\ncd", 0, 20, Some((1, 4))).rows;
+        assert!(rows[0].contains("\x1b[7mb\x1b[27m"));
+        assert!(rows[1].contains("\x1b[7mc\x1b[27m"));
     }
 
     #[test]
