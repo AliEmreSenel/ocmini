@@ -94,7 +94,7 @@ impl Drop for Ui {
 }
 
 fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · Enter send · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
+    println!("{DIM}┌ model {model} · Enter send · ←/→ Home End move · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
 }
 
 fn summarize_input(input: &Value) -> String {
@@ -352,6 +352,8 @@ pub(crate) enum Key {
     /// Move by N rows; page keys report a full page.
     Up(usize),
     Down(usize),
+    Left,
+    Right,
     Home,
     End,
     Tab,
@@ -395,6 +397,8 @@ pub(crate) fn decode_event(event: Event) -> Key {
             }),
             (KeyCode::PageUp, _) => Key::Up(PAGE),
             (KeyCode::PageDown, _) => Key::Down(PAGE),
+            (KeyCode::Left, _) => Key::Left,
+            (KeyCode::Right, _) => Key::Right,
             (KeyCode::Home, _) => Key::Home,
             (KeyCode::End, _) => Key::End,
             (KeyCode::Tab, _) => Key::Tab,
@@ -885,13 +889,14 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                 Err(message) => display.output(&format!("\n{YELLOW}{message}{RESET}\n"), terminal_width()),
                             }
                         } else {
-                            draft.text.push_str(&clean_input(&text));
+                            draft.insert_str(&clean_input(&text));
                         }
                     }
                     Key::Enter if pending_permission => {},
                     Key::Enter => {
                         display.finish_line();
                         let text = std::mem::take(&mut draft.text);
+                        draft.cursor = 0;
                         let files = std::mem::take(&mut draft.attachments);
                         if !text.is_empty() { println!("{BOLD}›{RESET} {text}"); }
                         for file in &files { println!("{DIM}● attached: {}{RESET}", clean_input(&file.filename)); }
@@ -923,7 +928,11 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                         }
                     }
                     Key::Backspace if !pending_permission => { draft.backspace(); }
-                    Key::Char(ch) => { draft.text.push(ch); }
+                    Key::Char(ch) => { draft.insert(ch); }
+                    Key::Left if !pending_question => draft.left(),
+                    Key::Right if !pending_question => draft.right(),
+                    Key::Home if !pending_question => draft.home(),
+                    Key::End if !pending_question => draft.end(),
                     Key::Esc if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     _ => {}
                 }
