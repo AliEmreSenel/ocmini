@@ -574,6 +574,10 @@ pub(super) struct Display {
     columns: usize,
     style: String,
     drawn_rows: usize,
+    /// Row of the drawn block the terminal cursor rests on after `draw`: the
+    /// caret's row, which is the block's last row only when the caret is at
+    /// the end of the draft.
+    caret_row: usize,
 }
 
 impl Display {
@@ -581,12 +585,17 @@ impl Display {
         if self.drawn_rows == 0 {
             return;
         }
+        // Climb from the caret to the block's first row. Climbing `drawn_rows
+        // - 1` instead assumes the caret sits on the last row, so with the
+        // caret higher it lands above the draft and clears committed
+        // transcript rows with it.
         print!("\r");
-        if self.drawn_rows > 1 {
-            print!("\x1b[{}A", self.drawn_rows - 1);
+        if self.caret_row > 0 {
+            print!("\x1b[{}A", self.caret_row);
         }
         print!("\x1b[J");
         self.drawn_rows = 0;
+        self.caret_row = 0;
     }
 
     pub fn finish_line(&mut self) {
@@ -668,6 +677,9 @@ impl Display {
             crate::println!("{}{RESET}", self.tail);
             self.drawn_rows += 1;
         }
+        // A flushed transcript row sits above the draft, so the block starts
+        // one row lower and the caret moves with it.
+        let first = self.drawn_rows;
         for (index, row) in layout.rows.iter().enumerate() {
             if index > 0 {
                 crate::print!("\r\n");
@@ -675,7 +687,8 @@ impl Display {
             crate::print!("{row}");
             self.drawn_rows += 1;
         }
-        let up = self.drawn_rows - 1 - layout.cursor.0;
+        self.caret_row = first + layout.cursor.0;
+        let up = self.drawn_rows - 1 - self.caret_row;
         if up > 0 {
             print!("\x1b[{up}A");
         }
@@ -994,5 +1007,32 @@ mod tests {
         display.output("c\x1b[0m", 5);
         assert_eq!(display.columns, 3);
         assert!(display.style.is_empty());
+    }
+
+    #[test]
+    fn erasing_the_draft_starts_at_the_caret_row() {
+        let ui = Ui {
+            part_kind: std::collections::HashMap::new(),
+            headered: std::collections::HashSet::new(),
+            tool_done: std::collections::HashSet::new(),
+            prompt: None,
+        };
+        let mut draft = Draft::default();
+        draft.insert_str("alpha\nbravo\ncharlie");
+        let mut display = Display::default();
+        // Caret at the end: the terminal cursor rests on the block's last row.
+        display.draw(&ui, &draft, 40);
+        assert_eq!((display.drawn_rows, display.caret_row), (3, 2));
+        // Caret on the first row: the erase climbs to the draft's first row,
+        // never above it, so committed transcript rows stay intact.
+        draft.cursor = 0;
+        display.draw(&ui, &draft, 40);
+        assert_eq!((display.drawn_rows, display.caret_row), (3, 0));
+        // A transcript row flushed above the draft shifts the block down.
+        display.output("streaming", 40);
+        display.draw(&ui, &draft, 40);
+        assert_eq!((display.drawn_rows, display.caret_row), (4, 1));
+        display.erase();
+        assert_eq!((display.drawn_rows, display.caret_row), (0, 0));
     }
 }
