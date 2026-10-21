@@ -11,7 +11,7 @@ mod output;
 pub mod patch;
 
 pub(crate) use files::media_type;
-pub use process::stop_background_jobs;
+pub use process::{cancel_background_jobs, stop_background_jobs};
 mod process;
 mod search;
 mod skills;
@@ -53,7 +53,7 @@ impl ToolCtx {
 
 pub fn tool_defs() -> Vec<Value> {
     vec![
-        fn_def("bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once, keeps running across tool calls and stops when ocmini exits. A timed-out command reports the output captured before the limit.", json!({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"},"timeout":{"type":"integer","minimum":1},"description":{"type":"string"},"background":{"type":"boolean"}},"required":["command"]})),
+        fn_def("bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once and keeps running across tool calls, ending when its session is aborted or deleted, or when ocmini exits. A timed-out command completes with the output captured before the limit and a shell_metadata timeout notice.", json!({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"},"timeout":{"type":"integer","minimum":1},"description":{"type":"string"},"background":{"type":"boolean"}},"required":["command"]})),
         fn_def("read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", json!({"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["filePath"]})),
         fn_def("write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", json!({"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]})),
         fn_def("edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", json!({"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string","minLength":1},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}},"required":["filePath","oldString","newString"]})),
@@ -162,7 +162,13 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                     .unwrap_or("."),
             );
             if input["background"].as_bool().unwrap_or(false) {
-                return process::shell_background(command, &directory, &output::directory()).await;
+                return process::shell_background(
+                    command,
+                    &directory,
+                    &ctx.session_id,
+                    &output::directory(),
+                )
+                .await;
             }
             let timeout = match input.get("timeout") {
                 None | Some(Value::Null) => 120_000,

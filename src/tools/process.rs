@@ -176,7 +176,7 @@ pub async fn shell(
             (
                 None,
                 format!(
-                    "\n[command timed out after {} milliseconds]",
+                    "\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout {} ms. If this command is expected to take longer, retry with a larger timeout value in milliseconds.\n</shell_metadata>",
                     timeout.as_millis()
                 ),
             )
@@ -197,37 +197,66 @@ pub async fn shell(
     .map_err(|e| failure(format!("Shell output task failed: {e}")))?
     .map_err(|e| failure(format!("Cannot read or save shell output: {e}")))?;
     if timed_out {
-        // The captured text is the only record of work the limit cut short.
-        return Err(failure(format!(
-            "Shell command timed out after {} milliseconds\n{}",
-            timeout.as_millis(),
-            result.output
-        )));
+        // OpenCode reports a command that overran its timeout as a completed
+        // call carrying what it printed, with the timeout in shell_metadata;
+        // the captured text is the only record of the work the limit cut short.
+        let mut result = result;
+        if result.output.starts_with("\n\n<shell_metadata>") {
+            result.output.insert_str(0, "(no output)");
+        }
+        result.metadata["timeout"] = true.into();
+        return Ok(result);
     }
     Ok(result)
 }
 
-/// Commands started with `background: true` outlive their tool call. The
-/// runtime stops them when it exits so a session cannot leak processes.
+/// Background jobs are `(session id, pid)`. They outlive the tool call that
+/// started them, so they need an owner: the session that started them ends them
+/// when it is aborted or deleted, and the runtime ends the rest when it exits.
 #[cfg(unix)]
-static BACKGROUND: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static BACKGROUND: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
 
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn take_jobs(keep: impl Fn(&(String, u32)) -> bool) -> Vec<u32> {
+    let mut jobs = BACKGROUND.lock().unwrap();
+    let pids = jobs
+        .iter()
+        .filter(|job| !keep(job))
+        .map(|(_, pid)| *pid)
+        .collect();
+    jobs.retain(keep);
+    pids
+}
+
+/// Ends every background job. Called when the runtime exits, matching the
+/// registry's process-local lifetime.
 pub fn stop_background_jobs() {
     #[cfg(unix)]
-    for pid in BACKGROUND
-        .lock()
-        .map(|mut jobs| std::mem::take(&mut *jobs))
-        .unwrap_or_default()
-    {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
+    for pid in take_jobs(|_| false) {
+        kill_group(pid);
+    }
+}
+
+/// Ends the background jobs one session started. Aborting a turn and deleting a
+/// session both own their sessions' work, so their jobs end with it.
+pub fn cancel_background_jobs(session_id: &str) {
+    #[cfg(unix)]
+    for pid in take_jobs(|(session, _)| session != session_id) {
+        kill_group(pid);
     }
 }
 
 pub async fn shell_background(
     command: &str,
     directory: &Path,
+    session_id: &str,
     output_directory: &Path,
 ) -> Result<ToolOutput, ToolError> {
     std::fs::create_dir_all(output_directory)
@@ -263,14 +292,12 @@ pub async fn shell_background(
     BACKGROUND
         .lock()
         .map_err(|e| failure(e.to_string()))?
-        .push(pid);
+        .push((session_id.to_string(), pid));
     // Reap the job so an exited command never becomes a zombie.
     tokio::spawn(async move {
         let _ = child.wait().await;
         #[cfg(unix)]
-        if let Ok(mut jobs) = BACKGROUND.lock() {
-            jobs.retain(|job| *job != pid);
-        }
+        BACKGROUND.lock().unwrap().retain(|(_, job)| *job != pid);
     });
     Ok(ToolOutput {
         title: format!(
@@ -428,7 +455,7 @@ mod tests {
             &directory,
         )
         .await;
-        assert!(result.unwrap_err().message.contains("timed out"));
+        assert_eq!(result.unwrap().metadata["timeout"], true);
         let pids: Vec<i32> = std::fs::read_to_string(&pidfile)
             .unwrap()
             .split_whitespace()
@@ -505,20 +532,48 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             &root.path().join("output"),
         )
-        .await;
-        let error = result.unwrap_err().message;
-        assert!(error.contains("timed out"), "{error}");
-        assert!(error.contains("BEFORE_LIMIT"), "{error}");
-        assert!(error.contains("BEFORE_STDERR"), "{error}");
+        .await
+        .unwrap();
+        // The captured output survives the limit and the timeout is metadata.
+        assert!(result.output.contains("BEFORE_LIMIT"), "{}", result.output);
+        assert!(result.output.contains("BEFORE_STDERR"), "{}", result.output);
+        assert!(
+            result.output.contains("exceeding timeout 500 ms"),
+            "{}",
+            result.output
+        );
+        assert_eq!(result.metadata["timeout"], true);
+        assert!(result.metadata["exit"].is_null());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_timed_out_silent_command_reports_no_output() {
+        let root = tempfile::tempdir().unwrap();
+        let result = shell(
+            "sleep 30",
+            root.path(),
+            Duration::from_millis(300),
+            Arc::new(AtomicBool::new(false)),
+            &root.path().join("output"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.output.starts_with("(no output)"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
-    async fn background_commands_survive_the_tool_call_and_stop_with_the_runtime() {
+    async fn background_commands_survive_the_tool_call_and_stop_with_their_session() {
         let root = tempfile::tempdir().unwrap();
         let result = shell_background(
             "for i in 1 2 3 4 5 6; do echo tick $i; sleep 0.2; done",
             root.path(),
+            "ses_owner",
             &root.path().join("output"),
         )
         .await
@@ -538,7 +593,10 @@ mod tests {
             Path::new(&format!("/proc/{pid}")).exists(),
             "background job was stopped with the command"
         );
-        stop_background_jobs();
+        // Another session's abort leaves this job alone; its own session ends it.
+        cancel_background_jobs("ses_other");
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        cancel_background_jobs("ses_owner");
         assert_process_stopped(pid).await;
     }
 

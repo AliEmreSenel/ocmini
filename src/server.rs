@@ -402,6 +402,7 @@ async fn session_delete(
         .store
         .delete_session(&id)
         .map_err(ApiError::runtime)?;
+    crate::tools::cancel_background_jobs(&id);
     bus().emit("session.deleted", json!({"info": session}));
     Ok(Json(true))
 }

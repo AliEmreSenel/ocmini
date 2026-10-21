@@ -97,7 +97,9 @@ Automatic compaction may repeat within a turn and within an overflowing model st
 
 Shell and MCP operations honor larger explicit positive timeouts. Web fetches use a 30-second default and clamp requested timeouts to 120 seconds, with a 5 MiB response limit. All remain cancellable. `grep` and `glob` require `rg` on PATH and stream at most 100 results with ripgrep's native glob/ignore rules, without a candidate-file ceiling. Text reads have no whole-file size ceiling: pages default to 2,000 lines, allow larger explicit limits, and retain at most 2,000 characters per line and 50 KiB of text. Existing media limits remain.
 
-A shell command that reaches its timeout reports the output captured before the limit, alongside the timeout, instead of discarding it. `bash` accepts `background: true`, which starts the command in a new session, returns its pid and log path immediately, keeps it running across tool calls, and stops it when the runtime exits. An aborted turn publishes no partial shell result.
+A shell command that reaches its timeout is a completed tool call carrying the output captured before the limit, with a `shell_metadata` notice and `metadata.timeout`, matching OpenCode's shell contract; `metadata.exit` stays null. An aborted turn publishes no partial shell result.
+
+`bash` also accepts `background: true`. This is an ocmini extension: OpenCode 1.19.x has no model-facing background launch, and its background-job registry serves task children. The command starts in a new session and the tool returns its pid and log path at once, so progress is read through the existing file tools. Ownership follows the upstream registry: jobs are process-local, non-durable, and belong to the session that started them, so aborting that turn, deleting that session, or exiting the runtime ends them. The owner-bound get/wait/cancel tools, completion delivery and durable status that upstream requires for this feature are not implemented; a background job has no live progress stream and does not survive a restart.
 
 ### Commands
 

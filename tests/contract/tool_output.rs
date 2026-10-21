@@ -301,10 +301,11 @@ async fn a_timed_out_shell_command_keeps_the_output_it_printed_first() {
         .filter(|part| part["type"] == "tool")
         .collect();
     assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0]["state"]["status"], "error", "{:#}", parts[0]);
-    let error = parts[0]["state"]["error"].as_str().unwrap();
-    assert!(error.contains("timed out"), "{error}");
-    assert!(error.contains("BEFORE_LIMIT"), "{error}");
+    assert_eq!(parts[0]["state"]["status"], "completed", "{:#}", parts[0]);
+    assert_eq!(parts[0]["state"]["metadata"]["timeout"], true);
+    let output = parts[0]["state"]["output"].as_str().unwrap();
+    assert!(output.contains("BEFORE_LIMIT"), "{output}");
+    assert!(output.contains("exceeding timeout 700 ms"), "{output}");
     // The model sees the captured output, not just a bare failure.
     loop {
         let request = provider.request().await;
@@ -317,8 +318,54 @@ async fn a_timed_out_shell_command_keeps_the_output_it_printed_first() {
             continue;
         };
         let content = tool["content"].as_str().unwrap();
-        assert!(content.contains("timed out"), "{content}");
         assert!(content.contains("BEFORE_LIMIT"), "{content}");
+        assert!(content.contains("exceeding timeout 700 ms"), "{content}");
         break;
     }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn aborting_a_session_stops_the_background_jobs_it_started() {
+    let provider = Provider::start(vec![
+        tool_script(
+            "bash",
+            json!({"command":"sleep 300", "background":true}),
+            "call_bg_abort",
+        ),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_bg_abort", "Start a long background job"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let messages = server.messages(&id).await;
+    let parts: Vec<_> = messages
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .filter(|part| part["type"] == "tool")
+        .collect();
+    let pid = parts[0]["state"]["metadata"]["pid"].as_i64().unwrap();
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    server
+        .post(&format!("/session/{id}/abort"), &json!({}))
+        .send()
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("background job {pid} survived the session abort");
 }
