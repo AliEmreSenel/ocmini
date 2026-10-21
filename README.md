@@ -116,7 +116,7 @@ Sessions are saved in `$XDG_DATA_HOME/ocmini/ocmini.db`; refreshed credentials u
 
 History is kept unless `OCMINI_RETENTION_DAYS` enables pruning. Recovery marks interrupted work and preserves queued prompts without replaying potentially completed tool calls.
 
-Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.3-ocmini.0.3.0`, identifies API compatibility.
+Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.3-ocmini.0.3.1`, identifies API compatibility.
 
 Async I/O runs on the main thread by default; file operations and history loading use a separate blocking pool as needed. Set `TOKIO_WORKER_THREADS` to a positive integer to opt into a multithreaded async runtime for heavier concurrent workloads. SQLite checkpoints allow oversized journal files to shrink to 1 MiB on reuse; active transactions can temporarily exceed this size.
 
