@@ -97,6 +97,8 @@ Automatic compaction may repeat within a turn and within an overflowing model st
 
 Shell and MCP operations honor larger explicit positive timeouts. Web fetches use a 30-second default and clamp requested timeouts to 120 seconds, with a 5 MiB response limit. All remain cancellable. `grep` and `glob` require `rg` on PATH and stream at most 100 results with ripgrep's native glob/ignore rules, without a candidate-file ceiling. Text reads have no whole-file size ceiling: pages default to 2,000 lines, allow larger explicit limits, and retain at most 2,000 characters per line and 50 KiB of text. Existing media limits remain.
 
+A shell command that reaches its timeout reports the output captured before the limit, alongside the timeout, instead of discarding it. `bash` accepts `background: true`, which starts the command in a new session, returns its pid and log path immediately, keeps it running across tool calls, and stops it when the runtime exits. An aborted turn publishes no partial shell result.
+
 ### Commands
 
 T3 sends `model` as a **string** on command requests, for example `provider/model`, plus `command`, `arguments`, `messageID`, optional `agent` and `variant`, and file `parts`. It does not send top-level `providerID` and `modelID` on this route.
@@ -218,6 +220,8 @@ MCP initialization is lazy per normalized request/session directory. Starting th
 ## Storage and deliberate exclusions
 
 Session state and transcripts live in the ocmini SQLite database under the XDG data directory. Writes that admit work or fork a transcript are transactional. Message/part ordering is stable. Deleting a session removes dependent data. Restart recovery distinguishes admitted work from interrupted execution; it must not silently rerun already-started shell mutations. There is no automatic 30-day transcript deletion: T3 resumes provider sessions by their native IDs and needs their history.
+
+Several ocmini processes share the database file. Recovery scans run outside the write transaction, so starting an instance does not make sibling writers wait for a full-table scan; a writer that meets a locked database waits on the busy timeout and a contended open is retried, so a burst of instance starts stays a slow start rather than a `database is locked` failure.
 
 For T3's usage widget, a separate `opencode-ocmini.db` sidecar under the OpenCode XDG data directory contains a compatible `message` table with `id`, `session_id`, `data`, and `time_created`. Do not overwrite the real `opencode.db` or duplicate billed usage when copying history during a fork.
 
