@@ -16,14 +16,6 @@ pub(super) struct Draft {
     undo: Vec<(String, usize)>,
 }
 
-pub(super) fn pop_grapheme(text: &mut String) -> bool {
-    let Some((index, _)) = text.grapheme_indices(true).next_back() else {
-        return false;
-    };
-    text.truncate(index);
-    true
-}
-
 pub(super) fn clean_input(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
@@ -453,6 +445,45 @@ pub(super) fn attachment_prefix(draft: &Draft) -> String {
     prefix
 }
 
+/// The text drawn in front of the active draft: a pending question shows its
+/// position, the normal prompt shows its attachment tags. Drawing and row
+/// math (`Draft::move_row`) must agree on it, so both call this.
+pub(super) fn input_prefix(ui: &Ui, draft: &Draft) -> String {
+    match &ui.prompt {
+        Some(PendingPrompt::Question {
+            questions, current, ..
+        }) => {
+            if questions.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "[{}/{}] ",
+                    (*current).min(questions.len() - 1) + 1,
+                    questions.len()
+                )
+            }
+        }
+        Some(PendingPrompt::Permission(_)) => String::new(),
+        None => attachment_prefix(draft),
+    }
+}
+
+/// What the input row shows: its prefix plus the active draft's text, caret
+/// and selection. A pending question draws its own answer draft; the prompt
+/// draft stays hidden underneath until the question settles.
+fn active_input(ui: &Ui, draft: &Draft) -> (String, String, usize, Option<(usize, usize)>) {
+    let prefix = input_prefix(ui, draft);
+    match &ui.prompt {
+        Some(PendingPrompt::Question { draft, .. }) => {
+            (prefix, draft.text.clone(), draft.cursor, draft.selection())
+        }
+        Some(PendingPrompt::Permission(_)) => {
+            (prefix, "[o]nce [a]lways [r]eject".into(), usize::MAX, None)
+        }
+        _ => (prefix, draft.text.clone(), draft.cursor, draft.selection()),
+    }
+}
+
 pub(super) struct Layout {
     pub rows: Vec<String>,
     /// Cursor position as (row, terminal column) among `rows`.
@@ -544,7 +575,14 @@ fn layout(
     }
     positions.push((rows.len(), 2 + col, 0));
     rows.push(row);
-    let (crow, ccol, _) = positions[(prefix_len + cursor).min(prefix_len + text_len)];
+    // usize::MAX means the caret sits after the last grapheme. Adding the
+    // prefix length to it would overflow, so resolve the sentinel first.
+    let caret = if cursor == usize::MAX {
+        prefix_len + text_len
+    } else {
+        (prefix_len + cursor).min(prefix_len + text_len)
+    };
+    let (crow, ccol, _) = positions[caret];
     let rows = rows
         .iter()
         .enumerate()
@@ -653,38 +691,7 @@ impl Display {
     }
 
     pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize) {
-        let (prefix, text, cursor, sel) = match &ui.prompt {
-            Some(PendingPrompt::Question {
-                questions,
-                current,
-                line,
-                ..
-            }) => {
-                // The input row shows which question the typed answer belongs to.
-                let position = if questions.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "[{}/{}] ",
-                        (*current).min(questions.len() - 1) + 1,
-                        questions.len()
-                    )
-                };
-                (position, line.clone(), usize::MAX, None)
-            }
-            Some(PendingPrompt::Permission(_)) => (
-                String::new(),
-                "[o]nce [a]lways [r]eject".into(),
-                usize::MAX,
-                None,
-            ),
-            None => (
-                attachment_prefix(draft),
-                draft.text.clone(),
-                draft.cursor,
-                draft.selection(),
-            ),
-        };
+        let (prefix, text, cursor, sel) = active_input(ui, draft);
         let layout = layout(&prefix, &text, cursor, width, sel);
         self.drawn_rows = 0;
         print!("\r");
@@ -998,6 +1005,42 @@ mod tests {
         // Wide characters wrap on cell widths, not grapheme counts.
         let rows = plain(&layout("", "中中中", 0, 5, None).rows);
         assert_eq!(rows, ["› 中", "  中", "  中"]);
+    }
+
+    #[test]
+    fn the_end_caret_sits_after_the_prefix() {
+        // The question prompt's "usize::MAX means the end" sentinel must land
+        // after the position prefix, not wrap into it.
+        let end = layout("[2/3] ", "1", usize::MAX, 40, None);
+        assert_eq!(end.cursor, (0, 9)); // "› [2/3] 1" is 8 cells, caret after
+        let empty = layout("[2/3] ", "", usize::MAX, 40, None);
+        assert_eq!(empty.cursor, (0, 8));
+    }
+
+    #[test]
+    fn a_pending_question_owns_the_input_row() {
+        // The question's own draft is what the input row draws; the prompt
+        // draft stays hidden underneath it.
+        let ui = Ui {
+            part_kind: std::collections::HashMap::new(),
+            headered: std::collections::HashSet::new(),
+            tool_done: std::collections::HashSet::new(),
+            prompt: Some(PendingPrompt::Question {
+                id: "q1".into(),
+                questions: vec![serde_json::json!({"question": "Pick", "options": []})],
+                answers: vec![Vec::new()],
+                current: 0,
+                draft: Draft {
+                    text: "2".into(),
+                    cursor: 1,
+                    ..Draft::default()
+                },
+            }),
+        };
+        let mut prompt = Draft::default();
+        prompt.insert_str("hidden prompt");
+        let (prefix, text, cursor, _) = active_input(&ui, &prompt);
+        assert_eq!((prefix.as_str(), text.as_str(), cursor), ("[1/1] ", "2", 1));
     }
 
     #[test]
