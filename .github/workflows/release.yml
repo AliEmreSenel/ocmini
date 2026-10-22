@@ -80,7 +80,11 @@ jobs:
           mkdir -p pkg/bin
           cp "target/${{ matrix.target }}/release/$bin" pkg/bin/
           cp README.md pkg/
-          tar -a -cf "$name.$ext" -C pkg bin README.md
+          if [ "$RUNNER_OS" = Windows ]; then
+            python -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", "pkg")' "$name"
+          else
+            tar -czf "$name.$ext" -C pkg bin README.md
+          fi
           if [ "$RUNNER_OS" = macOS ]; then
             shasum -a 256 "$name.$ext" > "$name.$ext.sha256"
           else
