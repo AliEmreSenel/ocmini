@@ -13,9 +13,7 @@ use crossterm::{
 use futures::{poll, StreamExt};
 use serde_json::Value;
 mod input;
-use input::{
-    attachment_prefix, clean_input, pop_grapheme, terminal_width, Display, Draft, History, KillRing,
-};
+use input::{attachment_prefix, clean_input, terminal_width, Display, Draft, History, KillRing};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -87,9 +85,9 @@ enum PendingPrompt {
         // One entry per question, in the same order. Empty until answered, so
         // earlier answers survive while the user goes back to change them.
         answers: Vec<Vec<String>>,
-        // The question whose answer is being typed.
+        // The question whose answer is being typed. The answer text lives in
+        // the shared input draft, which carries full line editing.
         current: usize,
-        line: String,
     },
 }
 
@@ -310,7 +308,6 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
                 questions: questions.clone(),
                 answers: answers.clone(),
                 current: 0,
-                line: String::new(),
             });
             // Questions appear one at a time: the first is shown now, each
             // next when the user reaches it.
@@ -356,17 +353,23 @@ fn parse_answer(line: &str, labels: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Feed one key to the pending question. Returns `(finished, transcript)`:
+/// Feed one key to the pending question. The answer is typed in the shared
+/// input draft, so the normal line editing - caret, selection, word motions,
+/// kill, yank, undo - works on it. Returns `(finished, transcript)`:
 /// `finished` restores the normal input prompt, `transcript` is text to commit
 /// above the input - the answered question's checkmark, the next question when
 /// advancing, a saved answer when going back, or a warning.
-fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> (bool, String) {
+fn answer_question(
+    app: &App,
+    state: &mut PendingPrompt,
+    key: Key,
+    draft: &mut Draft,
+) -> (bool, String) {
     let PendingPrompt::Question {
         id,
         questions,
         answers,
         current,
-        line,
     } = state
     else {
         return (false, String::new());
@@ -381,7 +384,7 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> (bool, Str
                 return (true, String::new());
             };
             let labels = option_labels(&question["options"]);
-            let choices = parse_answer(line, &labels);
+            let choices = parse_answer(&draft.text, &labels);
             if choices.is_empty() {
                 return (false, String::new());
             }
@@ -391,7 +394,7 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> (bool, Str
                 // the typed line so it can be narrowed.
                 return (false, format!("{YELLOW}one answer only{RESET}\n"));
             }
-            line.clear();
+            draft.clear();
             answers[*current] = choices;
             let mut out = format!("  {GREEN}✓{RESET} {}\n", answers[*current].join(", "));
             if answers.iter().all(|answer| !answer.is_empty()) {
@@ -404,23 +407,27 @@ fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> (bool, Str
                 .find(|index| answers[*index].is_empty())
                 .unwrap_or(*current);
             let labels = option_labels(&questions[*current]["options"]);
-            line.push_str(&answer_line(&answers[*current], &labels));
+            draft.insert_str(&answer_line(&answers[*current], &labels));
             out.push_str(&render_question(questions, answers, *current));
             (false, out)
         }
         Key::Backspace => {
             // Backspace edits the typed answer; on an empty line it returns to
             // the previous question with its answer prefilled for changing.
-            if pop_grapheme(line) || *current == 0 {
+            if !draft.text.is_empty() {
+                draft.backspace();
+                return (false, String::new());
+            }
+            if *current == 0 {
                 return (false, String::new());
             }
             *current -= 1;
             let labels = option_labels(&questions[*current]["options"]);
-            line.push_str(&answer_line(&answers[*current], &labels));
+            draft.insert_str(&answer_line(&answers[*current], &labels));
             (false, render_question(questions, answers, *current))
         }
         Key::Char(ch) => {
-            line.push(ch);
+            draft.insert(ch);
             (false, String::new())
         }
         _ => (false, String::new()),
@@ -933,6 +940,9 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     tokio::pin!(shutdown);
 
     let mut draft = Draft::default();
+    // The answer line reuses the draft, so the typed prompt is set aside
+    // while a question is being answered and restored when it settles.
+    let mut stash: Option<(String, Vec<Attachment>)> = None;
     let mut killring = KillRing::default();
     let mut prompt_history = History::default();
     prompt_history.load(session_prompts(&history));
@@ -971,9 +981,9 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::CtrlC => { engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
                     Key::CtrlL => { display.finish_line(); print!("\x1b[2J\x1b[H"); print_prompt(&model_display); }
                     Key::CtrlU => {
-                        if let Some(PendingPrompt::Question { line, .. }) = ui.prompt.as_mut() {
-                            line.clear();
-                        } else if !pending_permission {
+                        // During a question the draft is the answer line, so
+                        // clearing works the same way.
+                        if !pending_permission {
                             draft.clear();
                         }
                     }
@@ -1043,19 +1053,23 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     }
                     key @ (Key::Char(_) | Key::Enter | Key::Backspace | Key::Esc) if pending_question => {
                         if let Some(state) = ui.prompt.as_mut() {
-                            let (finished, out) = answer_question(&app, state, key);
+                            let (finished, out) = answer_question(&app, state, key, &mut draft);
                             if !out.is_empty() {
                                 display.output(&out, terminal_width());
                             }
                             if finished {
                                 ui.prompt = None;
+                                // Hand the answer line back to the prompt.
+                                if let Some((text, files)) = stash.take() {
+                                    draft.attachments = files;
+                                    draft.text = text;
+                                    draft.caret_at_end();
+                                }
                             }
                         }
                     }
                     Key::Paste(text) if pending_question => {
-                        if let Some(PendingPrompt::Question { line, .. }) = ui.prompt.as_mut() {
-                            line.push_str(&clean_input(&text).replace('\n', " "));
-                        }
+                        draft.insert_str(&clean_input(&text));
                     }
                     Key::Paste(_) if pending_permission => {}
                     Key::Paste(text) => {
@@ -1111,35 +1125,37 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::NewLine if !pending_permission && !pending_question => {
                         draft.insert('\n');
                     }
-                    Key::Delete if !pending_permission && !pending_question => draft.delete(),
-                    Key::Undo if !pending_permission && !pending_question => draft.undo(),
-                    Key::KillLine if !pending_permission && !pending_question => {
+                    // The answer line is the draft, so every motion, selection,
+                    // kill, yank and undo works on it while a question is open.
+                    Key::Delete if !pending_permission => draft.delete(),
+                    Key::Undo if !pending_permission => draft.undo(),
+                    Key::KillLine if !pending_permission => {
                         if let Some(killed) = draft.kill_line() {
                             killring.push(killed);
                         }
                     }
-                    Key::KillWord if !pending_permission && !pending_question => {
+                    Key::KillWord if !pending_permission => {
                         if let Some(killed) = draft.kill_word() {
                             killring.push(killed);
                         }
                     }
-                    Key::Yank if !pending_permission && !pending_question => {
+                    Key::Yank if !pending_permission => {
                         if let Some(text) = killring.top() {
                             draft.insert_str(text);
                         }
                     }
-                    Key::Left if !pending_question => draft.left(),
-                    Key::Right if !pending_question => draft.right(),
-                    Key::WordLeft if !pending_question => draft.word_left(),
-                    Key::WordRight if !pending_question => draft.word_right(),
-                    Key::Home if !pending_question => draft.home(),
-                    Key::End if !pending_question => draft.end(),
-                    Key::SelectLeft if !pending_question => draft.select_left(),
-                    Key::SelectRight if !pending_question => draft.select_right(),
-                    Key::SelectHome if !pending_question => draft.select_home(),
-                    Key::SelectEnd if !pending_question => draft.select_end(),
-                    Key::SelectWordLeft if !pending_question => draft.select_word_left(),
-                    Key::SelectWordRight if !pending_question => draft.select_word_right(),
+                    Key::Left => draft.left(),
+                    Key::Right => draft.right(),
+                    Key::WordLeft => draft.word_left(),
+                    Key::WordRight => draft.word_right(),
+                    Key::Home => draft.home(),
+                    Key::End => draft.end(),
+                    Key::SelectLeft => draft.select_left(),
+                    Key::SelectRight => draft.select_right(),
+                    Key::SelectHome => draft.select_home(),
+                    Key::SelectEnd => draft.select_end(),
+                    Key::SelectWordLeft => draft.select_word_left(),
+                    Key::SelectWordRight => draft.select_word_right(),
                     Key::Up(n) if !pending_permission && !pending_question => {
                         // Up on an empty draft recalls previous prompts;
                         // otherwise it moves the caret across display rows.
@@ -1161,7 +1177,19 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                 display.erase();
                 match event {
                     Ok(event) => {
+                        let was_prompt = ui.prompt.is_some();
                         let output = render_event(&mut ui, &event, &session.id);
+                        // The answer line takes over the draft, so set the
+                        // typed prompt aside when the question opens.
+                        if !was_prompt
+                            && matches!(ui.prompt, Some(PendingPrompt::Question { .. }))
+                        {
+                            stash = Some((
+                                std::mem::take(&mut draft.text),
+                                std::mem::take(&mut draft.attachments),
+                            ));
+                            draft.cursor = 0;
+                        }
                         display.output(&output, terminal_width());
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => display.output(&format!("\n{YELLOW}⚠ some events were skipped{RESET}\n"), terminal_width()),

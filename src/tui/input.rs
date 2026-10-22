@@ -16,14 +16,6 @@ pub(super) struct Draft {
     undo: Vec<(String, usize)>,
 }
 
-pub(super) fn pop_grapheme(text: &mut String) -> bool {
-    let Some((index, _)) = text.grapheme_indices(true).next_back() else {
-        return false;
-    };
-    text.truncate(index);
-    true
-}
-
 pub(super) fn clean_input(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
@@ -356,6 +348,12 @@ impl Draft {
         self.cursor = 0;
         self.anchor = None;
     }
+
+    /// Move the caret after the last grapheme, e.g. when the draft takes over
+    /// text typed elsewhere.
+    pub fn caret_at_end(&mut self) {
+        self.cursor = graphemes(&self.text);
+    }
 }
 
 /// Recently killed text, newest first; Ctrl+Y yanks the newest.
@@ -662,12 +660,11 @@ impl Display {
     pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize) {
         let (prefix, text, cursor, sel) = match &ui.prompt {
             Some(PendingPrompt::Question {
-                questions,
-                current,
-                line,
-                ..
+                questions, current, ..
             }) => {
-                // The input row shows which question the typed answer belongs to.
+                // The input row shows which question the typed answer belongs
+                // to. The answer is the shared draft, so full line editing -
+                // caret, selection, kill and undo - works on it.
                 let position = if questions.is_empty() {
                     String::new()
                 } else {
@@ -677,7 +674,12 @@ impl Display {
                         questions.len()
                     )
                 };
-                (position, line.clone(), usize::MAX, None)
+                (
+                    position,
+                    draft.text.clone(),
+                    draft.cursor,
+                    draft.selection(),
+                )
             }
             Some(PendingPrompt::Permission(_)) => (
                 String::new(),
@@ -1005,6 +1007,16 @@ mod tests {
         // Wide characters wrap on cell widths, not grapheme counts.
         let rows = plain(&layout("", "中中中", 0, 5, None).rows);
         assert_eq!(rows, ["› 中", "  中", "  中"]);
+    }
+
+    #[test]
+    fn caret_at_end_lands_after_the_text() {
+        let mut draft = Draft::default();
+        draft.insert_str("中ab");
+        draft.home();
+        assert_eq!(draft.cursor, 0);
+        draft.caret_at_end();
+        assert_eq!(draft.cursor, 3);
     }
 
     #[test]
