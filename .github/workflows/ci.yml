@@ -2,35 +2,64 @@ name: Rust runtime checks
 
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'validation/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'validation/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  RUSTFLAGS: -D warnings
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      RUSTFLAGS: -D warnings
-    strategy:
-      matrix:
-        rust: ["1.85.0", stable]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Install Rust
-        run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stable
+          # PRs restore the default branch cache without uploading a copy per PR.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Ensure ripgrep is available
+        run: |
+          if ! command -v rg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          fi
       - name: Check formatting
-        if: matrix.rust == 'stable'
         run: cargo +stable fmt --all -- --check
       - name: Lint all targets
-        run: cargo +${{ matrix.rust }} clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
       - name: Unit and contract tests
-        run: cargo +${{ matrix.rust }} test --all-targets --locked
-      # One release build is enough as a compile check; it is the slowest step
-      # in the job (fat LTO, one codegen unit), so skip it on the second leg.
-      - name: Build release executable
-        if: matrix.rust == '1.85.0'
-        run: cargo +${{ matrix.rust }} build --release --locked
+        run: cargo +stable test --all-targets --locked
+
+  msrv:
+    # Stable covers PRs; check compiler compatibility once after merging.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimum Rust version
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.85.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check all targets on the minimum Rust version
+        run: cargo +1.85.0 check --all-targets --all-features --locked
