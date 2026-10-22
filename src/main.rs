@@ -19,7 +19,7 @@ mod usage_db;
 
 use clap::{Args, Parser, Subcommand};
 
-pub const OPENCODE_COMPAT_VERSION: &str = "1.19.3-ocmini.0.3.2";
+pub const OPENCODE_COMPAT_VERSION: &str = "1.19.3-ocmini.0.3.3";
 
 #[derive(Parser)]
 #[command(version = OPENCODE_COMPAT_VERSION, about = "A compact OpenCode-compatible coding runtime", args_conflicts_with_subcommands = true)]
