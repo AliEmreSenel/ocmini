@@ -717,9 +717,6 @@ pub(super) struct Display {
     visibility: Visibility,
 }
 
-/// Transcript rows full-screen repaints keep in memory.
-const MAX_LINES: usize = 20_000;
-
 impl Default for Display {
     fn default() -> Self {
         Self::new(false)
@@ -843,15 +840,6 @@ impl Display {
     fn push_row(&mut self, row: String) {
         if self.fullscreen {
             self.lines.push((self.tail_kind, format!("{row}{RESET}")));
-            let excess = self.lines.len().saturating_sub(MAX_LINES);
-            if excess > 0 {
-                let removed: usize = self.lines[..excess]
-                    .iter()
-                    .map(|(_, line)| wrap_row(line, self.paint_width).len())
-                    .sum();
-                self.lines.drain(..excess);
-                self.scroll = self.scroll.map(|top| top.saturating_sub(removed));
-            }
         } else if self.visibility.visible(self.tail_kind) {
             crate::println!("{row}{RESET}");
         }
