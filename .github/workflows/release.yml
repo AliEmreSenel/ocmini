@@ -1,0 +1,81 @@
+name: Release binaries
+
+# Tag a commit as vX.Y.Z (matching Cargo.toml) and this publishes prebuilt
+# executables on the GitHub Release: Linux (glibc + musl), macOS (Apple
+# silicon) and Windows. Builds run on native runners, so the bundled SQLite
+# C build needs no cross toolchain. Binaries are unsigned: macOS users must
+# clear the Gatekeeper quarantine (`xattr -d com.apple.quarantine ocmini`)
+# and Windows shows a SmartScreen prompt.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the package version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          test "$version" = "$tag" || { echo "::error::tag v$tag but Cargo.toml says $version"; exit 1; }
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="ocmini-$version-${{ matrix.target }}"
+          bin=ocmini
+          ext=tar.gz
+          if [ "$RUNNER_OS" = Windows ]; then bin=ocmini.exe; ext=zip; fi
+          mkdir -p pkg/bin
+          cp "target/${{ matrix.target }}/release/$bin" pkg/bin/
+          cp README.md pkg/
+          tar -a -cf "$name.$ext" -C pkg bin README.md
+          sha256sum "$name.$ext" > "$name.$ext.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ocmini-*.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes artifacts/*

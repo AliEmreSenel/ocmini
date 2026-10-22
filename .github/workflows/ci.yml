@@ -29,5 +29,8 @@ jobs:
         run: cargo +${{ matrix.rust }} clippy --all-targets --all-features --locked -- -D warnings
       - name: Unit and contract tests
         run: cargo +${{ matrix.rust }} test --all-targets --locked
+      # One release build is enough as a compile check; it is the slowest step
+      # in the job (fat LTO, one codegen unit), so skip it on the second leg.
       - name: Build release executable
+        if: matrix.rust == '1.85.0'
         run: cargo +${{ matrix.rust }} build --release --locked
