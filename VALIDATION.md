@@ -335,14 +335,21 @@ into the text channel are stripped before a title is saved. Terminal chat
 shows `◦ generating title…` and the chosen title, run mode stays silent, and
 the bus carries `session.title` start/done events.
 
+Admission checks the placeholder rule before naming, not only before saving: a
+prompt in a session that already has a real title starts no title request, so
+the model path never paid a side request per message and never printed
+`◦ generating title…` for a rename `set_title` would refuse — a start event
+with no matching done, on every message.
+
 Seven unit tests cover title derivation, the placeholder rule, the once-only
-rename, control-token stripping and the model chain; two contract tests pin
+rename, control-token stripping and the model chain; three contract tests pin
 the server paths: `POST /session` starts as `New session`, the first
 `prompt_async` renames it and emits `session.updated` with the new title, and
 a session created with a title keeps it; with `title_model` set the session
 takes the model's title, the title request carries the prompt tool-free, and a
-title request that dies falls back to the first prompt line. Formatting,
-Clippy with warnings denied, and the full suite pass.
+title request that dies falls back to the first prompt line; a titled session's
+next prompt is answered by the model alone, with no title request and no start
+event. Formatting, Clippy with warnings denied, and the full suite pass.
 
 ## Manual checks
 

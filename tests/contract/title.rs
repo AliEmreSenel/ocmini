@@ -114,3 +114,88 @@ async fn the_title_model_names_the_session_and_failures_fall_back_to_the_prompt(
     }
     assert_eq!(title.as_deref(), Some("Investigate flaky tests"));
 }
+
+#[tokio::test]
+async fn a_session_with_a_title_stops_asking_the_title_model() {
+    // Every prompt used to print "generating title…" under `title_model`:
+    // admission started a title request for a session that already had a real
+    // title, and `set_title` refused the rename, so no "done" ever followed it.
+    // Naming is a first-prompt job; a titled session's prompts are only answered.
+    let mut provider = Provider::start(vec![
+        text_script("Titled By Model", ""),
+        text_script("first answer", ""),
+        text_script("second answer", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({"title_model": "mock/test-model"})).await;
+    let created: Value = server
+        .post("/session", &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_one", "Fix the resume picker"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
+    provider.request().await; // The title request.
+    provider.request().await; // The answer.
+
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_two", "Keep going"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let turn = events.through("session.idle").await;
+    assert!(
+        turn.iter().all(
+            |event| event["type"] != "session.title" || event["properties"]["state"] != "start"
+        ),
+        "a titled session started writing a title again: {turn:?}"
+    );
+
+    // Admission starts a title request before the drain runs, so a title
+    // request would arrive as this prompt's first request.
+    let answer = provider.request().await;
+    assert!(
+        !answer["messages"]
+            .as_array()
+            .is_some_and(
+                |messages| messages.iter().any(|message| message["role"] == "system"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Name this conversation")))
+            ),
+        "the second prompt asked for a title: {answer}"
+    );
+    assert!(
+        provider.requests.try_recv().is_err(),
+        "a titled session asked the title model again"
+    );
+    let session: Value = server
+        .get(&format!("/session/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["title"], "Titled By Model");
+}

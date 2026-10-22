@@ -58,8 +58,9 @@ pub fn open(
 }
 
 /// True when a title came from the launcher rather than from the user. A fork
-/// of a placeholder session is a placeholder too.
-fn is_placeholder(title: &str) -> bool {
+/// of a placeholder session is a placeholder too. Naming a session is the only
+/// job that looks at this, so it is the whole once-only rule.
+pub(crate) fn is_placeholder(title: &str) -> bool {
     let title = title.trim_end_matches(" (fork)");
     title.trim().is_empty() || PLACEHOLDER_TITLES.contains(&title)
 }

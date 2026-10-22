@@ -42,6 +42,16 @@ fn chain(cfg: &Config, session_model: &ModelRef) -> Vec<ModelRef> {
 /// reply) moves to the next model, and the last resort is the prompt's first
 /// line: a session is never left wearing its launcher title.
 pub(crate) fn launch(app: App, sid: String, parts: &[Value], session_model: &ModelRef) {
+    // Admission calls this for every prompt; naming is a first-prompt job. A
+    // session that already has a real title needs no rename, so a later prompt
+    // starts neither a title request nor the "generating title…" line that
+    // `set_title` would refuse and `apply` would never answer.
+    let Ok(Some(session)) = app.store.get_session(&sid) else {
+        return;
+    };
+    if !sessions::is_placeholder(&session.title) {
+        return;
+    }
     let chain = chain(&app.config.lock().unwrap(), session_model);
     if chain.is_empty() {
         apply(sessions::auto_title(&app.store, &sid, parts), &sid);
