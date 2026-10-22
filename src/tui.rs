@@ -82,12 +82,84 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
     out.replace('\n', " ")
 }
 
+/// Which runtime toggle hides a transcript row. Everything else is always
+/// painted, so a toggle can never swallow a prompt, an error or a tool's name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowKind {
+    Plain,
+    /// Chain of thought: the `◦ thinking` header and every reasoning delta.
+    Thinking,
+    /// A tool call's collapsed form: the `● tool` line and a truncated result.
+    ToolBrief,
+    /// The same call with its full command and its full result. Exactly one of
+    /// the two forms is painted, so Ctrl+O swaps views instead of hiding work.
+    ToolFull,
+}
+
+/// Transcript noise the reader can hide while chatting, with Ctrl+T and Ctrl+O.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Visibility {
+    pub thinking: bool,
+    /// Tool calls: collapsed one-liners, or the full command and full result.
+    pub tools_expanded: bool,
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Self {
+            thinking: true,
+            tools_expanded: false,
+        }
+    }
+}
+
+impl Visibility {
+    fn visible(&self, kind: RowKind) -> bool {
+        match kind {
+            RowKind::Plain => true,
+            RowKind::Thinking => self.thinking,
+            RowKind::ToolBrief => !self.tools_expanded,
+            RowKind::ToolFull => self.tools_expanded,
+        }
+    }
+
+    /// Header text naming each toggle's key with the state it switches to.
+    fn hints(&self) -> String {
+        format!(
+            " · Ctrl+T thinking {} · Ctrl+O tools {}",
+            if self.thinking { "on" } else { "off" },
+            if self.tools_expanded {
+                "expanded"
+            } else {
+                "collapsed"
+            }
+        )
+    }
+}
+
+/// Transcript text split by the kind that hides it, so the renderer filters per
+/// row instead of per call: one event can emit a visible tool line and a
+/// hideable result line.
+#[derive(Default)]
+struct Transcript(Vec<(RowKind, String)>);
+
+impl Transcript {
+    fn text(&mut self, kind: RowKind) -> &mut String {
+        if self.0.last().is_none_or(|(last, _)| *last != kind) {
+            self.0.push((kind, String::new()));
+        }
+        &mut self.0.last_mut().unwrap().1
+    }
+}
+
 struct Ui {
     part_kind: HashMap<String, &'static str>, // partID -> text | reasoning
     headered: std::collections::HashSet<String>, // part ids that printed their header
     tool_done: std::collections::HashSet<String>,
     // Prompt interaction routed from the terminal: lines when idle, keys while a request is pending.
     prompt: Option<PendingPrompt>,
+    /// Live transcript toggles, mirrored into the display on every change.
+    visibility: Visibility,
 }
 
 enum PendingPrompt {
@@ -119,7 +191,7 @@ impl Drop for Ui {
     }
 }
 
-fn prompt_header(model: &str, fullscreen: bool) -> String {
+fn prompt_header(model: &str, fullscreen: bool, visibility: Visibility) -> String {
     // Full-screen scrolling is app-owned, so the header names the keys the
     // terminal's own wheel would otherwise handle.
     let scroll = if fullscreen {
@@ -127,10 +199,12 @@ fn prompt_header(model: &str, fullscreen: bool) -> String {
     } else {
         ""
     };
-    format!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ↑↓ history · ←→↑↓ Home End move · Alt+←→ word · Shift select · Ctrl+A/E line · Ctrl+K/W cut · Ctrl+Y yank · Ctrl+Z undo · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{scroll}{RESET}")
+    format!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ↑↓ history · ←→↑↓ Home End move · Alt+←→ word · Shift select · Ctrl+A/E line · Ctrl+K/W cut · Ctrl+Y yank · Ctrl+Z undo · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{}{scroll}{RESET}", visibility.hints())
 }
 
-pub(crate) fn summarize_input(input: &Value) -> String {
+/// The parts that identify a tool call, in the order shown. Newlines survive,
+/// so an expanded multi-line command reads as typed.
+fn input_summary(input: &Value) -> String {
     let mut parts = Vec::new();
     if let Some(command) = input["command"].as_str() {
         parts.push(command.to_string());
@@ -150,48 +224,91 @@ pub(crate) fn summarize_input(input: &Value) -> String {
     if parts.is_empty() {
         parts.push(input.to_string());
     }
-    truncate(&parts.join(" "), 120)
+    parts.join(" ")
 }
 
-/// A tool call as the transcript shows it: the tool with its input summary
-/// (command, path, pattern, …). Shared by the live event stream and the
-/// resumed history so a session reads the same after `--continue` as it did
-/// while running.
-fn tool_line(part: &Value) -> String {
-    format!(
-        "{CYAN}● {}{RESET} {DIM}{}{RESET}",
-        part["tool"].as_str().unwrap_or("tool"),
-        summarize_input(&part["state"]["input"])
+/// The collapsed transcript line for a tool call.
+pub(crate) fn summarize_input(input: &Value) -> String {
+    truncate(&input_summary(input), 120)
+}
+
+/// Text one expanded tool call paints. The tool layer already caps a result at
+/// 50 KiB and points at the file it saved (`tools/output.rs`), so this is that
+/// same bound used as a display guard: a tool that ever handed over a 1 GiB
+/// result cannot flood the transcript and the terminal's scrollback.
+const MAX_EXPANDED: usize = 50 * 1024;
+
+/// Whole tool text for the expanded view, capped at `MAX_EXPANDED` and indented
+/// two columns, so a multi-line command or result reads as one block under its
+/// marker. A cut-off block names what it left out, so truncation never reads as
+/// a complete answer.
+fn expand(text: &str) -> String {
+    let shown: String = text.chars().take(MAX_EXPANDED).collect();
+    let omitted = text.chars().count() - shown.chars().count();
+    let note = if omitted == 0 {
+        String::new()
+    } else {
+        format!("\n\u2026 {omitted} more characters not shown").replace('\u2026', '…')
+    };
+    format!("{shown}{note}").replace('\n', "\n  ")
+}
+
+/// A tool call's opening row in the two forms `Ctrl+O` switches between:
+/// `(collapsed, expanded)` — the input summary truncated to one line, and the
+/// whole command. Shared by the live event stream and the resumed history, so a
+/// session reads the same after `--continue` as it did while running, and a
+/// saved call expands just like a live one.
+fn tool_line(part: &Value) -> (String, String) {
+    let mark = format!("{CYAN}● {}{RESET}", part["tool"].as_str().unwrap_or("tool"));
+    let input = input_summary(&part["state"]["input"]);
+    (
+        format!("{mark} {DIM}{}{RESET}", truncate(&input, 120)),
+        format!("{mark} {DIM}{}{RESET}", expand(&input)),
     )
 }
 
-/// The result line of a finished tool call: `✓` with an output preview, `✗`
-/// with the error. `None` while the call is still pending or running.
-fn tool_result(part: &Value) -> Option<String> {
+/// The result row of a finished tool call, in both forms: `✓` with an output
+/// preview, `✗` with the error. `None` while the call is still pending or
+/// running. A failure shows in both forms, so collapsing a call can never make
+/// it look like it succeeded.
+fn tool_result(part: &Value) -> Option<(String, String)> {
     let state = &part["state"];
-    match state["status"].as_str() {
-        Some("completed") => Some(format!(
-            "  {GREEN}✓{RESET} {DIM}{}{RESET}",
-            truncate(state["output"].as_str().unwrap_or_default(), 160)
-        )),
-        Some("error") => Some(format!(
-            "  {RED}✗{RESET} {}",
-            truncate(state["error"].as_str().unwrap_or("failed"), 160)
-        )),
-        _ => None,
-    }
+    let (mark, text) = match state["status"].as_str() {
+        // The preview is dim as a secondary line; a failure is not.
+        Some("completed") => (
+            format!("{GREEN}✓{RESET} {DIM}"),
+            state["output"].as_str().unwrap_or_default(),
+        ),
+        Some("error") => (
+            format!("{RED}✗{RESET} "),
+            state["error"].as_str().unwrap_or("failed"),
+        ),
+        _ => return None,
+    };
+    Some((
+        format!("  {mark}{}{RESET}", truncate(text, 160)),
+        format!("  {mark}{}{RESET}", expand(text)),
+    ))
 }
 
-/// One saved tool call: its line plus its result, or the status it stopped at
-/// when it never finished.
-fn tool_block(part: &Value) -> String {
+/// One saved tool call in both forms: its row plus its result, or the status it
+/// stopped at when it never finished.
+fn tool_block(part: &Value) -> (String, String) {
+    let (line, full_line) = tool_line(part);
     match tool_result(part) {
-        Some(result) => format!("\n{}\n{result}\n", tool_line(part)),
-        None => format!(
-            "\n{} {DIM}· {}{RESET}\n",
-            tool_line(part),
-            part["state"]["status"].as_str().unwrap_or_default()
+        Some((result, full_result)) => (
+            format!("\n{line}\n{result}\n"),
+            format!("\n{full_line}\n{full_result}\n"),
         ),
+        // A call that never finished has no result, so both forms show the
+        // status it stopped at.
+        None => {
+            let status = part["state"]["status"].as_str().unwrap_or_default();
+            (
+                format!("\n{line} {DIM}· {status}{RESET}\n"),
+                format!("\n{full_line} {DIM}· {status}{RESET}\n"),
+            )
+        }
     }
 }
 
@@ -271,14 +388,20 @@ fn answer_line(answer: &[String], labels: &[String]) -> String {
         .join(" ")
 }
 
-fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -> String {
+/// Transcript text for one bus event, split into runs that the Ctrl+T / Ctrl+O
+/// toggles can hide independently.
+fn render_event(
+    ui: &mut Ui,
+    event: &crate::types::BusEvent,
+    session_id: &str,
+) -> Vec<(RowKind, String)> {
     use std::fmt::Write as _;
-    let mut output = String::new();
+    let mut transcript = Transcript::default();
     macro_rules! print {
-        ($($arg:tt)*) => {{ let _ = write!(output, $($arg)*); }};
+        ($kind:expr, $($arg:tt)*) => {{ let _ = write!(transcript.text($kind), $($arg)*); }};
     }
     macro_rules! println {
-        ($($arg:tt)*) => {{ let _ = writeln!(output, $($arg)*); }};
+        ($kind:expr, $($arg:tt)*) => {{ let _ = writeln!(transcript.text($kind), $($arg)*); }};
     }
     let properties = &event.properties;
     if properties["sessionID"]
@@ -286,7 +409,7 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
         .or_else(|| properties["part"]["sessionID"].as_str())
         .is_some_and(|id| id != session_id)
     {
-        return output;
+        return Vec::new();
     }
     match event.r#type.as_str() {
         "message.part.updated" => {
@@ -302,19 +425,24 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
                     let is_new = ui.part_kind.insert(part_id.clone(), kind).is_none();
                     if is_new {
                         if kind == "reasoning" {
-                            println!("\n{DIM}◦ thinking{RESET}");
+                            println!(RowKind::Thinking, "\n{DIM}◦ thinking{RESET}");
                         } else {
-                            println!("\n{BOLD}assistant{RESET}");
+                            println!(RowKind::Plain, "\n{BOLD}assistant{RESET}");
                         }
                     }
                 }
                 Some("tool") => {
+                    // Both forms are emitted and Ctrl+O picks which one is
+                    // painted, so expanding shows a call that already ran.
+                    let (line, full_line) = tool_line(part);
                     if ui.headered.insert(format!("{part_id}:start")) {
-                        println!("\n{}", tool_line(part));
+                        println!(RowKind::ToolBrief, "\n{line}");
+                        println!(RowKind::ToolFull, "\n{full_line}");
                     }
-                    if let Some(result) = tool_result(part) {
+                    if let Some((result, full_result)) = tool_result(part) {
                         if ui.tool_done.insert(part_id) {
-                            println!("{result}");
+                            println!(RowKind::ToolBrief, "{result}");
+                            println!(RowKind::ToolFull, "{full_result}");
                         }
                     }
                 }
@@ -325,14 +453,15 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
             let part_id = properties["partID"].as_str().unwrap_or_default();
             let delta = properties["delta"].as_str().unwrap_or_default();
             match ui.part_kind.get(part_id).copied() {
-                Some("text") => print!("{delta}"),
-                Some("reasoning") => print!("{DIM}{delta}{RESET}"),
+                Some("text") => print!(RowKind::Plain, "{delta}"),
+                Some("reasoning") => print!(RowKind::Thinking, "{DIM}{delta}{RESET}"),
                 _ => {}
             }
         }
         "permission.asked" => {
             let id = properties["id"].as_str().unwrap_or_default().to_string();
             println!(
+                RowKind::Plain,
                 "\n{YELLOW}⚠ permission{}: {}{RESET} {DIM}[o]nce [a]lways [r]eject{RESET}",
                 properties["permission"]
                     .as_str()
@@ -371,21 +500,26 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
             // Questions appear one at a time: the first is shown now, each
             // next when the user reaches it.
             if !questions.is_empty() {
-                print!("{}", render_question(&questions, &answers, 0));
+                print!(
+                    RowKind::Plain,
+                    "{}",
+                    render_question(&questions, &answers, 0)
+                );
             }
         }
         "session.error" => {
             let message = properties["error"]["data"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
-            println!("\n{RED}error:{RESET} {message}");
+            println!(RowKind::Plain, "\n{RED}error:{RESET} {message}");
         }
         "session.idle" => {
-            println!("\n{DIM}└ idle{RESET}");
+            println!(RowKind::Plain, "\n{DIM}└ idle{RESET}");
         }
         "session.title" => match properties["state"].as_str() {
-            Some("start") => println!("\n{DIM}◦ generating title…{RESET}"),
+            Some("start") => println!(RowKind::Plain, "\n{DIM}◦ generating title…{RESET}"),
             Some("done") => println!(
+                RowKind::Plain,
                 "{DIM}◦ title: {}{RESET}",
                 truncate(properties["title"].as_str().unwrap_or_default(), 60)
             ),
@@ -393,7 +527,7 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
         },
         _ => {}
     }
-    output
+    transcript.0
 }
 
 /// One answer line for one question. A line of option numbers ("2", "1 3" for
@@ -589,6 +723,9 @@ pub(crate) enum Key {
     Tab,
     /// Shift+Tab: the previous question (Tab is the next-question motion).
     PreviousQuestion,
+    /// Ctrl+T / Ctrl+O: hide chain of thought and tool results while chatting.
+    ToggleThinking,
+    ToggleTools,
     /// Transcript scrolling. Full-screen mode scrolls its own transcript with
     /// these; native mode keeps the terminal's wheel and pages the draft.
     PageUp,
@@ -626,6 +763,8 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => Key::KillLine,
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => Key::KillWord,
             (KeyCode::Char('y'), KeyModifiers::CONTROL) => Key::Yank,
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => Key::ToggleThinking,
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => Key::ToggleTools,
             // Readline aliases for the line-start / line-end motion.
             (KeyCode::Char('a'), KeyModifiers::CONTROL) => Key::Home,
             (KeyCode::Char('e'), KeyModifiers::CONTROL) => Key::End,
@@ -980,7 +1119,13 @@ fn render_history(display: &mut Display, history: &[MessageWithParts]) {
                     &format!("{}\n", part["text"].as_str().unwrap_or_default()),
                     width,
                 ),
-                Some("tool") => display.output(&tool_block(part), width),
+                // A resumed call takes part in the Ctrl+O toggle, so it
+                // expands exactly like the live transcript did.
+                Some("tool") => {
+                    let (line, full_line) = tool_block(part);
+                    display.output_as(&line, width, RowKind::ToolBrief);
+                    display.output_as(&full_line, width, RowKind::ToolFull);
+                }
                 Some("file") => display.output(
                     &format!(
                         "{DIM}attachment: {}{RESET}\n",
@@ -1100,6 +1245,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
         headered: std::collections::HashSet::new(),
         tool_done: std::collections::HashSet::new(),
         prompt: None,
+        visibility: Visibility::default(),
     };
     let width = terminal_width();
     display.output(
@@ -1118,7 +1264,10 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     );
     render_history(&mut display, &history);
     display.output(
-        &format!("{}\n", prompt_header(&model_display, fullscreen)),
+        &format!(
+            "{}\n",
+            prompt_header(&model_display, fullscreen, ui.visibility)
+        ),
         width,
     );
     display.draw(&ui, &draft, terminal_width());
@@ -1143,9 +1292,27 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     Key::CtrlC => { engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
                     Key::CtrlL => display.clear_screen(
-                        &prompt_header(&model_display, fullscreen),
+                        &prompt_header(&model_display, fullscreen, ui.visibility),
                         terminal_width(),
                     ),
+                    key @ (Key::ToggleThinking | Key::ToggleTools) => {
+                        // Runtime transcript toggles. Full-screen mode repaints
+                        // from the rows it kept, so hidden text comes back;
+                        // native mode cannot rewrite the terminal's scrollback,
+                        // so the change applies to output from here on.
+                        match key {
+                            Key::ToggleThinking => ui.visibility.thinking = !ui.visibility.thinking,
+                            _ => ui.visibility.tools_expanded = !ui.visibility.tools_expanded,
+                        }
+                        display.set_visibility(ui.visibility);
+                        display.output(
+                            &format!(
+                                "{}\n",
+                                prompt_header(&model_display, fullscreen, ui.visibility)
+                            ),
+                            terminal_width(),
+                        );
+                    }
                     Key::CtrlU => {
                         if !pending_permission {
                             active_draft(&mut ui.prompt, &mut draft).clear();
@@ -1178,7 +1345,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                         display.output(
                                             &format!(
                                                 "{}\n",
-                                                prompt_header(&model_display, fullscreen)
+                                                prompt_header(&model_display, fullscreen, ui.visibility)
                                             ),
                                             terminal_width(),
                                         );
@@ -1215,7 +1382,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                         display.output(
                                             &format!(
                                                 "{}\n",
-                                                prompt_header(&model_display, fullscreen)
+                                                prompt_header(&model_display, fullscreen, ui.visibility)
                                             ),
                                             terminal_width(),
                                         );
@@ -1504,8 +1671,9 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                 display.erase();
                 match event {
                     Ok(event) => {
-                        let output = render_event(&mut ui, &event, &session.id);
-                        display.output(&output, terminal_width());
+                        for (kind, text) in render_event(&mut ui, &event, &session.id) {
+                            display.output_as(&text, terminal_width(), kind);
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => display.output(&format!("\n{YELLOW}⚠ some events were skipped{RESET}\n"), terminal_width()),
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1524,13 +1692,15 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_line, decode_event, file_attachment, image_attachment, parse_answer,
-        pasted_image_path, render_confirmation, render_event, render_question, switch_question,
-        tool_block, tool_line, tool_result, Draft, Key, PendingPrompt, Ui, WHEEL,
+        answer_line, decode_event, expand, file_attachment, image_attachment, parse_answer,
+        pasted_image_path, prompt_header, render_confirmation, render_event, render_question,
+        switch_question, tool_block, tool_line, tool_result, Draft, Key, PendingPrompt, RowKind,
+        Ui, Visibility, MAX_EXPANDED, WHEEL,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     };
+    use std::collections::{HashMap, HashSet};
 
     pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
 
@@ -1840,6 +2010,34 @@ mod tests {
         assert!(image_attachment(b"not an image".to_vec()).is_none());
     }
 
+    /// A `Ui` with no pending prompt, for transcript rendering.
+    fn new_ui() -> Ui {
+        Ui {
+            part_kind: HashMap::new(),
+            headered: HashSet::new(),
+            tool_done: HashSet::new(),
+            prompt: None,
+            visibility: Visibility::default(),
+        }
+    }
+
+    fn bus_event(type_: &str, properties: serde_json::Value) -> crate::types::BusEvent {
+        crate::types::BusEvent {
+            id: "e1".into(),
+            r#type: type_.into(),
+            properties,
+        }
+    }
+
+    /// The transcript text one toggle paints.
+    fn painted(segments: &[(RowKind, String)], kind: RowKind) -> String {
+        segments
+            .iter()
+            .filter(|(row_kind, _)| *row_kind == kind)
+            .map(|(_, text)| text.as_str())
+            .collect()
+    }
+
     fn completed_tool() -> serde_json::Value {
         serde_json::json!({"id":"prt_1","sessionID":"ses_1","messageID":"msg_1","type":"tool",
             "tool":"bash","callID":"call_1","state":{"status":"completed",
@@ -1852,19 +2050,29 @@ mod tests {
     fn a_resumed_tool_call_shows_its_command_and_its_result() {
         // The saved part keeps input, output and error, so a resumed session
         // has everything the live transcript showed.
-        let text = plain(&tool_block(&completed_tool()));
+        let (collapsed, expanded) = tool_block(&completed_tool());
+        let text = plain(&collapsed);
         assert!(text.contains("● bash ls -la"), "{text}");
         assert!(
             text.contains("✓ total 8 drwxr-xr-x 2 user user 4096 ."),
+            "{text}"
+        );
+        // A resumed call expands like a live one: the saved output whole, its
+        // continuation lines indented under the marker.
+        let text = plain(&expanded);
+        assert!(
+            text.contains("total 8\n  drwxr-xr-x 2 user user 4096 ."),
             "{text}"
         );
 
         let failed = serde_json::json!({"type":"tool","tool":"read","state":{
             "status":"error","input":{"filePath":"/tmp/missing.txt"},
             "error":"File not found","time":{"start":1,"end":2}}});
-        let text = plain(&tool_block(&failed));
-        assert!(text.contains("● read /tmp/missing.txt"), "{text}");
-        assert!(text.contains("✗ File not found"), "{text}");
+        let (collapsed, expanded) = tool_block(&failed);
+        for text in [plain(&collapsed), plain(&expanded)] {
+            assert!(text.contains("● read /tmp/missing.txt"), "{text}");
+            assert!(text.contains("✗ File not found"), "{text}");
+        }
     }
 
     #[test]
@@ -1872,9 +2080,12 @@ mod tests {
         for status in ["running", "pending"] {
             let part = serde_json::json!({"type":"tool","tool":"bash","state":{
                 "status":status,"input":{"command":"sleep 30"},"time":{"start":1}}});
-            let text = plain(&tool_block(&part));
-            assert!(text.contains("● bash sleep 30"), "{text}");
-            assert!(text.ends_with(&format!("· {status}\n")), "{text}");
+            let (collapsed, expanded) = tool_block(&part);
+            // The status is part of the call, so both forms carry it.
+            for text in [plain(&collapsed), plain(&expanded)] {
+                assert!(text.contains("● bash sleep 30"), "{text}");
+                assert!(text.ends_with(&format!("· {status}\n")), "{text}");
+            }
             assert!(tool_result(&part).is_none(), "{status} has no result line");
         }
     }
@@ -1882,39 +2093,234 @@ mod tests {
     #[test]
     fn the_live_tool_lines_and_the_resumed_ones_are_the_same_lines() {
         let part = completed_tool();
-        let mut ui = Ui {
-            part_kind: std::collections::HashMap::new(),
-            headered: Default::default(),
-            tool_done: Default::default(),
-            prompt: None,
-        };
-        let event = crate::types::BusEvent {
-            id: "evt_1".into(),
-            r#type: "message.part.updated".into(),
-            properties: serde_json::json!({"part": part.clone()}),
-        };
-        let live = plain(&render_event(&mut ui, &event, "ses_1"));
-        assert_eq!(live, plain(&tool_block(&part)));
+        let mut ui = new_ui();
+        let segments = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.updated",
+                serde_json::json!({"part": part.clone()}),
+            ),
+            "ses_1",
+        );
+        // One renderer formats a call for both paths, in both forms.
+        let (collapsed, expanded) = tool_block(&part);
+        assert_eq!(painted(&segments, RowKind::ToolBrief), collapsed);
+        assert_eq!(painted(&segments, RowKind::ToolFull), expanded);
 
         // The header and result each print once, however many updates follow.
-        let updates = ["running", "completed"].map(|status| crate::types::BusEvent {
-            id: "evt".into(),
-            r#type: "message.part.updated".into(),
-            properties: serde_json::json!({"part": serde_json::json!({
+        for status in ["running", "completed"] {
+            let event = bus_event(
+                "message.part.updated",
+                serde_json::json!({"part": serde_json::json!({
                     "id":"prt_1","sessionID":"ses_1","type":"tool","tool":"bash",
                     "state":{"status":status,"input":{"command":"ls -la"}}})}),
-        });
-        for event in updates {
-            assert_eq!(render_event(&mut ui, &event, "ses_1"), "");
+            );
+            assert!(render_event(&mut ui, &event, "ses_1").is_empty());
         }
         // A part from another session stays off this transcript.
-        let other = crate::types::BusEvent {
-            id: "evt_2".into(),
-            r#type: "message.part.updated".into(),
-            properties: serde_json::json!({"part": {"id":"prt_2","sessionID":"ses_2",
+        let other = bus_event(
+            "message.part.updated",
+            serde_json::json!({"part": {"id":"prt_2","sessionID":"ses_2",
                 "type":"tool","tool":"bash","state":{"status":"completed","input":{}}}}),
-        };
-        assert_eq!(render_event(&mut ui, &other, "ses_1"), "");
-        assert_eq!(plain(&tool_line(&completed_tool())), "● bash ls -la");
+        );
+        assert!(render_event(&mut ui, &other, "ses_1").is_empty());
+        assert_eq!(plain(&tool_line(&completed_tool()).0), "● bash ls -la");
+    }
+
+    #[test]
+    fn the_transcript_toggles_decode_and_report_their_state_in_the_header() {
+        for (ch, key) in [
+            ('t', Key::ToggleThinking),
+            ('o', Key::ToggleTools),
+            ('T', Key::Other),
+            ('O', Key::Other),
+        ] {
+            assert_eq!(
+                decode_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::CONTROL
+                ))),
+                key
+            );
+        }
+        // The header names both keys, so the toggles are discoverable. Thinking
+        // starts shown, tool calls start collapsed.
+        let starts = Visibility::default();
+        assert!(starts.thinking && !starts.tools_expanded);
+        let header = plain(&prompt_header("mock/m", false, starts));
+        assert!(header.contains("Ctrl+T thinking on"));
+        assert!(header.contains("Ctrl+O tools collapsed"));
+        let header = plain(&prompt_header(
+            "mock/m",
+            false,
+            Visibility {
+                thinking: false,
+                tools_expanded: true,
+            },
+        ));
+        assert!(header.contains("Ctrl+T thinking off"));
+        assert!(header.contains("Ctrl+O tools expanded"));
+    }
+
+    #[test]
+    fn thinking_and_tool_calls_split_into_segments_the_toggles_pick() {
+        let mut ui = new_ui();
+        // A reasoning part opens with a hideable header.
+        let segments = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.updated",
+                serde_json::json!({"sessionID": "s", "part": {"id": "r1", "sessionID": "s", "type": "reasoning"}}),
+            ),
+            "s",
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].0, RowKind::Thinking);
+        assert!(plain(&segments[0].1).contains("thinking"));
+        // Its deltas follow the part's kind, so hiding it hides the stream.
+        let segments = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.delta",
+                serde_json::json!({"sessionID": "s", "partID": "r1", "delta": "pondering"}),
+            ),
+            "s",
+        );
+        assert_eq!(segments[0].0, RowKind::Thinking);
+        assert_eq!(plain(&segments[0].1), "pondering");
+        // A finished tool emits a collapsed form and an expanded form, so
+        // Ctrl+O swaps views instead of hiding work, and shows calls that
+        // already ran. The long command and result are kept whole when expanded.
+        let command = format!("ls {}", "dir/".repeat(60));
+        let output = "notes.txt\nplan.md\nlong ".repeat(40);
+        let segments = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.updated",
+                serde_json::json!({"sessionID": "s", "part": {"id": "t1", "sessionID": "s",
+                    "type": "tool", "tool": "bash",
+                    "state": {"status": "completed", "input": {"command": command}, "output": output}}}),
+            ),
+            "s",
+        );
+        let segments: Vec<_> = segments
+            .into_iter()
+            .map(|(kind, text)| (kind, plain(&text)))
+            .collect();
+        let collapsed = segments
+            .iter()
+            .filter(|(kind, _)| *kind == RowKind::ToolBrief)
+            .map(|(_, text)| text)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("");
+        let expanded_form = segments
+            .iter()
+            .filter(|(kind, _)| *kind == RowKind::ToolFull)
+            .map(|(_, text)| text)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(collapsed.contains("● bash") && collapsed.contains("ls dir/"));
+        // Collapsed keeps the one-liners it always had.
+        assert!(collapsed.contains('…') && !collapsed.contains(&output));
+        // A leading blank row, then one row each for the call and its result.
+        assert_eq!(collapsed.lines().count(), 3);
+        // Expanded shows the whole command and the whole result, the multi-line
+        // result indented under its marker.
+        assert!(expanded_form.contains(&command));
+        assert!(expanded_form.contains("plan.md"));
+        assert!(expanded_form.contains("\n  long "));
+        assert_eq!(expanded_form.lines().count(), 2 + output.lines().count());
+        assert!(segments.iter().all(|(kind, _)| *kind != RowKind::Plain));
+        // Answer text is never hideable.
+        let mut ui = new_ui();
+        render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.updated",
+                serde_json::json!({"sessionID": "s", "part": {"id": "x1", "sessionID": "s", "type": "text"}}),
+            ),
+            "s",
+        );
+        let segments = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.delta",
+                serde_json::json!({"sessionID": "s", "partID": "x1", "delta": "the answer"}),
+            ),
+            "s",
+        );
+        assert_eq!(segments, vec![(RowKind::Plain, "the answer".into())]);
+    }
+
+    #[test]
+    fn a_failed_tool_call_shows_in_both_forms() {
+        for tools_expanded in [false, true] {
+            let mut ui = new_ui();
+            ui.visibility.tools_expanded = tools_expanded;
+            let segments = render_event(
+                &mut ui,
+                &bus_event(
+                    "message.part.updated",
+                    serde_json::json!({"sessionID": "s", "part": {"id": "t1", "sessionID": "s",
+                        "type": "tool", "tool": "bash",
+                        "state": {"status": "error", "input": {}, "error": "permission denied"}}}),
+                ),
+                "s",
+            );
+            // Hiding tool output must never hide a failure: a collapsed call
+            // that failed has to look like it failed.
+            assert!(segments.iter().any(|(kind, text)| ui
+                .visibility
+                .visible(*kind)
+                && plain(text).contains("✗ permission denied")));
+        }
+    }
+
+    #[test]
+    fn expanded_tool_text_is_capped_and_says_so() {
+        // Text that fits shows whole; continuation lines indent under the call.
+        assert_eq!(expand("short"), "short");
+        assert_eq!(expand("line\nline"), "line\n  line");
+        // Past the cap the write to the terminal is bounded, and the note names
+        // what is missing so a cut-off block never reads as complete.
+        let huge = "x".repeat(MAX_EXPANDED + 5_000);
+        let shown = expand(&huge);
+        assert!(shown.chars().count() < huge.chars().count());
+        assert!(shown.ends_with("\n  … 5000 more characters not shown"));
+    }
+
+    #[test]
+    fn a_huge_tool_result_cannot_flood_the_expanded_transcript() {
+        let mut ui = new_ui();
+        let output = "y".repeat(4 * MAX_EXPANDED);
+        let segments = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.updated",
+                serde_json::json!({"sessionID": "s", "part": {"id": "t1", "sessionID": "s",
+                    "type": "tool", "tool": "bash",
+                    "state": {"status": "completed", "input": {"command": "grep -r . ."}, "output": output}}}),
+            ),
+            "s",
+        );
+        // One expanded call paints its command plus its result, each capped,
+        // and the result says how much of it was left out.
+        let shown: String = segments
+            .iter()
+            .filter(|(kind, _)| *kind == RowKind::ToolFull)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        let text = plain(&shown);
+        assert!(text.contains("● bash grep -r . ."), "{text}");
+        assert!(text.contains("more characters not shown"), "{text}");
+        assert!(
+            shown.chars().count() <= 2 * MAX_EXPANDED + 200,
+            "{} chars",
+            shown.chars().count()
+        );
+    }
+}
     }
 }
