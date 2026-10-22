@@ -509,6 +509,27 @@ pub async fn cancelled(cancel: &Arc<AtomicBool>) {
 
 const COMPACTION_PROMPT: &str = "Summarize the conversation for another coding agent to continue. Preserve the user's goal, constraints, decisions, changed files, executed commands and their results, unresolved errors, and next actions. Quote relevant identifiers and paths. Do not perform the task or call tools. Produce a substantive continuation summary.";
 
+/// Transient provider failures permit five retries per request. OpenCode
+/// retries every model request, the compaction summary included, through the
+/// same processor policy.
+const MAX_RETRIES: u32 = 5;
+
+/// OpenCode caps each tool result in the summarizer input at 2000 characters:
+/// the summary needs the gist of a tool call, not its full output. Carrying
+/// whole tool outputs makes the summary request the largest of the turn.
+const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
+
+/// Truncate one tool result for the summarizer input, matching OpenCode's
+/// `truncate()`. Counts Unicode scalar characters, as ocmini's other caps do.
+fn truncate_tool_output(text: &str) -> String {
+    if text.chars().count() <= TOOL_OUTPUT_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut kept: String = text.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
+    kept.push_str("\n[truncated]");
+    kept
+}
+
 #[derive(Default)]
 struct CompactionPolicy {
     settings: CompactionCfg,
@@ -648,6 +669,16 @@ async fn compact_history(
     if request_messages.is_empty() {
         return Err("Nothing to compact".into());
     }
+    // OpenCode serializes the transcript for the summarizer with tool results
+    // capped at 2000 characters. Whole tool outputs make this the largest and
+    // slowest request of the turn, the one a flaky relay kills first.
+    for message in &mut request_messages {
+        if message["role"] == "tool" {
+            if let Some(content) = message["content"].as_str() {
+                message["content"] = json!(truncate_tool_output(content));
+            }
+        }
+    }
     request_messages
         .push(json!({"role": "user", "content": "Produce the continuation summary now."}));
     let request = ChatRequest {
@@ -659,10 +690,10 @@ async fn compact_history(
         session_id: Some(sid.into()),
     };
     // The summary request carries most of the window, so it is the largest and
-    // slowest request of the turn. The transport deaths the main loop retries
-    // must not end recovery here, or the overflow error surfaces verbatim and
-    // the turn is lost.
-    const MAX_COMPACTION_RETRIES: u32 = 3;
+    // slowest request of the turn. OpenCode sends it through the same retry
+    // policy as a model step; the transport deaths the main loop retries must
+    // not end recovery here, or the overflow error surfaces verbatim and the
+    // turn is lost.
     let mut summary = String::new();
     let mut attempt = 0u32;
     'summary: loop {
@@ -672,7 +703,7 @@ async fn compact_history(
             _ = cancelled(cancel) => return Err("Aborted".into()),
         } {
             Ok(stream) => stream,
-            Err(error) if error.retryable && attempt < MAX_COMPACTION_RETRIES => {
+            Err(error) if error.retryable && attempt < MAX_RETRIES => {
                 attempt += 1;
                 tokio::select! {
                     _ = tokio::time::sleep(retry_delay(error.retry_after, attempt)) => {}
@@ -709,7 +740,7 @@ async fn compact_history(
             None if finished => break 'summary,
             None => "provider compaction stream ended before a completion event".to_string(),
         };
-        if provider::stream_retryable(&error) && attempt < MAX_COMPACTION_RETRIES {
+        if provider::stream_retryable(&error) && attempt < MAX_RETRIES {
             attempt += 1;
             tokio::select! {
                 _ = tokio::time::sleep(retry_delay(None, attempt)) => {}
@@ -904,7 +935,6 @@ async fn run_turn(
         })?;
         emit_message(&info);
         emit_part(&start_part);
-        const MAX_RETRIES: u32 = 5;
         let mut attempt: u32 = 0;
         // Compaction may repeat while it reduces an overflowing request. Stop
         // when a checkpoint makes no progress, rather than after a fixed count.
@@ -2303,6 +2333,22 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn summarizer_caps_tool_outputs_at_the_upstream_length() {
+        assert_eq!(truncate_tool_output("short"), "short");
+        let long = "x".repeat(TOOL_OUTPUT_MAX_CHARS + 10);
+        assert_eq!(
+            truncate_tool_output(&long),
+            format!("{}\n[truncated]", "x".repeat(TOOL_OUTPUT_MAX_CHARS))
+        );
+        // Counts scalar characters, so a cap boundary never splits an escape.
+        let unicode = "é".repeat(TOOL_OUTPUT_MAX_CHARS + 5);
+        assert_eq!(
+            truncate_tool_output(&unicode).chars().count(),
+            TOOL_OUTPUT_MAX_CHARS + "\n[truncated]".chars().count()
+        );
     }
 
     #[test]

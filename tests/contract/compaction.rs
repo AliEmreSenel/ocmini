@@ -752,3 +752,74 @@ async fn context_overflow_compaction_retries_a_dying_summary_request() {
         .collect();
     assert_eq!(text, "Done after a retried compaction");
 }
+
+#[tokio::test]
+async fn compaction_summarizer_caps_tool_outputs_like_upstream() {
+    // Upstream serializes the summarizer input with each tool result capped at
+    // 2000 characters. Whole tool outputs make the summary request the largest
+    // of the turn, the one a flaky relay kills first. The verbatim tail replay
+    // keeps full results; only the summarizer input is capped.
+    let big = "x".repeat(9000);
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "bash",
+            json!({"command": "printf 'x%.0s' $(seq 1 9000)"}),
+            "call_0",
+        ),
+        Script::http_status_body(400, "maximum context length is 32000 tokens"),
+        text_script("Capped summary. ", "Ready to continue"),
+        text_script("Done ", "with a capped summarizer input"),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    let response = server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_capped", "print a lot"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "overflow recovery must succeed: {:?}",
+        response.text().await.unwrap()
+    );
+    let terminal = events.through("session.idle").await;
+    assert!(
+        !terminal
+            .iter()
+            .any(|event| event["type"] == "session.error"),
+        "the overflow must not surface: {terminal:?}"
+    );
+    let requests: Vec<_> = std::iter::from_fn(|| provider.requests.try_recv().ok()).collect();
+    assert_eq!(
+        requests.len(),
+        4,
+        "tool step, overflow, summarizer, replay: {requests:#?}"
+    );
+    let summarizer = &requests[2];
+    assert_eq!(
+        summarizer["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .map(|content| content.chars().filter(|c| *c == 'x').count())
+            .sum::<usize>(),
+        2000,
+        "the summarizer input must cap the tool result at 2000 characters"
+    );
+    let summarizer_text = summarizer.to_string();
+    assert!(
+        summarizer_text.contains("[truncated]"),
+        "the cap must be marked: {summarizer_text}"
+    );
+    assert!(
+        requests[3].to_string().contains(&big),
+        "the verbatim tail keeps the full tool result"
+    );
+}
