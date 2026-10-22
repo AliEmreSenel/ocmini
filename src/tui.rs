@@ -123,10 +123,10 @@ impl Visibility {
         }
     }
 
-    /// Header text naming each toggle's key with the state it switches to.
+    /// Compact status for the current transcript visibility.
     fn hints(&self) -> String {
         format!(
-            " · Ctrl+T thinking {} · Ctrl+O tools {}",
+            " · thinking {} · tools {}",
             if self.thinking { "on" } else { "off" },
             if self.tools_expanded {
                 "expanded"
@@ -191,15 +191,47 @@ impl Drop for Ui {
     }
 }
 
-fn prompt_header(model: &str, fullscreen: bool, visibility: Visibility) -> String {
-    // Full-screen scrolling is app-owned, so the header names the keys the
-    // terminal's own wheel would otherwise handle.
+fn prompt_header(model: &str, visibility: Visibility) -> String {
+    format!(
+        "{DIM}┌ /help · F1 help · model {model}{}{RESET}",
+        visibility.hints()
+    )
+}
+
+/// Local help is shown only on request, never sent to the model.
+fn help_text(fullscreen: bool) -> String {
     let scroll = if fullscreen {
-        " · PgUp/PgDn scroll transcript · Ctrl+Home/End jump · wheel scrolls"
+        "  PgUp/PgDn              Scroll transcript\n  Ctrl+Home/End          Jump to top/bottom\n  Mouse wheel            Scroll transcript\n"
     } else {
-        ""
+        "  PgUp/PgDn              Move through draft\n  Mouse wheel            Terminal scrollback\n"
     };
-    format!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ↑↓ history · ←→↑↓ Home End move · Alt+←→ word · Shift select · Ctrl+A/E line · Ctrl+K/W cut · Ctrl+Y yank · Ctrl+Z undo · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{}{scroll}{RESET}", visibility.hints())
+    format!(
+        "\n{BOLD}Help{RESET}\n\
+  /help or F1            Show this help\n\
+  /quit or Ctrl+D        Quit\n\
+  Enter                  Send\n\
+  Alt+Enter              Insert newline\n\
+  Up/Down                History on empty draft; move in text\n\
+  Left/Right, Home/End   Move caret\n\
+  Alt+Left/Right         Move by word (also Ctrl+Left/Right)\n\
+  Alt+B/F                Move by word\n\
+  Shift + motion         Select text\n\
+  Ctrl+A/E               Start/end of line\n\
+  Ctrl+K/W               Cut to line end / previous word\n\
+  Ctrl+Y                 Yank\n\
+  Ctrl+Z                 Undo\n\
+  Paste                  Insert all lines\n\
+  Ctrl+V/Ctrl+Shift+V    Attach clipboard image\n\
+  Alt+Backspace          Remove latest image\n\
+  Ctrl+U                 Clear draft and images\n\
+  Ctrl+C                 Abort turn\n\
+  Ctrl+L                 Clear screen\n\
+  Ctrl+R                 Switch session\n\
+  Ctrl+T                 Toggle thinking\n\
+  Ctrl+O                 Expand/collapse tools\n\
+{scroll}\
+  Questions: Tab/Shift+Tab switch; Enter answers/confirms; Esc dismisses\n"
+    )
 }
 
 /// The parts that identify a tool call, in the order shown. Newlines survive,
@@ -695,6 +727,7 @@ pub(crate) enum Key {
     CtrlD,
     CtrlL,
     CtrlR,
+    Help,
     CtrlV,
     CtrlU,
     RemoveAttachment,
@@ -752,6 +785,7 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => Key::CtrlD,
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => Key::CtrlL,
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => Key::CtrlR,
+            (KeyCode::F(1), _) => Key::Help,
             (KeyCode::Char('v' | 'V'), modifiers)
                 if modifiers.contains(KeyModifiers::CONTROL)
                     && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
@@ -1263,14 +1297,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
         width,
     );
     render_history(&mut display, &history);
-    display.output(
-        &format!(
-            "{}\n",
-            prompt_header(&model_display, fullscreen, ui.visibility)
-        ),
-        width,
-    );
-    display.draw(&ui, &draft, terminal_width());
+    display.draw(&ui, &draft, terminal_width(), &model_display);
 
     loop {
         tokio::select! {
@@ -1291,10 +1318,12 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     Key::CtrlC => { engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
-                    Key::CtrlL => display.clear_screen(
-                        &prompt_header(&model_display, fullscreen, ui.visibility),
-                        terminal_width(),
-                    ),
+                    Key::CtrlL => display.clear_screen(),
+                    Key::Help => {
+                        display.finish_line();
+                        display.output(&help_text(fullscreen), terminal_width());
+                        display.scroll_bottom();
+                    }
                     key @ (Key::ToggleThinking | Key::ToggleTools) => {
                         // Runtime transcript toggles. Full-screen mode repaints
                         // from the rows it kept, so hidden text comes back;
@@ -1305,13 +1334,6 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                             _ => ui.visibility.tools_expanded = !ui.visibility.tools_expanded,
                         }
                         display.set_visibility(ui.visibility);
-                        display.output(
-                            &format!(
-                                "{}\n",
-                                prompt_header(&model_display, fullscreen, ui.visibility)
-                            ),
-                            terminal_width(),
-                        );
                     }
                     Key::CtrlU => {
                         if !pending_permission {
@@ -1340,13 +1362,6 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                     Err(error) => {
                                         display.output(
                                             &format!("{RED}error:{RESET} {error}\n"),
-                                            terminal_width(),
-                                        );
-                                        display.output(
-                                            &format!(
-                                                "{}\n",
-                                                prompt_header(&model_display, fullscreen, ui.visibility)
-                                            ),
                                             terminal_width(),
                                         );
                                     }
@@ -1379,13 +1394,6 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                             terminal_width(),
                                         );
                                         render_history(&mut display, &history);
-                                        display.output(
-                                            &format!(
-                                                "{}\n",
-                                                prompt_header(&model_display, fullscreen, ui.visibility)
-                                            ),
-                                            terminal_width(),
-                                        );
                                     }
                                 }
                             }
@@ -1503,6 +1511,13 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                         }
                     }
                     Key::Enter if pending_permission => {},
+                    Key::Enter if draft.text.trim() == "/help" => {
+                        // Keep attachments: asking for help must not discard them.
+                        draft.clear_text();
+                        display.finish_line();
+                        display.output(&help_text(fullscreen), terminal_width());
+                        display.scroll_bottom();
+                    }
                     Key::Enter => {
                         display.finish_line();
                         let (text, files) = draft.take();
@@ -1663,7 +1678,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::Esc if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     _ => {}
                 }
-                display.draw(&ui, &draft, terminal_width());
+                display.draw(&ui, &draft, terminal_width(), &model_display);
             }
             event = events.recv() => {
                 display.erase();
@@ -1676,7 +1691,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => display.output(&format!("\n{YELLOW}⚠ some events were skipped{RESET}\n"), terminal_width()),
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                display.draw(&ui, &draft, terminal_width());
+                display.draw(&ui, &draft, terminal_width(), &model_display);
             }
         }
     }
@@ -1690,10 +1705,10 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_line, decode_event, expand, file_attachment, image_attachment, parse_answer,
-        pasted_image_path, prompt_header, render_confirmation, render_event, render_question,
-        switch_question, tool_block, tool_line, tool_result, Draft, Key, PendingPrompt, RowKind,
-        Ui, Visibility, MAX_EXPANDED, WHEEL,
+        answer_line, decode_event, expand, file_attachment, help_text, image_attachment,
+        parse_answer, pasted_image_path, prompt_header, render_confirmation, render_event,
+        render_question, switch_question, tool_block, tool_line, tool_result, Draft, Key,
+        PendingPrompt, RowKind, Ui, Visibility, MAX_EXPANDED, WHEEL,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -2126,6 +2141,23 @@ mod tests {
     }
 
     #[test]
+    fn help_is_discoverable_and_lists_the_active_scroll_controls() {
+        assert_eq!(
+            decode_event(Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))),
+            Key::Help
+        );
+        let header = plain(&prompt_header("mock/m", Visibility::default()));
+        assert!(header.contains("/help"));
+        assert!(header.contains("F1"));
+        assert!(!header.contains("Ctrl+"));
+        let fullscreen = plain(&help_text(true));
+        assert!(fullscreen.contains("Ctrl+T"));
+        assert!(fullscreen.contains("Ctrl+O"));
+        assert!(fullscreen.contains("Ctrl+Home/End"));
+        assert!(!help_text(false).contains("Ctrl+Home/End"));
+    }
+
+    #[test]
     fn the_transcript_toggles_decode_and_report_their_state_in_the_header() {
         for (ch, key) in [
             ('t', Key::ToggleThinking),
@@ -2141,23 +2173,21 @@ mod tests {
                 key
             );
         }
-        // The header names both keys, so the toggles are discoverable. Thinking
-        // starts shown, tool calls start collapsed.
+        // The status reports visibility; shortcuts are available in help.
         let starts = Visibility::default();
         assert!(starts.thinking && !starts.tools_expanded);
-        let header = plain(&prompt_header("mock/m", false, starts));
-        assert!(header.contains("Ctrl+T thinking on"));
-        assert!(header.contains("Ctrl+O tools collapsed"));
+        let header = plain(&prompt_header("mock/m", starts));
+        assert!(header.contains("thinking on"));
+        assert!(header.contains("tools collapsed"));
         let header = plain(&prompt_header(
             "mock/m",
-            false,
             Visibility {
                 thinking: false,
                 tools_expanded: true,
             },
         ));
-        assert!(header.contains("Ctrl+T thinking off"));
-        assert!(header.contains("Ctrl+O tools expanded"));
+        assert!(header.contains("thinking off"));
+        assert!(header.contains("tools expanded"));
     }
 
     #[test]
