@@ -87,6 +87,9 @@ enum PendingPrompt {
         answers: Vec<Vec<String>>,
         // The question whose answer is being typed.
         current: usize,
+        // The answered summary is on screen: Enter sends the answers, Tab
+        // steps back into them, any other key edits the current question.
+        confirm: bool,
         // Each question keeps its own draft, so switching questions (Tab /
         // Shift+Tab, or Backspace on an empty line) never loses a half-typed
         // answer, while the prompt draft waits untouched underneath the set.
@@ -311,6 +314,7 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
                 questions: questions.clone(),
                 answers: answers.clone(),
                 current: 0,
+                confirm: false,
                 drafts: (0..questions.len()).map(|_| Draft::default()).collect(),
             });
             // Questions appear one at a time: the first is shown now, each
@@ -384,15 +388,16 @@ fn active_draft<'a>(prompt: &'a mut Option<PendingPrompt>, draft: &'a mut Draft)
 /// Send the pending question's answer line. Returns `(finished, transcript)`:
 /// `finished` clears the pending question, and `transcript` is text to commit
 /// above the input - the answered question's checkmark, the next question when
-/// advancing, or a warning. A line that answers nothing stays in the answer
-/// draft.
-fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
+/// advancing, the confirmation screen, or a warning. A line that answers
+/// nothing stays in the answer draft.
+fn answer_question(state: &mut PendingPrompt) -> (bool, String) {
     let PendingPrompt::Question {
-        id,
         questions,
         answers,
         current,
+        confirm,
         drafts,
+        ..
     } = state
     else {
         return (false, String::new());
@@ -413,9 +418,10 @@ fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
     drafts[*current].clear();
     answers[*current] = choices;
     let mut out = format!("  {GREEN}✓{RESET} {}\n", answers[*current].join(", "));
+    // The last answer opens the confirmation screen; Enter sends from there.
     if answers.iter().all(|answer| !answer.is_empty()) {
-        let _ = app.questions.reply(id, std::mem::take(answers));
-        return (true, out);
+        *confirm = true;
+        return (false, render_confirmation(questions, answers));
     }
     // Enter walks the questions in order, wrapping to the first; an answered
     // one reopens prefilled, so going back to change an answer returns
@@ -430,6 +436,37 @@ fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
     (false, out)
 }
 
+/// The confirmation screen, shown when the last answer lands, before the
+/// answers are sent: every question with its answer, opencode's review step.
+/// Enter sends, Tab steps back to edit, Esc dismisses.
+fn render_confirmation(questions: &[Value], answers: &[Vec<String>]) -> String {
+    let mut out = String::from(&format!("\n{BOLD}Confirm answers{RESET}\n")[..]);
+    for (index, question) in questions.iter().enumerate() {
+        out.push_str(&format!(
+            "  {GREEN}✓{RESET} {CYAN}{}{RESET}. {}\n      {BOLD}{}{RESET}\n",
+            index + 1,
+            question["question"].as_str().unwrap_or_default(),
+            answers
+                .get(index)
+                .map(|answer| answer.join(", "))
+                .unwrap_or_default(),
+        ));
+    }
+    out.push_str(&format!(
+        "{DIM}Enter: send · Tab: edit answers · Esc: dismiss{RESET}\n"
+    ));
+    out
+}
+
+/// Send the confirmed answers. True when the question prompt is finished.
+fn confirm_question(app: &App, state: &mut PendingPrompt) -> bool {
+    let PendingPrompt::Question { id, answers, .. } = state else {
+        return false;
+    };
+    app.questions.reply(id, std::mem::take(answers));
+    true
+}
+
 /// Move to the next (positive) or previous (negative) question, wrapping.
 /// Each question keeps its own draft, so a half-typed answer survives the
 /// trip; an empty draft on an answered question reopens prefilled with its
@@ -440,6 +477,7 @@ fn switch_question(state: &mut PendingPrompt, delta: isize) -> Option<String> {
         questions,
         answers,
         current,
+        confirm,
         drafts,
         ..
     } = state
@@ -449,6 +487,7 @@ fn switch_question(state: &mut PendingPrompt, delta: isize) -> Option<String> {
     if questions.len() < 2 {
         return None;
     }
+    *confirm = false;
     *current = (*current as isize + delta).rem_euclid(questions.len() as isize) as usize;
     let draft = drafts.get_mut(*current)?;
     if draft.text.is_empty() {
@@ -999,6 +1038,8 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                 let key = decode_event(event);
                 let pending_permission = matches!(ui.prompt, Some(PendingPrompt::Permission(_)));
                 let pending_question = matches!(ui.prompt, Some(PendingPrompt::Question { .. }));
+                let confirming =
+                    matches!(ui.prompt, Some(PendingPrompt::Question { confirm: true, .. }));
                 match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
@@ -1073,11 +1114,19 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                             }
                         }
                     }
+                    Key::Enter if confirming => {
+                        // The confirmation screen is up; Enter sends.
+                        if let Some(state) = ui.prompt.as_mut() {
+                            if confirm_question(&app, state) {
+                                ui.prompt = None;
+                            }
+                        }
+                    }
                     Key::Enter if pending_question => {
                         // The answer's draft is the active input; the prompt
                         // draft stays untouched underneath it.
                         if let Some(state) = ui.prompt.as_mut() {
-                            let (finished, out) = answer_question(&app, state);
+                            let (finished, out) = answer_question(state);
                             if !out.is_empty() {
                                 display.output(&out, terminal_width());
                             }
@@ -1132,6 +1181,23 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::Esc if pending_question => {
                         if let Some(PendingPrompt::Question { id, .. }) = ui.prompt.take() {
                             app.questions.reject(&id);
+                        }
+                    }
+                    _key if confirming => {
+                        // Any other key steps out of the confirmation screen
+                        // back to editing; the keystroke is swallowed so a
+                        // stray tap can never send.
+                        if let Some(PendingPrompt::Question {
+                            questions,
+                            answers,
+                            current,
+                            confirm,
+                            ..
+                        }) = ui.prompt.as_mut()
+                        {
+                            *confirm = false;
+                            let out = render_question(questions, answers, *current);
+                            display.output(&out, terminal_width());
                         }
                     }
                     Key::Paste(_) if pending_permission => {}
@@ -1273,11 +1339,27 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
 mod tests {
     use super::{
         answer_line, decode_event, file_attachment, image_attachment, parse_answer,
-        pasted_image_path, render_question, switch_question, Draft, Key, PendingPrompt,
+        pasted_image_path, render_confirmation, render_question, switch_question, Draft, Key,
+        PendingPrompt,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+
+    /// Strip SGR color codes so assertions can match plain text.
+    fn plain(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(index) = rest.find("\x1b[") {
+            out.push_str(&rest[..index]);
+            rest = &rest[index + 2..];
+            // Skip the escape sequence's terminating byte.
+            if let Some(end) = rest.find(|ch: char| ('@'..='~').contains(&ch)) {
+                rest = &rest[end + 1..];
+            }
+        }
+        out + rest
+    }
 
     #[test]
     fn paste_shortcuts_accept_shift_and_uppercase_without_inserting_text() {
@@ -1387,6 +1469,7 @@ mod tests {
             ],
             answers: vec![Vec::new(), vec!["Two".to_string()]],
             current: 0,
+            confirm: false,
             drafts: vec![Draft::default(), Draft::default()],
         };
         // A half-typed answer survives the round trip to the next question.
@@ -1413,6 +1496,33 @@ mod tests {
         {
             assert_eq!((*current, drafts[1].text.as_str()), (1, "1"));
         }
+        // Tab steps back out of the confirmation screen.
+        if let PendingPrompt::Question { confirm, .. } = &mut state {
+            *confirm = true;
+        }
+        assert!(switch_question(&mut state, 1).is_some());
+        if let PendingPrompt::Question { confirm, .. } = &state {
+            assert!(!confirm);
+        }
+    }
+
+    #[test]
+    fn the_confirmation_screen_lists_every_answer() {
+        use serde_json::json;
+        let questions = vec![
+            json!({"question": "Pick a model", "options": []}),
+            json!({"question": "Run checks?", "options": []}),
+        ];
+        let answers = vec![
+            vec!["A".to_string()],
+            vec!["no im just testing".to_string()],
+        ];
+        let screen = plain(&render_confirmation(&questions, &answers));
+        assert!(screen.contains("Confirm answers"));
+        assert!(screen.contains("1. Pick a model"));
+        assert!(screen.contains("2. Run checks?"));
+        assert!(screen.contains("no im just testing"));
+        assert!(screen.contains("Enter: send"));
     }
 
     #[test]
@@ -1432,19 +1542,6 @@ mod tests {
     #[test]
     fn each_question_shows_its_position_options_and_saved_answer() {
         use serde_json::json;
-        fn plain(text: &str) -> String {
-            let mut out = String::new();
-            let mut rest = text;
-            while let Some(index) = rest.find("\x1b[") {
-                out.push_str(&rest[..index]);
-                rest = &rest[index + 2..];
-                // Skip the escape sequence's terminating byte.
-                if let Some(end) = rest.find(|ch: char| ('@'..='~').contains(&ch)) {
-                    rest = &rest[end + 1..];
-                }
-            }
-            out + rest
-        }
         let questions = vec![
             json!({"question": "Pick a model", "header": "Model", "multiple": false,
                    "options": [{"label": "A", "description": "First"},

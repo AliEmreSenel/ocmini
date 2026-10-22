@@ -1033,6 +1033,7 @@ mod tests {
                 questions: vec![serde_json::json!({"question": "Pick", "options": []})],
                 answers: vec![Vec::new()],
                 current: 0,
+                confirm: false,
                 drafts: vec![Draft {
                     text: "2".into(),
                     cursor: 1,
