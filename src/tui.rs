@@ -1,38 +1,53 @@
 // Terminal transcript and input over the shared session engine.
+use crate::config::ScrollMode;
 use crate::engine::{self, App, EngineApi};
 use crate::engine_impl::Engine;
 use crate::types::{MessageWithParts, PromptRequest};
 use base64::Engine as _;
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-        KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
-    terminal,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{poll, StreamExt};
 use serde_json::Value;
 mod input;
-use input::{clean_input, input_prefix, terminal_width, Display, Draft, History, KillRing};
+use input::{
+    clean_input, input_prefix, page_move, terminal_width, Display, Draft, History, KillRing,
+};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::task::Poll;
 
-struct RawMode;
+struct RawMode {
+    fullscreen: bool,
+}
 
 impl RawMode {
-    fn enter() -> std::io::Result<Self> {
+    /// Full-screen mode owns the terminal: the alternate screen leaves the
+    /// native scrollback intact, and mouse capture routes the wheel here.
+    fn enter(fullscreen: bool) -> std::io::Result<Self> {
         terminal::enable_raw_mode()?;
-        let guard = Self;
-        crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
+        let guard = Self { fullscreen };
+        let mut out = std::io::stdout();
+        if fullscreen {
+            crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+        }
+        crossterm::execute!(out, EnableBracketedPaste)?;
         Ok(guard)
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+        let mut out = std::io::stdout();
+        let _ = crossterm::execute!(out, DisableBracketedPaste);
+        if self.fullscreen {
+            let _ = crossterm::execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = terminal::disable_raw_mode();
         std::println!();
     }
@@ -104,8 +119,15 @@ impl Drop for Ui {
     }
 }
 
-fn print_prompt(model: &str) {
-    println!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ↑↓ history · ←→↑↓ Home End move · Alt+←→ word · Shift select · Ctrl+A/E line · Ctrl+K/W cut · Ctrl+Y yank · Ctrl+Z undo · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{RESET}");
+fn prompt_header(model: &str, fullscreen: bool) -> String {
+    // Full-screen scrolling is app-owned, so the header names the keys the
+    // terminal's own wheel would otherwise handle.
+    let scroll = if fullscreen {
+        " · PgUp/PgDn scroll transcript · Ctrl+Home/End jump · wheel scrolls"
+    } else {
+        ""
+    };
+    format!("{DIM}┌ model {model} · Enter send · Alt+Enter newline · ↑↓ history · ←→↑↓ Home End move · Alt+←→ word · Shift select · Ctrl+A/E line · Ctrl+K/W cut · Ctrl+Y yank · Ctrl+Z undo · paste inserts all lines · Ctrl+V/Ctrl+Shift+V image · Alt+Backspace remove image · Ctrl+U clear draft · Ctrl+C abort · Ctrl+D quit · Ctrl+L clear · Ctrl+R sessions{scroll}{RESET}")
 }
 
 pub(crate) fn summarize_input(input: &Value) -> String {
@@ -538,12 +560,23 @@ pub(crate) enum Key {
     Tab,
     /// Shift+Tab: the previous question (Tab is the next-question motion).
     PreviousQuestion,
+    /// Transcript scrolling. Full-screen mode scrolls its own transcript with
+    /// these; native mode keeps the terminal's wheel and pages the draft.
+    PageUp,
+    PageDown,
+    ScrollTop,
+    ScrollBottom,
+    /// Mouse wheel: rows per notch.
+    ScrollUp(usize),
+    ScrollDown(usize),
     Paste(String),
     Other,
 }
 
 /// Rows a page key moves, matching the picker's viewport height.
 const PAGE: usize = 10;
+/// Transcript rows one wheel notch scrolls in full-screen mode.
+const WHEEL: usize = 3;
 
 pub(crate) fn decode_event(event: Event) -> Key {
     match event {
@@ -589,8 +622,8 @@ pub(crate) fn decode_event(event: Event) -> Key {
             } else {
                 1
             }),
-            (KeyCode::PageUp, _) => Key::Up(PAGE),
-            (KeyCode::PageDown, _) => Key::Down(PAGE),
+            (KeyCode::PageUp, _) => Key::PageUp,
+            (KeyCode::PageDown, _) => Key::PageDown,
             (KeyCode::Left, modifiers)
                 if modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
@@ -619,6 +652,12 @@ pub(crate) fn decode_event(event: Event) -> Key {
             }
             (KeyCode::Left, _) => Key::Left,
             (KeyCode::Right, _) => Key::Right,
+            (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                Key::ScrollTop
+            }
+            (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                Key::ScrollBottom
+            }
             (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                 Key::SelectHome
             }
@@ -632,6 +671,11 @@ pub(crate) fn decode_event(event: Event) -> Key {
             {
                 Key::Char(ch)
             }
+            _ => Key::Other,
+        },
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Key::ScrollUp(WHEEL),
+            MouseEventKind::ScrollDown => Key::ScrollDown(WHEEL),
             _ => Key::Other,
         },
         _ => Key::Other,
@@ -897,31 +941,44 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     })
 }
 
-fn render_history(history: &[MessageWithParts]) {
+fn render_history(display: &mut Display, history: &[MessageWithParts]) {
+    let width = terminal_width();
     for message in history {
-        println!("\n{BOLD}{}{RESET}", message.info.role);
+        display.output(&format!("\n{BOLD}{}{RESET}\n", message.info.role), width);
         for part in &message.parts {
             match part["type"].as_str() {
-                Some("text") => println!("{}", part["text"].as_str().unwrap_or_default()),
-                Some("tool") => println!(
-                    "{DIM}● {} · {}{RESET}",
-                    part["tool"].as_str().unwrap_or("tool"),
-                    part["state"]["status"].as_str().unwrap_or_default()
+                Some("text") => display.output(
+                    &format!("{}\n", part["text"].as_str().unwrap_or_default()),
+                    width,
                 ),
-                Some("file") => println!(
-                    "{DIM}attachment: {}{RESET}",
-                    part["filename"]
-                        .as_str()
-                        .or_else(|| part["url"].as_str())
-                        .unwrap_or("file")
+                Some("tool") => display.output(
+                    &format!(
+                        "{DIM}● {} · {}{RESET}\n",
+                        part["tool"].as_str().unwrap_or("tool"),
+                        part["state"]["status"].as_str().unwrap_or_default()
+                    ),
+                    width,
+                ),
+                Some("file") => display.output(
+                    &format!(
+                        "{DIM}attachment: {}{RESET}\n",
+                        part["filename"]
+                            .as_str()
+                            .or_else(|| part["url"].as_str())
+                            .unwrap_or("file")
+                    ),
+                    width,
                 ),
                 _ => {}
             }
         }
         if let Some(error) = &message.info.error {
-            println!(
-                "{RED}error: {}{RESET}",
-                error["data"]["message"].as_str().unwrap_or("interrupted")
+            display.output(
+                &format!(
+                    "{RED}error: {}{RESET}\n",
+                    error["data"]["message"].as_str().unwrap_or("interrupted")
+                ),
+                width,
             );
         }
     }
@@ -963,7 +1020,8 @@ async fn pick_session(app: &App, directory: Option<&str>) -> Result<crate::types
         return Err("Session selection needs a terminal; resume by ID with --session ID".into());
     }
     let scope = directory.map(crate::sessions::directory).transpose()?;
-    let _raw = RawMode::enter().map_err(|error| format!("Cannot initialize terminal: {error}"))?;
+    let _raw =
+        RawMode::enter(false).map_err(|error| format!("Cannot initialize terminal: {error}"))?;
     let mut keys = EventStream::new();
     crate::picker::select(&app.store, scope.as_deref(), &mut keys)
         .await?
@@ -998,9 +1056,14 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     let mut variant = previous.and_then(|message| message.info.variant.clone());
     let mut model_display = display_model(model_ref.as_ref(), &app.config.lock().unwrap().model);
 
+    let fullscreen = matches!(
+        app.config.lock().unwrap().ui.scroll_mode,
+        ScrollMode::Fullscreen
+    );
     let shutdown =
         shutdown_signal().map_err(|error| format!("Cannot listen for shutdown: {error}"))?;
-    let _raw = RawMode::enter().map_err(|error| format!("Cannot initialize terminal: {error}"))?;
+    let _raw = RawMode::enter(fullscreen)
+        .map_err(|error| format!("Cannot initialize terminal: {error}"))?;
     let mut events = engine::bus().subscribe();
     let mut keys = EventStream::new();
     tokio::pin!(shutdown);
@@ -1009,20 +1072,33 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     let mut killring = KillRing::default();
     let mut prompt_history = History::default();
     prompt_history.load(session_prompts(&history));
-    let mut display = Display::default();
+    let mut display = Display::new(fullscreen);
     let mut ui = Ui {
         part_kind: HashMap::new(),
         headered: std::collections::HashSet::new(),
         tool_done: std::collections::HashSet::new(),
         prompt: None,
     };
-    println!(
-        "{BOLD}ocmini{RESET} {DIM}{}{RESET}",
-        crate::OPENCODE_COMPAT_VERSION
+    let width = terminal_width();
+    display.output(
+        &format!(
+            "{BOLD}ocmini{RESET} {DIM}{}{RESET}\n",
+            crate::OPENCODE_COMPAT_VERSION
+        ),
+        width,
     );
-    println!("{DIM}session {} · {}{RESET}", session.id, session.directory);
-    render_history(&history);
-    print_prompt(&model_display);
+    display.output(
+        &format!(
+            "{DIM}session {} · {}{RESET}\n",
+            session.id, session.directory
+        ),
+        width,
+    );
+    render_history(&mut display, &history);
+    display.output(
+        &format!("{}\n", prompt_header(&model_display, fullscreen)),
+        width,
+    );
     display.draw(&ui, &draft, terminal_width());
 
     loop {
@@ -1044,7 +1120,10 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     Key::CtrlC => { engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
-                    Key::CtrlL => { display.finish_line(); print!("\x1b[2J\x1b[H"); print_prompt(&model_display); }
+                    Key::CtrlL => display.clear_screen(
+                        &prompt_header(&model_display, fullscreen),
+                        terminal_width(),
+                    ),
                     Key::CtrlU => {
                         if !pending_permission {
                             active_draft(&mut ui.prompt, &mut draft).clear();
@@ -1070,8 +1149,17 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                     false,
                                 ) {
                                     Err(error) => {
-                                        println!("{RED}error:{RESET} {error}");
-                                        print_prompt(&model_display);
+                                        display.output(
+                                            &format!("{RED}error:{RESET} {error}\n"),
+                                            terminal_width(),
+                                        );
+                                        display.output(
+                                            &format!(
+                                                "{}\n",
+                                                prompt_header(&model_display, fullscreen)
+                                            ),
+                                            terminal_width(),
+                                        );
                                     }
                                     Ok(resumed) => {
                                         engine.abort(&session.id);
@@ -1094,12 +1182,21 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                         );
                                         draft.clear();
                                         prompt_history.load(session_prompts(&history));
-                                        println!(
-                                            "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}",
-                                            session.id, session.directory
+                                        display.output(
+                                            &format!(
+                                                "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}\n",
+                                                session.id, session.directory
+                                            ),
+                                            terminal_width(),
                                         );
-                                        render_history(&history);
-                                        print_prompt(&model_display);
+                                        render_history(&mut display, &history);
+                                        display.output(
+                                            &format!(
+                                                "{}\n",
+                                                prompt_header(&model_display, fullscreen)
+                                            ),
+                                            terminal_width(),
+                                        );
                                     }
                                 }
                             }
@@ -1222,8 +1319,21 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                         let text = std::mem::take(&mut draft.text);
                         draft.cursor = 0;
                         let files = std::mem::take(&mut draft.attachments);
-                        if !text.is_empty() { println!("{BOLD}›{RESET} {text}"); }
-                        for file in &files { println!("{DIM}● attached: {}{RESET}", clean_input(&file.filename)); }
+                        if !text.is_empty() {
+                            display.output(
+                                &format!("{BOLD}›{RESET} {text}\n"),
+                                terminal_width(),
+                            );
+                        }
+                        for file in &files {
+                            display.output(
+                                &format!(
+                                    "{DIM}● attached: {}{RESET}\n",
+                                    clean_input(&file.filename)
+                                ),
+                                terminal_width(),
+                            );
+                        }
                         if text.trim() == "/quit" { break; }
                         prompt_history.remember(text.clone());
                         let mut parts: Vec<Value> = Vec::new();
@@ -1248,7 +1358,10 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                 ..Default::default()
                             };
                             if let Err(error) = engine.start_turn(app.clone(), session.id.clone(), request) {
-                                println!("{RED}error:{RESET} {error}");
+                                display.output(
+                                    &format!("{RED}error:{RESET} {error}\n"),
+                                    terminal_width(),
+                                );
                             }
                         }
                     }
@@ -1296,18 +1409,68 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::Up(n) if !pending_permission => {
                         // Row math uses the same prefix the input row draws.
                         let prefix = input_prefix(&ui, &draft);
-                        let active = active_draft(&mut ui.prompt, &mut draft);
                         // Up on an empty draft recalls previous prompts;
                         // otherwise it moves the caret across display rows.
-                        if !prompt_history.select(active, -(n as isize)) {
-                            active.move_row(&prefix, terminal_width(), -(n as isize));
-                        }
+                        page_move(
+                            &mut ui.prompt,
+                            &mut draft,
+                            &mut prompt_history,
+                            &prefix,
+                            -(n as isize),
+                        );
                     }
                     Key::Down(n) if !pending_permission => {
                         let prefix = input_prefix(&ui, &draft);
-                        let active = active_draft(&mut ui.prompt, &mut draft);
-                        if !prompt_history.select(active, n as isize) {
-                            active.move_row(&prefix, terminal_width(), n as isize);
+                        page_move(
+                            &mut ui.prompt,
+                            &mut draft,
+                            &mut prompt_history,
+                            &prefix,
+                            n as isize,
+                        );
+                    }
+                    key @ (Key::PageUp
+                    | Key::PageDown
+                    | Key::ScrollTop
+                    | Key::ScrollBottom
+                    | Key::ScrollUp(_)
+                    | Key::ScrollDown(_)) => {
+                        // Full-screen mode owns transcript scrolling, so these
+                        // keys scroll even while a prompt is pending. Native
+                        // mode leaves the wheel to the terminal, so they keep
+                        // moving the draft as before.
+                        if fullscreen {
+                            let page = display.page() as isize;
+                            match key {
+                                Key::PageUp => display.scroll_by(-page),
+                                Key::PageDown => display.scroll_by(page),
+                                Key::ScrollUp(rows) => display.scroll_by(-(rows as isize)),
+                                Key::ScrollDown(rows) => display.scroll_by(rows as isize),
+                                Key::ScrollTop => display.scroll_top(),
+                                _ => display.scroll_bottom(),
+                            }
+                        } else if !pending_permission {
+                            let prefix = input_prefix(&ui, &draft);
+                            match key {
+                                Key::PageUp | Key::ScrollUp(_) => page_move(
+                                    &mut ui.prompt,
+                                    &mut draft,
+                                    &mut prompt_history,
+                                    &prefix,
+                                    -(PAGE as isize),
+                                ),
+                                Key::PageDown | Key::ScrollDown(_) => page_move(
+                                    &mut ui.prompt,
+                                    &mut draft,
+                                    &mut prompt_history,
+                                    &prefix,
+                                    PAGE as isize,
+                                ),
+                                Key::ScrollTop => {
+                                    active_draft(&mut ui.prompt, &mut draft).home();
+                                }
+                                _ => active_draft(&mut ui.prompt, &mut draft).end(),
+                            }
                         }
                     }
                     Key::Esc if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
@@ -1331,6 +1494,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     }
     display.erase();
     display.finish_line();
+    display.leave_screen();
     engine.abort_and_wait(&session.id).await;
     Ok(())
 }
@@ -1340,9 +1504,11 @@ mod tests {
     use super::{
         answer_line, decode_event, file_attachment, image_attachment, parse_answer,
         pasted_image_path, render_confirmation, render_question, switch_question, Draft, Key,
-        PendingPrompt,
+        PendingPrompt, WHEEL,
     };
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    };
 
     pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
 
@@ -1434,6 +1600,40 @@ mod tests {
         ] {
             assert_eq!(
                 decode_event(Event::Key(KeyEvent::new(code, modifiers))),
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_scroll_keys_decode_apart_from_draft_motion() {
+        for (code, modifiers, key) in [
+            (KeyCode::PageUp, KeyModifiers::empty(), Key::PageUp),
+            (KeyCode::PageDown, KeyModifiers::empty(), Key::PageDown),
+            (KeyCode::Home, KeyModifiers::CONTROL, Key::ScrollTop),
+            (KeyCode::End, KeyModifiers::CONTROL, Key::ScrollBottom),
+            // Plain Home/End stay draft motion; Ctrl+A/E keep their aliases.
+            (KeyCode::Home, KeyModifiers::empty(), Key::Home),
+            (KeyCode::End, KeyModifiers::empty(), Key::End),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL, Key::Home),
+        ] {
+            assert_eq!(
+                decode_event(Event::Key(KeyEvent::new(code, modifiers))),
+                key
+            );
+        }
+        for (kind, key) in [
+            (MouseEventKind::ScrollUp, Key::ScrollUp(WHEEL)),
+            (MouseEventKind::ScrollDown, Key::ScrollDown(WHEEL)),
+            (MouseEventKind::Moved, Key::Other),
+        ] {
+            assert_eq!(
+                decode_event(Event::Mouse(MouseEvent {
+                    kind,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                })),
                 key
             );
         }

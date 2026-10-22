@@ -487,6 +487,22 @@ fn active_input(ui: &Ui, draft: &Draft) -> (String, String, usize, Option<(usize
     }
 }
 
+/// Page keys move the draft: prompt history when the draft is empty, caret
+/// rows otherwise. Shared by Up/Down, PageUp/PageDown and Shift+Arrow. The
+/// caller resolves `input_prefix` first, so `ui` is borrowed once.
+pub(super) fn page_move(
+    prompt: &mut Option<PendingPrompt>,
+    draft: &mut Draft,
+    history: &mut History,
+    prefix: &str,
+    delta: isize,
+) {
+    let active = super::active_draft(prompt, draft);
+    if !history.select(active, delta) {
+        active.move_row(prefix, terminal_width(), delta);
+    }
+}
+
 pub(super) struct Layout {
     pub rows: Vec<String>,
     /// Cursor position as (row, terminal column) among `rows`.
@@ -605,11 +621,70 @@ fn layout(
     }
 }
 
-// Only the unfinished transcript row and the draft are redrawn. Complete
-// transcript rows are committed to scrollback and never erased by editing.
+/// Length of the leading SGR/CSI escape in `text`, matching the terminator
+/// range crossterm reports. Escapes are zero-width for layout.
+fn escape_len(text: &str) -> Option<usize> {
+    if !text.starts_with("\x1b[") {
+        return None;
+    }
+    text[2..]
+        .find(|ch: char| ('@'..='~').contains(&ch))
+        .map(|end| end + 3)
+}
+
+/// Split one styled transcript row into display rows of at most `width`
+/// cells, replaying its active SGR style after every break.
+fn wrap_row(row: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut out = String::new();
+    let mut columns = 0;
+    let mut style = String::new();
+    let mut rest = row;
+    while !rest.is_empty() {
+        if let Some(end) = escape_len(rest) {
+            let escape = &rest[..end];
+            if escape.ends_with('m') {
+                out.push_str(escape);
+                if escape == RESET {
+                    style.clear();
+                } else {
+                    style.push_str(escape);
+                }
+            }
+            rest = &rest[end..];
+            continue;
+        }
+        let grapheme = rest.graphemes(true).next().unwrap();
+        rest = &rest[grapheme.len()..];
+        if grapheme.contains('\n') {
+            rows.push(std::mem::take(&mut out));
+            columns = 0;
+            continue;
+        }
+        if grapheme.chars().any(char::is_control) {
+            continue;
+        }
+        let cells = grapheme.width();
+        if columns + cells > width && columns > 0 {
+            rows.push(std::mem::take(&mut out));
+            out.push_str(&style);
+            columns = 0;
+        }
+        out.push_str(grapheme);
+        columns += cells;
+    }
+    rows.push(out);
+    rows
+}
+
+// Two transcript renderers share one event pipeline. In native mode only the
+// unfinished row and the draft are redrawn: complete rows are committed to the
+// terminal's scrollback and never erased by editing, and the terminal owns
+// wheel scrolling. In full-screen mode (`ui.scroll_mode: "fullscreen"`) rows
+// are kept in memory and the whole screen is repainted, so the app scrolls the
+// transcript with PageUp/PageDown, Ctrl+Home/Ctrl+End and the wheel.
 // The draft may span several wrapped rows; the real terminal cursor is parked
 // on the edit position so typing, arrows and the caret stay in sync.
-#[derive(Default)]
 pub(super) struct Display {
     tail: String,
     columns: usize,
@@ -619,10 +694,49 @@ pub(super) struct Display {
     /// caret's row, which is the block's last row only when the caret is at
     /// the end of the draft.
     caret_row: usize,
+    /// Full-screen mode: committed transcript rows, oldest first.
+    lines: Vec<String>,
+    fullscreen: bool,
+    /// First transcript display row painted at the viewport top. None follows
+    /// the newest output.
+    scroll: Option<usize>,
+    /// Transcript rows the last repaint had room for: the scroll page size.
+    page: usize,
+    /// Width the last repaint wrapped transcript rows at: scrolling counts
+    /// display rows, so it has to wrap the same way the paint did.
+    paint_width: usize,
+}
+
+/// Transcript rows full-screen repaints keep in memory.
+const MAX_LINES: usize = 20_000;
+
+impl Default for Display {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl Display {
+    pub fn new(fullscreen: bool) -> Self {
+        Self {
+            tail: String::new(),
+            columns: 0,
+            style: String::new(),
+            drawn_rows: 0,
+            caret_row: 0,
+            lines: Vec::new(),
+            fullscreen,
+            scroll: None,
+            page: 24,
+            paint_width: 80,
+        }
+    }
+
     pub fn erase(&mut self) {
+        // A full-screen repaint clears the screen, so nothing to erase here.
+        if self.fullscreen {
+            return;
+        }
         if self.drawn_rows == 0 {
             return;
         }
@@ -641,7 +755,8 @@ impl Display {
 
     pub fn finish_line(&mut self) {
         if self.columns > 0 {
-            crate::println!("{}{RESET}", self.tail);
+            let tail = std::mem::take(&mut self.tail);
+            self.push_row(tail);
         }
         self.tail.clear();
         self.style.clear();
@@ -653,21 +768,18 @@ impl Display {
         // when wrapping a streaming delta across committed transcript rows.
         let mut rest = text;
         while !rest.is_empty() {
-            if rest.starts_with("\x1b[") {
-                if let Some(end) = rest[2..].find(|ch: char| ('@'..='~').contains(&ch)) {
-                    let end = end + 3;
-                    let escape = &rest[..end];
-                    if escape.ends_with('m') {
-                        self.tail.push_str(escape);
-                        if escape == RESET {
-                            self.style.clear();
-                        } else {
-                            self.style.push_str(escape);
-                        }
+            if let Some(end) = escape_len(rest) {
+                let escape = &rest[..end];
+                if escape.ends_with('m') {
+                    self.tail.push_str(escape);
+                    if escape == RESET {
+                        self.style.clear();
+                    } else {
+                        self.style.push_str(escape);
                     }
-                    rest = &rest[end..];
-                    continue;
                 }
+                rest = &rest[end..];
+                continue;
             }
             let grapheme = rest.graphemes(true).next().unwrap();
             rest = &rest[grapheme.len()..];
@@ -677,8 +789,10 @@ impl Display {
                 let spaces = 4 - self.columns % 4;
                 self.output(&" ".repeat(spaces), width);
             } else if !grapheme.chars().any(char::is_control) {
+                // Full-screen rows wrap at paint time, so a transcript row
+                // breaks only on a real newline and resizing re-wraps it.
                 let cells = grapheme.width();
-                if self.columns + cells > width && self.columns > 0 {
+                if !self.fullscreen && self.columns + cells > width && self.columns > 0 {
                     self.commit_row();
                 }
                 self.tail.push_str(grapheme);
@@ -688,14 +802,120 @@ impl Display {
     }
 
     fn commit_row(&mut self) {
-        crate::println!("{}{RESET}", self.tail);
+        let tail = std::mem::take(&mut self.tail);
+        self.push_row(tail);
         self.tail.clone_from(&self.style);
         self.columns = 0;
+    }
+
+    /// Native mode prints a finished row into the terminal's scrollback;
+    /// full-screen mode keeps it in memory for the next repaint.
+    fn push_row(&mut self, row: String) {
+        if self.fullscreen {
+            self.lines.push(format!("{row}{RESET}"));
+            let excess = self.lines.len().saturating_sub(MAX_LINES);
+            if excess > 0 {
+                let removed: usize = self.lines[..excess]
+                    .iter()
+                    .map(|line| wrap_row(line, self.paint_width).len())
+                    .sum();
+                self.lines.drain(..excess);
+                self.scroll = self.scroll.map(|top| top.saturating_sub(removed));
+            }
+        } else {
+            crate::println!("{row}{RESET}");
+        }
+    }
+
+    /// Ctrl+L: drop the transcript and repaint with a fresh prompt header.
+    pub fn clear_screen(&mut self, header: &str, width: usize) {
+        if self.fullscreen {
+            self.lines.clear();
+            self.scroll = None;
+        } else {
+            self.finish_line();
+            print!("\x1b[2J\x1b[H");
+        }
+        self.tail.clear();
+        self.style.clear();
+        self.columns = 0;
+        self.output(&format!("{header}\n"), width);
+    }
+
+    /// Leaving full-screen mode: the transcript is printed on the primary
+    /// screen so the conversation stays in the terminal's own scrollback.
+    pub fn leave_screen(&mut self) {
+        if !self.fullscreen {
+            return;
+        }
+        self.finish_line();
+        // Leave the alternate screen first: a transcript painted on it would
+        // disappear with it, so the conversation lands on the primary screen.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        print!("\x1b[2J\x1b[H");
+        for line in &self.lines {
+            crate::println!("{line}");
+        }
+        self.lines.clear();
+        self.scroll = None;
+    }
+
+    /// Scroll the transcript window by `delta` display rows, staying attached
+    /// to the newest output once the bottom is reached again.
+    pub fn scroll_by(&mut self, delta: isize) {
+        let last = self.last_scroll();
+        let top = (self.scroll.unwrap_or(last) as isize)
+            .saturating_add(delta)
+            .clamp(0, last as isize) as usize;
+        self.scroll = (top < last).then_some(top);
+    }
+
+    pub fn scroll_top(&mut self) {
+        self.scroll = (self.last_scroll() > 0).then_some(0);
+    }
+
+    pub fn scroll_bottom(&mut self) {
+        self.scroll = None;
+    }
+
+    /// Scroll position of the bottom view: the first display row that still
+    /// fits a full page.
+    fn last_scroll(&self) -> usize {
+        self.wrapped(self.paint_width)
+            .len()
+            .saturating_sub(self.page)
+    }
+
+    /// Rows PageUp/PageDown move: the transcript viewport height.
+    pub fn page(&self) -> usize {
+        self.page.max(1)
+    }
+
+    /// Every transcript line wrapped for `width`, oldest first.
+    fn wrapped(&self, width: usize) -> Vec<String> {
+        let mut rows: Vec<String> = Vec::new();
+        for line in &self.lines {
+            rows.extend(wrap_row(line, width));
+        }
+        rows
+    }
+
+    /// Transcript display rows for the current scroll position, oldest first,
+    /// at most `self.page` rows.
+    fn viewport(&self, width: usize) -> Vec<String> {
+        let rows = self.wrapped(width);
+        let last = rows.len().saturating_sub(self.page);
+        let top = self.scroll.unwrap_or(last).min(last);
+        rows[top..(top + self.page).min(rows.len())].to_vec()
     }
 
     pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize) {
         let (prefix, text, cursor, sel) = active_input(ui, draft);
         let layout = layout(&prefix, &text, cursor, width, sel);
+        if self.fullscreen {
+            self.draw_screen(&layout);
+            return;
+        }
         self.drawn_rows = 0;
         print!("\r");
         if self.columns > 0 {
@@ -723,18 +943,55 @@ impl Display {
         }
         let _ = std::io::stdout().flush();
     }
+
+    /// Repaint the whole screen: the transcript window, then the draft. The
+    /// clear replaces every cell, so nothing needs row-by-row erase
+    /// bookkeeping, and rows are joined without a trailing newline so the
+    /// bottom row never scrolls the screen.
+    fn draw_screen(&mut self, layout: &Layout) {
+        self.finish_line();
+        let (width, height) = terminal_size();
+        self.page = height.saturating_sub(layout.rows.len());
+        self.paint_width = width;
+        let rows = self.viewport(width);
+        let mut out = String::from("\x1b[2J\x1b[H");
+        let mut drawn = 0usize;
+        for row in rows.iter().chain(layout.rows.iter()) {
+            if drawn > 0 {
+                out.push_str("\r\n");
+            }
+            out.push_str(row);
+            drawn += 1;
+        }
+        self.caret_row = rows.len() + layout.cursor.0;
+        self.drawn_rows = drawn;
+        out.push_str(&format!(
+            "\x1b[{};{}H",
+            self.caret_row + 1,
+            layout.cursor.1 + 1
+        ));
+        crate::print!("{out}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+pub(super) fn terminal_size() -> (usize, usize) {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    (
+        usize::from(width).saturating_sub(1).max(3),
+        usize::from(height).max(1),
+    )
 }
 
 pub(super) fn terminal_width() -> usize {
     // Leave the last cell unused so the terminal never has a pending autowrap.
-    crossterm::terminal::size()
-        .map(|(width, _)| usize::from(width).saturating_sub(1).max(3))
-        .unwrap_or(79)
+    terminal_size().0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::DIM;
 
     #[test]
     fn deletion_stops_at_draft_boundary_and_removes_whole_graphemes() {
@@ -1096,5 +1353,80 @@ mod tests {
         assert_eq!((display.drawn_rows, display.caret_row), (4, 1));
         display.erase();
         assert_eq!((display.drawn_rows, display.caret_row), (0, 0));
+    }
+
+    #[test]
+    fn wrap_row_breaks_on_cells_and_replays_the_style() {
+        // Width 3: "中" is two cells, so "中中a" fills rows "中" and "中a",
+        // and the DIM style restarts after each break.
+        assert_eq!(
+            wrap_row(&format!("{DIM}中中a{RESET}b"), 3),
+            [
+                format!("{DIM}中"),
+                format!("{DIM}中a{RESET}"),
+                "b".to_string()
+            ]
+        );
+        assert_eq!(wrap_row("", 10), [""]);
+        assert_eq!(wrap_row("abc", 10), ["abc"]);
+    }
+
+    #[test]
+    fn fullscreen_scrolling_counts_wrapped_rows() {
+        // 40-column lines at width 20 take two display rows each: scrolling is
+        // counted in display rows, so a transcript of two long lines scrolls.
+        let mut display = Display::new(true);
+        display.page = 2;
+        display.paint_width = 20;
+        for line in ["x", "y"] {
+            display.output(&format!("{}\n", line.repeat(40)), 20);
+        }
+        let rows = |display: &Display| display.viewport(20);
+        assert_eq!(rows(&display).len(), 2);
+        assert!(rows(&display).iter().all(|row| row.starts_with('y')));
+        display.scroll_top();
+        assert!(rows(&display).iter().all(|row| row.starts_with('x')));
+        display.scroll_by(1);
+        assert!(rows(&display)[0].starts_with('x'));
+        assert!(rows(&display)[1].starts_with('y'));
+    }
+
+    #[test]
+    fn fullscreen_scrolling_pages_the_transcript() {
+        let mut display = Display::new(true);
+        display.page = 2;
+        for line in ["a", "b", "c", "d"] {
+            display.output(&format!("{line}\n"), 40);
+        }
+        let plain = |display: &Display| {
+            display
+                .viewport(40)
+                .iter()
+                .map(|row| row.replace(RESET, ""))
+                .collect::<Vec<_>>()
+        };
+        // Following the newest output keeps the last rows in view.
+        assert_eq!(plain(&display), ["c", "d"]);
+        display.scroll_by(-1);
+        assert_eq!(display.scroll, Some(1));
+        assert_eq!(plain(&display), ["b", "c"]);
+        display.scroll_by(-10);
+        assert_eq!(display.scroll, Some(0));
+        assert_eq!(plain(&display), ["a", "b"]);
+        // Scrolling back to the bottom resumes following the newest output.
+        display.scroll_by(10);
+        assert_eq!(display.scroll, None);
+        assert_eq!(plain(&display), ["c", "d"]);
+        display.scroll_top();
+        assert_eq!(plain(&display), ["a", "b"]);
+        display.scroll_bottom();
+        assert_eq!(plain(&display), ["c", "d"]);
+        // A new row below a scrolled view keeps the page where it was.
+        display.scroll_top();
+        display.output("e\n", 40);
+        assert_eq!(display.scroll, Some(0));
+        assert_eq!(plain(&display), ["a", "b"]);
+        display.scroll_bottom();
+        assert_eq!(plain(&display), ["d", "e"]);
     }
 }
