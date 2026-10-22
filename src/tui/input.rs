@@ -949,11 +949,18 @@ impl Display {
     /// bookkeeping, and rows are joined without a trailing newline so the
     /// bottom row never scrolls the screen.
     fn draw_screen(&mut self, layout: &Layout) {
-        self.finish_line();
         let (width, height) = terminal_size();
         self.page = height.saturating_sub(layout.rows.len());
         self.paint_width = width;
-        let rows = self.viewport(width);
+        // The tail is the unfinished transcript row: paint it, never commit
+        // it. Committing on every repaint would stack a snapshot of the text
+        // so far each time a streaming delta arrives.
+        let mut rows = self.viewport(width);
+        if self.columns > 0 && self.scroll.is_none() {
+            rows.extend(wrap_row(&format!("{}{RESET}", self.tail), width));
+            let cut = rows.len().saturating_sub(self.page);
+            rows.drain(..cut);
+        }
         let mut out = String::from("\x1b[2J\x1b[H");
         let mut drawn = 0usize;
         for row in rows.iter().chain(layout.rows.iter()) {
@@ -1369,6 +1376,30 @@ mod tests {
         );
         assert_eq!(wrap_row("", 10), [""]);
         assert_eq!(wrap_row("abc", 10), ["abc"]);
+    }
+
+    #[test]
+    fn fullscreen_repaint_keeps_the_streaming_tail_uncommitted() {
+        let ui = crate::tui::Ui {
+            part_kind: std::collections::HashMap::new(),
+            headered: std::collections::HashSet::new(),
+            tool_done: std::collections::HashSet::new(),
+            prompt: None,
+        };
+        let draft = Draft::default();
+        let mut display = Display::new(true);
+        display.output("assistant\n", 40);
+        display.draw(&ui, &draft, 40);
+        // Streaming deltas grow one unfinished row. Repainting paints it; it
+        // must not be committed, which used to stack a snapshot per repaint.
+        for delta in ["The ", "user ", "says ", "hi"] {
+            display.output(delta, 40);
+            display.draw(&ui, &draft, 40);
+        }
+        assert_eq!(display.lines.len(), 1);
+        // Only a real newline commits the row.
+        display.output("\n", 40);
+        assert_eq!(display.lines.len(), 2);
     }
 
     #[test]
