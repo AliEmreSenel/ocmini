@@ -87,9 +87,10 @@ enum PendingPrompt {
         answers: Vec<Vec<String>>,
         // The question whose answer is being typed.
         current: usize,
-        // The answer's own draft: the keyboard edits it (full caret, selection,
-        // kill, yank, undo) while the prompt draft waits untouched underneath.
-        draft: Draft,
+        // Each question keeps its own draft, so switching questions (Tab /
+        // Shift+Tab, or Backspace on an empty line) never loses a half-typed
+        // answer, while the prompt draft waits untouched underneath the set.
+        drafts: Vec<Draft>,
     },
 }
 
@@ -183,7 +184,7 @@ fn render_question(questions: &[Value], answers: &[Vec<String>], which: usize) -
     if let Some(answer) = answers.get(which).filter(|answer| !answer.is_empty()) {
         out.push_str(&format!("  {GREEN}✓{RESET} {}\n", answer.join(", ")));
     }
-    out.push_str(&format!("{DIM}number(s) + Enter answers · Backspace on an empty line: previous question · Esc: dismiss{RESET}\n"));
+    out.push_str(&format!("{DIM}number(s) + Enter answers · Tab: next question · Shift+Tab: previous · Esc: dismiss{RESET}\n"));
     out
 }
 
@@ -310,7 +311,7 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
                 questions: questions.clone(),
                 answers: answers.clone(),
                 current: 0,
-                draft: Draft::default(),
+                drafts: (0..questions.len()).map(|_| Draft::default()).collect(),
             });
             // Questions appear one at a time: the first is shown now, each
             // next when the user reaches it.
@@ -373,7 +374,9 @@ fn parse_answer(line: &str, labels: &[String]) -> Vec<String> {
 /// and returns when the question settles.
 fn active_draft<'a>(prompt: &'a mut Option<PendingPrompt>, draft: &'a mut Draft) -> &'a mut Draft {
     match prompt {
-        Some(PendingPrompt::Question { draft, .. }) => draft,
+        Some(PendingPrompt::Question {
+            drafts, current, ..
+        }) => drafts.get_mut(*current).unwrap_or(draft),
         _ => draft,
     }
 }
@@ -389,7 +392,7 @@ fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
         questions,
         answers,
         current,
-        draft,
+        drafts,
     } = state
     else {
         return (false, String::new());
@@ -398,7 +401,7 @@ fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
         return (true, String::new());
     };
     let labels = option_labels(&question["options"]);
-    let choices = parse_answer(&draft.text, &labels);
+    let choices = parse_answer(&drafts[*current].text, &labels);
     if choices.is_empty() {
         return (false, String::new());
     }
@@ -407,7 +410,7 @@ fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
         // accepting a list here would stall the tool.
         return (false, format!("{YELLOW}one answer only{RESET}\n"));
     }
-    draft.clear();
+    drafts[*current].clear();
     answers[*current] = choices;
     let mut out = format!("  {GREEN}✓{RESET} {}\n", answers[*current].join(", "));
     if answers.iter().all(|answer| !answer.is_empty()) {
@@ -421,10 +424,38 @@ fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
     let labels = option_labels(&questions[*current]["options"]);
     let prefill = answer_line(&answers[*current], &labels);
     if !prefill.is_empty() {
-        draft.insert_str(&prefill);
+        drafts[*current].insert_str(&prefill);
     }
     out.push_str(&render_question(questions, answers, *current));
     (false, out)
+}
+
+/// Move to the next (positive) or previous (negative) question, wrapping.
+/// Each question keeps its own draft, so a half-typed answer survives the
+/// trip; an empty draft on an answered question reopens prefilled with its
+/// saved answer. Returns the question text to print, if the prompt is a
+/// question with more than one entry.
+fn switch_question(state: &mut PendingPrompt, delta: isize) -> Option<String> {
+    let PendingPrompt::Question {
+        questions,
+        answers,
+        current,
+        drafts,
+        ..
+    } = state
+    else {
+        return None;
+    };
+    if questions.len() < 2 {
+        return None;
+    }
+    *current = (*current as isize + delta).rem_euclid(questions.len() as isize) as usize;
+    let draft = drafts.get_mut(*current)?;
+    if draft.text.is_empty() {
+        let labels = option_labels(&questions[*current]["options"]);
+        draft.insert_str(&answer_line(&answers[*current], &labels));
+    }
+    Some(render_question(questions, answers, *current))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -466,6 +497,8 @@ pub(crate) enum Key {
     Home,
     End,
     Tab,
+    /// Shift+Tab: the previous question (Tab is the next-question motion).
+    PreviousQuestion,
     Paste(String),
     Other,
 }
@@ -554,6 +587,7 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Home, _) => Key::Home,
             (KeyCode::End, _) => Key::End,
             (KeyCode::Tab, _) => Key::Tab,
+            (KeyCode::BackTab, _) => Key::PreviousQuestion,
             (KeyCode::Char(ch), modifiers)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
@@ -1054,22 +1088,43 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     }
                     Key::Backspace if pending_question => {
                         // Backspace edits the answer; on the empty line it
-                        // returns to the previous question, answer prefilled.
+                        // returns to the previous question. Shift+Tab does
+                        // that from any draft, keeping the typed text.
                         if let Some(PendingPrompt::Question {
                             questions,
                             answers,
                             current,
-                            draft,
+                            drafts,
                             ..
                         }) = ui.prompt.as_mut()
                         {
-                            if !draft.text.is_empty() {
-                                draft.backspace();
+                            if drafts
+                                .get(*current)
+                                .is_some_and(|draft| !draft.text.is_empty())
+                            {
+                                drafts[*current].backspace();
                             } else if *current > 0 {
                                 *current -= 1;
                                 let labels = option_labels(&questions[*current]["options"]);
-                                draft.insert_str(&answer_line(&answers[*current], &labels));
+                                drafts[*current]
+                                    .insert_str(&answer_line(&answers[*current], &labels));
                                 let out = render_question(questions, answers, *current);
+                                display.output(&out, terminal_width());
+                            }
+                        }
+                    }
+                    Key::Tab if pending_question => {
+                        // Tab walks the questions forward; each keeps its own
+                        // draft, so a half-typed answer survives the trip.
+                        if let Some(state) = ui.prompt.as_mut() {
+                            if let Some(out) = switch_question(state, 1) {
+                                display.output(&out, terminal_width());
+                            }
+                        }
+                    }
+                    Key::PreviousQuestion if pending_question => {
+                        if let Some(state) = ui.prompt.as_mut() {
+                            if let Some(out) = switch_question(state, -1) {
                                 display.output(&out, terminal_width());
                             }
                         }
@@ -1218,7 +1273,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
 mod tests {
     use super::{
         answer_line, decode_event, file_attachment, image_attachment, parse_answer,
-        pasted_image_path, render_question, Key,
+        pasted_image_path, render_question, switch_question, Draft, Key, PendingPrompt,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -1276,6 +1331,8 @@ mod tests {
             (KeyCode::Char('b'), KeyModifiers::ALT, Key::WordLeft),
             (KeyCode::Left, KeyModifiers::SHIFT, Key::SelectLeft),
             (KeyCode::Right, KeyModifiers::SHIFT, Key::SelectRight),
+            (KeyCode::Tab, KeyModifiers::NONE, Key::Tab),
+            (KeyCode::BackTab, KeyModifiers::SHIFT, Key::PreviousQuestion),
             (KeyCode::Home, KeyModifiers::SHIFT, Key::SelectHome),
             (KeyCode::End, KeyModifiers::SHIFT, Key::SelectEnd),
             (
@@ -1317,6 +1374,45 @@ mod tests {
         // Numbers without an option make the whole line a custom answer.
         assert_eq!(parse_answer("0 9", &labels), ["0 9"]);
         assert_eq!(parse_answer("", &labels), Vec::<String>::new());
+    }
+
+    #[test]
+    fn switching_questions_keeps_each_draft() {
+        use serde_json::json;
+        let mut state = PendingPrompt::Question {
+            id: "q".into(),
+            questions: vec![
+                json!({"question": "A", "options": [{"label": "One", "description": ""}]}),
+                json!({"question": "B", "options": [{"label": "Two", "description": ""}]}),
+            ],
+            answers: vec![Vec::new(), vec!["Two".to_string()]],
+            current: 0,
+            drafts: vec![Draft::default(), Draft::default()],
+        };
+        // A half-typed answer survives the round trip to the next question.
+        if let PendingPrompt::Question {
+            drafts, current, ..
+        } = &mut state
+        {
+            drafts[*current].insert_str("half-typed");
+        }
+        assert!(switch_question(&mut state, 1).is_some());
+        assert!(switch_question(&mut state, -1).is_some());
+        if let PendingPrompt::Question {
+            current, drafts, ..
+        } = &state
+        {
+            assert_eq!(*current, 0);
+            assert_eq!(drafts[0].text, "half-typed");
+        }
+        // An answered question reopens prefilled with its saved answer.
+        switch_question(&mut state, 1);
+        if let PendingPrompt::Question {
+            current, drafts, ..
+        } = &state
+        {
+            assert_eq!((*current, drafts[1].text.as_str()), (1, "1"));
+        }
     }
 
     #[test]
@@ -1369,7 +1465,7 @@ mod tests {
         assert!(current.contains("2/2: Run checks?"));
         assert!(current.contains("(one or more)"));
         assert!(!current.contains("✓"));
-        assert!(current.contains("Backspace"));
+        assert!(current.contains("Tab: next question"));
     }
 
     #[test]

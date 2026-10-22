@@ -469,12 +469,15 @@ pub(super) fn input_prefix(ui: &Ui, draft: &Draft) -> String {
 }
 
 /// What the input row shows: its prefix plus the active draft's text, caret
-/// and selection. A pending question draws its own answer draft; the prompt
-/// draft stays hidden underneath until the question settles.
+/// and selection. A pending question draws the draft of the question being
+/// answered; the prompt draft stays hidden underneath until it settles.
 fn active_input(ui: &Ui, draft: &Draft) -> (String, String, usize, Option<(usize, usize)>) {
     let prefix = input_prefix(ui, draft);
     match &ui.prompt {
-        Some(PendingPrompt::Question { draft, .. }) => {
+        Some(PendingPrompt::Question {
+            drafts, current, ..
+        }) => {
+            let draft = drafts.get(*current).unwrap_or(draft);
             (prefix, draft.text.clone(), draft.cursor, draft.selection())
         }
         Some(PendingPrompt::Permission(_)) => {
@@ -1030,11 +1033,11 @@ mod tests {
                 questions: vec![serde_json::json!({"question": "Pick", "options": []})],
                 answers: vec![Vec::new()],
                 current: 0,
-                draft: Draft {
+                drafts: vec![Draft {
                     text: "2".into(),
                     cursor: 1,
                     ..Draft::default()
-                },
+                }],
             }),
         };
         let mut prompt = Draft::default();
