@@ -536,59 +536,6 @@ async fn prompt_sync(
         .map_err(ApiError::runtime)
 }
 
-pub fn expand_command(template: &str, arguments: &str) -> String {
-    let argument_pattern = regex::Regex::new(r#"(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)"#)
-        .expect("constant regex");
-    let arguments_list: Vec<String> = argument_pattern
-        .find_iter(arguments)
-        .map(|item| item.as_str().trim_matches(['\'', '"']).to_owned())
-        .collect();
-    let placeholder = regex::Regex::new(r"\$(\d+)").expect("constant regex");
-    let has_numbered = placeholder.is_match(template);
-    let last = placeholder
-        .captures_iter(template)
-        .filter_map(|capture| capture[1].parse::<usize>().ok())
-        .max()
-        .unwrap_or(0);
-    let expanded = placeholder.replace_all(template, |capture: &regex::Captures<'_>| {
-        let position = capture[1].parse::<usize>().unwrap_or(0);
-        let Some(index) = position.checked_sub(1) else {
-            return String::new();
-        };
-        if index >= arguments_list.len() {
-            return String::new();
-        }
-        if position == last {
-            arguments_list[index..].join(" ")
-        } else {
-            arguments_list[index].clone()
-        }
-    });
-    let expanded = expanded.replace("$ARGUMENTS", arguments);
-    if !has_numbered && !template.contains("$ARGUMENTS") && !arguments.trim().is_empty() {
-        format!("{}\n\n{}", expanded.trim(), arguments)
-            .trim()
-            .to_owned()
-    } else {
-        expanded.trim().to_owned()
-    }
-}
-
-fn model_from_slug(slug: &str) -> Result<ModelRef, ApiError> {
-    let (provider, model) = slug
-        .split_once('/')
-        .ok_or_else(|| ApiError::invalid("Command model must use provider/model format"))?;
-    if provider.is_empty() || model.is_empty() {
-        return Err(ApiError::invalid(
-            "Command model must use provider/model format",
-        ));
-    }
-    Ok(ModelRef {
-        provider_id: provider.to_owned(),
-        model_id: model.to_owned(),
-    })
-}
-
 async fn command_run(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -612,34 +559,13 @@ async fn command_run(
         .transpose()?
         .unwrap_or("");
     let config = Config::load_for(&session.directory).map_err(ApiError::invalid)?;
-    let command = config
-        .command
-        .get(name)
-        .ok_or_else(|| ApiError::not_found(format!("Command {name} is not configured")))?;
-    let template = command
-        .get("template")
-        .and_then(Value::as_str)
-        .or_else(|| command.as_str())
-        .ok_or_else(|| ApiError::invalid(format!("Command {name} has no template")))?;
-    let model = body
-        .get("model")
-        .or_else(|| command.get("model"))
-        .map(|value| {
-            value
-                .as_str()
-                .ok_or_else(|| ApiError::invalid("model must be a provider/model string"))
-                .and_then(model_from_slug)
-        })
-        .transpose()?;
+    if !config.command.contains_key(name) {
+        return Err(ApiError::not_found(format!(
+            "Command {name} is not configured"
+        )));
+    }
     let optional_string = |key: &str| -> Result<Option<String>, ApiError> {
         body.get(key)
-            .or_else(|| {
-                if key == "agent" {
-                    command.get(key)
-                } else {
-                    None
-                }
-            })
             .map(|value| {
                 value
                     .as_str()
@@ -648,7 +574,7 @@ async fn command_run(
             })
             .transpose()
     };
-    let mut parts = vec![json!({"type": "text", "text": expand_command(template, arguments)})];
+    let mut parts = Vec::new();
     if let Some(files) = body.get("parts") {
         let files = files
             .as_array()
@@ -663,15 +589,23 @@ async fn command_run(
         }
         parts.extend(files.iter().cloned());
     }
-    let request = PromptRequest {
-        model,
-        parts,
-        message_id: optional_string("messageID")?,
-        agent: optional_string("agent")?,
-        variant: optional_string("variant")?,
-        command: Some(name.to_owned()),
-        ..Default::default()
-    };
+    let request = crate::commands::prepare(
+        &config,
+        name,
+        arguments,
+        PromptRequest {
+            model: optional_string("model")?
+                .map(|model| ModelRef::parse(&model))
+                .transpose()
+                .map_err(ApiError::invalid)?,
+            parts,
+            message_id: optional_string("messageID")?,
+            agent: optional_string("agent")?,
+            variant: optional_string("variant")?,
+            ..Default::default()
+        },
+    )
+    .map_err(ApiError::invalid)?;
     validate_prompt(&request)?;
     st.engine
         .run_sync(st.app.clone(), id, request)
@@ -1439,18 +1373,18 @@ mod tests {
     #[test]
     fn command_arguments_are_literal_and_last_position_collects_remainder() {
         assert_eq!(
-            expand_command("First $1. Rest $2.", "\"alpha beta\" gamma delta"),
+            crate::commands::expand("First $1. Rest $2.", "\"alpha beta\" gamma delta"),
             "First alpha beta. Rest gamma delta."
         );
         assert_eq!(
-            expand_command("$ARGUMENTS / $ARGUMENTS", "$& $$ $` $'"),
+            crate::commands::expand("$ARGUMENTS / $ARGUMENTS", "$& $$ $` $'"),
             "$& $$ $` $' / $& $$ $` $'"
         );
         assert_eq!(
-            expand_command("Review.", "branch main"),
+            crate::commands::expand("Review.", "branch main"),
             "Review.\n\nbranch main"
         );
-        assert_eq!(expand_command("$2", "only"), "");
+        assert_eq!(crate::commands::expand("$2", "only"), "");
     }
 
     #[test]

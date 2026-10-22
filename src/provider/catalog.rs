@@ -1,6 +1,6 @@
 use super::{Adapter, ChatRequest, Protocol};
 use crate::auth::AuthStore;
-use crate::config::{deep_merge, Config, ModelInfo};
+use crate::config::{deep_merge, Config, ModelInfo, ProviderCfg};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -54,7 +54,6 @@ pub async fn discover_models(config: &Config, auth: &AuthStore) -> (Config, Vec<
             }
         }
     }
-    apply_reasoning_options(&mut result);
     (result, errors)
 }
 
@@ -66,38 +65,41 @@ const OUTPUT_TOKEN_MAX: u64 = 32_000;
 /// replaces the catalog-derived ones; configured `variants` still merge on top.
 /// Options no supported protocol maps leave the catalog variants in place, as
 /// upstream does.
+pub(crate) fn normalize_provider(id: &str, source: &ProviderCfg) -> ProviderCfg {
+    let mut provider = source.clone();
+    let npm_default = provider.npm.clone();
+    let provider_options = serde_json::to_value(&provider.options).unwrap_or_else(|_| json!({}));
+    for model in provider.models.values_mut() {
+        let Some(options) = model
+            .extra
+            .get("reasoning_options")
+            .and_then(Value::as_array)
+            .cloned()
+        else {
+            continue;
+        };
+        let protocol = model_protocol(id, &npm_default, &provider_options, model);
+        let Some(generated) = reasoning_variants(&options, protocol, model) else {
+            continue;
+        };
+        let mut variants = Value::Object(generated);
+        let configured = model
+            .extra
+            .get("variants")
+            .cloned()
+            .filter(|value| value.is_object());
+        if let Some(configured) = configured {
+            deep_merge(&mut variants, configured);
+        }
+        model.extra.insert("variants".into(), variants);
+    }
+    provider
+}
+
+#[cfg(test)]
 fn apply_reasoning_options(config: &mut Config) {
     for (id, provider) in &mut config.provider {
-        let npm_default = provider.npm.clone();
-        let provider_options =
-            serde_json::to_value(&provider.options).unwrap_or_else(|_| json!({}));
-        for model in provider.models.values_mut() {
-            let Some(options) = model
-                .extra
-                .get("reasoning_options")
-                .and_then(Value::as_array)
-                .cloned()
-            else {
-                continue;
-            };
-            let protocol = model_protocol(id, &npm_default, &provider_options, model);
-            let Some(generated) = reasoning_variants(&options, protocol, model) else {
-                continue;
-            };
-            let mut variants = Value::Object(generated);
-            let configured = model
-                .extra
-                .get("variants")
-                .cloned()
-                .filter(|value| value.is_object());
-            if let Some(configured) = configured {
-                deep_merge(&mut variants, configured);
-            }
-            if let Some(entries) = variants.as_object_mut() {
-                entries.retain(|_, value| value["disabled"] != json!(true));
-            }
-            model.extra.insert("variants".into(), variants);
-        }
+        *provider = normalize_provider(id, provider);
     }
 }
 
@@ -175,7 +177,8 @@ fn reasoning_variants(
         .as_u64()
         .map(|max| max.saturating_sub(1))
         .unwrap_or(OUTPUT_TOKEN_MAX - 1)
-        .min(output.saturating_sub(1));
+        .min(output.saturating_sub(1))
+        .min(OUTPUT_TOKEN_MAX - 1);
     if maximum == 0 {
         return None;
     }

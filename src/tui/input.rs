@@ -1,6 +1,8 @@
 use super::{Attachment, PendingPrompt, RowKind, Ui, Visibility, BOLD, RESET};
+use std::cell::{Ref, RefCell};
 use std::collections::VecDeque;
 use std::io::Write;
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -12,8 +14,28 @@ pub(super) struct Draft {
     pub cursor: usize,
     /// Fixed end of the selection, when the caret is moving it.
     anchor: Option<usize>,
-    /// Snapshot stack for Ctrl+Z.
-    undo: Vec<(String, usize)>,
+    /// Reverse edits retain deleted text, never a copy of the entire draft.
+    undo: VecDeque<UndoEdit>,
+    undo_bytes: usize,
+    typing: bool,
+    /// Invalidated by externally assigned cursor positions or history recall.
+    position: Option<(usize, usize)>,
+}
+
+const MAX_UNDO_BYTES: usize = 1024 * 1024;
+const MAX_UNDO_EDITS: usize = 1000;
+
+struct UndoEdit {
+    start: usize,
+    inserted: usize,
+    removed: String,
+    cursor: usize,
+}
+
+impl UndoEdit {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.removed.capacity()
+    }
 }
 
 pub(super) fn clean_input(text: &str) -> String {
@@ -65,24 +87,100 @@ fn word_end(chars: &[&str], from: usize) -> usize {
 
 impl Draft {
     pub fn insert(&mut self, ch: char) {
-        // delete_selection() snapshots; typing over a selection is ONE undo step.
-        if self.selection().is_none() {
-            self.snapshot();
-        }
-        self.delete_selection();
-        self.text.insert(byte_index(&self.text, self.cursor), ch);
-        self.cursor += 1;
+        self.insert_text(ch.encode_utf8(&mut [0; 4]), true);
     }
 
     pub fn insert_str(&mut self, text: &str) {
-        if self.selection().is_none() {
-            self.snapshot();
+        self.insert_text(text, false);
+    }
+
+    fn offset(&self) -> usize {
+        self.position
+            .filter(|(cursor, _)| *cursor == self.cursor)
+            .map_or_else(|| byte_index(&self.text, self.cursor), |(_, offset)| offset)
+    }
+
+    fn insert_text(&mut self, text: &str, typing: bool) {
+        let (lo, hi) = self.selection().unwrap_or((self.cursor, self.cursor));
+        let start = if lo == self.cursor {
+            self.offset()
+        } else {
+            byte_index(&self.text, lo)
+        };
+        let end = if hi == self.cursor {
+            self.offset()
+        } else {
+            byte_index(&self.text, hi)
+        };
+        let append_ascii =
+            start == self.text.len() && text.is_ascii() && !self.text.ends_with('\r');
+        self.replace(start..end, text, typing && lo == hi);
+        self.cursor = if append_ascii {
+            lo + text.len()
+        } else {
+            self.text
+                .grapheme_indices(true)
+                .take_while(|(index, _)| *index < start + text.len())
+                .count()
+        };
+        let offset = if append_ascii {
+            start + text.len()
+        } else {
+            byte_index(&self.text, self.cursor)
+        };
+        self.position = Some((self.cursor, offset));
+    }
+
+    fn replace(&mut self, range: Range<usize>, text: &str, typing: bool) {
+        if range.is_empty() && text.is_empty() {
+            return;
         }
-        self.delete_selection();
-        let added = graphemes(text);
-        self.text
-            .insert_str(byte_index(&self.text, self.cursor), text);
-        self.cursor += added;
+        let edit = UndoEdit {
+            start: range.start,
+            inserted: text.len(),
+            removed: self.text[range.clone()].to_owned(),
+            cursor: self.cursor,
+        };
+        let coalesce = typing
+            && self.typing
+            && edit.removed.is_empty()
+            && self.undo.back().is_some_and(|last| {
+                last.removed.is_empty() && last.start + last.inserted == edit.start
+            });
+        if coalesce {
+            self.undo.back_mut().unwrap().inserted += edit.inserted;
+        } else if edit.bytes() > MAX_UNDO_BYTES {
+            // An oversized deletion cannot fit. Do not leave older records
+            // whose byte ranges refer to text this edit has replaced.
+            self.reset_undo();
+        } else {
+            while self.undo_bytes + edit.bytes() > MAX_UNDO_BYTES
+                || self.undo.len() >= MAX_UNDO_EDITS
+            {
+                self.undo_bytes -= self.undo.pop_front().unwrap().bytes();
+            }
+            self.undo_bytes += edit.bytes();
+            self.undo.push_back(edit);
+        }
+        self.text.replace_range(range, text);
+        self.anchor = None;
+        self.position = None;
+        self.typing = typing;
+    }
+
+    fn reset_undo(&mut self) {
+        self.undo.clear();
+        self.undo_bytes = 0;
+        self.typing = false;
+        self.position = None;
+    }
+
+    /// Submitting starts a fresh editing lifetime, including undo/selection.
+    pub fn take(&mut self) -> (String, Vec<Attachment>) {
+        let Self {
+            text, attachments, ..
+        } = std::mem::take(self);
+        (text, attachments)
     }
 
     pub fn selection(&self) -> Option<(usize, usize)> {
@@ -92,6 +190,7 @@ impl Draft {
     }
 
     fn anchor_here(&mut self) {
+        self.typing = false;
         self.anchor = Some(self.anchor.unwrap_or(self.cursor));
     }
 
@@ -104,25 +203,23 @@ impl Draft {
     /// Remove the selection, returning its text (for the kill ring).
     fn delete_selection(&mut self) -> Option<String> {
         let (lo, hi) = self.selection()?;
-        let text = self.text[byte_index(&self.text, lo)..byte_index(&self.text, hi)].to_string();
-        self.snapshot();
-        self.text
-            .replace_range(byte_index(&self.text, lo)..byte_index(&self.text, hi), "");
+        let range = byte_index(&self.text, lo)..byte_index(&self.text, hi);
+        let text = self.text[range.clone()].to_owned();
+        self.replace(range, "", false);
         self.cursor = lo;
-        self.anchor = None;
         Some(text)
     }
 
-    fn snapshot(&mut self) {
-        self.undo.push((self.text.clone(), self.cursor));
-    }
-
     pub fn undo(&mut self) {
-        if let Some((text, cursor)) = self.undo.pop() {
-            self.text = text;
-            self.cursor = cursor.min(graphemes(&self.text));
+        if let Some(edit) = self.undo.pop_back() {
+            self.undo_bytes -= edit.bytes();
+            self.text
+                .replace_range(edit.start..edit.start + edit.inserted, &edit.removed);
+            self.cursor = edit.cursor.min(graphemes(&self.text));
             self.anchor = None;
+            self.position = None;
         }
+        self.typing = false;
     }
 
     fn clamped(&self) -> usize {
@@ -130,15 +227,18 @@ impl Draft {
     }
 
     fn left_impl(&mut self) {
+        self.typing = false;
         self.cursor = self.cursor.saturating_sub(1);
     }
 
     fn right_impl(&mut self) {
+        self.typing = false;
         self.cursor = (self.cursor + 1).min(graphemes(&self.text));
     }
 
     /// Start of the current line; 0 for the first line.
     fn home_impl(&mut self) {
+        self.typing = false;
         let bytes = byte_index(&self.text, self.clamped());
         let start = self.text[..bytes].rfind('\n').map_or(0, |i| i + 1);
         self.cursor = graphemes(&self.text[..start]);
@@ -146,6 +246,7 @@ impl Draft {
 
     /// End of the current line; the text end for the last line.
     fn end_impl(&mut self) {
+        self.typing = false;
         let bytes = byte_index(&self.text, self.clamped());
         let end = self.text[bytes..]
             .find('\n')
@@ -154,11 +255,13 @@ impl Draft {
     }
 
     fn word_left_impl(&mut self) {
+        self.typing = false;
         let chars: Vec<&str> = self.text.graphemes(true).collect();
         self.cursor = word_start(&chars, self.clamped());
     }
 
     fn word_right_impl(&mut self) {
+        self.typing = false;
         let chars: Vec<&str> = self.text.graphemes(true).collect();
         self.cursor = word_end(&chars, self.clamped());
     }
@@ -166,6 +269,7 @@ impl Draft {
     /// Move the caret to the same column on the row above (negative) or
     /// below, using the same wrapped layout the preview draws.
     fn move_row_impl(&mut self, prefix: &str, width: usize, delta: isize) {
+        self.typing = false;
         let l = layout(prefix, &self.text, self.cursor, width, None);
         let total = l.positions.len() - 1;
         let (row, col, _) = l.positions[(l.prefix_len + self.clamped()).min(total)];
@@ -283,8 +387,7 @@ impl Draft {
             return None;
         }
         let killed = self.text[bytes..end].to_string();
-        self.snapshot();
-        self.text.replace_range(bytes..end, "");
+        self.replace(bytes..end, "", false);
         Some(killed)
     }
 
@@ -300,8 +403,7 @@ impl Draft {
         }
         let bytes = byte_index(&self.text, start)..byte_index(&self.text, self.cursor);
         let killed = self.text[bytes.clone()].to_string();
-        self.snapshot();
-        self.text.replace_range(bytes, "");
+        self.replace(bytes, "", false);
         self.cursor = start;
         Some(killed)
     }
@@ -316,10 +418,10 @@ impl Draft {
         if self.cursor == count {
             return;
         }
-        self.snapshot();
-        self.text.replace_range(
+        self.replace(
             byte_index(&self.text, self.cursor)..byte_index(&self.text, self.cursor + 1),
             "",
+            false,
         );
     }
 
@@ -334,16 +436,14 @@ impl Draft {
             }
             return;
         }
-        self.snapshot();
         let start = byte_index(&self.text, self.cursor - 1);
         let end = byte_index(&self.text, self.cursor);
-        self.text.replace_range(start..end, "");
+        self.replace(start..end, "", false);
         self.cursor -= 1;
     }
 
     pub fn clear(&mut self) {
-        self.snapshot();
-        self.text.clear();
+        self.replace(0..self.text.len(), "", false);
         self.attachments.clear();
         self.cursor = 0;
         self.anchor = None;
@@ -425,6 +525,7 @@ impl History {
             return true;
         }
         self.index = (next < len).then_some(next);
+        draft.reset_undo();
         if next == len {
             draft.text = std::mem::take(&mut self.saved);
         } else {
@@ -715,6 +816,19 @@ pub(super) struct Display {
     tail_kind: RowKind,
     /// Ctrl+T / Ctrl+O state: which kinds are painted.
     visibility: Visibility,
+    wrapped: RefCell<WrappedRows>,
+}
+
+/// Only new logical rows need wrapping between paints. Resizing or changing
+/// visibility rebuilds this index once; ordinary paints copy the viewport only.
+#[derive(Default)]
+struct WrappedRows {
+    width: usize,
+    visibility: Visibility,
+    through: usize,
+    rows: Vec<String>,
+    #[cfg(test)]
+    work: usize,
 }
 
 impl Default for Display {
@@ -738,6 +852,7 @@ impl Display {
             paint_width: 80,
             tail_kind: RowKind::Plain,
             visibility: Visibility::default(),
+            wrapped: RefCell::new(WrappedRows::default()),
         }
     }
 
@@ -788,6 +903,19 @@ impl Display {
     /// brings it back, and dropped in native mode, where the terminal's
     /// scrollback cannot be rewritten.
     pub fn output_as(&mut self, text: &str, width: usize, kind: RowKind) {
+        let mut text = text;
+        if kind != self.tail_kind {
+            let committed = self.columns > 0;
+            // The existing tail belongs to the preceding event, even when the
+            // next event begins with its terminating newline under another kind.
+            self.finish_line();
+            if committed {
+                text = text
+                    .strip_prefix("\r\n")
+                    .or_else(|| text.strip_prefix('\n'))
+                    .unwrap_or(text);
+            }
+        }
         self.tail_kind = kind;
         // Track SGR sequences as zero-width tokens. Replay the current style
         // when wrapping a streaming delta across committed transcript rows.
@@ -849,6 +977,8 @@ impl Display {
     pub fn clear_screen(&mut self, header: &str, width: usize) {
         if self.fullscreen {
             self.lines.clear();
+            self.wrapped.get_mut().rows.clear();
+            self.wrapped.get_mut().through = 0;
             self.scroll = None;
         } else {
             self.finish_line();
@@ -871,12 +1001,13 @@ impl Display {
         // disappear with it, so the conversation lands on the primary screen.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         print!("\x1b[2J\x1b[H");
-        // Handing the transcript to the terminal's scrollback is a one-way
-        // trip, so it carries every row, hidden kinds included.
-        for (_, line) in &self.lines {
+        // Export the view the user selected, with one form of each tool call.
+        for line in self.export_rows() {
             crate::println!("{line}");
         }
         self.lines.clear();
+        self.wrapped.get_mut().rows.clear();
+        self.wrapped.get_mut().through = 0;
         self.scroll = None;
     }
 
@@ -911,16 +1042,35 @@ impl Display {
         self.page.max(1)
     }
 
-    /// Every visible transcript line wrapped for `width`, oldest first. Hidden
-    /// kinds are left out, so scrolling counts only what is painted.
-    fn wrapped(&self, width: usize) -> Vec<String> {
-        let mut rows: Vec<String> = Vec::new();
-        for (kind, line) in &self.lines {
+    /// Export one visible representation, respecting both transcript toggles.
+    fn export_rows(&self) -> impl Iterator<Item = &str> {
+        self.lines
+            .iter()
+            .filter(|(kind, _)| self.visibility.visible(*kind))
+            .map(|(_, line)| line.as_str())
+    }
+
+    /// Cache visible display rows; scrolling and painting share this index.
+    fn wrapped(&self, width: usize) -> Ref<'_, Vec<String>> {
+        let mut cache = self.wrapped.borrow_mut();
+        if cache.width != width || cache.visibility != self.visibility {
+            cache.width = width;
+            cache.visibility = self.visibility;
+            cache.through = 0;
+            cache.rows.clear();
+        }
+        for (kind, line) in &self.lines[cache.through..] {
             if self.visibility.visible(*kind) {
-                rows.extend(wrap_row(line, width));
+                cache.rows.extend(wrap_row(line, width));
+                #[cfg(test)]
+                {
+                    cache.work += 1;
+                }
             }
         }
-        rows
+        cache.through = self.lines.len();
+        drop(cache);
+        Ref::map(self.wrapped.borrow(), |cache| &cache.rows)
     }
 
     /// Transcript display rows for the current scroll position, oldest first,
@@ -1554,5 +1704,125 @@ mod tests {
         assert_eq!(plain(&display), ["a", "b"]);
         display.scroll_bottom();
         assert_eq!(plain(&display), ["d", "e"]);
+    }
+
+    #[test]
+    fn large_pastes_and_typing_store_edits_and_submission_drops_undo() {
+        let mut draft = Draft::default();
+        let original = "x".repeat(1024 * 1024);
+        draft.insert_str(&original);
+        for _ in 0..1000 {
+            draft.insert('a');
+        }
+        assert_eq!(draft.text.len(), original.len() + 1000);
+        assert!(
+            draft.undo_bytes < 1024,
+            "typing must not retain whole draft copies"
+        );
+        draft.undo();
+        assert_eq!(draft.text, original);
+        draft.undo();
+        assert!(draft.text.is_empty());
+        draft.insert_str("sent");
+        let (text, _) = draft.take();
+        assert_eq!(text, "sent");
+        draft.undo();
+        assert!(draft.text.is_empty());
+        draft.insert_str(&"x".repeat(2 * MAX_UNDO_BYTES));
+        draft.clear();
+        assert!(draft.undo_bytes <= MAX_UNDO_BYTES);
+        draft.undo();
+        assert!(
+            draft.text.is_empty(),
+            "an omitted large deletion invalidates older records"
+        );
+    }
+
+    #[test]
+    fn undo_records_are_bounded_and_unicode_edits_round_trip() {
+        let mut draft = Draft::default();
+        for _ in 0..2 * MAX_UNDO_EDITS {
+            draft.insert_str("x");
+        }
+        assert_eq!(draft.undo.len(), MAX_UNDO_EDITS);
+        assert!(draft.undo_bytes <= MAX_UNDO_BYTES);
+        draft.take();
+        draft.insert_str("e");
+        draft.insert('\u{301}');
+        assert_eq!(draft.cursor, 1);
+        draft.insert('!');
+        assert_eq!(draft.text, "e\u{301}!");
+        draft.undo();
+        assert_eq!(draft.text, "e");
+        draft.undo();
+        assert!(draft.text.is_empty());
+        draft.insert_str("a👩‍💻z");
+        draft.left();
+        draft.select_left();
+        draft.insert_str("中");
+        assert_eq!(draft.text, "a中z");
+        draft.undo();
+        assert_eq!(draft.text, "a👩‍💻z");
+        draft.backspace();
+        draft.undo();
+        assert_eq!(draft.text, "a👩‍💻z");
+    }
+
+    #[test]
+    fn kind_transitions_preserve_the_previous_tail_and_export_one_tool_form() {
+        let mut display = Display::new(true);
+        display.output_as("secret thinking", 80, RowKind::Thinking);
+        display.output("\nassistant\nanswer without newline", 80);
+        display.output_as("\nbrief command\n", 80, RowKind::ToolBrief);
+        display.output_as("expanded command\nexpanded output\n", 80, RowKind::ToolFull);
+        display.set_visibility(Visibility {
+            thinking: false,
+            tools_expanded: false,
+        });
+        let rows = display.wrapped(80).join("\n");
+        assert!(!rows.contains("secret thinking"));
+        assert!(rows.contains("answer without newline"));
+        let exported = display.export_rows().collect::<Vec<_>>().join("\n");
+        assert!(exported.contains("brief command"));
+        assert!(!exported.contains("expanded command"));
+        assert!(!exported.contains("secret thinking"));
+        display.set_visibility(Visibility {
+            thinking: true,
+            tools_expanded: true,
+        });
+        let exported = display.export_rows().collect::<Vec<_>>().join("\n");
+        assert!(exported.contains("secret thinking"));
+        assert!(exported.contains("expanded command"));
+        assert!(!exported.contains("brief command"));
+    }
+
+    #[test]
+    fn paints_reuse_wrapped_history_and_invalidate_on_resize_toggle_and_clear() {
+        let mut display = Display::new(true);
+        for _ in 0..8000 {
+            display.output("a long transcript row\n", 80);
+        }
+        display.viewport(80);
+        let work = display.wrapped.borrow().work;
+        for _ in 0..10 {
+            display.viewport(80);
+        }
+        assert_eq!(display.wrapped.borrow().work, work);
+        display.output("new row\n", 80);
+        display.viewport(80);
+        assert_eq!(display.wrapped.borrow().work, work + 1);
+        display.viewport(10);
+        let resized = display.wrapped.borrow().work;
+        assert_eq!(resized, work + 1 + 8001);
+        display.set_visibility(Visibility {
+            thinking: false,
+            tools_expanded: false,
+        });
+        display.viewport(10);
+        assert_eq!(display.wrapped.borrow().work, resized + 8001);
+        display.clear_screen("fresh", 10);
+        let rows = display.viewport(10).join("|");
+        assert!(rows.contains("fresh"));
+        assert!(!rows.contains("transcript"));
     }
 }

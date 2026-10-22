@@ -370,3 +370,87 @@ async fn the_first_prompt_names_a_session_started_without_a_title() {
         .unwrap();
     assert_eq!(session["title"], "Chosen title");
 }
+
+#[tokio::test]
+async fn sibling_startup_does_not_drain_a_live_sessions_queued_turn() {
+    let (release, gate) = oneshot::channel();
+    let mut first = text_script("FIRST_RESPONSE_CONTEXT", " completed");
+    first.gate = Some(gate);
+    let mut provider = Provider::start(vec![first, text_script("second done", "")]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{sid}/prompt_async"),
+            &prompt("first_owned", "first turn"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    server
+        .post(
+            &format!("/session/{sid}/prompt_async"),
+            &prompt("queued_owned", "second turn"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let (mut sibling, sibling_url) = launch(server.root.path(), &server.directory).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), provider.requests.recv())
+            .await
+            .is_err(),
+        "sibling started queued work before the live response finished"
+    );
+    let response = server
+        .client
+        .post(format!("{sibling_url}/session/{sid}/prompt_async"))
+        .json(&prompt("foreign_owned", "foreign turn"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    release.send(()).unwrap();
+    let second = provider.request().await;
+    assert!(second
+        .to_string()
+        .contains("FIRST_RESPONSE_CONTEXT completed"));
+    events.through("session.idle").await;
+    let messages = server.messages(&sid).await;
+    assert!(!messages
+        .iter()
+        .any(|message| message["info"]["id"] == "foreign_owned"));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["info"]["role"] == "assistant")
+            .count(),
+        2
+    );
+    sibling.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_stays_responsive_while_a_sibling_holds_the_sqlite_write_lock() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let connection =
+        rusqlite::Connection::open(server.root.path().join(".local/share/ocmini/ocmini.db"))
+            .unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let create = server.post("/session", &json!({"title":"waiting writer"}));
+    let pending = tokio::spawn(async move { create.send().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pending.is_finished());
+    let health =
+        tokio::time::timeout(Duration::from_secs(1), server.get("/global/health").send()).await;
+    connection.execute_batch("ROLLBACK").unwrap();
+    assert!(health.unwrap().unwrap().status().is_success());
+    assert!(pending.await.unwrap().unwrap().status().is_success());
+}

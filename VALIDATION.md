@@ -413,3 +413,18 @@ warnings denied, and the full suite pass.
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.
 
 Live-provider calls and full client-application workflows require validation in the target environment. Local tests do not establish performance or compatibility with unsupported provider protocols. See [SPEC-CONTRACT.md](SPEC-CONTRACT.md) for the API surface.
+
+
+## Runtime and terminal audit fixes (2026-10-22)
+
+The audit follow-up adds regressions for live ownership during sibling startup, foreign admission, stale lease release, CLI stream resets, configured command templates and defaults, advertised reasoning budgets on actual HTTP/CLI requests, disabled variants, and HTTP health responsiveness during SQLite write contention. Idle ownership is released before completing synchronous responses so an immediate restart remains resumable.
+
+The executable now defaults to one Tokio async worker. Store, usage-mirror and synchronous engine sections use `block_in_place`, allowing Tokio to hand the scheduler to a replacement worker while database calls or engine mutexes block. `TOKIO_WORKER_THREADS` still selects the async worker count; a fixed total thread count is not promised during blocking work.
+
+Undo stores reverse edits, coalesces contiguous typing, and is bounded by 1 MiB of edit records and 1,000 entries. Submitting or changing sessions discards the previous editor history. An oversized deletion clears the history rather than retaining an unbounded copy. Tests cover Unicode/selection round trips, budget eviction, and submission reset. An isolated optimized harness using the production editor retained two records (96 accounted bytes) after pasting 10 MiB and typing 1,000 characters; this measures undo data, excluding the draft and container/allocator overhead.
+
+Transcript tests cover visibility changes across unfinished rows, selecting one tool representation for exit, and wrapping-cache invalidation. A work counter verifies that repeated paints do not re-wrap archived rows. In a synthetic 140-character-row fixture at width 79, warmed viewport construction measured approximately 0.3–0.5 microseconds at 300, 3,000 and 8,000 logical rows; resize/visibility changes still rebuild the wrapping index. These are renderer measurements, not end-to-end terminal latency.
+
+Validation on stable and Rust 1.85.0: `cargo test --all-targets --locked` passed 172 unit and 62 contract tests on each compiler, and `cargo clippy --all-targets --all-features --locked -- -D warnings` passed on each. Stable formatting and the Rust 1.85.0 locked release build passed. Each compiler used an isolated target directory. Real pseudo-terminal checks in native and full-screen modes verified paste → typing → undo → submission, clean exit, and full-screen export with hidden reasoning and a single collapsed tool call.
+
+The original local-provider reproductions now complete without the CLI panic, advertise/send the same 15,999-token reasoning budget, keep the sibling from starting queued work, and expand `run --command` templates. In the external SQLite write-lock fixture, the concurrent health request completed in 1.5 ms while the session writer remained blocked. These use isolated temporary config/data directories and localhost providers, not production sessions or external inference.

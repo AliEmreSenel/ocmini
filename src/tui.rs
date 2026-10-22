@@ -600,7 +600,7 @@ fn answer_question(state: &mut PendingPrompt) -> (bool, String) {
         // accepting a list here would stall the tool.
         return (false, format!("{YELLOW}one answer only{RESET}\n"));
     }
-    drafts[*current].clear();
+    drafts[*current] = Draft::default();
     answers[*current] = choices;
     let mut out = format!("  {GREEN}✓{RESET} {}\n", answers[*current].join(", "));
     // The last answer opens the confirmation screen; Enter sends from there.
@@ -669,7 +669,7 @@ fn switch_question(state: &mut PendingPrompt, delta: isize) -> Option<String> {
     else {
         return None;
     };
-    if questions.len() < 2 {
+    if questions.is_empty() {
         return None;
     }
     *confirm = false;
@@ -1279,7 +1279,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                 let Some(event) = event else { break; };
                 let event = event.map_err(|error| error.to_string())?;
                 display.erase();
-                if matches!(event, Event::Resize(_, _)) {
+                if matches!(event, Event::Resize(_, _)) && !fullscreen {
                     display.finish_line();
                 }
                 let key = decode_event(event);
@@ -1369,7 +1369,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                             model_ref.as_ref(),
                                             &app.config.lock().unwrap().model,
                                         );
-                                        draft.clear();
+                                        draft = Draft::default();
                                         prompt_history.load(session_prompts(&history));
                                         display.output(
                                             &format!(
@@ -1505,9 +1505,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     Key::Enter if pending_permission => {},
                     Key::Enter => {
                         display.finish_line();
-                        let text = std::mem::take(&mut draft.text);
-                        draft.cursor = 0;
-                        let files = std::mem::take(&mut draft.attachments);
+                        let (text, files) = draft.take();
                         if !text.is_empty() {
                             display.output(
                                 &format!("{BOLD}›{RESET} {text}\n"),
@@ -2320,5 +2318,27 @@ mod tests {
             "{} chars",
             shown.chars().count()
         );
+    }
+    #[test]
+    fn a_single_confirmed_question_can_be_reopened_with_tab() {
+        let mut state = PendingPrompt::Question {
+            id: "q".into(),
+            questions: vec![
+                serde_json::json!({"question":"Pick", "options":[{"label":"first","description":""}]}),
+            ],
+            answers: vec![vec!["first".into()]],
+            current: 0,
+            confirm: true,
+            drafts: vec![Draft::default()],
+        };
+        assert!(switch_question(&mut state, 1).is_some());
+        let PendingPrompt::Question {
+            confirm, drafts, ..
+        } = state
+        else {
+            unreachable!()
+        };
+        assert!(!confirm);
+        assert_eq!(drafts[0].text, "1");
     }
 }

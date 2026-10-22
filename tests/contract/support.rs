@@ -143,6 +143,7 @@ impl Provider {
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let router = Router::new()
             .route("/v1/chat/completions", post(provider_reply))
+            .route("/v1/messages", post(provider_reply))
             .with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();

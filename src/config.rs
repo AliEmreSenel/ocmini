@@ -289,6 +289,7 @@ impl Config {
             if !self.provider_enabled(pid) {
                 continue;
             }
+            let p = crate::provider::normalize_provider(pid, p);
             let whitelist = p.extra.get("whitelist").and_then(Value::as_array);
             let blacklist = p.extra.get("blacklist").and_then(Value::as_array);
             for (mid, m) in &p.models {
@@ -303,6 +304,9 @@ impl Config {
                     continue;
                 }
                 let mut model = serde_json::to_value(m).unwrap_or_else(|_| json!({}));
+                if let Some(variants) = model["variants"].as_object_mut() {
+                    variants.retain(|_, value| value["disabled"] != true);
+                }
                 model["id"] = json!(format!("{pid}/{mid}"));
                 model["providerID"] = json!(pid);
                 model["modelID"] = json!(mid);
