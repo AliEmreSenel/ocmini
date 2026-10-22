@@ -28,6 +28,13 @@ Set it in `opencode.json` before starting; a running TUI keeps the mode it start
 { "ui": { "scroll_mode": "fullscreen" } }
 ```
 
+Two transcript toggles work while you chat, and the prompt header shows the current state:
+
+- `Ctrl+T` hides chain of thought - the `◦ thinking` block and everything streamed into it - for a transcript of just answers and tool calls.
+- `Ctrl+O` expands tool calls. Collapsed (default) shows one line per call: the command truncated to 120 columns and the result truncated to 160. Expanded shows the whole command and the whole result, with multi-line output indented under its `✓` / `✗` marker. One call paints at most 50 KiB, the same cap the tool layer puts on a result, and says how much it left out.
+
+Press a key again to switch back. In `fullscreen` mode the transcript is re-rendered, so expanding shows calls that already ran and hiding brings text back exactly as it was, at any scroll position. In `native` mode ocmini cannot rewrite the terminal's scrollback, so the toggle applies to output from that keystroke on.
+
 Clipboard image paste needs `wl-paste` (Wayland), `xclip` (X11), `osascript` (macOS) or PowerShell (Windows). Many terminals handle Ctrl+Shift+V themselves: pasted text and image paths work, but a screenshot cannot reach the app if the terminal sends no paste event or image data. Use Ctrl+V for a direct clipboard read, or configure the terminal to forward Ctrl+Shift+V. PNG, JPEG, GIF and WebP images are supported. Quoted paths, shell-escaped spaces and percent-encoded `file://` URLs work too.
 
 Over SSH, ordinary terminal paste carries text, not your local image clipboard. Copy the image to the remote host (for example with `scp`) and paste its **remote** path. X11 clipboard forwarding can also work when `DISPLAY` is forwarded and `xclip` is installed on the remote host. Clipboard images are stored with the message, so they remain available when resuming a session.

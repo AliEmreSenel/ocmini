@@ -1,4 +1,4 @@
-use super::{Attachment, PendingPrompt, Ui, BOLD, RESET};
+use super::{Attachment, PendingPrompt, RowKind, Ui, Visibility, BOLD, RESET};
 use std::collections::VecDeque;
 use std::io::Write;
 use unicode_segmentation::UnicodeSegmentation;
@@ -683,6 +683,11 @@ fn wrap_row(row: &str, width: usize) -> Vec<String> {
 // wheel scrolling. In full-screen mode (`ui.scroll_mode: "fullscreen"`) rows
 // are kept in memory and the whole screen is repainted, so the app scrolls the
 // transcript with PageUp/PageDown, Ctrl+Home/Ctrl+End and the wheel.
+//
+// Every row carries the Ctrl+T / Ctrl+O toggle that can hide it. Full-screen
+// mode filters at paint time, so hidden text returns when the toggle flips;
+// native mode cannot rewrite the terminal's scrollback, so a hidden row is
+// never printed and the toggle only affects output from then on.
 // The draft may span several wrapped rows; the real terminal cursor is parked
 // on the edit position so typing, arrows and the caret stay in sync.
 pub(super) struct Display {
@@ -694,8 +699,9 @@ pub(super) struct Display {
     /// caret's row, which is the block's last row only when the caret is at
     /// the end of the draft.
     caret_row: usize,
-    /// Full-screen mode: committed transcript rows, oldest first.
-    lines: Vec<String>,
+    /// Full-screen mode: committed transcript rows with the kind that can hide
+    /// them, oldest first. Hidden rows stay stored so a toggle brings them back.
+    lines: Vec<(RowKind, String)>,
     fullscreen: bool,
     /// First transcript display row painted at the viewport top. None follows
     /// the newest output.
@@ -705,6 +711,10 @@ pub(super) struct Display {
     /// Width the last repaint wrapped transcript rows at: scrolling counts
     /// display rows, so it has to wrap the same way the paint did.
     paint_width: usize,
+    /// Kind of the row being written, so the unfinished tail is hidden with it.
+    tail_kind: RowKind,
+    /// Ctrl+T / Ctrl+O state: which kinds are painted.
+    visibility: Visibility,
 }
 
 /// Transcript rows full-screen repaints keep in memory.
@@ -729,7 +739,16 @@ impl Display {
             scroll: None,
             page: 24,
             paint_width: 80,
+            tail_kind: RowKind::Plain,
+            visibility: Visibility::default(),
         }
+    }
+
+    /// Ctrl+T / Ctrl+O: change which transcript rows are painted. Full-screen
+    /// mode repaints from the rows it kept, so hidden text comes back; native
+    /// mode drops hidden rows as they arrive.
+    pub fn set_visibility(&mut self, visibility: Visibility) {
+        self.visibility = visibility;
     }
 
     pub fn erase(&mut self) {
@@ -764,6 +783,15 @@ impl Display {
     }
 
     pub fn output(&mut self, text: &str, width: usize) {
+        self.output_as(text, width, RowKind::Plain);
+    }
+
+    /// Output one run of transcript text tagged with the toggle that can hide
+    /// it. A hidden run is stored in full-screen mode, so flipping the toggle
+    /// brings it back, and dropped in native mode, where the terminal's
+    /// scrollback cannot be rewritten.
+    pub fn output_as(&mut self, text: &str, width: usize, kind: RowKind) {
+        self.tail_kind = kind;
         // Track SGR sequences as zero-width tokens. Replay the current style
         // when wrapping a streaming delta across committed transcript rows.
         let mut rest = text;
@@ -787,7 +815,7 @@ impl Display {
                 self.commit_row();
             } else if grapheme == "\t" {
                 let spaces = 4 - self.columns % 4;
-                self.output(&" ".repeat(spaces), width);
+                self.output_as(&" ".repeat(spaces), width, kind);
             } else if !grapheme.chars().any(char::is_control) {
                 // Full-screen rows wrap at paint time, so a transcript row
                 // breaks only on a real newline and resizing re-wraps it.
@@ -809,20 +837,22 @@ impl Display {
     }
 
     /// Native mode prints a finished row into the terminal's scrollback;
-    /// full-screen mode keeps it in memory for the next repaint.
+    /// full-screen mode keeps it in memory for the next repaint. A row whose
+    /// toggle is off is never printed, and never stored in native mode, where
+    /// it could not be taken back.
     fn push_row(&mut self, row: String) {
         if self.fullscreen {
-            self.lines.push(format!("{row}{RESET}"));
+            self.lines.push((self.tail_kind, format!("{row}{RESET}")));
             let excess = self.lines.len().saturating_sub(MAX_LINES);
             if excess > 0 {
                 let removed: usize = self.lines[..excess]
                     .iter()
-                    .map(|line| wrap_row(line, self.paint_width).len())
+                    .map(|(_, line)| wrap_row(line, self.paint_width).len())
                     .sum();
                 self.lines.drain(..excess);
                 self.scroll = self.scroll.map(|top| top.saturating_sub(removed));
             }
-        } else {
+        } else if self.visibility.visible(self.tail_kind) {
             crate::println!("{row}{RESET}");
         }
     }
@@ -853,7 +883,9 @@ impl Display {
         // disappear with it, so the conversation lands on the primary screen.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         print!("\x1b[2J\x1b[H");
-        for line in &self.lines {
+        // Handing the transcript to the terminal's scrollback is a one-way
+        // trip, so it carries every row, hidden kinds included.
+        for (_, line) in &self.lines {
             crate::println!("{line}");
         }
         self.lines.clear();
@@ -891,11 +923,14 @@ impl Display {
         self.page.max(1)
     }
 
-    /// Every transcript line wrapped for `width`, oldest first.
+    /// Every visible transcript line wrapped for `width`, oldest first. Hidden
+    /// kinds are left out, so scrolling counts only what is painted.
     fn wrapped(&self, width: usize) -> Vec<String> {
         let mut rows: Vec<String> = Vec::new();
-        for line in &self.lines {
-            rows.extend(wrap_row(line, width));
+        for (kind, line) in &self.lines {
+            if self.visibility.visible(*kind) {
+                rows.extend(wrap_row(line, width));
+            }
         }
         rows
     }
@@ -918,7 +953,9 @@ impl Display {
         }
         self.drawn_rows = 0;
         print!("\r");
-        if self.columns > 0 {
+        // The streaming row follows the toggle of the text it carries, so
+        // hidden thinking never peeks out above the draft.
+        if self.columns > 0 && self.visibility.visible(self.tail_kind) {
             crate::println!("{}{RESET}", self.tail);
             self.drawn_rows += 1;
         }
@@ -956,7 +993,7 @@ impl Display {
         // it. Committing on every repaint would stack a snapshot of the text
         // so far each time a streaming delta arrives.
         let mut rows = self.viewport(width);
-        if self.columns > 0 && self.scroll.is_none() {
+        if self.columns > 0 && self.scroll.is_none() && self.visibility.visible(self.tail_kind) {
             rows.extend(wrap_row(&format!("{}{RESET}", self.tail), width));
             let cut = rows.len().saturating_sub(self.page);
             rows.drain(..cut);
@@ -1304,6 +1341,7 @@ mod tests {
                     ..Draft::default()
                 }],
             }),
+            visibility: Visibility::default(),
         };
         let mut prompt = Draft::default();
         prompt.insert_str("hidden prompt");
@@ -1342,6 +1380,7 @@ mod tests {
             headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
+            visibility: Visibility::default(),
         };
         let mut draft = Draft::default();
         draft.insert_str("alpha\nbravo\ncharlie");
@@ -1379,12 +1418,80 @@ mod tests {
     }
 
     #[test]
+    fn the_toggles_filter_rows_at_paint_time_and_bring_hidden_ones_back() {
+        let mut display = Display::new(true);
+        display.output("the answer\n", 80);
+        display.output_as("pondering\n", 80, RowKind::Thinking);
+        display.output_as("  collapsed result\n", 80, RowKind::ToolBrief);
+        display.output_as("  full command\n  full result\n", 80, RowKind::ToolFull);
+        let all = display.wrapped(80).join("|");
+        assert!(all.contains("the answer"));
+        assert!(all.contains("pondering"));
+        // Tool calls start collapsed: one form is painted, never both.
+        assert!(all.contains("collapsed result"));
+        assert!(!all.contains("full result"));
+        display.set_visibility(Visibility {
+            thinking: false,
+            tools_expanded: false,
+        });
+        let hidden = display.wrapped(80).join("|");
+        assert!(hidden.contains("the answer"));
+        // Hidden rows are filtered at paint time, never dropped, so flipping
+        // the toggle restores the transcript exactly.
+        assert!(!hidden.contains("pondering"));
+        // Collapsed rows are what a collapsed view shows.
+        assert!(hidden.contains("collapsed result"));
+        assert!(!hidden.contains("full result"));
+        // Expanding swaps in the full command and result, and keeps thinking off.
+        display.set_visibility(Visibility {
+            thinking: false,
+            tools_expanded: true,
+        });
+        let expanded = display.wrapped(80).join("|");
+        assert!(expanded.contains("full command") && expanded.contains("full result"));
+        assert!(!expanded.contains("collapsed result"));
+        assert!(!expanded.contains("pondering"));
+        display.set_visibility(Visibility {
+            thinking: true,
+            tools_expanded: true,
+        });
+        assert!(display.wrapped(80).join("|").contains("pondering"));
+        display.set_visibility(Visibility::default());
+        assert_eq!(display.wrapped(80).join("|"), all);
+    }
+
+    #[test]
+    fn a_hidden_streaming_row_never_peeks_above_the_draft() {
+        let ui = Ui {
+            part_kind: std::collections::HashMap::new(),
+            headered: std::collections::HashSet::new(),
+            tool_done: std::collections::HashSet::new(),
+            prompt: None,
+            visibility: Visibility::default(),
+        };
+        let draft = Draft::default();
+        let mut display = Display::default();
+        display.set_visibility(Visibility {
+            thinking: false,
+            tools_expanded: false,
+        });
+        display.output_as("pondering", 40, RowKind::Thinking);
+        // The hidden tail is not painted, so no thinking text shows above the
+        // draft and nothing reaches the scrollback when the row commits.
+        display.draw(&ui, &draft, 40);
+        assert_eq!(display.drawn_rows, 1);
+        display.output("\n", 40);
+        assert_eq!(display.tail, "");
+    }
+
+    #[test]
     fn fullscreen_repaint_keeps_the_streaming_tail_uncommitted() {
         let ui = crate::tui::Ui {
             part_kind: std::collections::HashMap::new(),
             headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
+            visibility: Visibility::default(),
         };
         let draft = Draft::default();
         let mut display = Display::new(true);
