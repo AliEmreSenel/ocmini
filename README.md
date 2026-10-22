@@ -125,6 +125,8 @@ Example for a local compatible server:
 
 Use the model ID served by your endpoint. Hosted providers can use `options.apiKey: "{env:YOUR_API_KEY}"`. Set `options.endpoint` to `chat`, `responses` or `messages` when needed.
 
+A model can declare the reasoning controls it accepts with `provider.<id>.models.<id>.reasoning_options`: `{ "type": "effort", "values": ["low", "high"] }`, `{ "type": "budget_tokens", "min": 4000, "max": 12000 }` on a `messages` endpoint, or `[]` for none. These build the model's variants and replace the ones discovery derives; a `variants` object still merges on top. An effort maps to `reasoningEffort` on Chat Completions and Responses, and to adaptive thinking with an output effort on Messages.
+
 Credentials come from `$XDG_DATA_HOME/opencode/auth.json`, `OPENCODE_AUTH_CONTENT`, provider configuration or supported environment variables. Existing OpenAI/Codex OAuth tokens can be refreshed; interactive login flows are excluded. Original OpenCode configuration and credentials are left untouched.
 
 ## Storage and server
@@ -133,7 +135,7 @@ Sessions are saved in `$XDG_DATA_HOME/ocmini/ocmini.db`; refreshed credentials u
 
 History is kept unless `OCMINI_RETENTION_DAYS` enables pruning. Recovery marks interrupted work and preserves queued prompts without replaying potentially completed tool calls.
 
-Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.3-ocmini.0.3.3`, identifies API compatibility.
+Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.4-ocmini.0.3.4`, identifies API compatibility.
 
 Async I/O runs on the main thread by default; file operations and history loading use a separate blocking pool as needed. Set `TOKIO_WORKER_THREADS` to a positive integer to opt into a multithreaded async runtime for heavier concurrent workloads. SQLite checkpoints allow oversized journal files to shrink to 1 MiB on reuse; active transactions can temporarily exceed this size.
 

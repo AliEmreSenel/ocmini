@@ -1,6 +1,6 @@
 use super::{Adapter, ChatRequest, Protocol};
 use crate::auth::AuthStore;
-use crate::config::{Config, ModelInfo};
+use crate::config::{deep_merge, Config, ModelInfo};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -54,7 +54,159 @@ pub async fn discover_models(config: &Config, auth: &AuthStore) -> (Config, Vec<
             }
         }
     }
+    apply_reasoning_options(&mut result);
     (result, errors)
+}
+
+/// Upstream's ceiling for a generated reasoning budget.
+const OUTPUT_TOKEN_MAX: u64 = 32_000;
+
+/// OpenCode 1.19.3: `provider.<id>.models.<id>.reasoning_options` declares the
+/// reasoning controls a model accepts, builds its variants from them and
+/// replaces the catalog-derived ones; configured `variants` still merge on top.
+/// Options no supported protocol maps leave the catalog variants in place, as
+/// upstream does.
+fn apply_reasoning_options(config: &mut Config) {
+    for (id, provider) in &mut config.provider {
+        let npm_default = provider.npm.clone();
+        let provider_options =
+            serde_json::to_value(&provider.options).unwrap_or_else(|_| json!({}));
+        for model in provider.models.values_mut() {
+            let Some(options) = model
+                .extra
+                .get("reasoning_options")
+                .and_then(Value::as_array)
+                .cloned()
+            else {
+                continue;
+            };
+            let protocol = model_protocol(id, &npm_default, &provider_options, model);
+            let Some(generated) = reasoning_variants(&options, protocol, model) else {
+                continue;
+            };
+            let mut variants = Value::Object(generated);
+            let configured = model
+                .extra
+                .get("variants")
+                .cloned()
+                .filter(|value| value.is_object());
+            if let Some(configured) = configured {
+                deep_merge(&mut variants, configured);
+            }
+            if let Some(entries) = variants.as_object_mut() {
+                entries.retain(|_, value| value["disabled"] != json!(true));
+            }
+            model.extra.insert("variants".into(), variants);
+        }
+    }
+}
+
+/// The protocol requests to this model use, mirroring `Adapter::prepare`.
+fn model_protocol(
+    provider: &str,
+    npm_default: &str,
+    provider_options: &Value,
+    model: &ModelInfo,
+) -> Protocol {
+    let npm = model
+        .extra
+        .get("provider")
+        .and_then(|v| v.get("npm"))
+        .and_then(Value::as_str)
+        .unwrap_or(npm_default);
+    let mut options = provider_options.clone();
+    for key in ["options", "settings", "request"] {
+        if let Some(value) = model.extra.get(key).filter(|value| value.is_object()) {
+            deep_merge(&mut options, value.clone());
+        }
+    }
+    let endpoint = options["endpoint"]
+        .as_str()
+        .or_else(|| options["api"].as_str());
+    // Discovery cannot know about an OAuth login, so `codex` is unknown here;
+    // it only selects Responses, which maps efforts exactly like Chat.
+    super::protocol(provider, npm, endpoint, &model.id, false).unwrap_or(Protocol::Chat)
+}
+
+/// Variants from a model's `reasoning_options`, mirroring upstream's
+/// `reasoningVariants` for the protocols ocmini speaks. `None` means no
+/// supported mapping exists, so the catalog variants stay in place.
+fn reasoning_variants(
+    options: &[Value],
+    protocol: Protocol,
+    model: &ModelInfo,
+) -> Option<serde_json::Map<String, Value>> {
+    let mut variants = serde_json::Map::new();
+    // An empty option list means the model takes no reasoning variants at all.
+    if options.is_empty() {
+        return Some(variants);
+    }
+    // A declared effort list wins over the other option shapes.
+    if let Some(efforts) = options
+        .iter()
+        .find(|option| option["type"] == "effort")
+        .and_then(|option| option["values"].as_array())
+    {
+        for value in efforts {
+            // A null entry is the "none" variant, as upstream.
+            let effort = match value {
+                Value::Null => "none",
+                Value::String(effort) => effort.as_str(),
+                _ => continue,
+            };
+            variants.insert(effort.into(), effort_variant(protocol, effort));
+        }
+        return Some(variants);
+    }
+    let budget = options
+        .iter()
+        .find(|option| option["type"] == "budget_tokens")?;
+    // Only the Anthropic Messages protocol maps a token budget among the
+    // protocols ocmini speaks, and a bare toggle is provider-SDK specific.
+    if protocol != Protocol::Anthropic {
+        return None;
+    }
+    let output = model
+        .limit
+        .as_ref()
+        .and_then(|limit| limit["output"].as_u64())
+        .unwrap_or(OUTPUT_TOKEN_MAX);
+    let maximum = budget["max"]
+        .as_u64()
+        .map(|max| max.saturating_sub(1))
+        .unwrap_or(OUTPUT_TOKEN_MAX - 1)
+        .min(output.saturating_sub(1));
+    if maximum == 0 {
+        return None;
+    }
+    let high = budget["min"]
+        .as_u64()
+        .unwrap_or(0)
+        .max(maximum.div_ceil(2))
+        .min(maximum);
+    for (id, tokens) in [("high", high), ("max", maximum)] {
+        variants.insert(
+            id.into(),
+            json!({"thinking":{"type":"enabled","budgetTokens":tokens}}),
+        );
+    }
+    Some(variants)
+}
+
+fn effort_variant(protocol: Protocol, effort: &str) -> Value {
+    if protocol == Protocol::Anthropic {
+        adaptive_effort(effort)
+    } else {
+        openai_effort(effort)
+    }
+}
+
+fn adaptive_effort(effort: &str) -> Value {
+    json!({"thinking":{"type":"adaptive"},"output_config":{"effort":effort}})
+}
+
+fn openai_effort(effort: &str) -> Value {
+    json!({"reasoningEffort":effort})
 }
 
 async fn discover(
@@ -263,9 +415,9 @@ fn parse_models(provider: &str, data: &Value) -> Result<HashMap<String, ModelInf
             for effort in efforts {
                 if let Some(effort) = effort.as_str().or_else(|| effort["effort"].as_str()) {
                     let variant = if supports["adaptive_thinking"] == true {
-                        json!({"thinking":{"type":"adaptive"},"output_config":{"effort":effort}})
+                        adaptive_effort(effort)
                     } else {
-                        json!({"reasoningEffort":effort})
+                        openai_effort(effort)
                     };
                     variants.insert(effort.into(), variant);
                 }
@@ -311,5 +463,111 @@ mod tests {
     fn generic_catalog_does_not_invent_limits() {
         let models = parse_models("custom", &json!({"data":[{"id":"local-model"}]})).unwrap();
         assert!(models["local-model"].limit.is_none());
+    }
+
+    fn config(value: Value) -> Config {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn reasoning_options_replace_catalog_variants_and_merge_configured_ones() {
+        let mut cfg = config(json!({"provider":{"local":{
+            "npm":"@ai-sdk/openai-compatible",
+            "options":{"baseURL":"http://127.0.0.1:1/v1","apiKey":"key"},
+            "models":{"m":{
+                "reasoning_options":[{"type":"effort","values":["low",null]}],
+                "variants":{"high":{"headers":{"x-mode":"high"}}},
+            }}
+        }}}));
+        apply_reasoning_options(&mut cfg);
+        let variants = &cfg.provider["local"].models["m"].extra["variants"];
+        assert_eq!(variants["low"]["reasoningEffort"], "low");
+        assert_eq!(variants["none"]["reasoningEffort"], "none");
+        assert_eq!(variants["high"]["headers"]["x-mode"], "high");
+        assert_eq!(variants.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reasoning_options_follow_the_model_protocol() {
+        let mut cfg = config(json!({
+            "provider": {
+                "anthropic": {
+                    "npm": "@ai-sdk/anthropic",
+                    "models": {
+                        "claude": {
+                            "reasoning_options": [{"type": "effort", "values": ["low"]}]
+                        }
+                    }
+                },
+                "local": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "models": {
+                        "cleared": {
+                            "reasoning_options": [],
+                            "variants": {"high": {"reasoningEffort": "high"}}
+                        },
+                        "kept": {
+                            "reasoning_options": [{"type": "toggle"}],
+                            "variants": {"high": {"reasoningEffort": "high"}}
+                        }
+                    }
+                }
+            }
+        }));
+        apply_reasoning_options(&mut cfg);
+        let claude = &cfg.provider["anthropic"].models["claude"].extra["variants"];
+        assert_eq!(claude["low"]["thinking"]["type"], "adaptive");
+        assert_eq!(claude["low"]["output_config"]["effort"], "low");
+        // An empty option list removes the discovered variants; the model's own
+        // configured variants still merge on top, exactly as upstream merges them.
+        assert_eq!(
+            cfg.provider["local"].models["cleared"].extra["variants"],
+            json!({"high":{"reasoningEffort":"high"}})
+        );
+        // Options no supported protocol maps keep the discovered variants.
+        assert_eq!(
+            cfg.provider["local"].models["kept"].extra["variants"],
+            json!({"high":{"reasoningEffort":"high"}})
+        );
+    }
+
+    #[test]
+    fn empty_reasoning_options_leaves_a_model_no_variants() {
+        let mut cfg = config(json!({
+            "provider": {
+                "local": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "models": {"cleared": {"reasoning_options": []}}
+                }
+            }
+        }));
+        apply_reasoning_options(&mut cfg);
+        assert_eq!(
+            cfg.provider["local"].models["cleared"].extra["variants"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn budget_token_options_build_anthropic_variants() {
+        let mut cfg = config(json!({
+            "provider": {
+                "anthropic": {
+                    "npm": "@ai-sdk/anthropic",
+                    "models": {
+                        "claude": {
+                            "limit": {"context": 200000, "output": 16000},
+                            "reasoning_options": [{"type": "budget_tokens", "min": 4000, "max": 12000}]
+                        }
+                    }
+                }
+            }
+        }));
+        apply_reasoning_options(&mut cfg);
+        let variants = &cfg.provider["anthropic"].models["claude"].extra["variants"];
+        // The budget stays under the model's output ceiling: 12000-1, and the
+        // high variant is the midpoint floor clamped up to the configured min.
+        assert_eq!(variants["high"]["thinking"]["budgetTokens"], 6000);
+        assert_eq!(variants["max"]["thinking"]["budgetTokens"], 11999);
     }
 }
