@@ -1,11 +1,10 @@
 name: Release binaries
 
 # Tag a commit as vX.Y.Z (matching Cargo.toml) and this publishes prebuilt
-# executables on the GitHub Release: Linux (glibc + musl), macOS (Apple
-# silicon) and Windows. Builds run on native runners, so the bundled SQLite
-# C build needs no cross toolchain. Binaries are unsigned: macOS users must
-# clear the Gatekeeper quarantine (`xattr -d com.apple.quarantine ocmini`)
-# and Windows shows a SmartScreen prompt.
+# executables on the GitHub Release: Linux (x86_64 glibc + musl, ARM64,
+# ARMv7 and ARMv6 hard-float) and Windows (x86_64). ARMv7/ARMv6 use cross
+# containers for the C toolchain needed by bundled SQLite; other targets
+# build natively. Windows binaries are unsigned and show a SmartScreen prompt.
 
 on:
   push:
@@ -22,12 +21,22 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            builder: cargo
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-          - os: macos-14
-            target: aarch64-apple-darwin
+            builder: cargo
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            builder: cargo
+          - os: ubuntu-24.04
+            target: armv7-unknown-linux-gnueabihf
+            builder: cross
+          - os: ubuntu-24.04
+            target: arm-unknown-linux-gnueabihf
+            builder: cross
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+            builder: cargo
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +53,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - run: rustup target add ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/cross"
+          curl --fail --location --retry 3 https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C "$RUNNER_TEMP/cross"
+          echo "$RUNNER_TEMP/cross" >> "$GITHUB_PATH"
+
+      - run: ${{ matrix.builder }} build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash

@@ -4,6 +4,8 @@ A minimal OpenCode replica in Rust. One binary for terminal chat, coding tools, 
 
 ## Quick start
 
+Prebuilt binaries are available on the [GitHub Releases page](https://github.com/AliEmreSenel/ocmini/releases) for Linux (x86_64 glibc/musl, ARM64, ARMv7 and ARMv6 hard-float) and Windows (x86_64). For ARMv6, use the `arm-unknown-linux-gnueabihf` archive; ARMv7 uses `armv7-unknown-linux-gnueabihf`.
+
 Building requires Rust 1.85+ and a C compiler for bundled SQLite. Search tools require ripgrep (`rg`) on `PATH`.
 
 ```sh
