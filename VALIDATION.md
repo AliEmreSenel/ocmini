@@ -11,7 +11,9 @@ cargo test --all-targets --locked
 cargo build --release --locked
 ```
 
-CI runs tests, Clippy and release builds on Rust 1.85.0 and stable with warnings treated as errors. Formatting runs on stable. To check the minimum compiler locally, install it with `rustup toolchain install 1.85.0 --profile minimal --component clippy` and use `cargo +1.85.0`.
+CI runs formatting, Clippy and all unit/contract tests on stable for pull requests and pushes to `main`, with warnings treated as errors. Pushes to `main` also run `cargo +1.85.0 check --all-targets --all-features --locked` to check minimum compiler compatibility. Rust dependencies and build outputs are cached; only `main` saves caches, which PRs can restore. Superseded runs are cancelled. Feature-branch pushes, tags, and changes limited to Markdown or `validation/` reports do not trigger runtime CI. The workflow can also be run manually, including the minimum compiler check.
+
+Optimized release builds (fat LTO) run only in the release workflow on `v*` tags, which builds the distributed binaries. Before tagging, run the release build locally with the command above. To check the minimum compiler locally, install it with `rustup toolchain install 1.85.0 --profile minimal` and use `cargo +1.85.0`.
 
 Checked on Linux on 2026-10-17: all 100 tests and Clippy passed on Rust 1.85.0 and stable. The four process tests also passed 25 consecutive runs. Pseudo-terminal checks verified history and context reuse, saved model/agent/directory, model overrides, Unicode, terminal restoration and immediate resume after exiting during a stalled request.
 
