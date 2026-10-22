@@ -509,6 +509,27 @@ pub async fn cancelled(cancel: &Arc<AtomicBool>) {
 
 const COMPACTION_PROMPT: &str = "Summarize the conversation for another coding agent to continue. Preserve the user's goal, constraints, decisions, changed files, executed commands and their results, unresolved errors, and next actions. Quote relevant identifiers and paths. Do not perform the task or call tools. Produce a substantive continuation summary.";
 
+/// Transient provider failures permit five retries per request. OpenCode
+/// retries every model request, the compaction summary included, through the
+/// same processor policy.
+const MAX_RETRIES: u32 = 5;
+
+/// OpenCode caps each tool result in the summarizer input at 2000 characters:
+/// the summary needs the gist of a tool call, not its full output. Carrying
+/// whole tool outputs makes the summary request the largest of the turn.
+const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
+
+/// Truncate one tool result for the summarizer input, matching OpenCode's
+/// `truncate()`. Counts Unicode scalar characters, as ocmini's other caps do.
+fn truncate_tool_output(text: &str) -> String {
+    if text.chars().count() <= TOOL_OUTPUT_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut kept: String = text.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
+    kept.push_str("\n[truncated]");
+    kept
+}
+
 #[derive(Default)]
 struct CompactionPolicy {
     settings: CompactionCfg,
@@ -648,6 +669,16 @@ async fn compact_history(
     if request_messages.is_empty() {
         return Err("Nothing to compact".into());
     }
+    // OpenCode serializes the transcript for the summarizer with tool results
+    // capped at 2000 characters. Whole tool outputs make this the largest and
+    // slowest request of the turn, the one a flaky relay kills first.
+    for message in &mut request_messages {
+        if message["role"] == "tool" {
+            if let Some(content) = message["content"].as_str() {
+                message["content"] = json!(truncate_tool_output(content));
+            }
+        }
+    }
     request_messages
         .push(json!({"role": "user", "content": "Produce the continuation summary now."}));
     let request = ChatRequest {
@@ -658,22 +689,66 @@ async fn compact_history(
         variant: None,
         session_id: Some(sid.into()),
     };
-    let mut stream = tokio::select! {
-        result = adapter.stream(&request) => result.map_err(|error| error.message)?,
-        _ = cancelled(cancel) => return Err("Aborted".into()),
-    };
-    drop(request);
+    // The summary request carries most of the window, so it is the largest and
+    // slowest request of the turn. OpenCode sends it through the same retry
+    // policy as a model step; the transport deaths the main loop retries must
+    // not end recovery here, or the overflow error surfaces verbatim and the
+    // turn is lost.
     let mut summary = String::new();
-    while let Some(event) = tokio::select! {
-        event = stream.next() => event,
-        _ = cancelled(cancel) => return Err("Aborted".into()),
-    } {
-        match event {
-            ProviderEvent::TextDelta(delta) => summary.push_str(&delta),
-            ProviderEvent::Finished { .. } => break,
-            ProviderEvent::Error(error) => return Err(error),
-            _ => {}
+    let mut attempt = 0u32;
+    'summary: loop {
+        summary.clear();
+        let mut stream = match tokio::select! {
+            result = adapter.stream(&request) => result,
+            _ = cancelled(cancel) => return Err("Aborted".into()),
+        } {
+            Ok(stream) => stream,
+            Err(error) if error.retryable && attempt < MAX_RETRIES => {
+                attempt += 1;
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay(error.retry_after, attempt)) => {}
+                    _ = cancelled(cancel) => return Err("Aborted".into()),
+                }
+                continue 'summary;
+            }
+            Err(error) => return Err(error.message),
+        };
+        let mut failure: Option<String> = None;
+        let mut finished = false;
+        while let Some(event) = tokio::select! {
+            event = stream.next() => event,
+            _ = cancelled(cancel) => return Err("Aborted".into()),
+        } {
+            match event {
+                ProviderEvent::TextDelta(delta) => summary.push_str(&delta),
+                ProviderEvent::Finished { .. } => {
+                    finished = true;
+                    break;
+                }
+                ProviderEvent::Error(error) => {
+                    failure = Some(error);
+                    break;
+                }
+                _ => {}
+            }
         }
+        drop(stream);
+        // A stream that never completed holds a partial summary: discard it and
+        // re-request, exactly like the main loop does.
+        let error = match failure {
+            Some(error) => error,
+            None if finished => break 'summary,
+            None => "provider compaction stream ended before a completion event".to_string(),
+        };
+        if provider::stream_retryable(&error) && attempt < MAX_RETRIES {
+            attempt += 1;
+            tokio::select! {
+                _ = tokio::time::sleep(retry_delay(None, attempt)) => {}
+                _ = cancelled(cancel) => return Err("Aborted".into()),
+            }
+            continue 'summary;
+        }
+        return Err(error);
     }
     let text = summary.trim();
     if text.is_empty() {
@@ -860,7 +935,6 @@ async fn run_turn(
         })?;
         emit_message(&info);
         emit_part(&start_part);
-        const MAX_RETRIES: u32 = 5;
         let mut attempt: u32 = 0;
         // Compaction may repeat while it reduces an overflowing request. Stop
         // when a checkpoint makes no progress, rather than after a fixed count.
@@ -1026,6 +1100,7 @@ async fn run_turn(
                         .iter()
                         .map(|message| message.to_string().len())
                         .sum::<usize>();
+                    let mut message = error.message;
                     if error.overflow
                         && !compact
                         && compaction.settings.automatic()
@@ -1033,7 +1108,7 @@ async fn run_turn(
                         && !cancel.load(Ordering::Acquire)
                     {
                         previous_overflow_bytes = Some(request_bytes);
-                        if let Some(parsed) = provider::parse_context_limit(&error.message) {
+                        if let Some(parsed) = provider::parse_context_limit(&message) {
                             compaction.context = Some(parsed);
                         }
                         match compact_history(
@@ -1062,17 +1137,18 @@ async fn run_turn(
                                 continue 'attempt;
                             }
                             Err(compact_error) => {
-                                eprintln!("ocmini: auto-compaction failed: {compact_error}")
+                                // The server's stderr is invisible to the TUI, so
+                                // the reason recovery gave up must reach the user.
+                                eprintln!("ocmini: auto-compaction failed: {compact_error}");
+                                message = format!(
+                                    "{} (auto-compaction failed: {compact_error})",
+                                    message
+                                );
                             }
                         }
                     }
-                    fail_message(
-                        &app,
-                        &mut info,
-                        &error.message,
-                        cancel.load(Ordering::Acquire),
-                    )?;
-                    return Err(error.message);
+                    fail_message(&app, &mut info, &message, cancel.load(Ordering::Acquire))?;
+                    return Err(message);
                 }
             }
         };
@@ -2257,6 +2333,22 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn summarizer_caps_tool_outputs_at_the_upstream_length() {
+        assert_eq!(truncate_tool_output("short"), "short");
+        let long = "x".repeat(TOOL_OUTPUT_MAX_CHARS + 10);
+        assert_eq!(
+            truncate_tool_output(&long),
+            format!("{}\n[truncated]", "x".repeat(TOOL_OUTPUT_MAX_CHARS))
+        );
+        // Counts scalar characters, so a cap boundary never splits an escape.
+        let unicode = "é".repeat(TOOL_OUTPUT_MAX_CHARS + 5);
+        assert_eq!(
+            truncate_tool_output(&unicode).chars().count(),
+            TOOL_OUTPUT_MAX_CHARS + "\n[truncated]".chars().count()
+        );
     }
 
     #[test]
