@@ -248,7 +248,7 @@ fn expand(text: &str) -> String {
     let note = if omitted == 0 {
         String::new()
     } else {
-        format!("\n\u2026 {omitted} more characters not shown").replace('\u2026', '…')
+        format!("\n… {omitted} more characters not shown")
     };
     format!("{shown}{note}").replace('\n', "\n  ")
 }
@@ -2271,10 +2271,10 @@ mod tests {
             );
             // Hiding tool output must never hide a failure: a collapsed call
             // that failed has to look like it failed.
-            assert!(segments.iter().any(|(kind, text)| ui
-                .visibility
-                .visible(*kind)
-                && plain(text).contains("✗ permission denied")));
+            assert!(segments
+                .iter()
+                .any(|(kind, text)| ui.visibility.visible(*kind)
+                    && plain(text).contains("✗ permission denied")));
         }
     }
 
@@ -2320,7 +2320,5 @@ mod tests {
             "{} chars",
             shown.chars().count()
         );
-    }
-}
     }
 }
