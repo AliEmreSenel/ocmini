@@ -13,6 +13,8 @@ ocmini --model local/my-model --directory ~/project
 ocmini serve --hostname 127.0.0.1 --port 4096
 ```
 
+The input shows a compact status row that updates in place. Type `/help` or press F1 for the full shortcut list; F1 keeps your current draft. Help is handled locally.
+
 Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+V (or Ctrl+Shift+V when forwarded by the terminal) attaches a clipboard image, and pasting an image file path attaches it. Alt+Backspace removes the latest attachment; Backspace also removes it when the text is empty. Ctrl+U clears text and attachments. Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector. The draft previews multiline text with `↵` and scrolls horizontally; the full text and line breaks are sent unchanged. Backspace removes whole Unicode characters and stays within the draft.
 
 Questions appear one at a time with their numbered options. The answer line is the same full editor as the prompt - caret movement, selection, word motions, kill, yank, undo and multiline all work on the answer - and the prompt you were typing stays untouched underneath, returning when the question settles. A line of option numbers answers with those options; any other text is sent as a custom answer exactly as typed. Enter walks to the next question and wraps back to the first, and each answer is kept in the transcript. Tab and Shift+Tab walk the questions forward and back - each question keeps its own draft, so switching never loses a half-typed answer, and answered questions reopen prefilled so they can be changed. Backspace on an empty answer line also steps back, and Esc dismisses the request. When the last answer lands, a confirmation screen lists every question with its answer - Enter sends, Tab steps back to edit, Esc dismisses. Your prompt is never sent while a question is open.
@@ -20,7 +22,7 @@ Questions appear one at a time with their numbered options. The answer line is t
 Transcript scrolling is a config option, `ui.scroll_mode`:
 
 - `native` (default): completed transcript rows commit to the terminal's own scrollback and only the prompt is redrawn. Wheel and terminal shortcuts scroll as usual; PageUp/PageDown page the draft.
-- `fullscreen`: ocmini repaints the whole screen on the alternate screen and scrolls the transcript itself. PageUp/PageDown page, Ctrl+Home/Ctrl+End jump to the top and bottom, and the mouse wheel scrolls (Shift+wheel keeps the terminal's native selection scroll). The prompt header lists these keys. On exit the transcript is restored to the terminal's scrollback.
+- `fullscreen`: ocmini repaints the whole screen on the alternate screen and scrolls the transcript itself. PageUp/PageDown page, Ctrl+Home/Ctrl+End jump to the top and bottom, and the mouse wheel scrolls (Shift+wheel keeps the terminal's native selection scroll). Help lists these keys. On exit the transcript is restored to the terminal's scrollback.
 
 Set it in `opencode.json` before starting; a running TUI keeps the mode it started with:
 
@@ -28,7 +30,7 @@ Set it in `opencode.json` before starting; a running TUI keeps the mode it start
 { "ui": { "scroll_mode": "fullscreen" } }
 ```
 
-Two transcript toggles work while you chat, and the prompt header shows the current state:
+Two transcript toggles work while you chat, and the status row shows the current state when space allows:
 
 - `Ctrl+T` hides chain of thought - the `◦ thinking` block and everything streamed into it - for a transcript of just answers and tool calls.
 - `Ctrl+O` expands tool calls. Collapsed (default) shows one line per call: the command truncated to 120 columns and the result truncated to 160. Expanded shows the whole command and the whole result, with multi-line output indented under its `✓` / `✗` marker. One call paints at most 50 KiB, the same cap the tool layer puts on a result, and says how much it left out.
