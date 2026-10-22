@@ -153,6 +153,48 @@ pub(crate) fn summarize_input(input: &Value) -> String {
     truncate(&parts.join(" "), 120)
 }
 
+/// A tool call as the transcript shows it: the tool with its input summary
+/// (command, path, pattern, …). Shared by the live event stream and the
+/// resumed history so a session reads the same after `--continue` as it did
+/// while running.
+fn tool_line(part: &Value) -> String {
+    format!(
+        "{CYAN}● {}{RESET} {DIM}{}{RESET}",
+        part["tool"].as_str().unwrap_or("tool"),
+        summarize_input(&part["state"]["input"])
+    )
+}
+
+/// The result line of a finished tool call: `✓` with an output preview, `✗`
+/// with the error. `None` while the call is still pending or running.
+fn tool_result(part: &Value) -> Option<String> {
+    let state = &part["state"];
+    match state["status"].as_str() {
+        Some("completed") => Some(format!(
+            "  {GREEN}✓{RESET} {DIM}{}{RESET}",
+            truncate(state["output"].as_str().unwrap_or_default(), 160)
+        )),
+        Some("error") => Some(format!(
+            "  {RED}✗{RESET} {}",
+            truncate(state["error"].as_str().unwrap_or("failed"), 160)
+        )),
+        _ => None,
+    }
+}
+
+/// One saved tool call: its line plus its result, or the status it stopped at
+/// when it never finished.
+fn tool_block(part: &Value) -> String {
+    match tool_result(part) {
+        Some(result) => format!("\n{}\n{result}\n", tool_line(part)),
+        None => format!(
+            "\n{} {DIM}· {}{RESET}\n",
+            tool_line(part),
+            part["state"]["status"].as_str().unwrap_or_default()
+        ),
+    }
+}
+
 /// Option label and description in the order shown to the user.
 fn option_values(options: &Value) -> Vec<(String, String)> {
     options
@@ -267,25 +309,12 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
                     }
                 }
                 Some("tool") => {
-                    let tool = part["tool"].as_str().unwrap_or("tool");
-                    let state = &part["state"];
                     if ui.headered.insert(format!("{part_id}:start")) {
-                        println!(
-                            "\n{CYAN}● {tool}{RESET} {DIM}{}{RESET}",
-                            summarize_input(&state["input"])
-                        );
+                        println!("\n{}", tool_line(part));
                     }
-                    let status = state["status"].as_str().unwrap_or_default();
-                    if (status == "completed" || status == "error") && ui.tool_done.insert(part_id)
-                    {
-                        if status == "completed" {
-                            let output = state["output"].as_str().unwrap_or_default();
-                            println!("  {GREEN}✓{RESET} {DIM}{}{RESET}", truncate(output, 160));
-                        } else {
-                            println!(
-                                "  {RED}✗{RESET} {}",
-                                truncate(state["error"].as_str().unwrap_or("failed"), 160)
-                            );
+                    if let Some(result) = tool_result(part) {
+                        if ui.tool_done.insert(part_id) {
+                            println!("{result}");
                         }
                     }
                 }
@@ -951,14 +980,7 @@ fn render_history(display: &mut Display, history: &[MessageWithParts]) {
                     &format!("{}\n", part["text"].as_str().unwrap_or_default()),
                     width,
                 ),
-                Some("tool") => display.output(
-                    &format!(
-                        "{DIM}● {} · {}{RESET}\n",
-                        part["tool"].as_str().unwrap_or("tool"),
-                        part["state"]["status"].as_str().unwrap_or_default()
-                    ),
-                    width,
-                ),
+                Some("tool") => display.output(&tool_block(part), width),
                 Some("file") => display.output(
                     &format!(
                         "{DIM}attachment: {}{RESET}\n",
@@ -1503,8 +1525,8 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
 mod tests {
     use super::{
         answer_line, decode_event, file_attachment, image_attachment, parse_answer,
-        pasted_image_path, render_confirmation, render_question, switch_question, Draft, Key,
-        PendingPrompt, WHEEL,
+        pasted_image_path, render_confirmation, render_event, render_question, switch_question,
+        tool_block, tool_line, tool_result, Draft, Key, PendingPrompt, Ui, WHEEL,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -1816,5 +1838,83 @@ mod tests {
             )
         );
         assert!(image_attachment(b"not an image".to_vec()).is_none());
+    }
+
+    fn completed_tool() -> serde_json::Value {
+        serde_json::json!({"id":"prt_1","sessionID":"ses_1","messageID":"msg_1","type":"tool",
+            "tool":"bash","callID":"call_1","state":{"status":"completed",
+            "input":{"command":"ls -la"},
+            "output":"total 8\ndrwxr-xr-x 2 user user 4096 .\n",
+            "time":{"start":1,"end":2}}})
+    }
+
+    #[test]
+    fn a_resumed_tool_call_shows_its_command_and_its_result() {
+        // The saved part keeps input, output and error, so a resumed session
+        // has everything the live transcript showed.
+        let text = plain(&tool_block(&completed_tool()));
+        assert!(text.contains("● bash ls -la"), "{text}");
+        assert!(
+            text.contains("✓ total 8 drwxr-xr-x 2 user user 4096 ."),
+            "{text}"
+        );
+
+        let failed = serde_json::json!({"type":"tool","tool":"read","state":{
+            "status":"error","input":{"filePath":"/tmp/missing.txt"},
+            "error":"File not found","time":{"start":1,"end":2}}});
+        let text = plain(&tool_block(&failed));
+        assert!(text.contains("● read /tmp/missing.txt"), "{text}");
+        assert!(text.contains("✗ File not found"), "{text}");
+    }
+
+    #[test]
+    fn a_tool_call_that_never_finished_shows_the_status_it_stopped_at() {
+        for status in ["running", "pending"] {
+            let part = serde_json::json!({"type":"tool","tool":"bash","state":{
+                "status":status,"input":{"command":"sleep 30"},"time":{"start":1}}});
+            let text = plain(&tool_block(&part));
+            assert!(text.contains("● bash sleep 30"), "{text}");
+            assert!(text.ends_with(&format!("· {status}\n")), "{text}");
+            assert!(tool_result(&part).is_none(), "{status} has no result line");
+        }
+    }
+
+    #[test]
+    fn the_live_tool_lines_and_the_resumed_ones_are_the_same_lines() {
+        let part = completed_tool();
+        let mut ui = Ui {
+            part_kind: std::collections::HashMap::new(),
+            headered: Default::default(),
+            tool_done: Default::default(),
+            prompt: None,
+        };
+        let event = crate::types::BusEvent {
+            id: "evt_1".into(),
+            r#type: "message.part.updated".into(),
+            properties: serde_json::json!({"part": part.clone()}),
+        };
+        let live = plain(&render_event(&mut ui, &event, "ses_1"));
+        assert_eq!(live, plain(&tool_block(&part)));
+
+        // The header and result each print once, however many updates follow.
+        let updates = ["running", "completed"].map(|status| crate::types::BusEvent {
+            id: "evt".into(),
+            r#type: "message.part.updated".into(),
+            properties: serde_json::json!({"part": serde_json::json!({
+                    "id":"prt_1","sessionID":"ses_1","type":"tool","tool":"bash",
+                    "state":{"status":status,"input":{"command":"ls -la"}}})}),
+        });
+        for event in updates {
+            assert_eq!(render_event(&mut ui, &event, "ses_1"), "");
+        }
+        // A part from another session stays off this transcript.
+        let other = crate::types::BusEvent {
+            id: "evt_2".into(),
+            r#type: "message.part.updated".into(),
+            properties: serde_json::json!({"part": {"id":"prt_2","sessionID":"ses_2",
+                "type":"tool","tool":"bash","state":{"status":"completed","input":{}}}}),
+        };
+        assert_eq!(render_event(&mut ui, &other, "ses_1"), "");
+        assert_eq!(plain(&tool_line(&completed_tool())), "● bash ls -la");
     }
 }

@@ -387,6 +387,27 @@ runtime and the musl cross-build install flags, which has no counterpart in a
 Rust runtime with no JS dependencies, and changes no part of the 1.x HTTP/SSE
 surface.
 
+## Tool calls in the resumed transcript
+
+A resumed session showed every tool call as one dim line — `● bash · completed` —
+while the same call running live printed `● bash ls -la` and a `✓` line with the
+output. The saved part keeps `state.input`, `state.output` and `state.error`
+(pruning only marks older output for the provider and leaves it browsable), so
+the data was there; `render_history` simply formatted only the tool name and
+status. Every command, path and pattern in the history was invisible after
+`--continue`, `--session` or `Ctrl+R`.
+
+One renderer now formats a tool call — `tool_line` for the call with its input
+summary, `tool_result` for the `✓`/`✗` line — and both paths call it, so a
+resumed transcript is byte-identical to the live one. A call that never
+finished (`pending`/`running`, stored as `Aborted` on cancel) has no result, so
+it shows the status it stopped at.
+
+Three unit tests pin the resumed block (command and output, path and error, the
+status of an unfinished call) and assert the live event path emits exactly the
+same text, once per part, for this session only. Formatting, Clippy with
+warnings denied, and the full suite pass.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.
