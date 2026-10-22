@@ -341,12 +341,16 @@ impl Draft {
         self.cursor -= 1;
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear_text(&mut self) {
         self.snapshot();
         self.text.clear();
-        self.attachments.clear();
         self.cursor = 0;
         self.anchor = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.clear_text();
+        self.attachments.clear();
     }
 }
 
@@ -845,8 +849,8 @@ impl Display {
         }
     }
 
-    /// Ctrl+L: drop the transcript and repaint with a fresh prompt header.
-    pub fn clear_screen(&mut self, header: &str, width: usize) {
+    /// Ctrl+L: drop the transcript; the next draw restores the status and draft.
+    pub fn clear_screen(&mut self) {
         if self.fullscreen {
             self.lines.clear();
             self.scroll = None;
@@ -857,7 +861,6 @@ impl Display {
         self.tail.clear();
         self.style.clear();
         self.columns = 0;
-        self.output(&format!("{header}\n"), width);
     }
 
     /// Leaving full-screen mode: the transcript is printed on the primary
@@ -932,9 +935,18 @@ impl Display {
         rows[top..(top + self.page).min(rows.len())].to_vec()
     }
 
-    pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize) {
+    pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize, model: &str) {
         let (prefix, text, cursor, sel) = active_input(ui, draft);
-        let layout = layout(&prefix, &text, cursor, width, sel);
+        let mut layout = layout(&prefix, &text, cursor, width, sel);
+        // Status belongs to the editable block, never the transcript. Clip it
+        // to one row even when the provider/model name is very long.
+        let header = super::prompt_header(model, ui.visibility);
+        let row = wrap_row(&header, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        layout.rows.insert(0, format!("{row}{RESET}"));
+        layout.cursor.0 += 1;
         if self.fullscreen {
             self.draw_screen(&layout);
             return;
@@ -1374,17 +1386,17 @@ mod tests {
         draft.insert_str("alpha\nbravo\ncharlie");
         let mut display = Display::default();
         // Caret at the end: the terminal cursor rests on the block's last row.
-        display.draw(&ui, &draft, 40);
-        assert_eq!((display.drawn_rows, display.caret_row), (3, 2));
+        display.draw(&ui, &draft, 40, "mock/m");
+        assert_eq!((display.drawn_rows, display.caret_row), (4, 3));
         // Caret on the first row: the erase climbs to the draft's first row,
         // never above it, so committed transcript rows stay intact.
         draft.cursor = 0;
-        display.draw(&ui, &draft, 40);
-        assert_eq!((display.drawn_rows, display.caret_row), (3, 0));
+        display.draw(&ui, &draft, 40, "mock/m");
+        assert_eq!((display.drawn_rows, display.caret_row), (4, 1));
         // A transcript row flushed above the draft shifts the block down.
         display.output("streaming", 40);
-        display.draw(&ui, &draft, 40);
-        assert_eq!((display.drawn_rows, display.caret_row), (4, 1));
+        display.draw(&ui, &draft, 40, "mock/m");
+        assert_eq!((display.drawn_rows, display.caret_row), (5, 2));
         display.erase();
         assert_eq!((display.drawn_rows, display.caret_row), (0, 0));
     }
@@ -1466,8 +1478,8 @@ mod tests {
         display.output_as("pondering", 40, RowKind::Thinking);
         // The hidden tail is not painted, so no thinking text shows above the
         // draft and nothing reaches the scrollback when the row commits.
-        display.draw(&ui, &draft, 40);
-        assert_eq!(display.drawn_rows, 1);
+        display.draw(&ui, &draft, 40, "mock/m");
+        assert_eq!(display.drawn_rows, 2);
         display.output("\n", 40);
         assert_eq!(display.tail, "");
     }
@@ -1484,17 +1496,72 @@ mod tests {
         let draft = Draft::default();
         let mut display = Display::new(true);
         display.output("assistant\n", 40);
-        display.draw(&ui, &draft, 40);
+        display.draw(&ui, &draft, 40, "mock/m");
         // Streaming deltas grow one unfinished row. Repainting paints it; it
         // must not be committed, which used to stack a snapshot per repaint.
         for delta in ["The ", "user ", "says ", "hi"] {
             display.output(delta, 40);
-            display.draw(&ui, &draft, 40);
+            display.draw(&ui, &draft, 40, "mock/m");
         }
         assert_eq!(display.lines.len(), 1);
         // Only a real newline commits the row.
         display.output("\n", 40);
         assert_eq!(display.lines.len(), 2);
+    }
+
+    #[test]
+    fn clearing_the_help_command_keeps_attachments_and_resets_selection() {
+        let mut draft = Draft::default();
+        draft.insert_str("/help");
+        draft.select_home();
+        draft.attachments.push(crate::tui::Attachment {
+            filename: "image.png".into(),
+            url: "data:image/png;base64,test".into(),
+            mime: "image/png",
+        });
+        draft.clear_text();
+        assert!(draft.text.is_empty());
+        assert_eq!(draft.cursor, 0);
+        assert_eq!(draft.selection(), None);
+        assert_eq!(draft.attachments.len(), 1);
+        draft.insert_str("next prompt");
+        assert_eq!(draft.text, "next prompt");
+    }
+
+    #[test]
+    fn status_redraws_stay_one_row_and_never_enter_the_transcript() {
+        let mut ui = Ui {
+            part_kind: std::collections::HashMap::new(),
+            headered: std::collections::HashSet::new(),
+            tool_done: std::collections::HashSet::new(),
+            prompt: None,
+            visibility: Visibility::default(),
+        };
+        let mut draft = Draft::default();
+        draft.insert_str("unfinished");
+        let model = "provider/中👩‍💻".repeat(30);
+        for fullscreen in [false, true] {
+            let mut display = Display::new(fullscreen);
+            display.output("existing transcript\n", 40);
+            let saved = display.lines.clone();
+            for _ in 0..6 {
+                ui.visibility.thinking = !ui.visibility.thinking;
+                ui.visibility.tools_expanded = !ui.visibility.tools_expanded;
+                display.set_visibility(ui.visibility);
+                display.erase();
+                display.draw(&ui, &draft, 40, &model);
+                let transcript_rows = usize::from(fullscreen);
+                assert_eq!(display.drawn_rows, 2 + transcript_rows);
+                assert_eq!(display.caret_row, 1 + transcript_rows);
+                assert_eq!(display.lines, saved);
+                assert!(display.tail.is_empty());
+                assert_eq!(draft.text, "unfinished");
+            }
+            display.erase();
+            display.clear_screen();
+            assert!(display.lines.is_empty());
+            assert!(display.tail.is_empty());
+        }
     }
 
     #[test]
