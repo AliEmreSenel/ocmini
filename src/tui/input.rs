@@ -654,8 +654,23 @@ impl Display {
 
     pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize) {
         let (prefix, text, cursor, sel) = match &ui.prompt {
-            Some(PendingPrompt::Question { line, .. }) => {
-                (String::new(), line.clone(), usize::MAX, None)
+            Some(PendingPrompt::Question {
+                questions,
+                current,
+                line,
+                ..
+            }) => {
+                // The input row shows which question the typed answer belongs to.
+                let position = if questions.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "[{}/{}] ",
+                        (*current).min(questions.len() - 1) + 1,
+                        questions.len()
+                    )
+                };
+                (position, line.clone(), usize::MAX, None)
             }
             Some(PendingPrompt::Permission(_)) => (
                 String::new(),
