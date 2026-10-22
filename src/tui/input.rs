@@ -544,7 +544,14 @@ fn layout(
     }
     positions.push((rows.len(), 2 + col, 0));
     rows.push(row);
-    let (crow, ccol, _) = positions[(prefix_len + cursor).min(prefix_len + text_len)];
+    // usize::MAX means the caret sits after the last grapheme. Adding the
+    // prefix length to it would overflow, so resolve the sentinel first.
+    let caret = if cursor == usize::MAX {
+        prefix_len + text_len
+    } else {
+        (prefix_len + cursor).min(prefix_len + text_len)
+    };
+    let (crow, ccol, _) = positions[caret];
     let rows = rows
         .iter()
         .enumerate()
@@ -998,6 +1005,16 @@ mod tests {
         // Wide characters wrap on cell widths, not grapheme counts.
         let rows = plain(&layout("", "中中中", 0, 5, None).rows);
         assert_eq!(rows, ["› 中", "  中", "  中"]);
+    }
+
+    #[test]
+    fn the_end_caret_sits_after_the_prefix() {
+        // The question prompt's "usize::MAX means the end" sentinel must land
+        // after the position prefix, not wrap into it.
+        let end = layout("[2/3] ", "1", usize::MAX, 40, None);
+        assert_eq!(end.cursor, (0, 9)); // "› [2/3] 1" is 8 cells, caret after
+        let empty = layout("[2/3] ", "", usize::MAX, 40, None);
+        assert_eq!(empty.cursor, (0, 8));
     }
 
     #[test]
