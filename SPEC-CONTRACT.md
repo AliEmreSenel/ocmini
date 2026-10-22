@@ -1,6 +1,6 @@
 # ocmini compatibility contract
 
-ocmini implements the OpenCode 1.x HTTP/SSE API. Its compatibility version is `1.19.3-ocmini.0.3.2`; the package version is separate. `GET /api/info` returns 404 because the 2.x protocol is not supported. `GET /global/health` returns `healthy: true` and the compatibility version.
+ocmini implements the OpenCode 1.x HTTP/SSE API. Its compatibility version is `1.19.3-ocmini.0.3.3`; the package version is separate. `GET /api/info` returns 404 because the 2.x protocol is not supported. `GET /global/health` returns `healthy: true` and the compatibility version.
 
 This document specifies observable behavior. Integration tests are grouped under `tests/contract/`, with unit tests beside their subsystems.
 
