@@ -1,5 +1,7 @@
 mod auth;
+mod blocking;
 mod bus;
+mod commands;
 mod config;
 mod engine;
 mod engine_impl;
@@ -19,7 +21,7 @@ mod usage_db;
 
 use clap::{Args, Parser, Subcommand};
 
-pub const OPENCODE_COMPAT_VERSION: &str = "1.19.4-ocmini.0.3.4";
+pub const OPENCODE_COMPAT_VERSION: &str = concat!("1.19.4-ocmini.", env!("CARGO_PKG_VERSION"));
 
 #[derive(Parser)]
 #[command(version = OPENCODE_COMPAT_VERSION, about = "A compact OpenCode-compatible coding runtime", args_conflicts_with_subcommands = true)]
@@ -261,14 +263,13 @@ fn main() {
         }
         error.exit()
     });
-    // A single client mostly waits on providers and tools. Drive async I/O on
-    // the main thread; blocking jobs still use Tokio's separate blocking pool.
-    // Keep an explicit opt-in for instances serving CPU-heavy concurrent work.
-    let mut runtime = if std::env::var_os("TOKIO_WORKER_THREADS").is_some() {
-        tokio::runtime::Builder::new_multi_thread()
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-    };
+    // One async worker is enough for provider I/O. Blocking database sections
+    // hand the scheduler off through block_in_place instead of stalling health,
+    // streaming or cancellation. TOKIO_WORKER_THREADS still overrides the count.
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        runtime.worker_threads(1);
+    }
     let result = runtime
         .enable_all()
         .build()

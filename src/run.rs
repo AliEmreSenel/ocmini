@@ -61,32 +61,32 @@ pub async fn run(args: crate::RunArgs) -> Result<(), String> {
     for path in &args.file {
         parts.push(file_part(path)?);
     }
-    if parts.is_empty() {
+    if parts.is_empty() && args.command.is_none() {
         return Err("No prompt: pass a message, pipe stdin, or attach a file".into());
     }
 
-    let json = args.format == "json";
-    let tty = std::io::stdout().is_terminal();
-    if !json {
-        let agent = args.agent.as_deref().unwrap_or("build");
-        let model = tui::display_model(args.model.as_ref(), &app.config.lock().unwrap().model);
-        println!("> {agent} · {model}");
-    }
-
-    let engine = Engine::new();
-    let mut events = bus().subscribe();
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-
     let user_mid = types::hex_id("msg_");
-    let request = PromptRequest {
+    let mut request = PromptRequest {
         message_id: Some(user_mid.clone()),
         model: args.model.clone(),
         parts,
         agent: args.agent.clone(),
         variant: args.variant.clone(),
-        command: args.command.clone(),
         ..Default::default()
     };
+    if let Some(command) = &args.command {
+        request = crate::commands::prepare(&app.config.lock().unwrap(), command, &text, request)?;
+    }
+    let json = args.format == "json";
+    let tty = std::io::stdout().is_terminal();
+    if !json {
+        let agent = request.agent.as_deref().unwrap_or("build");
+        let model = tui::display_model(request.model.as_ref(), &app.config.lock().unwrap().model);
+        println!("> {agent} · {model}");
+    }
+    let engine = Engine::new();
+    let mut events = bus().subscribe();
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let result = pump(
         &app,
         &args,
@@ -103,7 +103,7 @@ pub async fn run(args: crate::RunArgs) -> Result<(), String> {
         Ok(true) if !json => println!(),
         Ok(_) => {}
         Err(error) => {
-            eprintln!("ocmini: {error}");
+            engine.abort_and_wait(&session.id).await;
             return Err(error);
         }
     }
@@ -121,8 +121,9 @@ pub async fn run(args: crate::RunArgs) -> Result<(), String> {
             if line.trim() == "/exit" {
                 return Ok(());
             }
+            let user_mid = types::hex_id("msg_");
             let request = PromptRequest {
-                message_id: Some(types::hex_id("msg_")),
+                message_id: Some(user_mid.clone()),
                 model: args.model.clone(),
                 parts: vec![json!({"type":"text","text":line})],
                 agent: args.agent.clone(),
@@ -140,11 +141,14 @@ pub async fn run(args: crate::RunArgs) -> Result<(), String> {
                 &mut events,
                 &mut lines,
             )
-            .await
-            .map_err(|error| {
-                eprintln!("ocmini: {error}");
-                error
-            })?;
+            .await;
+            let printed = match printed {
+                Ok(printed) => printed,
+                Err(error) => {
+                    engine.abort_and_wait(&session.id).await;
+                    return Err(error);
+                }
+            };
             if printed && !json {
                 println!();
             }
@@ -241,7 +245,17 @@ fn on_event(
                         }
                     } else {
                         let shown = st.printed.entry(id).or_insert(0);
-                        let suffix = &full[*shown..];
+                        let suffix = match full.get(*shown..) {
+                            Some(suffix) => suffix,
+                            None => {
+                                // A failed attempt's streamed part is reset before
+                                // retrying. Terminal output cannot be taken back.
+                                if *shown > 0 && (kind == "text" || args.thinking) {
+                                    println!("\n[partial response discarded; retrying]");
+                                }
+                                full
+                            }
+                        };
                         *shown = full.len();
                         if suffix.is_empty() {
                             return;

@@ -4,6 +4,7 @@ pub mod openai_compat;
 pub mod responses;
 pub mod sse;
 pub use catalog::discover_models;
+pub(crate) use catalog::normalize_provider;
 
 use crate::auth::{configured_token, AuthEntry, AuthStore};
 use crate::config::{deep_merge, ProviderCfg};
@@ -174,7 +175,9 @@ pub fn build(
 ) -> Box<dyn ProviderAdapter> {
     Box::new(Adapter {
         provider_id: provider_id.into(),
-        cfg: cfg.cloned().unwrap_or_default(),
+        cfg: cfg
+            .map(|cfg| normalize_provider(provider_id, cfg))
+            .unwrap_or_default(),
         configured: cfg.is_some(),
         auth: auth.clone(),
     })

@@ -718,6 +718,13 @@ async fn context_overflow_compaction_retries_a_dying_summary_request() {
             .count(),
         1
     );
+    assert!(
+        terminal
+            .iter()
+            .any(|event| event["type"] == "session.status"
+                && event["properties"]["status"]["type"] == "retry"),
+        "summary retries must report status"
+    );
     let requests: Vec<_> = std::iter::from_fn(|| provider.requests.try_recv().ok()).collect();
     assert_eq!(
         requests.len(),

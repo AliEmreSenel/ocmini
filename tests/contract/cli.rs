@@ -15,7 +15,10 @@ async fn startup_auth_and_cli_inventory_match_t3() {
         .await
         .unwrap();
     assert_eq!(health["healthy"], true);
-    assert_eq!(health["version"], "1.19.4-ocmini.0.3.4");
+    assert_eq!(
+        health["version"],
+        concat!("1.19.4-ocmini.", env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(server.get("/api/info").send().await.unwrap().status(), 404);
     for path in ["/global/health", "/api/info", "/event", "/session"] {
         assert_eq!(
@@ -104,7 +107,7 @@ async fn cli_help_version_and_invalid_arguments_do_not_start_the_runtime() {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
-            "1.19.4-ocmini.0.3.4"
+            concat!("1.19.4-ocmini.", env!("CARGO_PKG_VERSION"))
         );
     }
     for arguments in [
@@ -388,4 +391,69 @@ async fn configured_reasoning_options_replace_the_catalog_variants() {
         "high"
     );
     assert_eq!(models["plain"]["variants"], json!({}));
+}
+
+#[tokio::test]
+async fn run_retries_partial_responses_without_panicking() {
+    let provider = Provider::start(vec![
+        Script::mid_stream_error("provider stream failed: error decoding response body"),
+        text_script("Recovered answer", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let output = configured_command(server.root.path(), &server.directory)
+        .args(["run", "hello"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("partial response discarded; retrying"));
+    assert!(stdout.contains("Recovered answer"));
+}
+
+#[tokio::test]
+async fn run_commands_use_templates_models_agents_and_allow_empty_arguments() {
+    let mut provider =
+        Provider::start(vec![text_script("reviewed", ""), text_script("pong", "")]).await;
+    let server = TestServer::start(&provider, json!({
+        "provider":{"mock":{"npm":"@ai-sdk/openai-compatible", "options":{"baseURL":provider.url},
+            "models":{"test-model":{},"command-model":{}}}},
+        "command":{
+            "review":{"template":"First $1. Rest $2.", "agent":"reviewer", "model":"mock/command-model"},
+            "ping":{"template":"PING_WITHOUT_ARGUMENTS"}
+        }
+    })).await;
+    for args in [
+        vec!["run", "--command", "review", "\"alpha beta\" gamma delta"],
+        vec!["run", "--command", "ping"],
+    ] {
+        let output = configured_command(server.root.path(), &server.directory)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let review = provider.request().await;
+    assert_eq!(review["model"], "command-model");
+    assert!(review
+        .to_string()
+        .contains("First alpha beta. Rest gamma delta."));
+    assert!(review.to_string().contains("REVIEWER_SYSTEM"));
+    assert!(provider
+        .request()
+        .await
+        .to_string()
+        .contains("PING_WITHOUT_ARGUMENTS"));
 }

@@ -32,28 +32,34 @@ impl Engine {
 
     pub async fn abort_and_wait(&self, sid: &str) {
         self.abort(sid);
-        while self.running.lock().unwrap().contains_key(sid) {
+        self.wait_for_idle(sid).await;
+    }
+
+    pub async fn wait_for_idle(&self, sid: &str) {
+        while crate::blocking::run(|| self.running.lock().unwrap().contains_key(sid)) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
     fn wake(&self, app: App, sid: String) {
-        let mut running = self.running.lock().unwrap();
-        if running.contains_key(&sid) {
-            return;
-        }
-        let cancel = match self.claim(&mut running, &app, &sid, None) {
-            Ok(cancel) => cancel,
-            Err(error) => {
-                emit_error(&sid, &error, false);
+        crate::blocking::run(|| {
+            let mut running = self.running.lock().unwrap();
+            if running.contains_key(&sid) {
                 return;
             }
-        };
-        drop(running);
-        let engine = self.clone();
-        tokio::spawn(async move {
-            engine.drain(app, sid, cancel).await;
-        });
+            let cancel = match self.claim(&mut running, &app, &sid, None) {
+                Ok(cancel) => cancel,
+                Err(error) => {
+                    emit_error(&sid, &error, false);
+                    return;
+                }
+            };
+            drop(running);
+            let engine = self.clone();
+            tokio::spawn(async move {
+                engine.drain(app, sid, cancel).await;
+            });
+        })
     }
 
     fn claim(
@@ -64,7 +70,6 @@ impl Engine {
         waiter: Option<(String, oneshot::Sender<Value>)>,
     ) -> Result<Arc<AtomicBool>, String> {
         app.store.claim(sid)?;
-        app.store.set_busy(sid, true)?;
         let cancel = Arc::new(AtomicBool::new(false));
         running.insert(
             sid.into(),
@@ -106,27 +111,30 @@ impl Engine {
         loop {
             // Admission and the idle transition share this lock. A prompt cannot
             // land between the final inbox check and releasing session ownership.
-            let request = {
+            let request = crate::blocking::run(|| {
                 let mut running = self.running.lock().unwrap();
                 if cancel.load(Ordering::Acquire) {
                     if let Err(e) = app.store.cancel_pending(&sid) {
                         emit_error(&sid, &e, false);
                     }
                     finish_running(&app, &sid, running.remove(&sid), Some("Aborted"));
-                    return;
+                    return None;
                 }
                 match app.store.next_prompt(&sid) {
-                    Ok(Some(request)) => request,
+                    Ok(Some(request)) => Some(request),
                     Ok(None) => {
                         finish_running(&app, &sid, running.remove(&sid), None);
-                        return;
+                        None
                     }
                     Err(error) => {
                         emit_error(&sid, &error, false);
                         finish_running(&app, &sid, running.remove(&sid), Some(&error));
-                        return;
+                        None
                     }
                 }
+            });
+            let Some(request) = request else {
+                return;
             };
             let mid = request.message_id.clone().unwrap_or_default();
             let engine: Arc<dyn EngineApi> = Arc::new(self.clone());
@@ -141,11 +149,36 @@ impl Engine {
             if let Err(error) = app.store.finish_prompt(&mid) {
                 emit_error(&sid, &error, false);
             }
-            let mut running = self.running.lock().unwrap();
-            if let Some(state) = running.get_mut(&sid) {
-                for waiter in state.waiters.remove(&mid).unwrap_or_default() {
+            let idle = crate::blocking::run(|| {
+                let mut running = self.running.lock().unwrap();
+                let waiters = running
+                    .get_mut(&sid)
+                    .and_then(|state| state.waiters.remove(&mid))
+                    .unwrap_or_default();
+                let idle = match app.store.has_waiting(&sid) {
+                    Ok(waiting) => !waiting,
+                    Err(error) => {
+                        emit_error(&sid, &error, false);
+                        finish_running(&app, &sid, running.remove(&sid), Some(&error));
+                        for waiter in waiters {
+                            let _ = waiter.send(value.clone());
+                        }
+                        return true;
+                    }
+                };
+                if idle {
+                    // A completed synchronous response promises resumable work.
+                    // Release ownership before waking its client, which may exit
+                    // or restart the server as soon as it receives the response.
+                    finish_running(&app, &sid, running.remove(&sid), None);
+                }
+                for waiter in waiters {
                     let _ = waiter.send(value.clone());
                 }
+                idle
+            });
+            if idle {
+                return;
             }
         }
     }
@@ -155,9 +188,6 @@ fn finish_running(app: &App, sid: &str, running: Option<Running>, error: Option<
     app.perms.reject_all(sid);
     app.questions.reject_all(sid);
     app.store.release(sid);
-    if let Err(error) = app.store.set_busy(sid, false) {
-        eprintln!("ocmini: {error}");
-    }
     if let Some(running) = running {
         let value = json!({"error":error.unwrap_or("Prompt is no longer pending")});
         for waiters in running.waiters.into_values() {
@@ -189,177 +219,194 @@ impl EngineApi for Engine {
         sid: String,
         mut request: PromptRequest,
     ) -> Result<oneshot::Receiver<Value>, String> {
-        let session = app.store.get_session(&sid)?.ok_or("Session not found")?;
-        let mut guard = self.running.lock().unwrap();
-        let mid = request.message_id.clone().unwrap_or_else(|| hex_id("msg_"));
-        if mid.is_empty()
-            || mid.len() > 256
-            || !mid
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-        {
-            return Err(
-                "messageID must contain 1–256 ASCII letters, digits, underscores or hyphens".into(),
-            );
-        }
-        let (tx, rx) = oneshot::channel();
-        if let Some(owner) = app.store.message_owner(&mid)? {
-            if owner != sid {
-                return Err("messageID already belongs to another session".into());
+        crate::blocking::run(|| {
+            let session = app.store.get_session(&sid)?.ok_or("Session not found")?;
+            let mut guard = self.running.lock().unwrap();
+            let mid = request.message_id.clone().unwrap_or_else(|| hex_id("msg_"));
+            if mid.is_empty()
+                || mid.len() > 256
+                || !mid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            {
+                return Err(
+                    "messageID must contain 1–256 ASCII letters, digits, underscores or hyphens"
+                        .into(),
+                );
             }
-            let existing = app.store.message(&sid, &mid)?.ok_or("Message not found")?;
-            if existing.info.role != "user" {
-                return Err("messageID already belongs to an assistant message".into());
-            }
-            if app.store.is_pending_message(&mid)? {
-                if let Some(state) = guard.get_mut(&sid) {
-                    state.waiters.entry(mid).or_default().push(tx);
+            let (tx, rx) = oneshot::channel();
+            if let Some(owner) = app.store.message_owner(&mid)? {
+                if owner != sid {
+                    return Err("messageID already belongs to another session".into());
+                }
+                let existing = app.store.message(&sid, &mid)?.ok_or("Message not found")?;
+                if existing.info.role != "user" {
+                    return Err("messageID already belongs to an assistant message".into());
+                }
+                if app.store.is_pending_message(&mid)? {
+                    if let Some(state) = guard.get_mut(&sid) {
+                        state.waiters.entry(mid).or_default().push(tx);
+                        return Ok(rx);
+                    }
+                    let scoped = app.for_directory(&session.directory)?;
+                    let cancel = self.claim(&mut guard, &scoped, &sid, Some((mid, tx)))?;
+                    drop(guard);
+                    let engine = self.clone();
+                    tokio::spawn(async move {
+                        engine.drain(scoped, sid, cancel).await;
+                    });
                     return Ok(rx);
                 }
-                let scoped = app.for_directory(&session.directory)?;
-                let cancel = self.claim(&mut guard, &scoped, &sid, Some((mid, tx)))?;
-                drop(guard);
-                let engine = self.clone();
-                tokio::spawn(async move {
-                    engine.drain(scoped, sid, cancel).await;
-                });
+                let result = app.store.reply_to(&sid, &mid)?.unwrap_or(existing);
+                let _ = tx.send(serde_json::to_value(result).map_err(|e| e.to_string())?);
                 return Ok(rx);
             }
-            let result = app.store.reply_to(&sid, &mid)?.unwrap_or(existing);
-            let _ = tx.send(serde_json::to_value(result).map_err(|e| e.to_string())?);
-            return Ok(rx);
-        }
-        let app = app.for_directory(&session.directory)?;
-        let cfg = app.config.lock().unwrap().clone();
-        request.message_id = Some(mid.clone());
-        let agent = request
-            .agent
-            .get_or_insert_with(|| {
-                cfg.extra
-                    .get("default_agent")
-                    .and_then(Value::as_str)
-                    .unwrap_or("build")
-                    .to_string()
-            })
-            .clone();
-        if !["build", "plan", "general", "explore", "subagent"].contains(&agent.as_str())
-            && !cfg.agent.contains_key(&agent)
-        {
-            return Err(format!("Unknown agent '{agent}'"));
-        }
-        if cfg.agent.get(&agent).is_some_and(|a| a["disable"] == true) {
-            return Err(format!("Agent '{agent}' is disabled"));
-        }
-        let model = resolve_model(&cfg, &app, &sid, request.model.as_ref(), Some(&agent))?;
-        if !model_available(&cfg, &model) {
-            return Err(format!("Provider or model is disabled: {model}"));
-        }
-        request.model = Some(model);
-        if request.parts.is_empty() {
-            return Err("Prompt requires at least one text or file part".into());
-        }
-        let mut seen_parts = HashSet::new();
-        for part in &mut request.parts {
-            let kind = part["type"]
-                .as_str()
-                .ok_or("Every prompt part requires a type")?;
-            match kind {
-                "text" if part["text"].is_string() => {}
-                "file" if part["url"].is_string() && part["mime"].is_string() => {}
-                "agent" if part["name"].is_string() => {}
-                "compaction" if request.command.as_deref() == Some("__ocmini_compact") => {}
-                _ => return Err(format!("Invalid or unsupported prompt part '{kind}'")),
+            let app = app.for_directory(&session.directory)?;
+            let cfg = app.config.lock().unwrap().clone();
+            request.message_id = Some(mid.clone());
+            let agent = request
+                .agent
+                .get_or_insert_with(|| {
+                    cfg.extra
+                        .get("default_agent")
+                        .and_then(Value::as_str)
+                        .unwrap_or("build")
+                        .to_string()
+                })
+                .clone();
+            if !["build", "plan", "general", "explore", "subagent"].contains(&agent.as_str())
+                && !cfg.agent.contains_key(&agent)
+            {
+                return Err(format!("Unknown agent '{agent}'"));
             }
-            let id = part["id"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| hex_id("prt_"));
-            if !seen_parts.insert(id.clone()) {
-                return Err("Duplicate part id in prompt".into());
+            if cfg.agent.get(&agent).is_some_and(|a| a["disable"] == true) {
+                return Err(format!("Agent '{agent}' is disabled"));
             }
-            part["id"] = json!(id);
-            part["messageID"] = json!(mid);
-            part["sessionID"] = json!(sid);
-        }
-        // rowid is the stable tie breaker for messages created in one millisecond.
-        let created = now_ms();
-        let mut info = MessageInfo {
-            id: mid.clone(),
-            session_id: sid.clone(),
-            role: "user".into(),
-            time: MessageTime {
-                created,
-                completed: None,
-            },
-            model: request.model.clone(),
-            agent: Some(agent),
-            system: request.system.clone(),
-            variant: request.variant.clone(),
-            ..Default::default()
-        };
-        if let Some(tools) = &request.tools {
-            info.extra.insert("tools".into(), json!(tools));
-        }
-        if let Some(command) = &request.command {
-            info.extra.insert("command".into(), json!(command));
-        }
-        let message = MessageWithParts {
-            info,
-            parts: request.parts.clone(),
-        };
-        app.store.admit(&request, &message)?;
-        emit_message(&message.info);
-        for part in &message.parts {
-            emit_part(part);
-        }
-        // A launcher title ("tui session", "run") says nothing about the chat.
-        // Name the session after its first prompt, with the model writing the
-        // title in the background when `title_model` is configured.
-        if let Some(model) = &request.model {
-            title::launch(app.clone(), sid.clone(), &message.parts, model);
-        }
-        if request.no_reply {
-            let _ = tx.send(serde_json::to_value(message).map_err(|e| e.to_string())?);
-            return Ok(rx);
-        }
-        if let Some(state) = guard.get_mut(&sid) {
-            state.waiters.entry(mid).or_default().push(tx);
-            return Ok(rx);
-        }
-        let cancel = self.claim(&mut guard, &app, &sid, Some((mid, tx)))?;
-        drop(guard);
-        let engine = self.clone();
-        tokio::spawn(async move {
-            engine.drain(app, sid, cancel).await;
-        });
-        Ok(rx)
+            let model = resolve_model(&cfg, &app, &sid, request.model.as_ref(), Some(&agent))?;
+            if !model_available(&cfg, &model) {
+                return Err(format!("Provider or model is disabled: {model}"));
+            }
+            request.model = Some(model);
+            if request.parts.is_empty() {
+                return Err("Prompt requires at least one text or file part".into());
+            }
+            let mut seen_parts = HashSet::new();
+            for part in &mut request.parts {
+                let kind = part["type"]
+                    .as_str()
+                    .ok_or("Every prompt part requires a type")?;
+                match kind {
+                    "text" if part["text"].is_string() => {}
+                    "file" if part["url"].is_string() && part["mime"].is_string() => {}
+                    "agent" if part["name"].is_string() => {}
+                    "compaction" if request.command.as_deref() == Some("__ocmini_compact") => {}
+                    _ => return Err(format!("Invalid or unsupported prompt part '{kind}'")),
+                }
+                let id = part["id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| hex_id("prt_"));
+                if !seen_parts.insert(id.clone()) {
+                    return Err("Duplicate part id in prompt".into());
+                }
+                part["id"] = json!(id);
+                part["messageID"] = json!(mid);
+                part["sessionID"] = json!(sid);
+            }
+            // rowid is the stable tie breaker for messages created in one millisecond.
+            let created = now_ms();
+            let mut info = MessageInfo {
+                id: mid.clone(),
+                session_id: sid.clone(),
+                role: "user".into(),
+                time: MessageTime {
+                    created,
+                    completed: None,
+                },
+                model: request.model.clone(),
+                agent: Some(agent),
+                system: request.system.clone(),
+                variant: request.variant.clone(),
+                ..Default::default()
+            };
+            if let Some(tools) = &request.tools {
+                info.extra.insert("tools".into(), json!(tools));
+            }
+            if let Some(command) = &request.command {
+                info.extra.insert("command".into(), json!(command));
+            }
+            let message = MessageWithParts {
+                info,
+                parts: request.parts.clone(),
+            };
+            // Reserve an idle session before persisting acknowledged work.
+            // Otherwise another process could claim it between admission and
+            // starting the drain, leaving work queued after a rejected request.
+            let claimed = !request.no_reply && !guard.contains_key(&sid);
+            if claimed {
+                app.store.claim(&sid)?;
+            }
+            if let Err(error) = app.store.admit(&request, &message) {
+                if claimed {
+                    app.store.release(&sid);
+                }
+                return Err(error);
+            }
+            emit_message(&message.info);
+            for part in &message.parts {
+                emit_part(part);
+            }
+            // A launcher title ("tui session", "run") says nothing about the chat.
+            // Name the session after its first prompt, with the model writing the
+            // title in the background when `title_model` is configured.
+            if let Some(model) = &request.model {
+                title::launch(app.clone(), sid.clone(), &message.parts, model);
+            }
+            if request.no_reply {
+                let _ = tx.send(serde_json::to_value(message).map_err(|e| e.to_string())?);
+                return Ok(rx);
+            }
+            if let Some(state) = guard.get_mut(&sid) {
+                state.waiters.entry(mid).or_default().push(tx);
+                return Ok(rx);
+            }
+            let cancel = self.claim(&mut guard, &app, &sid, Some((mid, tx)))?;
+            drop(guard);
+            let engine = self.clone();
+            tokio::spawn(async move {
+                engine.drain(app, sid, cancel).await;
+            });
+            Ok(rx)
+        })
     }
 
     fn abort(&self, sid: &str) {
-        let mut queue = vec![sid.to_string()];
-        let running = self.running.lock().unwrap();
-        let mut visited = HashSet::new();
-        while let Some(id) = queue.pop() {
-            if !visited.insert(id.clone()) {
-                continue;
+        crate::blocking::run(|| {
+            let mut queue = vec![sid.to_string()];
+            let running = self.running.lock().unwrap();
+            let mut visited = HashSet::new();
+            while let Some(id) = queue.pop() {
+                if !visited.insert(id.clone()) {
+                    continue;
+                }
+                crate::tools::cancel_background_jobs(&id);
+                if let Some(state) = running.get(&id) {
+                    state.cancel.store(true, Ordering::Release);
+                    state.app.perms.reject_all(&id);
+                    state.app.questions.reject_all(&id);
+                    queue.extend(
+                        state
+                            .app
+                            .store
+                            .children(&id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|s| s.id),
+                    );
+                }
             }
-            crate::tools::cancel_background_jobs(&id);
-            if let Some(state) = running.get(&id) {
-                state.cancel.store(true, Ordering::Release);
-                state.app.perms.reject_all(&id);
-                state.app.questions.reject_all(&id);
-                queue.extend(
-                    state
-                        .app
-                        .store
-                        .children(&id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|s| s.id),
-                );
-            }
-        }
+        })
     }
 
     fn run_sync(
@@ -399,14 +446,16 @@ impl EngineApi for Engine {
     }
 
     fn recover(&self, app: App) {
-        for sid in app.store.pending_sessions().unwrap_or_default() {
-            if let Some(session) = app.store.get_session(&sid).unwrap_or_default() {
-                match app.for_directory(&session.directory) {
-                    Ok(scoped) => self.wake(scoped, sid),
-                    Err(error) => emit_error(&sid, &error, false),
+        crate::blocking::run(|| {
+            for sid in app.store.pending_sessions().unwrap_or_default() {
+                if let Some(session) = app.store.get_session(&sid).unwrap_or_default() {
+                    match app.for_directory(&session.directory) {
+                        Ok(scoped) => self.wake(scoped, sid),
+                        Err(error) => emit_error(&sid, &error, false),
+                    }
                 }
             }
-        }
+        })
     }
 }
 
@@ -705,10 +754,7 @@ async fn compact_history(
             Ok(stream) => stream,
             Err(error) if error.retryable && attempt < MAX_RETRIES => {
                 attempt += 1;
-                tokio::select! {
-                    _ = tokio::time::sleep(retry_delay(error.retry_after, attempt)) => {}
-                    _ = cancelled(cancel) => return Err("Aborted".into()),
-                }
+                wait_retry(app, sid, &error.message, error.retry_after, attempt, cancel).await?;
                 continue 'summary;
             }
             Err(error) => return Err(error.message),
@@ -742,10 +788,7 @@ async fn compact_history(
         };
         if provider::stream_retryable(&error) && attempt < MAX_RETRIES {
             attempt += 1;
-            tokio::select! {
-                _ = tokio::time::sleep(retry_delay(None, attempt)) => {}
-                _ = cancelled(cancel) => return Err("Aborted".into()),
-            }
+            wait_retry(app, sid, &error, None, attempt, cancel).await?;
             continue 'summary;
         }
         return Err(error);
@@ -1046,18 +1089,12 @@ async fn run_turn(
                             emit_part(&part.part);
                         }
                         attempt += 1;
-                        let delay = retry_delay(None, attempt);
-                        update_status(
-                            &app,
-                            sid,
-                            json!({"type":"retry","attempt":attempt,"message":error,"next":now_ms()+delay.as_millis() as i64}),
-                        );
-                        tokio::select! { _=tokio::time::sleep(delay)=>{}, _=cancelled(&cancel)=>{} }
-                        if cancel.load(Ordering::Acquire) {
-                            fail_message(&app, &mut info, "Aborted", true)?;
-                            return Err("Aborted".into());
+                        if let Err(error) =
+                            wait_retry(&app, sid, &error, None, attempt, &cancel).await
+                        {
+                            fail_message(&app, &mut info, &error, true)?;
+                            return Err(error);
                         }
-                        update_status(&app, sid, json!({"type":"busy"}));
                         continue 'attempt;
                     }
                     for part in &mut tool_parts {
@@ -1078,18 +1115,19 @@ async fn run_turn(
                         && !cancel.load(Ordering::Acquire) =>
                 {
                     attempt += 1;
-                    let delay = retry_delay(error.retry_after, attempt);
-                    update_status(
+                    if let Err(error) = wait_retry(
                         &app,
                         sid,
-                        json!({"type":"retry","attempt":attempt,"message":error.message,"next":now_ms()+delay.as_millis() as i64}),
-                    );
-                    tokio::select! { _=tokio::time::sleep(delay)=>{}, _=cancelled(&cancel)=>{} }
-                    if cancel.load(Ordering::Acquire) {
-                        fail_message(&app, &mut info, "Aborted", true)?;
-                        return Err("Aborted".into());
+                        &error.message,
+                        error.retry_after,
+                        attempt,
+                        &cancel,
+                    )
+                    .await
+                    {
+                        fail_message(&app, &mut info, &error, true)?;
+                        return Err(error);
                     }
-                    update_status(&app, sid, json!({"type":"busy"}));
                 }
                 Err(error) => {
                     // A context overflow can never succeed verbatim: compact
@@ -1391,6 +1429,29 @@ fn append_delta(
         app.store.update_part(sid, &entry.part)?;
         entry.last_flush = std::time::Instant::now();
     }
+    Ok(())
+}
+
+async fn wait_retry(
+    app: &App,
+    sid: &str,
+    message: &str,
+    retry_after: Option<std::time::Duration>,
+    attempt: u32,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let delay = retry_delay(retry_after, attempt);
+    update_status(
+        app,
+        sid,
+        json!({"type":"retry", "attempt":attempt, "message":message,
+        "next":now_ms()+delay.as_millis() as i64}),
+    );
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {},
+        _ = cancelled(cancel) => return Err("Aborted".into()),
+    }
+    update_status(app, sid, json!({"type":"busy"}));
     Ok(())
 }
 

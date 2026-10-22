@@ -48,22 +48,24 @@ impl Store {
     /// at once, so opening is fallible: contention must surface as a clean
     /// startup error, never as a panic.
     pub fn open(path: &Path, instance: &str) -> Result<Self, String> {
-        // Startup competes with sibling instances that are recovering the same
-        // file, and SQLite answers some of those races with SQLITE_BUSY
-        // immediately, before busy_timeout applies. Opening is idempotent, so a
-        // new instance waits a bounded time instead of failing the launch.
-        let mut locked = None;
-        for attempt in 0..5 {
-            match Self::open_once(path, instance) {
-                Ok(store) => return Ok(store),
-                Err(error) if attempt < 4 && error.contains("database is locked") => {
-                    locked = Some(error);
-                    std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+        crate::blocking::run(|| {
+            // Startup competes with sibling instances that are recovering the same
+            // file, and SQLite answers some of those races with SQLITE_BUSY
+            // immediately, before busy_timeout applies. Opening is idempotent, so a
+            // new instance waits a bounded time instead of failing the launch.
+            let mut locked = None;
+            for attempt in 0..5 {
+                match Self::open_once(path, instance) {
+                    Ok(store) => return Ok(store),
+                    Err(error) if attempt < 4 && error.contains("database is locked") => {
+                        locked = Some(error);
+                        std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
-        }
-        Err(locked.unwrap_or_else(|| "Session database: unavailable".into()))
+            Err(locked.unwrap_or_else(|| "Session database: unavailable".into()))
+        })
     }
 
     fn open_once(path: &Path, instance: &str) -> Result<Self, String> {
@@ -184,85 +186,115 @@ impl Store {
     /// Mark a session's work as owned by this instance. Live sessions with a
     /// fresh lease are invisible to startup recovery in every other process.
     pub fn claim(&self, sid: &str) -> Result<(), String> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO owner(session_id,instance_id,lease_expires) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET instance_id=excluded.instance_id,lease_expires=excluded.lease_expires",
-            params![sid, self.instance, now_ms() + LEASE_MS],
+        crate::blocking::run(|| {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut conn)?;
+            let now = now_ms();
+            let claimed = tx.execute(
+            "INSERT INTO owner(session_id,instance_id,lease_expires) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET instance_id=excluded.instance_id,lease_expires=excluded.lease_expires WHERE owner.instance_id=?2 OR owner.lease_expires<?4",
+            params![sid, self.instance, now + LEASE_MS, now],
         ).map_err(sql_error)?;
-        Ok(())
+            if claimed == 0 {
+                return Err("Session is busy in another instance".into());
+            }
+            tx.execute("UPDATE session SET busy=1 WHERE id=?1", params![sid])
+                .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(())
+        })
     }
 
     pub fn heartbeat(&self, sid: &str) -> Result<(), String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE owner SET lease_expires=?2 WHERE session_id=?1 AND instance_id=?3",
-                params![sid, now_ms() + LEASE_MS, self.instance],
-            )
-            .map_err(sql_error)?;
-        Ok(())
+        crate::blocking::run(|| {
+            self.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE owner SET lease_expires=?2 WHERE session_id=?1 AND instance_id=?3",
+                    params![sid, now_ms() + LEASE_MS, self.instance],
+                )
+                .map_err(sql_error)?;
+            Ok(())
+        })
     }
 
     pub fn release(&self, sid: &str) {
-        let _ = self.conn.lock().unwrap().execute(
-            "DELETE FROM owner WHERE session_id=?1 AND instance_id=?2",
-            params![sid, self.instance],
-        );
+        crate::blocking::run(|| {
+            let release = || -> Result<(), String> {
+                let mut conn = self.conn.lock().unwrap();
+                let tx = self.write_tx(&mut conn)?;
+                tx.execute("UPDATE session SET busy=0 WHERE id=?1 AND EXISTS(SELECT 1 FROM owner WHERE session_id=?1 AND instance_id=?2)", params![sid, self.instance]).map_err(sql_error)?;
+                tx.execute(
+                    "DELETE FROM owner WHERE session_id=?1 AND instance_id=?2",
+                    params![sid, self.instance],
+                )
+                .map_err(sql_error)?;
+                tx.commit().map_err(sql_error)
+            };
+            if let Err(error) = release() {
+                eprintln!("ocmini: {error}");
+            }
+        })
     }
 
     fn recover_interrupted(&self) -> Result<(), String> {
-        // Only recover sessions this process owns, sessions with an expired
-        // lease, or sessions no instance has ever claimed. A sibling instance
-        // that is actively streaming must not be interrupted by a restart.
-        //
-        // The two scans below run on the read connection: holding the write lock
-        // across them makes every sibling instance queue, and a burst of instance
-        // startups pushes them past their busy timeout with "database is locked".
-        // Each update re-checks the scanned condition, so a row a sibling changed
-        // in the meantime is left alone. The expression indexes below the scan
-        // prefixes keep the scans proportional to unfinished work, not to the
-        // size of the store.
-        let now = now_ms();
-        let (unfinished, parts) = self.with_read(|c| {
-            Ok((
-                scan_interrupted(c, &self.instance, now, RECOVER_MESSAGES)?,
-                scan_interrupted(c, &self.instance, now, RECOVER_PARTS)?,
-            ))
-        })?;
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        for (id, raw) in unfinished {
-            let mut info: MessageInfo = serde_json::from_str(&raw).map_err(sql_error)?;
-            info.time.completed = Some(now.max(info.time.created));
-            info.error = Some(
-                json!({"name":"MessageAbortedError","data":{"message":"Server stopped before this response completed; send a new prompt to continue."}}),
-            );
-            tx.execute(
-                "UPDATE message SET json=?2,completed=?3 WHERE id=?1 AND completed IS NULL",
-                params![
-                    id,
-                    serde_json::to_string(&info).map_err(sql_error)?,
-                    info.time.completed
-                ],
+        crate::blocking::run(|| {
+            // Only recover sessions this process owns, sessions with an expired
+            // lease, or sessions no instance has ever claimed. A sibling instance
+            // that is actively streaming must not be interrupted by a restart.
+            //
+            // The two scans below run on the read connection: holding the write lock
+            // across them makes every sibling instance queue, and a burst of instance
+            // startups pushes them past their busy timeout with "database is locked".
+            // Each update re-checks the scanned condition, so a row a sibling changed
+            // in the meantime is left alone. The expression indexes below the scan
+            // prefixes keep the scans proportional to unfinished work, not to the
+            // size of the store.
+            let now = now_ms();
+            let (unfinished, parts) = self.with_read(|c| {
+                Ok((
+                    scan_interrupted(c, &self.instance, now, RECOVER_MESSAGES)?,
+                    scan_interrupted(c, &self.instance, now, RECOVER_PARTS)?,
+                ))
+            })?;
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            for (id, raw) in unfinished {
+                let mut info: MessageInfo = serde_json::from_str(&raw).map_err(sql_error)?;
+                info.time.completed = Some(now.max(info.time.created));
+                info.error = Some(
+                    json!({"name":"MessageAbortedError","data":{"message":"Server stopped before this response completed; send a new prompt to continue."}}),
+                );
+                tx.execute(
+                    "UPDATE message SET json=?2,completed=?3 WHERE id=?1 AND completed IS NULL AND NOT EXISTS(SELECT 1 FROM owner o WHERE o.session_id=message.session_id AND o.instance_id<>?4 AND o.lease_expires>=?5)",
+                    params![
+                        id,
+                        serde_json::to_string(&info).map_err(sql_error)?,
+                        info.time.completed,
+                        self.instance,
+                        now
+                    ],
+                )
+                .map_err(sql_error)?;
+            }
+            for (id, raw) in parts {
+                let mut part: Value = serde_json::from_str(&raw).map_err(sql_error)?;
+                part["state"]["status"] = json!("error");
+                part["state"]["error"] = json!(
+                    "Execution interrupted by server restart; the operation was not replayed."
+                );
+                part["state"]["time"]["end"] = json!(now);
+                tx.execute(
+                "UPDATE part SET json=?2,status='error' WHERE id=?1 AND status IN ('pending','running') AND NOT EXISTS(SELECT 1 FROM owner o WHERE o.session_id=part.session_id AND o.instance_id<>?3 AND o.lease_expires>=?4)",
+                params![id, part.to_string(), self.instance, now],
             )
             .map_err(sql_error)?;
-        }
-        for (id, raw) in parts {
-            let mut part: Value = serde_json::from_str(&raw).map_err(sql_error)?;
-            part["state"]["status"] = json!("error");
-            part["state"]["error"] =
-                json!("Execution interrupted by server restart; the operation was not replayed.");
-            part["state"]["time"]["end"] = json!(now);
-            tx.execute(
-                "UPDATE part SET json=?2,status='error' WHERE id=?1 AND status IN ('pending','running')",
-                params![id, part.to_string()],
-            )
-            .map_err(sql_error)?;
-        }
-        // Never replay a possibly completed filesystem or shell side effect after a crash.
-        tx.execute("DELETE FROM inbox WHERE started=1 AND session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)", params![self.instance, now]).map_err(sql_error)?;
-        tx.execute("UPDATE session SET busy=0 WHERE busy=1 AND id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)", params![self.instance, now]).map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
+            }
+            // Never replay a possibly completed filesystem or shell side effect after a crash.
+            tx.execute("DELETE FROM inbox WHERE started=1 AND session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)", params![self.instance, now]).map_err(sql_error)?;
+            tx.execute("UPDATE session SET busy=0 WHERE busy=1 AND id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)", params![self.instance, now]).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)
+        })
     }
 
     /// Cached session→directory lookup for event stream filtering; session
@@ -291,8 +323,10 @@ impl Store {
     }
 
     pub fn prune(&self, before: i64) -> Result<usize, String> {
-        let c = self.conn.lock().unwrap();
-        c.execute("DELETE FROM session WHERE busy=0 AND time_updated<?1 AND id NOT IN (SELECT session_id FROM inbox) AND id NOT IN (SELECT parent_id FROM session WHERE parent_id IS NOT NULL) AND id NOT IN (SELECT session_id FROM owner WHERE lease_expires>=?2)", params![before, now_ms()]).map_err(sql_error)
+        crate::blocking::run(|| {
+            let c = self.conn.lock().unwrap();
+            c.execute("DELETE FROM session WHERE busy=0 AND time_updated<?1 AND id NOT IN (SELECT session_id FROM inbox) AND id NOT IN (SELECT parent_id FROM session WHERE parent_id IS NOT NULL) AND id NOT IN (SELECT session_id FROM owner WHERE lease_expires>=?2)", params![before, now_ms()]).map_err(sql_error)
+        })
     }
 
     #[cfg(test)]
@@ -327,11 +361,13 @@ impl Store {
     }
 
     pub fn create_session(&self, s: &Session) -> Result<(), String> {
-        self.conn.lock().unwrap().execute(
+        crate::blocking::run(|| {
+            self.conn.lock().unwrap().execute(
             "INSERT INTO session(id,json,time_created,time_updated,parent_id) VALUES(?1,?2,?3,?4,?5)",
             params![s.id, serde_json::to_string(s).map_err(sql_error)?, s.time.created, s.time.updated.unwrap_or(s.time.created), s.parent_id],
         ).map_err(sql_error)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn list_sessions(&self, dir: Option<&str>) -> Result<Vec<Session>, String> {
@@ -372,65 +408,71 @@ impl Store {
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>, String> {
-        let raw: Option<String> = self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT json FROM session WHERE id=?1", params![id], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()
-            .map_err(sql_error)?;
-        raw.map(|j| serde_json::from_str(&j).map_err(sql_error))
-            .transpose()
+        crate::blocking::run(|| {
+            let raw: Option<String> = self
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT json FROM session WHERE id=?1", params![id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(sql_error)?;
+            raw.map(|j| serde_json::from_str(&j).map_err(sql_error))
+                .transpose()
+        })
     }
 
     pub fn update_session(&self, s: &Session) -> Result<(), String> {
-        let n = self
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE session SET json=?2,time_updated=?3,parent_id=?4 WHERE id=?1",
-                params![
-                    s.id,
-                    serde_json::to_string(s).map_err(sql_error)?,
-                    s.time.updated.unwrap_or_else(now_ms),
-                    s.parent_id
-                ],
-            )
-            .map_err(sql_error)?;
-        if n == 0 {
-            return Err("Session not found".into());
-        }
-        Ok(())
+        crate::blocking::run(|| {
+            let n = self
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE session SET json=?2,time_updated=?3,parent_id=?4 WHERE id=?1",
+                    params![
+                        s.id,
+                        serde_json::to_string(s).map_err(sql_error)?,
+                        s.time.updated.unwrap_or_else(now_ms),
+                        s.parent_id
+                    ],
+                )
+                .map_err(sql_error)?;
+            if n == 0 {
+                return Err("Session not found".into());
+            }
+            Ok(())
+        })
     }
 
     pub fn delete_session(&self, id: &str) -> Result<bool, String> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        let exists: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)",
-                params![id],
-                |r| r.get(0),
-            )
-            .map_err(sql_error)?;
-        if !exists {
-            return Ok(false);
-        }
-        // Check the inbox as well as busy: admission commits before the engine
-        // publishes busy, and a delete must not erase acknowledged work.
-        let active: bool = tx.query_row("WITH RECURSIVE descendants(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id=d.id) SELECT EXISTS(SELECT 1 FROM session WHERE id IN (SELECT id FROM descendants) AND busy=1) OR EXISTS(SELECT 1 FROM inbox WHERE session_id IN (SELECT id FROM descendants))", params![id], |row| row.get(0)).map_err(sql_error)?;
-        if active {
-            return Err(
-                "Session or a child session is busy; abort and wait for idle before deleting"
-                    .into(),
-            );
-        }
-        tx.execute("WITH RECURSIVE descendants(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id=d.id) DELETE FROM session WHERE id IN (SELECT id FROM descendants)", params![id]).map_err(sql_error)?;
-        tx.commit().map_err(sql_error)?;
-        Ok(true)
+        crate::blocking::run(|| {
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .map_err(sql_error)?;
+            if !exists {
+                return Ok(false);
+            }
+            // Check the inbox as well as busy: admission commits before the engine
+            // publishes busy, and a delete must not erase acknowledged work.
+            let active: bool = tx.query_row("WITH RECURSIVE descendants(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id=d.id) SELECT EXISTS(SELECT 1 FROM session WHERE id IN (SELECT id FROM descendants) AND busy=1) OR EXISTS(SELECT 1 FROM inbox WHERE session_id IN (SELECT id FROM descendants))", params![id], |row| row.get(0)).map_err(sql_error)?;
+            if active {
+                return Err(
+                    "Session or a child session is busy; abort and wait for idle before deleting"
+                        .into(),
+                );
+            }
+            tx.execute("WITH RECURSIVE descendants(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id=d.id) DELETE FROM session WHERE id IN (SELECT id FROM descendants)", params![id]).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(true)
+        })
     }
 
     pub fn children(&self, id: &str) -> Result<Vec<Session>, String> {
@@ -444,6 +486,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn set_busy(&self, id: &str, busy: bool) -> Result<bool, String> {
         let n = self
             .conn
@@ -481,17 +524,21 @@ impl Store {
     }
 
     pub fn add_message(&self, m: &MessageWithParts) -> Result<(), String> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        save_message(&tx, m)?;
-        tx.commit().map_err(sql_error)
+        crate::blocking::run(|| {
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            save_message(&tx, m)?;
+            tx.commit().map_err(sql_error)
+        })
     }
 
     pub fn update_part(&self, session_id: &str, part: &Value) -> Result<(), String> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        save_part(&tx, session_id, part, now_ms())?;
-        tx.commit().map_err(sql_error)
+        crate::blocking::run(|| {
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            save_part(&tx, session_id, part, now_ms())?;
+            tx.commit().map_err(sql_error)
+        })
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>, String> {
@@ -502,55 +549,57 @@ impl Store {
     /// of completed tool output, and marks older output only when at least
     /// another 20k tokens can be removed. Original output stays browsable.
     pub fn prune_tool_outputs(&self, sid: &str, through: &str) -> Result<Vec<Value>, String> {
-        let messages = self.context_messages(sid, through)?;
-        let mut turns = 0;
-        let mut total = 0usize;
-        let mut pruned = 0usize;
-        let mut parts = Vec::new();
-        'history: for message in messages.into_iter().rev() {
-            if message.info.role == "user" {
-                turns += 1;
-            }
-            if turns < 2 {
-                continue;
-            }
-            if message.info.summary == Some(true) {
-                break;
-            }
-            for mut part in message.parts.into_iter().rev() {
-                if part["type"] != "tool"
-                    || part["state"]["status"] != "completed"
-                    || part["tool"] == "skill"
-                {
+        crate::blocking::run(|| {
+            let messages = self.context_messages(sid, through)?;
+            let mut turns = 0;
+            let mut total = 0usize;
+            let mut pruned = 0usize;
+            let mut parts = Vec::new();
+            'history: for message in messages.into_iter().rev() {
+                if message.info.role == "user" {
+                    turns += 1;
+                }
+                if turns < 2 {
                     continue;
                 }
-                if part["state"]["time"]["compacted"].is_number() {
-                    break 'history;
+                if message.info.summary == Some(true) {
+                    break;
                 }
-                let tokens = part["state"]["output"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .len()
-                    .div_ceil(4);
-                total = total.saturating_add(tokens);
-                if total <= 40_000 {
-                    continue;
+                for mut part in message.parts.into_iter().rev() {
+                    if part["type"] != "tool"
+                        || part["state"]["status"] != "completed"
+                        || part["tool"] == "skill"
+                    {
+                        continue;
+                    }
+                    if part["state"]["time"]["compacted"].is_number() {
+                        break 'history;
+                    }
+                    let tokens = part["state"]["output"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .len()
+                        .div_ceil(4);
+                    total = total.saturating_add(tokens);
+                    if total <= 40_000 {
+                        continue;
+                    }
+                    pruned = pruned.saturating_add(tokens);
+                    part["state"]["time"]["compacted"] = json!(now_ms());
+                    parts.push(part);
                 }
-                pruned = pruned.saturating_add(tokens);
-                part["state"]["time"]["compacted"] = json!(now_ms());
-                parts.push(part);
             }
-        }
-        if pruned <= 20_000 {
-            return Ok(Vec::new());
-        }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut conn)?;
-        for part in &parts {
-            save_part(&tx, sid, part, now_ms())?;
-        }
-        tx.commit().map_err(sql_error)?;
-        Ok(parts)
+            if pruned <= 20_000 {
+                return Ok(Vec::new());
+            }
+            let mut conn = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut conn)?;
+            for part in &parts {
+                save_part(&tx, sid, part, now_ms())?;
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(parts)
+        })
     }
 
     pub fn messages_limited(
@@ -705,78 +754,97 @@ impl Store {
         request: &PromptRequest,
         message: &MessageWithParts,
     ) -> Result<bool, String> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        let owner: Option<(String, String)> = tx
-            .query_row(
-                "SELECT session_id,role FROM message WHERE id=?1",
-                params![message.info.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        if let Some((sid, role)) = owner {
-            if sid == message.info.session_id && role == "user" {
-                return Ok(false);
+        crate::blocking::run(|| {
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            let foreign_owner: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM owner WHERE session_id=?1 AND instance_id<>?2 AND lease_expires>=?3)",
+            params![message.info.session_id, self.instance, now_ms()], |row| row.get(0),
+        ).map_err(sql_error)?;
+            if foreign_owner {
+                return Err("Session is busy in another instance".into());
             }
-            return Err("messageID already belongs to another session or message type".into());
-        }
-        save_message(&tx, message)?;
-        if !request.no_reply {
-            tx.execute(
-                "INSERT INTO inbox(message_id,session_id,request) VALUES(?1,?2,?3)",
-                params![
-                    message.info.id,
-                    message.info.session_id,
-                    serde_json::to_string(request).map_err(sql_error)?
-                ],
-            )
-            .map_err(sql_error)?;
-        }
-        let now = now_ms();
-        tx.execute("UPDATE session SET time_updated=?2,json=json_set(json,'$.time.updated',?2) WHERE id=?1", params![message.info.session_id,now]).map_err(sql_error)?;
-        tx.commit().map_err(sql_error)?;
-        Ok(true)
+            let owner: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT session_id,role FROM message WHERE id=?1",
+                    params![message.info.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some((sid, role)) = owner {
+                if sid == message.info.session_id && role == "user" {
+                    return Ok(false);
+                }
+                return Err("messageID already belongs to another session or message type".into());
+            }
+            save_message(&tx, message)?;
+            if !request.no_reply {
+                tx.execute(
+                    "INSERT INTO inbox(message_id,session_id,request) VALUES(?1,?2,?3)",
+                    params![
+                        message.info.id,
+                        message.info.session_id,
+                        serde_json::to_string(request).map_err(sql_error)?
+                    ],
+                )
+                .map_err(sql_error)?;
+            }
+            let now = now_ms();
+            tx.execute("UPDATE session SET time_updated=?2,json=json_set(json,'$.time.updated',?2) WHERE id=?1", params![message.info.session_id,now]).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(true)
+        })
     }
 
     pub fn next_prompt(&self, session_id: &str) -> Result<Option<PromptRequest>, String> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        let next: Option<(i64,String)> = tx.query_row("SELECT seq,request FROM inbox WHERE session_id=?1 AND started=0 ORDER BY seq LIMIT 1", params![session_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql_error)?;
-        let Some((seq, raw)) = next else {
-            return Ok(None);
-        };
-        let request = serde_json::from_str(&raw).map_err(sql_error)?;
-        tx.execute("UPDATE inbox SET started=1 WHERE seq=?1", params![seq])
-            .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)?;
-        Ok(Some(request))
+        crate::blocking::run(|| {
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            let next: Option<(i64,String)> = tx.query_row("SELECT seq,request FROM inbox WHERE session_id=?1 AND started=0 ORDER BY seq LIMIT 1", params![session_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql_error)?;
+            let Some((seq, raw)) = next else {
+                return Ok(None);
+            };
+            let request = serde_json::from_str(&raw).map_err(sql_error)?;
+            tx.execute("UPDATE inbox SET started=1 WHERE seq=?1", params![seq])
+                .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(Some(request))
+        })
     }
 
     pub fn finish_prompt(&self, id: &str) -> Result<(), String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM inbox WHERE message_id=?1", params![id])
-            .map_err(sql_error)?;
-        Ok(())
+        crate::blocking::run(|| {
+            self.conn
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM inbox WHERE message_id=?1", params![id])
+                .map_err(sql_error)?;
+            Ok(())
+        })
     }
 
     pub fn cancel_pending(&self, sid: &str) -> Result<(), String> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        tx.execute("UPDATE part SET json=json_set(json,'$.ignored',json('true')) WHERE message_id IN (SELECT message_id FROM inbox WHERE session_id=?1 AND started=0)",params![sid]).map_err(sql_error)?;
-        tx.execute("DELETE FROM inbox WHERE session_id=?1", params![sid])
-            .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
+        crate::blocking::run(|| {
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            tx.execute("UPDATE part SET json=json_set(json,'$.ignored',json('true')) WHERE message_id IN (SELECT message_id FROM inbox WHERE session_id=?1 AND started=0)",params![sid]).map_err(sql_error)?;
+            tx.execute("DELETE FROM inbox WHERE session_id=?1", params![sid])
+                .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)
+        })
     }
 
     pub fn pending_sessions(&self) -> Result<Vec<String>, String> {
         self.with_read(|c| {
             let mut s = c
-                .prepare("SELECT DISTINCT session_id FROM inbox WHERE started=0")
+                .prepare(&format!(
+                    "SELECT DISTINCT session_id FROM inbox WHERE started=0 AND {RECOVER_SCOPE}"
+                ))
                 .map_err(sql_error)?;
-            let rows = s.query_map([], |r| r.get(0)).map_err(sql_error)?;
+            let rows = s
+                .query_map(params![self.instance, now_ms()], |r| r.get(0))
+                .map_err(sql_error)?;
             rows.collect::<Result<_, _>>().map_err(sql_error)
         })
     }
@@ -804,22 +872,24 @@ impl Store {
     }
 
     pub fn set_todos(&self, sid: &str, todos: &Value) -> Result<(), String> {
-        if !todos.is_array() {
-            return Err("todos must be an array".into());
-        }
-        let c = self.conn.lock().unwrap();
-        let exists: bool = c
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)",
-                params![sid],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if !exists {
-            return Err("Session not found".into());
-        }
-        c.execute("INSERT INTO todo(session_id,json) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET json=excluded.json", params![sid,todos.to_string()]).map_err(sql_error)?;
-        Ok(())
+        crate::blocking::run(|| {
+            if !todos.is_array() {
+                return Err("todos must be an array".into());
+            }
+            let c = self.conn.lock().unwrap();
+            let exists: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)",
+                    params![sid],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if !exists {
+                return Err("Session not found".into());
+            }
+            c.execute("INSERT INTO todo(session_id,json) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET json=excluded.json", params![sid,todos.to_string()]).map_err(sql_error)?;
+            Ok(())
+        })
     }
 
     #[cfg(test)]
@@ -840,97 +910,99 @@ impl Store {
     }
 
     pub fn try_fork(&self, source: &Session, up_to: Option<&str>) -> Result<Session, String> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = self.write_tx(&mut c)?;
-        let history = read_messages(&tx, &source.id, None)?;
-        if up_to.is_some_and(|id| !history.iter().any(|m| m.info.id == id)) {
-            return Err("Fork boundary message not found".into());
-        }
-        let mut s = source.clone();
-        s.id = crate::types::hex_id("ses_");
-        s.slug = crate::types::slug();
-        s.title = format!("{} (fork)", source.title);
-        s.time = Time {
-            created: now_ms(),
-            updated: Some(now_ms()),
-            ..Time::default()
-        };
-        s.parent_id = None;
-        s.cost = 0.0;
-        s.tokens = Tokens::default();
-        s.extra.remove("revert");
-        s.extra.remove("share");
-        let mut ids = HashMap::new();
-        let mut copied = Vec::new();
-        for mut m in history {
-            // OpenCode's boundary is the first EXCLUDED message, as used by T3 rewind.
-            if up_to == Some(m.info.id.as_str()) {
-                break;
+        crate::blocking::run(|| {
+            let mut c = self.conn.lock().unwrap();
+            let tx = self.write_tx(&mut c)?;
+            let history = read_messages(&tx, &source.id, None)?;
+            if up_to.is_some_and(|id| !history.iter().any(|m| m.info.id == id)) {
+                return Err("Fork boundary message not found".into());
             }
-            let new_id = crate::types::hex_id("msg_");
-            ids.insert(m.info.id.clone(), new_id.clone());
-            m.info.id = new_id.clone();
-            m.info.session_id = s.id.clone();
-            m.info.parent_id = m
-                .info
-                .parent_id
-                .as_ref()
-                .and_then(|id| ids.get(id).cloned());
-            if let Some(tokens) = &m.info.tokens {
-                s.tokens.input += tokens.input;
-                s.tokens.output += tokens.output;
-                s.tokens.reasoning += tokens.reasoning;
-                s.tokens.cache.read += tokens.cache.read;
-                s.tokens.cache.write += tokens.cache.write;
-            }
-            s.cost += m.info.cost.unwrap_or(0.0);
-            for part in &mut m.parts {
-                part["id"] = json!(crate::types::hex_id("prt_"));
-                part["messageID"] = json!(new_id);
-                part["sessionID"] = json!(s.id);
-                if let Some(pending) = part["compactionPending"].as_str() {
-                    part["compactionPending"] = json!(ids.get(pending));
+            let mut s = source.clone();
+            s.id = crate::types::hex_id("ses_");
+            s.slug = crate::types::slug();
+            s.title = format!("{} (fork)", source.title);
+            s.time = Time {
+                created: now_ms(),
+                updated: Some(now_ms()),
+                ..Time::default()
+            };
+            s.parent_id = None;
+            s.cost = 0.0;
+            s.tokens = Tokens::default();
+            s.extra.remove("revert");
+            s.extra.remove("share");
+            let mut ids = HashMap::new();
+            let mut copied = Vec::new();
+            for mut m in history {
+                // OpenCode's boundary is the first EXCLUDED message, as used by T3 rewind.
+                if up_to == Some(m.info.id.as_str()) {
+                    break;
                 }
-                // A copied task cannot point at a live child owned by the source thread.
-                if part["type"] == "tool" && part["tool"] == "task" {
-                    if let Some(meta) = part["state"]["metadata"].as_object_mut() {
-                        meta.remove("sessionId");
-                        meta.remove("sessionID");
+                let new_id = crate::types::hex_id("msg_");
+                ids.insert(m.info.id.clone(), new_id.clone());
+                m.info.id = new_id.clone();
+                m.info.session_id = s.id.clone();
+                m.info.parent_id = m
+                    .info
+                    .parent_id
+                    .as_ref()
+                    .and_then(|id| ids.get(id).cloned());
+                if let Some(tokens) = &m.info.tokens {
+                    s.tokens.input += tokens.input;
+                    s.tokens.output += tokens.output;
+                    s.tokens.reasoning += tokens.reasoning;
+                    s.tokens.cache.read += tokens.cache.read;
+                    s.tokens.cache.write += tokens.cache.write;
+                }
+                s.cost += m.info.cost.unwrap_or(0.0);
+                for part in &mut m.parts {
+                    part["id"] = json!(crate::types::hex_id("prt_"));
+                    part["messageID"] = json!(new_id);
+                    part["sessionID"] = json!(s.id);
+                    if let Some(pending) = part["compactionPending"].as_str() {
+                        part["compactionPending"] = json!(ids.get(pending));
+                    }
+                    // A copied task cannot point at a live child owned by the source thread.
+                    if part["type"] == "tool" && part["tool"] == "task" {
+                        if let Some(meta) = part["state"]["metadata"].as_object_mut() {
+                            meta.remove("sessionId");
+                            meta.remove("sessionID");
+                        }
                     }
                 }
+                copied.push(m);
             }
-            copied.push(m);
-        }
-        tx.execute("INSERT INTO session(id,json,time_created,time_updated,parent_id) VALUES(?1,?2,?3,?4,NULL)", params![s.id,serde_json::to_string(&s).map_err(sql_error)?,s.time.created,s.time.updated]).map_err(sql_error)?;
-        for m in copied {
-            save_message(&tx, &m)?;
-        }
-        if let Some(raw) = tx
-            .query_row(
-                "SELECT json FROM todo WHERE session_id=?1",
-                params![source.id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(sql_error)?
-        {
-            tx.execute(
-                "INSERT INTO todo(session_id,json) VALUES(?1,?2)",
-                params![s.id, raw],
-            )
-            .map_err(sql_error)?;
-        }
-        tx.commit().map_err(sql_error)?;
-        Ok(s)
+            tx.execute("INSERT INTO session(id,json,time_created,time_updated,parent_id) VALUES(?1,?2,?3,?4,NULL)", params![s.id,serde_json::to_string(&s).map_err(sql_error)?,s.time.created,s.time.updated]).map_err(sql_error)?;
+            for m in copied {
+                save_message(&tx, &m)?;
+            }
+            if let Some(raw) = tx
+                .query_row(
+                    "SELECT json FROM todo WHERE session_id=?1",
+                    params![source.id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sql_error)?
+            {
+                tx.execute(
+                    "INSERT INTO todo(session_id,json) VALUES(?1,?2)",
+                    params![s.id, raw],
+                )
+                .map_err(sql_error)?;
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(s)
+        })
     }
 }
 
 impl Store {
     fn with_read<T>(&self, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-        match &self.read {
+        crate::blocking::run(|| match &self.read {
             Some(read) => f(&read.lock().unwrap()),
             None => f(&self.conn.lock().unwrap()),
-        }
+        })
     }
 }
 
@@ -1343,6 +1415,8 @@ mod tests {
         // A second instance opening the same file must leave the live session untouched.
         let sibling = Store::open(&path, "instance-sibling").unwrap();
         assert!(sibling.is_busy(&busy.id).unwrap());
+        assert!(sibling.pending_sessions().unwrap().is_empty());
+        assert_eq!(live.pending_sessions().unwrap(), vec![busy.id.clone()]);
         assert_eq!(sibling.messages(&busy.id).unwrap()[0].info.error, None);
         assert_eq!(sibling.messages(&busy.id).unwrap()[1].info.error, None);
 
@@ -1793,5 +1867,34 @@ mod tests {
         let other = db.create_session_owned("other", "/work");
         assert!(db.last_model(&other.id).unwrap().is_none());
         assert!(db.reply_to(&other.id, "prompt").unwrap().is_none());
+    }
+
+    #[test]
+    fn live_leases_cannot_be_stolen_and_stale_releases_cannot_clear_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("leases.db");
+        let first = Store::open(&path, "first").unwrap();
+        let session = first.create_session_owned("lease", "/work");
+        first.claim(&session.id).unwrap();
+        let second = Store::open(&path, "second").unwrap();
+        assert!(second.claim(&session.id).unwrap_err().contains("busy"));
+        second.release(&session.id);
+        assert!(first.is_busy(&session.id).unwrap());
+        assert!(second
+            .admit(&PromptRequest::default(), &user(&session, "foreign", "no"))
+            .unwrap_err()
+            .contains("busy"));
+        assert!(first.message(&session.id, "foreign").unwrap().is_none());
+        first
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE owner SET lease_expires=0", [])
+            .unwrap();
+        second.claim(&session.id).unwrap();
+        first.release(&session.id);
+        assert!(second.is_busy(&session.id).unwrap());
+        second.release(&session.id);
+        assert!(!second.is_busy(&session.id).unwrap());
     }
 }

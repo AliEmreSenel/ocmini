@@ -15,14 +15,16 @@ ocmini serve --hostname 127.0.0.1 --port 4096
 
 The input shows a compact status row that updates in place. Type `/help` or press F1 for the full shortcut list; F1 keeps your current draft. Help is handled locally.
 
-Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+V (or Ctrl+Shift+V when forwarded by the terminal) attaches a clipboard image, and pasting an image file path attaches it. Alt+Backspace removes the latest attachment; Backspace also removes it when the text is empty. Ctrl+U clears text and attachments. Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector. The draft previews multiline text with `↵` and scrolls horizontally; the full text and line breaks are sent unchanged. Backspace removes whole Unicode characters and stays within the draft.
+Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+V (or Ctrl+Shift+V when forwarded by the terminal) attaches a clipboard image, and pasting an image file path attaches it. Alt+Backspace removes the latest attachment; Backspace also removes it when the text is empty. Ctrl+U clears text and attachments. Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector. The draft wraps across rows and preserves pasted line breaks. Backspace removes whole Unicode graphemes and stays within the draft.
+
+Undo records changes rather than copying the draft. Consecutive typing is one undo step, and sending a prompt or switching sessions clears undo history. History is limited to 1 MiB and 1,000 edits; a deletion too large to fit clears undo history. Large text pastes do not multiply memory use with each subsequent keystroke.
 
 Questions appear one at a time with their numbered options. The answer line is the same full editor as the prompt - caret movement, selection, word motions, kill, yank, undo and multiline all work on the answer - and the prompt you were typing stays untouched underneath, returning when the question settles. A line of option numbers answers with those options; any other text is sent as a custom answer exactly as typed. Enter walks to the next question and wraps back to the first, and each answer is kept in the transcript. Tab and Shift+Tab walk the questions forward and back - each question keeps its own draft, so switching never loses a half-typed answer, and answered questions reopen prefilled so they can be changed. Backspace on an empty answer line also steps back, and Esc dismisses the request. When the last answer lands, a confirmation screen lists every question with its answer - Enter sends, Tab steps back to edit, Esc dismisses. Your prompt is never sent while a question is open.
 
 Transcript scrolling is a config option, `ui.scroll_mode`:
 
 - `native` (default): completed transcript rows commit to the terminal's own scrollback and only the prompt is redrawn. Wheel and terminal shortcuts scroll as usual; PageUp/PageDown page the draft.
-- `fullscreen`: ocmini repaints the whole screen on the alternate screen and scrolls the transcript itself. PageUp/PageDown page, Ctrl+Home/Ctrl+End jump to the top and bottom, and the mouse wheel scrolls (Shift+wheel keeps the terminal's native selection scroll). Help lists these keys. On exit the transcript is restored to the terminal's scrollback.
+- `fullscreen`: ocmini repaints the whole screen on the alternate screen and scrolls the transcript itself. PageUp/PageDown page, Ctrl+Home/Ctrl+End jump to the top and bottom, and the mouse wheel scrolls (Shift+wheel keeps the terminal's native selection scroll). Help lists these keys. On exit the visible transcript is restored to the terminal's scrollback, using the selected thinking/tool view. Completed rows are wrapped once per width and visibility setting, so ordinary repaints process only new rows and the live tail.
 
 Set it in `opencode.json` before starting; a running TUI keeps the mode it started with:
 
@@ -144,9 +146,9 @@ Sessions are saved in `$XDG_DATA_HOME/ocmini/ocmini.db`; refreshed credentials u
 
 History is kept unless `OCMINI_RETENTION_DAYS` enables pruning. Recovery marks interrupted work and preserves queued prompts without replaying potentially completed tool calls.
 
-Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.4-ocmini.0.3.4`, identifies API compatibility.
+Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.4-ocmini.<package version>`, identifies API compatibility.
 
-Async I/O runs on the main thread by default; file operations and history loading use a separate blocking pool as needed. Set `TOKIO_WORKER_THREADS` to a positive integer to opt into a multithreaded async runtime for heavier concurrent workloads. SQLite checkpoints allow oversized journal files to shrink to 1 MiB on reuse; active transactions can temporarily exceed this size.
+Async I/O uses one Tokio worker by default. Synchronous database operations hand the scheduler to another worker while they run, so database lock waits do not stall the async event loop. File operations and history loading also use the blocking pool. Set `TOKIO_WORKER_THREADS` to a positive integer to choose a different async worker count. SQLite checkpoints allow oversized journal files to shrink to 1 MiB on reuse; active transactions can temporarily exceed this size.
 
 ## Development
 

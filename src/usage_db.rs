@@ -13,20 +13,22 @@ pub struct UsageDb {
 
 impl UsageDb {
     pub fn open() -> Self {
-        let path = Path::new(&data_home()).join("opencode/opencode-ocmini.db");
-        let conn = match Self::connect(&path) {
-            Ok(conn) => Some(conn),
-            Err(error) => {
-                eprintln!(
-                    "ocmini: usage statistics unavailable at {}: {error}",
-                    path.display()
-                );
-                None
+        crate::blocking::run(|| {
+            let path = Path::new(&data_home()).join("opencode/opencode-ocmini.db");
+            let conn = match Self::connect(&path) {
+                Ok(conn) => Some(conn),
+                Err(error) => {
+                    eprintln!(
+                        "ocmini: usage statistics unavailable at {}: {error}",
+                        path.display()
+                    );
+                    None
+                }
+            };
+            Self {
+                conn: Mutex::new(conn),
             }
-        };
-        Self {
-            conn: Mutex::new(conn),
-        }
+        })
     }
 
     fn connect(path: &Path) -> Result<Connection, String> {
@@ -58,22 +60,24 @@ impl UsageDb {
         tokens: &Tokens,
         created: i64,
     ) {
-        let guard = self.conn.lock().unwrap();
-        let Some(c) = &*guard else {
-            return;
-        };
-        let data = serde_json::json!({
-            "role": "assistant",
-            "model": {"providerID": provider_id, "modelID": model_id},
-            "tokens": tokens
-        });
-        if let Err(error) = c.execute(
+        crate::blocking::run(|| {
+            let guard = self.conn.lock().unwrap();
+            let Some(c) = &*guard else {
+                return;
+            };
+            let data = serde_json::json!({
+                "role": "assistant",
+                "model": {"providerID": provider_id, "modelID": model_id},
+                "tokens": tokens
+            });
+            if let Err(error) = c.execute(
             "INSERT INTO message(id, session_id, data, time_created) VALUES(?1,?2,?3,?4)
              ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id,data=excluded.data,time_created=excluded.time_created",
             params![msg_id, session_id, data.to_string(), created],
         ) {
             eprintln!("ocmini: could not record usage for {msg_id}: {error}");
         }
+        })
     }
 }
 

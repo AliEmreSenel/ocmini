@@ -190,3 +190,97 @@ async fn chat_requests_merge_reasoning_of_every_step_into_one_assistant_message(
     assert_eq!(third[3]["role"], "tool");
     assert_eq!(third[3]["tool_call_id"], "call_two");
 }
+
+#[tokio::test]
+async fn configured_reasoning_budgets_match_the_advertised_variant_on_the_wire() {
+    let script = || {
+        Script::ok(vec![
+            json!({"type":"message_start","message":{"id":"native","usage":{"input_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"done"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ])
+    };
+    let mut provider = Provider::start(vec![script(), script()]).await;
+    let server = TestServer::start(
+        &provider,
+        json!({
+            "provider":{"mock":{"npm":"@ai-sdk/anthropic", "options":{"baseURL":provider.url},
+                "models":{"test-model":{"limit":{"context":100000,"output":20000},
+                    "reasoning_options":[{"type":"budget_tokens","min":1024,"max":16000}]}}}}
+        }),
+    )
+    .await;
+    let inventory: Value = server
+        .get("/provider")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let budget = inventory["all"][0]["models"]["test-model"]["variants"]["max"]["thinking"]
+        ["budgetTokens"]
+        .clone();
+    assert_eq!(budget, 15999);
+    let sid = server.session(allow()).await;
+    let mut body = prompt("reasoning_budget", "hello");
+    body["variant"] = json!("max");
+    server
+        .post(&format!("/session/{sid}/message"), &body)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let request = provider.request().await;
+    assert_eq!(request["thinking"]["budget_tokens"], budget);
+    assert_eq!(request["max_tokens"], 20000);
+    let output = configured_command(server.root.path(), &server.directory)
+        .args(["run", "--variant", "max", "hello"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        provider.request().await["thinking"]["budget_tokens"],
+        budget
+    );
+}
+
+#[tokio::test]
+async fn disabled_generated_variants_stay_disabled_during_execution() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({
+        "provider":{"mock":{"npm":"@ai-sdk/openai-compatible", "options":{"baseURL":provider.url},
+            "models":{"test-model":{"reasoning_options":[{"type":"effort","values":["high","low"]}],
+                "variants":{"high":{"disabled":true}}}}}}
+    })).await;
+    let inventory: Value = server
+        .get("/provider")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(inventory["all"][0]["models"]["test-model"]["variants"]
+        .get("high")
+        .is_none());
+    let sid = server.session(allow()).await;
+    let mut body = prompt("disabled_preset", "hello");
+    body["variant"] = json!("high");
+    let response = server
+        .post(&format!("/session/{sid}/message"), &body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("disabled"));
+}
