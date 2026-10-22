@@ -1,6 +1,6 @@
 # OpenCode limits comparison
 
-Compared on 2026-10-18 against [OpenCode v1.19.3](https://github.com/anomalyco/opencode/releases/tag/v1.19.3), the latest release (published 2026-10-16), pinned to commit `e3c4eb242585dcd77be1a867391b7c25fd47ce52`. This primarily compares the 1.x runtime ocmini targets. ocmini values include this checkout's audit fixes and the subsequent requested parity updates. This is a source comparison, not a direct performance benchmark.
+Compared on 2026-10-18 against [OpenCode v1.19.3](https://github.com/anomalyco/opencode/releases/tag/v1.19.3), pinned to commit `e3c4eb242585dcd77be1a867391b7c25fd47ce52`. v1.19.4 (published 2026-10-22) is the current latest 1.x release: it upgrades the bundled Bun runtime and build scripts and changes no part of the 1.x HTTP/SSE surface this compares. This primarily compares the 1.x runtime ocmini targets. ocmini values include this checkout's audit fixes and the subsequent requested parity updates. This is a source comparison, not a direct performance benchmark.
 
 | Limit | Upstream OpenCode 1.x | ocmini after fixes |
 | --- | --- | --- |

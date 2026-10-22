@@ -1,6 +1,6 @@
 # ocmini compatibility contract
 
-ocmini implements the OpenCode 1.x HTTP/SSE API. Its compatibility version is `1.19.3-ocmini.0.3.3`; the package version is separate. `GET /api/info` returns 404 because the 2.x protocol is not supported. `GET /global/health` returns `healthy: true` and the compatibility version.
+ocmini implements the OpenCode 1.x HTTP/SSE API. Its compatibility version is `1.19.4-ocmini.0.3.4`; the package version is separate. `GET /api/info` returns 404 because the 2.x protocol is not supported. `GET /global/health` returns `healthy: true` and the compatibility version.
 
 This document specifies observable behavior. Integration tests are grouped under `tests/contract/`, with unit tests beside their subsystems.
 
@@ -196,7 +196,7 @@ Real task tools create child sessions and publish `session.created` with `parent
 
 ## Models, agents, commands, skills and MCP
 
-`GET /provider` returns `{all, connected, default}`. Every advertised model has a nonempty `id` and `name`; configured variants, limits and capability metadata are preserved. `connected` reflects usable configuration/credentials, not every known provider name. T3 builds its model picker only from connected providers. Unsupported provider SDKs fail explicitly rather than being sent through an unrelated API format.
+`GET /provider` returns `{all, connected, default}`. Every advertised model has a nonempty `id` and `name`; configured variants, limits and capability metadata are preserved. A model's configured `reasoning_options` (OpenCode 1.19.3) build its variants and replace the discovered ones: an `effort` list yields one variant per value (`null` is `none`), `budget_tokens` yields `high`/`max` on `messages` endpoints, configured `variants` merge on top, `disabled` entries drop out, and an empty list leaves only the model's own configured variants. `connected` reflects usable configuration/credentials, not every known provider name. T3 builds its model picker only from connected providers. Unsupported provider SDKs fail explicitly rather than being sent through an unrelated API format.
 
 `GET /agent` returns agent objects with `name`, `mode`, `permission`, `options`, and relevant description/prompt/hidden metadata. Built-in and configured agents use the same catalog as CLI probes. Disabled agents are omitted. T3 exposes primary/all agents and hides subagent-only or hidden entries.
 

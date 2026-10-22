@@ -351,6 +351,42 @@ title request that dies falls back to the first prompt line; a titled session's
 next prompt is answered by the model alone, with no title request and no start
 event. Formatting, Clippy with warnings denied, and the full suite pass.
 
+## Configured reasoning options
+
+OpenCode 1.19.3 added `provider.<id>.models.<id>.reasoning_options`: the reasoning
+controls a model accepts, which build its variants and **replace** the
+catalog-derived ones, with configured `variants` merged on top and
+`reasoning_options: []` meaning no variants at all. ocmini parsed the key as an
+unknown model field, so a configuration written for upstream showed no reasoning
+variants in T3's picker, and `reasoning_options: []` — "this model takes no
+variants" — left the discovered ones in place.
+
+Variants are built at the end of model discovery, the single point every surface
+already reads: `GET /provider`, `models --verbose` and the engine's request
+options. The picker and the engine therefore see one list. A declared `effort`
+list yields one variant per value, with `null` as `none`; the payload follows the
+model's protocol the way discovered variants already do — `reasoningEffort` for
+Chat Completions and Responses, adaptive thinking plus an output effort for
+Messages — and the protocol comes from the same detection a request uses
+([`protocol`](src/provider/mod.rs)), so a model's variant payload matches its
+transport. `budget_tokens` builds `high`/`max` thinking-budget variants on
+Messages endpoints, bounded by the model's output limit and upstream's
+32,000-token ceiling; OpenAI-style endpoints have no budget mapping, so, as
+upstream does, options no supported protocol maps leave the discovered variants
+untouched. Configured `variants` merge on top of the generated list and `disabled`
+entries drop out, so an empty list leaves only the variants the model declares
+itself.
+
+Four unit tests cover the effort mapping, the protocol split, clearing and
+keeping, and the budget arithmetic; one contract test pins `GET /provider`, where
+a configured `reasoning_options` model replaces the discovered variants, keeps a
+configured variant's extra options on top, and `reasoning_options: []` yields none.
+Formatting, Clippy with warnings denied, and the full suite pass. The version
+string moves to `1.19.4-ocmini.0.3.4`: upstream v1.19.4 upgrades the bundled Bun
+runtime and the musl cross-build install flags, which has no counterpart in a
+Rust runtime with no JS dependencies, and changes no part of the 1.x HTTP/SSE
+surface.
+
 ## Manual checks
 
 Use a terminal to check Unicode input, multiline paste, Ctrl+C abort, Ctrl+D exit and terminal restoration. Send a prompt, exit, then resume with `--continue` or `--session ID` and verify the next response uses the earlier conversation. Exercise the session selector with `--resume` and `Ctrl+R`: search by title/ID/directory, Tab through sort orders, arrow/page navigation, Enter resume, Esc cancel.

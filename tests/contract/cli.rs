@@ -15,7 +15,7 @@ async fn startup_auth_and_cli_inventory_match_t3() {
         .await
         .unwrap();
     assert_eq!(health["healthy"], true);
-    assert_eq!(health["version"], "1.19.3-ocmini.0.3.3");
+    assert_eq!(health["version"], "1.19.4-ocmini.0.3.4");
     assert_eq!(server.get("/api/info").send().await.unwrap().status(), 404);
     for path in ["/global/health", "/api/info", "/event", "/session"] {
         assert_eq!(
@@ -104,7 +104,7 @@ async fn cli_help_version_and_invalid_arguments_do_not_start_the_runtime() {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
-            "1.19.3-ocmini.0.3.3"
+            "1.19.4-ocmini.0.3.4"
         );
     }
     for arguments in [
@@ -338,4 +338,54 @@ async fn run_command_appends_piped_stdin_to_the_prompt() {
     let text = request["messages"].to_string();
     assert!(text.contains("head line"), "{text}");
     assert!(text.contains("piped tail"), "{text}");
+}
+
+#[tokio::test]
+async fn configured_reasoning_options_replace_the_catalog_variants() {
+    // OpenCode 1.19.3: provider.<id>.models.<id>.reasoning_options declares the
+    // reasoning controls a model accepts. They build the variants a client can
+    // offer and replace the discovered ones; configured variants merge on top,
+    // and an empty list means the model takes no variants at all.
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(
+        &provider,
+        json!({"provider":{"mock":{
+            "npm":"@ai-sdk/openai-compatible",
+            "name":"Local test model",
+            "options":{"baseURL":provider.url},
+            "models":{
+                "test-model":{
+                    "reasoning_options":[{"type":"effort","values":["low",null]}],
+                    "variants":{"high":{"headers":{"x-mode":"high"}}}
+                },
+                "plain":{
+                    "name":"Plain model",
+                    "reasoning_options":[]
+                }
+            }
+        }}}),
+    )
+    .await;
+    let inventory: Value = server
+        .get("/provider")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = &inventory["all"][0]["models"];
+    assert_eq!(
+        models["test-model"]["variants"]["low"]["reasoningEffort"],
+        "low"
+    );
+    assert_eq!(
+        models["test-model"]["variants"]["none"]["reasoningEffort"],
+        "none"
+    );
+    assert_eq!(
+        models["test-model"]["variants"]["high"]["headers"]["x-mode"],
+        "high"
+    );
+    assert_eq!(models["plain"]["variants"], json!({}));
 }
