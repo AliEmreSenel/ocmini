@@ -2,9 +2,10 @@ name: Release binaries
 
 # Tag a commit as vX.Y.Z (matching Cargo.toml) and this publishes prebuilt
 # executables on the GitHub Release: Linux (x86_64 glibc + musl, ARM64,
-# ARMv7 and ARMv6 hard-float) and Windows (x86_64). ARMv7/ARMv6 use cross
-# containers for the C toolchain needed by bundled SQLite; other targets
-# build natively. Windows binaries are unsigned and show a SmartScreen prompt.
+# ARMv7 and ARMv6 hard-float), macOS (Apple silicon) and Windows (x86_64).
+# ARMv7/ARMv6 use cross containers for bundled SQLite's C toolchain; other targets
+# build natively. Binaries are unsigned: macOS users must clear the Gatekeeper
+# quarantine (`xattr -d com.apple.quarantine ocmini`); Windows shows SmartScreen.
 
 on:
   push:
@@ -34,6 +35,9 @@ jobs:
           - os: ubuntu-24.04
             target: arm-unknown-linux-gnueabihf
             builder: cross
+          - os: macos-14
+            target: aarch64-apple-darwin
+            builder: cargo
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             builder: cargo
