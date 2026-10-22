@@ -81,9 +81,14 @@ enum PendingPrompt {
     Permission(String),
     Question {
         id: String,
-        // One entry per question: its option labels in the numbered order shown.
-        options: Vec<Vec<String>>,
+        // One entry per question: the full question object as asked (question,
+        // header, multiple, options), so it can be re-shown while navigating.
+        questions: Vec<Value>,
+        // One entry per question, in the same order. Empty until answered, so
+        // earlier answers survive while the user goes back to change them.
         answers: Vec<Vec<String>>,
+        // The question whose answer is being typed.
+        current: usize,
         line: String,
     },
 }
@@ -139,6 +144,63 @@ fn option_values(options: &Value) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+fn option_labels(options: &Value) -> Vec<String> {
+    option_values(options)
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect()
+}
+
+/// The question being answered with its numbered options, so the prompt always
+/// shows what a typed number refers to. Shown when the user reaches a question,
+/// including a revisit; a saved answer stays visible when navigating back.
+fn render_question(questions: &[Value], answers: &[Vec<String>], which: usize) -> String {
+    let question = &questions[which];
+    let mut out = format!(
+        "\n{YELLOW}? {}/{}: {}{RESET}",
+        which + 1,
+        questions.len(),
+        question["question"].as_str().unwrap_or_default(),
+    );
+    if let Some(header) = question["header"]
+        .as_str()
+        .filter(|header| !header.is_empty())
+    {
+        out.push_str(&format!(" {DIM}{header}{RESET}"));
+    }
+    if question["multiple"] == true {
+        out.push_str(&format!(" {DIM}(one or more){RESET}"));
+    }
+    out.push('\n');
+    for (index, (label, description)) in option_values(&question["options"]).iter().enumerate() {
+        out.push_str(&format!(
+            "  {CYAN}{}{RESET}. {label} {DIM}{description}{RESET}\n",
+            index + 1
+        ));
+    }
+    if let Some(answer) = answers.get(which).filter(|answer| !answer.is_empty()) {
+        out.push_str(&format!("  {GREEN}✓{RESET} {}\n", answer.join(", ")));
+    }
+    out.push_str(&format!("{DIM}number(s) + Enter answers · Backspace on an empty line: previous question · Esc: dismiss{RESET}\n"));
+    out
+}
+
+/// A saved answer as a fresh input line: option labels become their numbers, so
+/// Enter keeps the answer unchanged and typing replaces it.
+fn answer_line(answer: &[String], labels: &[String]) -> String {
+    answer
+        .iter()
+        .map(|answer| {
+            labels
+                .iter()
+                .position(|label| label == answer)
+                .map(|index| (index + 1).to_string())
+                .unwrap_or_else(|| answer.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -> String {
@@ -238,30 +300,23 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
         }
         "question.asked" => {
             let id = properties["id"].as_str().unwrap_or_default().to_string();
-            let mut options = Vec::new();
-            if let Some(list) = properties["questions"].as_array() {
-                for question in list {
-                    println!(
-                        "\n{YELLOW}? {}{RESET}",
-                        question["question"].as_str().unwrap_or_default()
-                    );
-                    let choices = option_values(&question["options"]);
-                    for (index, (label, description)) in choices.iter().enumerate() {
-                        println!(
-                            "  {CYAN}{}{RESET}. {label} {DIM}{description}{RESET}",
-                            index + 1
-                        );
-                    }
-                    options.push(choices.into_iter().map(|(label, _)| label).collect());
-                }
-                println!("{DIM}type number(s), Enter to answer, Esc to dismiss{RESET}");
-            }
+            let questions = properties["questions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let answers: Vec<Vec<String>> = vec![Vec::new(); questions.len()];
             ui.prompt = Some(PendingPrompt::Question {
                 id,
-                options,
-                answers: Vec::new(),
+                questions: questions.clone(),
+                answers: answers.clone(),
+                current: 0,
                 line: String::new(),
             });
+            // Questions appear one at a time: the first is shown now, each
+            // next when the user reaches it.
+            if !questions.is_empty() {
+                print!("{}", render_question(&questions, &answers, 0));
+            }
         }
         "session.error" => {
             let message = properties["error"]["data"]["message"]
@@ -301,48 +356,74 @@ fn parse_answer(line: &str, labels: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> bool {
-    // True when the prompt finished and the normal input prompt should return.
+/// Feed one key to the pending question. Returns `(finished, transcript)`:
+/// `finished` restores the normal input prompt, `transcript` is text to commit
+/// above the input - the answered question's checkmark, the next question when
+/// advancing, a saved answer when going back, or a warning.
+fn answer_question(app: &App, state: &mut PendingPrompt, key: Key) -> (bool, String) {
     let PendingPrompt::Question {
         id,
-        options,
+        questions,
         answers,
+        current,
         line,
     } = state
     else {
-        return false;
+        return (false, String::new());
     };
     match key {
         Key::Esc => {
             app.questions.reject(id);
-            true
+            (true, String::new())
         }
         Key::Enter => {
-            let labels = options
-                .get(answers.len())
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let choices = parse_answer(line, labels);
+            let Some(question) = questions.get(*current) else {
+                return (true, String::new());
+            };
+            let labels = option_labels(&question["options"]);
+            let choices = parse_answer(line, &labels);
+            if choices.is_empty() {
+                return (false, String::new());
+            }
+            if question["multiple"] != true && choices.len() > 1 {
+                // The reply contract takes one answer per single-choice
+                // question; accepting a list here would stall the tool. Keep
+                // the typed line so it can be narrowed.
+                return (false, format!("{YELLOW}one answer only{RESET}\n"));
+            }
             line.clear();
-            if !choices.is_empty() {
-                answers.push(choices);
+            answers[*current] = choices;
+            let mut out = format!("  {GREEN}✓{RESET} {}\n", answers[*current].join(", "));
+            if answers.iter().all(|answer| !answer.is_empty()) {
+                let _ = app.questions.reply(id, std::mem::take(answers));
+                return (true, out);
             }
-            if answers.len() >= options.len() {
-                let payload = std::mem::take(answers);
-                let _ = app.questions.reply(id, payload);
-                return true;
-            }
-            false
+            // Answer in order, wrapping to the first gap after the end.
+            *current = (*current + 1..questions.len())
+                .chain(0..*current)
+                .find(|index| answers[*index].is_empty())
+                .unwrap_or(*current);
+            let labels = option_labels(&questions[*current]["options"]);
+            line.push_str(&answer_line(&answers[*current], &labels));
+            out.push_str(&render_question(questions, answers, *current));
+            (false, out)
         }
         Key::Backspace => {
-            pop_grapheme(line);
-            false
+            // Backspace edits the typed answer; on an empty line it returns to
+            // the previous question with its answer prefilled for changing.
+            if pop_grapheme(line) || *current == 0 {
+                return (false, String::new());
+            }
+            *current -= 1;
+            let labels = option_labels(&questions[*current]["options"]);
+            line.push_str(&answer_line(&answers[*current], &labels));
+            (false, render_question(questions, answers, *current))
         }
         Key::Char(ch) => {
             line.push(ch);
-            false
+            (false, String::new())
         }
-        _ => false,
+        _ => (false, String::new()),
     }
 }
 
@@ -962,7 +1043,11 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                     }
                     key @ (Key::Char(_) | Key::Enter | Key::Backspace | Key::Esc) if pending_question => {
                         if let Some(state) = ui.prompt.as_mut() {
-                            if answer_question(&app, state, key) {
+                            let (finished, out) = answer_question(&app, state, key);
+                            if !out.is_empty() {
+                                display.output(&out, terminal_width());
+                            }
+                            if finished {
                                 ui.prompt = None;
                             }
                         }
@@ -1095,7 +1180,8 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_event, file_attachment, image_attachment, parse_answer, pasted_image_path, Key,
+        answer_line, decode_event, file_attachment, image_attachment, parse_answer,
+        pasted_image_path, render_question, Key,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -1188,6 +1274,59 @@ mod tests {
         // Free text and numbers without an option stay exactly as typed.
         assert_eq!(parse_answer("keep-it-brief", &labels), ["keep-it-brief"]);
         assert_eq!(parse_answer("0 9", &labels), ["0", "9"]);
+    }
+
+    #[test]
+    fn saved_answers_reload_as_option_numbers_when_revisiting() {
+        let labels = ["A".to_string(), "Keep it brief".to_string()];
+        assert_eq!(answer_line(&["A".to_string()], &labels), "1");
+        // A multi-select answer becomes its number list, and reparsing it
+        // reproduces the stored labels, so Enter keeps the answer unchanged.
+        let multi = answer_line(&["Keep it brief".to_string(), "A".to_string()], &labels);
+        assert_eq!(multi, "2 1");
+        assert_eq!(parse_answer(&multi, &labels), ["Keep it brief", "A"]);
+        // A custom answer stays its own text.
+        assert_eq!(answer_line(&["custom-7".to_string()], &labels), "custom-7");
+        assert_eq!(answer_line(&[], &labels), "");
+    }
+
+    #[test]
+    fn each_question_shows_its_position_options_and_saved_answer() {
+        use serde_json::json;
+        fn plain(text: &str) -> String {
+            let mut out = String::new();
+            let mut rest = text;
+            while let Some(index) = rest.find("\x1b[") {
+                out.push_str(&rest[..index]);
+                rest = &rest[index + 2..];
+                // Skip the escape sequence's terminating byte.
+                if let Some(end) = rest.find(|ch: char| ('@'..='~').contains(&ch)) {
+                    rest = &rest[end + 1..];
+                }
+            }
+            out + rest
+        }
+        let questions = vec![
+            json!({"question": "Pick a model", "header": "Model", "multiple": false,
+                   "options": [{"label": "A", "description": "First"},
+                               {"label": "B", "description": "Second"}]}),
+            json!({"question": "Run checks?", "header": "Checks", "multiple": true,
+                   "options": [{"label": "Unit", "description": "Unit tests"}]}),
+        ];
+        let answers = vec![vec!["A".to_string()], Vec::new()];
+        // Revisiting question 1 shows its saved answer with numbered options.
+        let revisited = plain(&render_question(&questions, &answers, 0));
+        assert!(revisited.contains("1/2: Pick a model"));
+        assert!(revisited.contains("Model"));
+        assert!(revisited.contains("1. A"));
+        assert!(revisited.contains("✓ A"));
+        assert!(!revisited.contains("2/2"));
+        // Question 2 is unanswered, multi-select, and marks itself as the last.
+        let current = plain(&render_question(&questions, &answers, 1));
+        assert!(current.contains("2/2: Run checks?"));
+        assert!(current.contains("(one or more)"));
+        assert!(!current.contains("✓"));
+        assert!(current.contains("Backspace"));
     }
 
     #[test]
