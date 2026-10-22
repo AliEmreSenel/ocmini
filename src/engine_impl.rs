@@ -658,22 +658,66 @@ async fn compact_history(
         variant: None,
         session_id: Some(sid.into()),
     };
-    let mut stream = tokio::select! {
-        result = adapter.stream(&request) => result.map_err(|error| error.message)?,
-        _ = cancelled(cancel) => return Err("Aborted".into()),
-    };
-    drop(request);
+    // The summary request carries most of the window, so it is the largest and
+    // slowest request of the turn. The transport deaths the main loop retries
+    // must not end recovery here, or the overflow error surfaces verbatim and
+    // the turn is lost.
+    const MAX_COMPACTION_RETRIES: u32 = 3;
     let mut summary = String::new();
-    while let Some(event) = tokio::select! {
-        event = stream.next() => event,
-        _ = cancelled(cancel) => return Err("Aborted".into()),
-    } {
-        match event {
-            ProviderEvent::TextDelta(delta) => summary.push_str(&delta),
-            ProviderEvent::Finished { .. } => break,
-            ProviderEvent::Error(error) => return Err(error),
-            _ => {}
+    let mut attempt = 0u32;
+    'summary: loop {
+        summary.clear();
+        let mut stream = match tokio::select! {
+            result = adapter.stream(&request) => result,
+            _ = cancelled(cancel) => return Err("Aborted".into()),
+        } {
+            Ok(stream) => stream,
+            Err(error) if error.retryable && attempt < MAX_COMPACTION_RETRIES => {
+                attempt += 1;
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay(error.retry_after, attempt)) => {}
+                    _ = cancelled(cancel) => return Err("Aborted".into()),
+                }
+                continue 'summary;
+            }
+            Err(error) => return Err(error.message),
+        };
+        let mut failure: Option<String> = None;
+        let mut finished = false;
+        while let Some(event) = tokio::select! {
+            event = stream.next() => event,
+            _ = cancelled(cancel) => return Err("Aborted".into()),
+        } {
+            match event {
+                ProviderEvent::TextDelta(delta) => summary.push_str(&delta),
+                ProviderEvent::Finished { .. } => {
+                    finished = true;
+                    break;
+                }
+                ProviderEvent::Error(error) => {
+                    failure = Some(error);
+                    break;
+                }
+                _ => {}
+            }
         }
+        drop(stream);
+        // A stream that never completed holds a partial summary: discard it and
+        // re-request, exactly like the main loop does.
+        let error = match failure {
+            Some(error) => error,
+            None if finished => break 'summary,
+            None => "provider compaction stream ended before a completion event".to_string(),
+        };
+        if provider::stream_retryable(&error) && attempt < MAX_COMPACTION_RETRIES {
+            attempt += 1;
+            tokio::select! {
+                _ = tokio::time::sleep(retry_delay(None, attempt)) => {}
+                _ = cancelled(cancel) => return Err("Aborted".into()),
+            }
+            continue 'summary;
+        }
+        return Err(error);
     }
     let text = summary.trim();
     if text.is_empty() {
@@ -1026,6 +1070,7 @@ async fn run_turn(
                         .iter()
                         .map(|message| message.to_string().len())
                         .sum::<usize>();
+                    let mut message = error.message;
                     if error.overflow
                         && !compact
                         && compaction.settings.automatic()
@@ -1033,7 +1078,7 @@ async fn run_turn(
                         && !cancel.load(Ordering::Acquire)
                     {
                         previous_overflow_bytes = Some(request_bytes);
-                        if let Some(parsed) = provider::parse_context_limit(&error.message) {
+                        if let Some(parsed) = provider::parse_context_limit(&message) {
                             compaction.context = Some(parsed);
                         }
                         match compact_history(
@@ -1062,17 +1107,18 @@ async fn run_turn(
                                 continue 'attempt;
                             }
                             Err(compact_error) => {
-                                eprintln!("ocmini: auto-compaction failed: {compact_error}")
+                                // The server's stderr is invisible to the TUI, so
+                                // the reason recovery gave up must reach the user.
+                                eprintln!("ocmini: auto-compaction failed: {compact_error}");
+                                message = format!(
+                                    "{} (auto-compaction failed: {compact_error})",
+                                    message
+                                );
                             }
                         }
                     }
-                    fail_message(
-                        &app,
-                        &mut info,
-                        &error.message,
-                        cancel.load(Ordering::Acquire),
-                    )?;
-                    return Err(error.message);
+                    fail_message(&app, &mut info, &message, cancel.load(Ordering::Acquire))?;
+                    return Err(message);
                 }
             }
         };
