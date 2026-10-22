@@ -111,6 +111,26 @@ impl CompactionCfg {
     }
 }
 
+/// How the terminal chat scrolls its transcript.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollMode {
+    /// Transcript rows commit to the terminal's own scrollback and only the
+    /// draft is redrawn; the mouse wheel scrolls with the terminal.
+    #[default]
+    Native,
+    /// Repaint the whole screen on the alternate screen and scroll the
+    /// transcript in-app: PageUp/PageDown, Ctrl+Home/Ctrl+End and the wheel.
+    Fullscreen,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+pub struct UiCfg {
+    /// Terminal transcript scrolling: `native` (default) or `fullscreen`.
+    #[serde(default)]
+    pub scroll_mode: ScrollMode,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Config {
     #[serde(default)]
@@ -137,6 +157,8 @@ pub struct Config {
     pub skills: Value,
     #[serde(default)]
     pub compaction: CompactionCfg,
+    #[serde(default)]
+    pub ui: UiCfg,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_depth: Option<u64>,
     #[serde(default)]
@@ -638,6 +660,20 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<Config>(config).is_err());
         }
+    }
+    #[test]
+    fn scroll_mode_defaults_to_native_and_validates_values() {
+        assert_eq!(Config::default().ui.scroll_mode, ScrollMode::Native);
+        let cfg: Config =
+            serde_json::from_value(json!({"ui": {"scroll_mode": "fullscreen"}})).unwrap();
+        assert_eq!(cfg.ui.scroll_mode, ScrollMode::Fullscreen);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["ui"]["scroll_mode"],
+            json!("fullscreen"),
+        );
+        assert!(
+            serde_json::from_value::<Config>(json!({"ui": {"scroll_mode": "pagewise"}})).is_err()
+        );
     }
     #[test]
     fn jsonc_rejects_json5_and_malformed_input() {

@@ -17,6 +17,17 @@ Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+V (
 
 Questions appear one at a time with their numbered options. The answer line is the same full editor as the prompt - caret movement, selection, word motions, kill, yank, undo and multiline all work on the answer - and the prompt you were typing stays untouched underneath, returning when the question settles. A line of option numbers answers with those options; any other text is sent as a custom answer exactly as typed. Enter walks to the next question and wraps back to the first, and each answer is kept in the transcript. Tab and Shift+Tab walk the questions forward and back - each question keeps its own draft, so switching never loses a half-typed answer, and answered questions reopen prefilled so they can be changed. Backspace on an empty answer line also steps back, and Esc dismisses the request. When the last answer lands, a confirmation screen lists every question with its answer - Enter sends, Tab steps back to edit, Esc dismisses. Your prompt is never sent while a question is open.
 
+Transcript scrolling is a config option, `ui.scroll_mode`:
+
+- `native` (default): completed transcript rows commit to the terminal's own scrollback and only the prompt is redrawn. Wheel and terminal shortcuts scroll as usual; PageUp/PageDown page the draft.
+- `fullscreen`: ocmini repaints the whole screen on the alternate screen and scrolls the transcript itself. PageUp/PageDown page, Ctrl+Home/Ctrl+End jump to the top and bottom, and the mouse wheel scrolls (Shift+wheel keeps the terminal's native selection scroll). The prompt header lists these keys. On exit the transcript is restored to the terminal's scrollback.
+
+Set it in `opencode.json` before starting; a running TUI keeps the mode it started with:
+
+```json
+{ "ui": { "scroll_mode": "fullscreen" } }
+```
+
 Clipboard image paste needs `wl-paste` (Wayland), `xclip` (X11), `osascript` (macOS) or PowerShell (Windows). Many terminals handle Ctrl+Shift+V themselves: pasted text and image paths work, but a screenshot cannot reach the app if the terminal sends no paste event or image data. Use Ctrl+V for a direct clipboard read, or configure the terminal to forward Ctrl+Shift+V. PNG, JPEG, GIF and WebP images are supported. Quoted paths, shell-escaped spaces and percent-encoded `file://` URLs work too.
 
 Over SSH, ordinary terminal paste carries text, not your local image clipboard. Copy the image to the remote host (for example with `scp`) and paste its **remote** path. X11 clipboard forwarding can also work when `DISPLAY` is forwarded and `xclip` is installed on the remote host. Clipboard images are stored with the message, so they remain available when resuming a session.
