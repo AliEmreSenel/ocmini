@@ -340,20 +340,32 @@ fn render_event(ui: &mut Ui, event: &crate::types::BusEvent, session_id: &str) -
     output
 }
 
-/// One answer line for one question. A typed number selects an option, and the
-/// answer carries that option's label: the question contract and the model both
-/// expect labels, so the displayed index must not reach the tool output.
-/// Anything else, including an out-of-range number, is a custom answer as typed.
+/// One answer line for one question. A line of option numbers ("2", "1 3" for
+/// multiple) answers with those options' labels: the question contract and the
+/// model both expect labels, so the displayed index must not reach the tool
+/// output. Any other line - prose, an out-of-range number - is one custom
+/// answer, kept exactly as typed.
 fn parse_answer(line: &str, labels: &[String]) -> Vec<String> {
-    line.split_ascii_whitespace()
-        .map(|token| match token.parse::<usize>() {
-            Ok(number) if number >= 1 => labels
-                .get(number - 1)
-                .cloned()
-                .unwrap_or_else(|| token.to_string()),
-            _ => token.to_string(),
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let numbers: Option<Vec<usize>> = trimmed
+        .split_ascii_whitespace()
+        .map(|token| {
+            token
+                .parse::<usize>()
+                .ok()
+                .filter(|number| (1..=labels.len()).contains(number))
         })
-        .collect()
+        .collect();
+    match numbers {
+        Some(numbers) => numbers
+            .iter()
+            .map(|number| labels[number - 1].clone())
+            .collect(),
+        None => vec![trimmed.to_string()],
+    }
 }
 
 /// The draft the keyboard edits: a pending question's own answer draft, so
@@ -402,11 +414,10 @@ fn answer_question(app: &App, state: &mut PendingPrompt) -> (bool, String) {
         let _ = app.questions.reply(id, std::mem::take(answers));
         return (true, out);
     }
-    // Answer in order, wrapping to the first gap after the end.
-    *current = (*current + 1..questions.len())
-        .chain(0..*current)
-        .find(|index| answers[*index].is_empty())
-        .unwrap_or(*current);
+    // Enter walks the questions in order, wrapping to the first; an answered
+    // one reopens prefilled, so going back to change an answer returns
+    // forward through every question, not across the answered ones.
+    *current = (*current + 1) % questions.len();
     let labels = option_labels(&questions[*current]["options"]);
     let prefill = answer_line(&answers[*current], &labels);
     if !prefill.is_empty() {
@@ -1297,9 +1308,15 @@ mod tests {
             parse_answer("1  2", &labels),
             ["session-rename-notes", "scratch"]
         );
-        // Free text and numbers without an option stay exactly as typed.
+        // Prose is one custom answer, exactly as typed - never one per word.
         assert_eq!(parse_answer("keep-it-brief", &labels), ["keep-it-brief"]);
-        assert_eq!(parse_answer("0 9", &labels), ["0", "9"]);
+        assert_eq!(
+            parse_answer("no im just testing", &labels),
+            ["no im just testing"]
+        );
+        // Numbers without an option make the whole line a custom answer.
+        assert_eq!(parse_answer("0 9", &labels), ["0 9"]);
+        assert_eq!(parse_answer("", &labels), Vec::<String>::new());
     }
 
     #[test]
