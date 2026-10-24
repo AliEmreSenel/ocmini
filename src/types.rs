@@ -211,6 +211,13 @@ pub struct PromptRequest {
     pub tools: Option<HashMap<String, bool>>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_arguments: Option<String>,
+    /// Runtime-only registrations: HTTP clients cannot install executable hooks.
+    #[serde(skip)]
+    pub hook_snapshot: Option<Value>,
+    #[serde(skip)]
+    pub admission_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]

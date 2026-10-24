@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+mod hook_state;
+pub(crate) use hook_state::AdmissionReservation;
+mod hook_events;
+pub(crate) use hook_events::HookDeliveryBudget;
+
 /// Minutes a claimed session lease stays valid without a heartbeat. A crashed
 /// instance's sessions become recoverable for other instances after expiry;
 /// a live instance refreshes its lease continuously while draining.
@@ -44,6 +49,28 @@ fn sql_error(error: impl std::fmt::Display) -> String {
 }
 
 impl Store {
+    /// Debug inspection must never recover turns, create tables, or start
+    /// observer processes. Older stores simply have no delivery metadata yet.
+    pub fn inspect_hook_deliveries(path: &Path, directory: &str) -> Result<Vec<Value>, String> {
+        crate::blocking::run(|| {
+            let connection =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(sql_error)?;
+            connection.busy_timeout(BUSY_TIMEOUT).map_err(sql_error)?;
+            let exists:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='hook_delivery')",[],|r|r.get(0)).map_err(sql_error)?;
+            if !exists {
+                return Ok(Vec::new());
+            }
+            let store = Self {
+                conn: Mutex::new(connection),
+                read: None,
+                dirs: Mutex::new(Default::default()),
+                instance: "debug".into(),
+            };
+            store.hook_deliveries(directory)
+        })
+    }
+
     /// Open the shared session database. Several ocmini processes use this file
     /// at once, so opening is fallible: contention must surface as a clean
     /// startup error, never as a panic.
@@ -94,6 +121,21 @@ impl Store {
              CREATE INDEX IF NOT EXISTS inbox_session ON inbox(session_id, seq);
              CREATE TABLE IF NOT EXISTS todo(session_id TEXT PRIMARY KEY, json TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS owner(session_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, lease_expires INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS hook_turn(message_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,state TEXT NOT NULL,snapshot TEXT,result TEXT,reason TEXT,started INTEGER NOT NULL DEFAULT 0,continuations INTEGER NOT NULL DEFAULT 0,finalizer TEXT);
+             CREATE INDEX IF NOT EXISTS hook_turn_session ON hook_turn(session_id);
+             CREATE INDEX IF NOT EXISTS hook_turn_pending ON hook_turn(state,session_id) WHERE state IN ('running','finalizing');
+             CREATE TABLE IF NOT EXISTS hook_pending_events(message_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,json TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS session_delete_pending_hook_events AFTER DELETE ON session BEGIN DELETE FROM hook_pending_events WHERE session_id=OLD.id; END;
+             CREATE TABLE IF NOT EXISTS hook_admission(seq INTEGER PRIMARY KEY AUTOINCREMENT,message_id TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL,token TEXT NOT NULL,state TEXT NOT NULL,deadline INTEGER NOT NULL,error TEXT);
+             CREATE INDEX IF NOT EXISTS hook_admission_queue ON hook_admission(session_id,state,seq);
+             CREATE TABLE IF NOT EXISTS hook_delivery(subscription_key TEXT NOT NULL,event_id TEXT NOT NULL,directory TEXT NOT NULL,event_json TEXT NOT NULL,event_bytes INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt INTEGER NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL,lease_owner TEXT,lease_until INTEGER,PRIMARY KEY(subscription_key,event_id));
+             CREATE INDEX IF NOT EXISTS hook_delivery_claim ON hook_delivery(subscription_key,state,next_attempt);
+             CREATE INDEX IF NOT EXISTS hook_delivery_dir ON hook_delivery(directory,state);
+             CREATE INDEX IF NOT EXISTS hook_delivery_expiry ON hook_delivery(expires);
+             CREATE TRIGGER IF NOT EXISTS session_delete_hooks AFTER DELETE ON session BEGIN
+               DELETE FROM hook_turn WHERE session_id=OLD.id;
+               DELETE FROM hook_admission WHERE session_id=OLD.id;
+             END;
              CREATE TRIGGER IF NOT EXISTS session_delete_parts AFTER DELETE ON session BEGIN
                DELETE FROM part WHERE session_id=OLD.id;
                DELETE FROM message WHERE session_id=OLD.id;
@@ -105,6 +147,11 @@ impl Store {
                DELETE FROM part WHERE message_id=OLD.id;
              END;",
         ).map_err(sql_error)?;
+        conn.execute(
+            "DELETE FROM hook_delivery WHERE expires<=?1",
+            params![now_ms()],
+        )
+        .map_err(sql_error)?;
         // One-time schema migrations run under the write lock exactly once per
         // database; every instance opening the file must not repeat these writes.
         let version: i32 = conn
@@ -291,9 +338,20 @@ impl Store {
             .map_err(sql_error)?;
             }
             // Never replay a possibly completed filesystem or shell side effect after a crash.
+            let (recovered_events, delivery_failures) = self.recover_hook_events(&tx, now)?;
+            tx.execute("UPDATE hook_turn SET state='done',reason='error',result=json_object('error','Execution interrupted by server restart; no effects were replayed.'),finalizer='interrupted' WHERE state='running' AND session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)",params![self.instance,now]).map_err(sql_error)?;
+            tx.execute("UPDATE hook_turn SET state='done',finalizer='interrupted' WHERE state='finalizing' AND session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)",params![self.instance,now]).map_err(sql_error)?;
             tx.execute("DELETE FROM inbox WHERE started=1 AND session_id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)", params![self.instance, now]).map_err(sql_error)?;
             tx.execute("UPDATE session SET busy=0 WHERE busy=1 AND id IN (SELECT s.id FROM session s LEFT JOIN owner o ON o.session_id=s.id WHERE o.session_id IS NULL OR o.instance_id=?1 OR o.lease_expires<?2)", params![self.instance, now]).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)
+            tx.commit().map_err(sql_error)?;
+            drop(c);
+            for event in recovered_events {
+                crate::engine::bus().publish(event);
+            }
+            for error in delivery_failures {
+                crate::engine::bus().emit("ocmini.hook.queue.overflow",json!({"delivery":"durable","diagnostic":error.chars().take(512).collect::<String>()}));
+            }
+            Ok(())
         })
     }
 
@@ -446,7 +504,24 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn delete_session(&self, id: &str) -> Result<bool, String> {
+        self.delete_session_inner(id, None)
+    }
+
+    pub fn delete_session_checked(
+        &self,
+        id: &str,
+        expected_ids: &[String],
+    ) -> Result<bool, String> {
+        self.delete_session_inner(id, Some(expected_ids))
+    }
+
+    fn delete_session_inner(
+        &self,
+        id: &str,
+        expected_ids: Option<&[String]>,
+    ) -> Result<bool, String> {
         crate::blocking::run(|| {
             let mut c = self.conn.lock().unwrap();
             let tx = self.write_tx(&mut c)?;
@@ -459,6 +534,22 @@ impl Store {
                 .map_err(sql_error)?;
             if !exists {
                 return Ok(false);
+            }
+            if let Some(expected) = expected_ids {
+                let mut statement=tx.prepare("WITH RECURSIVE descendants(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id=d.id) SELECT id FROM descendants ORDER BY id").map_err(sql_error)?;
+                let current = statement
+                    .query_map(params![id], |r| r.get::<_, String>(0))
+                    .map_err(sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                let mut expected = expected.to_vec();
+                expected.sort();
+                expected.dedup();
+                if current != expected {
+                    return Err(
+                        "Session descendants changed during delete hooks; retry deletion".into(),
+                    );
+                }
             }
             // Check the inbox as well as busy: admission commits before the engine
             // publishes busy, and a delete must not erase acknowledged work.
@@ -778,8 +869,20 @@ impl Store {
                 }
                 return Err("messageID already belongs to another session or message type".into());
             }
+            if let Some(token) = &request.admission_token {
+                let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM hook_admission WHERE message_id=?1 AND session_id=?2 AND token=?3 AND state='reserved' AND deadline>=?4)",params![message.info.id,message.info.session_id,token,now_ms()],|r|r.get(0)).map_err(sql_error)?;
+                if !valid {
+                    return Err("Prompt admission was aborted or expired".into());
+                }
+                tx.execute(
+                    "UPDATE hook_admission SET state='accepted' WHERE message_id=?1 AND token=?2",
+                    params![message.info.id, token],
+                )
+                .map_err(sql_error)?;
+            }
             save_message(&tx, message)?;
             if !request.no_reply {
+                tx.execute("INSERT INTO hook_turn(message_id,session_id,state,snapshot) VALUES(?1,?2,'queued',?3)",params![message.info.id,message.info.session_id,request.hook_snapshot.as_ref().map(Value::to_string)]).map_err(sql_error)?;
                 tx.execute(
                     "INSERT INTO inbox(message_id,session_id,request) VALUES(?1,?2,?3)",
                     params![
@@ -808,6 +911,7 @@ impl Store {
             let request = serde_json::from_str(&raw).map_err(sql_error)?;
             tx.execute("UPDATE inbox SET started=1 WHERE seq=?1", params![seq])
                 .map_err(sql_error)?;
+            tx.execute("INSERT INTO hook_turn(message_id,session_id,state,started) SELECT message_id,session_id,'running',1 FROM inbox WHERE seq=?1 ON CONFLICT(message_id) DO UPDATE SET state='running',started=1",params![seq]).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
             Ok(Some(request))
         })

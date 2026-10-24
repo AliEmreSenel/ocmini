@@ -73,7 +73,34 @@ enum Transport {
     Remote(Remote),
 }
 
+#[derive(Clone)]
+struct ScopedHooks {
+    hooks: std::sync::Weak<crate::hooks::Hooks>,
+    directory: String,
+}
+
+#[derive(Clone, Default)]
+struct EventScope {
+    target: Arc<Mutex<Option<ScopedHooks>>>,
+}
+impl EventScope {
+    fn emit(&self, name: &str, status: &str) {
+        let target = self.target.lock().unwrap().clone();
+        if let Some(target) = target {
+            let context = json!({"directory":target.directory});
+            let data = json!({"server":name,"status":status});
+            if let Some(hooks) = target.hooks.upgrade() {
+                hooks.emit("ocmini.mcp.status", &context, data);
+            } else {
+                crate::engine::bus().emit("ocmini.mcp.status",json!({"version":1,"directory":target.directory,"time":crate::types::now_ms(),"server":name,"status":status}));
+            }
+        }
+    }
+}
+
 struct Server {
+    name: String,
+    events: EventScope,
     config: Value,
     status: Arc<Mutex<Status>>,
     tools: Mutex<Vec<Value>>,
@@ -87,19 +114,35 @@ struct Server {
 
 impl Server {
     fn set_status(&self, state: &str, error: Option<String>) {
-        *self.status.lock().unwrap() = Status {
-            state: state.into(),
-            error,
-        };
-    }
-
-    fn set_status_for(&self, generation: u64, state: &str, error: Option<String>) {
-        let mut status = self.status.lock().unwrap();
-        if self.generation.load(Ordering::Acquire) == generation {
+        let changed = {
+            let mut status = self.status.lock().unwrap();
+            let changed = status.state != state || status.error != error;
             *status = Status {
                 state: state.into(),
                 error,
             };
+            changed
+        };
+        if changed {
+            self.events.emit(&self.name, state);
+        }
+    }
+
+    fn set_status_for(&self, generation: u64, state: &str, error: Option<String>) {
+        let changed = {
+            let mut status = self.status.lock().unwrap();
+            if self.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let changed = status.state != state || status.error != error;
+            *status = Status {
+                state: state.into(),
+                error,
+            };
+            changed
+        };
+        if changed {
+            self.events.emit(&self.name, state);
         }
     }
 
@@ -131,11 +174,19 @@ impl Drop for Server {
 #[derive(Clone, Default)]
 pub struct McpHub {
     servers: Arc<Mutex<BTreeMap<String, Arc<Server>>>>,
+    events: EventScope,
 }
 
 impl McpHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_hooks(&self, hooks: Arc<crate::hooks::Hooks>, directory: &str) {
+        *self.events.target.lock().unwrap() = Some(ScopedHooks {
+            hooks: Arc::downgrade(&hooks),
+            directory: directory.into(),
+        });
     }
 
     pub fn add(&self, name: &str, config: Value) -> Result<Value, String> {
@@ -147,6 +198,8 @@ impl McpHub {
     pub async fn add_async(&self, name: &str, config: Value) -> Result<Value, String> {
         validate_config(name, &config)?;
         let server = Arc::new(Server {
+            name: name.into(),
+            events: self.events.clone(),
             config,
             status: Arc::new(Mutex::new(Status {
                 state: "disconnected".into(),
@@ -460,7 +513,7 @@ async fn connect(server: &Arc<Server>) {
         armed: true,
     };
     server.stop();
-    server.set_status("disconnected", None);
+    server.set_status("connecting", None);
     let transport = if transport_kind(&server.config) == "remote" {
         create_remote(&server.config, server.changed.clone()).map(Transport::Remote)
     } else {
@@ -468,6 +521,8 @@ async fn connect(server: &Arc<Server>) {
             &server.config,
             server.status.clone(),
             server.changed.clone(),
+            server.events.clone(),
+            server.name.clone(),
         )
         .map(Transport::Local)
     };
@@ -502,6 +557,8 @@ async fn connect(server: &Arc<Server>) {
                     state: "connected".into(),
                     error: None,
                 };
+                drop(status);
+                server.events.emit(&server.name, "connected");
             }
         }
         Err(mut error) => {
@@ -618,6 +675,8 @@ fn create_local(
     config: &Value,
     status: Arc<Mutex<Status>>,
     changed: Arc<AtomicBool>,
+    events: EventScope,
+    server_name: String,
 ) -> Result<Local, String> {
     let args = config["command"]
         .as_array()
@@ -722,6 +781,8 @@ fn create_local(
                     state: "failed".into(),
                     error: Some(error),
                 };
+                drop(status);
+                events.emit(&server_name, "failed");
             }
         }
         if let Some(mut child) = reader_child.lock().unwrap().take() {

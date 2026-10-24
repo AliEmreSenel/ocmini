@@ -131,8 +131,19 @@ pub struct UiCfg {
     pub scroll_mode: ScrollMode,
 }
 
+#[derive(Clone, Debug)]
+pub struct HookConfigSource {
+    pub value: Value,
+    pub source: String,
+    pub base: PathBuf,
+    pub trusted: bool,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Config {
+    /// Source-preserving hooks are kept outside the generic config merge.
+    #[serde(skip)]
+    pub hook_sources: Option<std::sync::Arc<Vec<HookConfigSource>>>,
     #[serde(default)]
     pub provider: HashMap<String, ProviderCfg>,
     #[serde(default)]
@@ -204,8 +215,16 @@ impl Config {
         let global = PathBuf::from(config_home()).join("opencode");
         let mut value = json!({});
         let mut seen = HashSet::new();
+        let mut hook_sources = Vec::new();
         for name in ["opencode.json", "opencode.jsonc"] {
-            merge_file(&mut value, &global.join(name), false, &mut seen)?;
+            merge_file(
+                &mut value,
+                &global.join(name),
+                false,
+                &mut seen,
+                &mut hook_sources,
+                true,
+            )?;
         }
         load_markdown(&mut value, &global, "agent", "prompt")?;
         load_markdown(&mut value, &global, "command", "template")?;
@@ -216,6 +235,8 @@ impl Config {
                     &absolute_path(Path::new(&path), &directory),
                     true,
                     &mut seen,
+                    &mut hook_sources,
+                    true,
                 )?;
             }
         }
@@ -227,12 +248,26 @@ impl Config {
         {
             for base in ancestors {
                 for name in ["opencode.json", "opencode.jsonc"] {
-                    merge_file(&mut value, &base.join(name), false, &mut seen)?;
+                    merge_file(
+                        &mut value,
+                        &base.join(name),
+                        false,
+                        &mut seen,
+                        &mut hook_sources,
+                        false,
+                    )?;
                 }
                 let root = base.join(".opencode");
                 if root.is_dir() {
                     for name in ["opencode.json", "opencode.jsonc"] {
-                        merge_file(&mut value, &root.join(name), false, &mut seen)?;
+                        merge_file(
+                            &mut value,
+                            &root.join(name),
+                            false,
+                            &mut seen,
+                            &mut hook_sources,
+                            false,
+                        )?;
                     }
                     load_markdown(&mut value, &root, "agent", "prompt")?;
                     load_markdown(&mut value, &root, "command", "template")?;
@@ -243,7 +278,14 @@ impl Config {
             if !path.trim().is_empty() {
                 let root = absolute_path(Path::new(&path), &directory);
                 for name in ["opencode.json", "opencode.jsonc"] {
-                    merge_file(&mut value, &root.join(name), false, &mut seen)?;
+                    merge_file(
+                        &mut value,
+                        &root.join(name),
+                        false,
+                        &mut seen,
+                        &mut hook_sources,
+                        true,
+                    )?;
                 }
                 load_markdown(&mut value, &root, "agent", "prompt")?;
                 load_markdown(&mut value, &root, "command", "template")?;
@@ -252,11 +294,20 @@ impl Config {
         if let Ok(content) = std::env::var("OPENCODE_CONFIG_CONTENT") {
             if !content.trim().is_empty() {
                 let overlay = parse_config(&content, "OPENCODE_CONFIG_CONTENT", &directory)?;
+                collect_hook_source(
+                    &overlay,
+                    "OPENCODE_CONFIG_CONTENT",
+                    &directory,
+                    true,
+                    &mut hook_sources,
+                );
                 deep_merge(&mut value, overlay);
             }
         }
         let mut cfg: Config = serde_json::from_value(value)
             .map_err(|e| format!("invalid OpenCode configuration: {e}"))?;
+        cfg.hook_sources = Some(std::sync::Arc::new(hook_sources));
+        crate::hooks::validate_config(&cfg, &directory.to_string_lossy())?;
         validate_permission(&cfg.permission)?;
         for (pid, p) in cfg.provider.iter_mut() {
             if p.name.is_empty() {
@@ -403,9 +454,22 @@ fn merge_file(
     path: &Path,
     required: bool,
     seen: &mut HashSet<PathBuf>,
+    hook_sources: &mut Vec<HookConfigSource>,
+    trusted: bool,
 ) -> Result<(), String> {
     let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !seen.insert(key) {
+    if !seen.insert(key.clone()) {
+        if trusted {
+            for source in hook_sources.iter_mut() {
+                if Path::new(&source.source)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&source.source))
+                    == key
+                {
+                    source.trusted = true;
+                }
+            }
+        }
         return Ok(());
     }
     let text = match std::fs::read_to_string(path) {
@@ -413,15 +477,29 @@ fn merge_file(
         Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
     };
-    deep_merge(
-        base,
-        parse_config(
-            &text,
-            &path.display().to_string(),
-            path.parent().unwrap_or(Path::new(".")),
-        )?,
-    );
+    let source = path.display().to_string();
+    let directory = path.parent().unwrap_or(Path::new("."));
+    let overlay = parse_config(&text, &source, directory)?;
+    collect_hook_source(&overlay, &source, directory, trusted, hook_sources);
+    deep_merge(base, overlay);
     Ok(())
+}
+
+fn collect_hook_source(
+    value: &Value,
+    source: &str,
+    base: &Path,
+    trusted: bool,
+    sources: &mut Vec<HookConfigSource>,
+) {
+    if let Some(value) = value.get("ocmini").and_then(|v| v.get("hooks")) {
+        sources.push(HookConfigSource {
+            value: value.clone(),
+            source: source.to_string(),
+            base: base.to_path_buf(),
+            trusted,
+        });
+    }
 }
 
 fn parse_config(text: &str, source: &str, base: &Path) -> Result<Value, String> {
@@ -750,5 +828,54 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0]["id"], "x/visible");
         assert!(models[0]["variants"]["high"].is_object());
+    }
+    #[test]
+    fn hook_file_merge_retains_sources_and_explicit_launch_trust() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global.json");
+        let project = root.path().join("project.json");
+        std::fs::write(&global,r#"{"ocmini":{"hooks":{"handlers":[{"id":"trusted","on":"turn.start.before","command":["true"]}]}}}"#).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"ocmini":{"hooks":{"handlers":[],"allowProjectHooks":true}}}"#,
+        )
+        .unwrap();
+        let mut value = json!({});
+        let mut seen = HashSet::new();
+        let mut sources = Vec::new();
+        merge_file(&mut value, &global, true, &mut seen, &mut sources, true).unwrap();
+        merge_file(&mut value, &project, true, &mut seen, &mut sources, false).unwrap();
+        assert!(value["ocmini"]["hooks"]["handlers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(sources.len(), 2);
+        assert!(sources[0].trusted);
+        assert!(!sources[1].trusted);
+        let mut cfg: Config = serde_json::from_value(value).unwrap();
+        cfg.hook_sources = Some(std::sync::Arc::new(sources.clone()));
+        let debug = crate::hooks::debug_config(&cfg, root.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            debug["registrations"]["handlers"][0]["registration"]["id"],
+            "trusted"
+        );
+        assert_eq!(
+            debug["registrations"]["settings"]["allowProjectHooks"],
+            false
+        );
+        merge_file(
+            &mut json!({}),
+            &project,
+            true,
+            &mut seen,
+            &mut sources,
+            true,
+        )
+        .unwrap();
+        assert!(sources[1].trusted);
+        assert!(serde_json::to_value(cfg)
+            .unwrap()
+            .get("hook_sources")
+            .is_none());
     }
 }

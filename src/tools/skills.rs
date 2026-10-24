@@ -2,6 +2,7 @@ use super::{failure, resolve_path};
 use crate::types::{ToolError, ToolOutput};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 pub fn list(directory: Option<&str>, extra: &[String]) -> Vec<Value> {
@@ -89,8 +90,11 @@ fn read_skill(path: &Path) -> Option<Value> {
         return None;
     }
     let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    raw.hash(&mut hash);
+    let fingerprint = format!("{:016x}", hash.finish());
     Some(
-        json!({"name":name,"id":name,"description":fields.get("description").cloned().unwrap_or_default(),"location":path,"content":content.trim()}),
+        json!({"name":name,"id":name,"description":fields.get("description").cloned().unwrap_or_default(),"location":path,"content":content.trim(),"sourceFingerprint":fingerprint}),
     )
 }
 
@@ -128,7 +132,18 @@ fn frontmatter(raw: &str) -> (BTreeMap<String, String>, &str) {
     (fields, &rest[consumed..])
 }
 
+#[cfg(test)]
 pub(super) fn load(directory: &str, extra: &[String], name: &str) -> Result<ToolOutput, ToolError> {
+    let mut out = load_content(directory, extra, name)?;
+    render_content(&mut out);
+    Ok(out)
+}
+
+pub(super) fn load_content(
+    directory: &str,
+    extra: &[String],
+    name: &str,
+) -> Result<ToolOutput, ToolError> {
     let skills = list(Some(directory), extra);
     let skill = skills
         .iter()
@@ -156,13 +171,25 @@ pub(super) fn load(directory: &str, extra: &[String], name: &str) -> Result<Tool
         .map(|entry| entry.path().display().to_string())
         .take(100)
         .collect::<Vec<_>>();
-    let output = format!("<skill_content name={}>\n{}\n\nSkill directory: {}\nRelative resource paths in these instructions are resolved from this directory.\n{}\n</skill_content>",
-        serde_json::to_string(name).unwrap(), skill["content"].as_str().unwrap_or_default(), base.display(), if resources.is_empty() { String::new() } else { format!("Resources:\n{}", resources.join("\n")) });
     Ok(ToolOutput {
         title: format!("Loaded skill {name}"),
-        output,
-        metadata: json!({"name":name,"location":location,"resources":resources}),
+        output: skill["content"].as_str().unwrap_or_default().into(),
+        metadata: json!({"name":name,"location":location,"resources":resources,"sourceFingerprint":skill["sourceFingerprint"]}),
     })
+}
+
+pub(super) fn render_content(out: &mut ToolOutput) {
+    let name = out.metadata["name"].as_str().unwrap_or_default();
+    let location = out.metadata["location"].as_str().unwrap_or_default();
+    let base = Path::new(location)
+        .parent()
+        .unwrap_or_else(|| Path::new(location));
+    let resources = out.metadata["resources"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    out.output = format!("<skill_content name={}>\n{}\n\nSkill directory: {}\nRelative resource paths in these instructions are resolved from this directory.\n{}\n</skill_content>",
+        serde_json::to_string(name).unwrap(),out.output,base.display(),if resources.is_empty(){String::new()}else{format!("Resources:\n{}",resources.join("\n"))});
 }
 
 #[cfg(test)]
@@ -196,5 +223,36 @@ mod tests {
         .unwrap();
         assert!(result.output.contains("Do exactly this."));
         assert!(result.output.contains(root.to_str().unwrap()));
+    }
+    #[test]
+    fn transformed_body_preserves_source_and_resource_provenance() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("skills/example");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: provenance-test\n---\noriginal body",
+        )
+        .unwrap();
+        std::fs::write(root.join("resource.txt"), "resource").unwrap();
+        let mut out = load_content(
+            temporary.path().to_str().unwrap(),
+            &["skills".into()],
+            "provenance-test",
+        )
+        .unwrap();
+        assert_eq!(out.output, "original body");
+        let metadata = out.metadata.clone();
+        out.output = "transformed body".into();
+        render_content(&mut out);
+        assert!(out.output.contains("transformed body"));
+        assert!(!out.output.contains("original body"));
+        assert!(out.output.contains(root.to_str().unwrap()));
+        assert!(out.output.contains("resource.txt"));
+        assert_eq!(out.metadata, metadata);
+        assert!(!out.metadata["sourceFingerprint"]
+            .as_str()
+            .unwrap()
+            .is_empty());
     }
 }

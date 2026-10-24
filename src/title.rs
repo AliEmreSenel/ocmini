@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::engine::{bus, App};
 use crate::provider::{self, ChatRequest};
 use crate::sessions;
-use crate::types::{ModelRef, ProviderEvent, Session};
+use crate::types::{hex_id, ModelRef, ProviderEvent, Session};
 use futures::StreamExt;
 use serde_json::{json, Value};
 
@@ -129,21 +129,48 @@ async fn request(
         cfg.provider(&model.provider_id),
         &app.auth,
     );
-    let chat = ChatRequest {
+    let context = json!({
+        "sessionID":sid,
+        "directory":app.store.get_session(sid)?.map(|s| s.directory).unwrap_or_default(),
+        "requestID":hex_id("req_"),
+        "requestKind":"title",
+        "turnKind":"primary",
+        "attempt":1,
+        "model":{"providerID":model.provider_id,"modelID":model.model_id}
+    });
+    let mut chat = ChatRequest {
         model: model.model_id.clone(),
         system: TITLE_PROMPT.into(),
         messages: vec![json!({"role": "user", "content": prompt})],
         tools: Vec::new(),
         variant: None,
         session_id: Some(sid.into()),
+        ..Default::default()
     };
-    let mut stream = adapter.stream(&chat).await.map_err(|error| error.message)?;
+    provider::prepare_hooks(app, &context, &mut chat, None).await?;
+    app.hooks
+        .emit("ocmini.model.started", &context, json!({"attempt":1}));
+    let mut stream = match adapter.stream(&chat).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            app.hooks.emit(
+                "ocmini.model.failed",
+                &context,
+                json!({"error":error.message,"retryable":false}),
+            );
+            return Err(error.message);
+        }
+    };
     let mut reply = String::new();
     let mut failed = None;
+    let mut completed = None;
     while let Some(event) = stream.next().await {
         match event {
             ProviderEvent::TextDelta(delta) => reply.push_str(&delta),
-            ProviderEvent::Finished { .. } => break,
+            ProviderEvent::Finished { finish, usage } => {
+                completed = Some((finish, usage));
+                break;
+            }
             ProviderEvent::Error(error) => {
                 failed = Some(error);
                 break;
@@ -152,10 +179,31 @@ async fn request(
         }
     }
     drop(stream);
-    match failed {
-        Some(error) => Err(error),
-        None => Ok(Some(reply)),
+    if let Some(error) = failed {
+        app.hooks.emit(
+            "ocmini.model.failed",
+            &context,
+            json!({"error":error,"retryable":false}),
+        );
+        return Err(error);
     }
+    let Some((finish, usage)) = completed else {
+        let error = "title provider stream ended before completion";
+        app.hooks.emit(
+            "ocmini.model.failed",
+            &context,
+            json!({"error":error,"retryable":false}),
+        );
+        return Err(error.into());
+    };
+    app.hooks.emit(
+        "ocmini.model.completed",
+        &context,
+        json!({"finish":finish,"usage":usage}),
+    );
+    Ok(Some(
+        provider::complete_text(app, &context, reply, None).await?,
+    ))
 }
 
 #[cfg(test)]

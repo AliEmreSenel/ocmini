@@ -121,9 +121,11 @@ struct McpScope {
 }
 
 impl McpScope {
-    fn new(config: &Config, directory: &str) -> Self {
+    fn new(config: &Config, directory: &str, hooks: Arc<crate::hooks::Hooks>) -> Self {
+        let hub = Arc::new(McpHub::new());
+        hub.set_hooks(hooks, directory);
         Self {
-            hub: Arc::new(McpHub::new()),
+            hub,
             entries: config.mcp.clone(),
             directory: directory.to_string(),
             started: Once::new(),
@@ -170,6 +172,7 @@ pub struct App {
     pub usage: Arc<UsageDb>,
     pub always: Arc<Mutex<std::collections::HashMap<String, Vec<crate::types::PermissionRule>>>>,
     pub statuses: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    pub hooks: Arc<crate::hooks::Hooks>,
 }
 
 impl App {
@@ -178,16 +181,19 @@ impl App {
         crate::tools::cleanup_outputs()?;
         let directory = std::env::current_dir().unwrap_or_default();
         let directory = directory.to_string_lossy().into_owned();
-        let mcp_scope = Arc::new(McpScope::new(&config, &directory));
+        let hooks = crate::hooks::Hooks::for_config(&config, &directory)?;
+        let store = Arc::new(Store::open(
+            &crate::config::store_path(),
+            &crate::types::hex_id("ocm_"),
+        )?);
+        hooks.attach_store(store.clone());
+        let mcp_scope = Arc::new(McpScope::new(&config, &directory, hooks.clone()));
         let mcp_scopes = Arc::new(Mutex::new(std::collections::HashMap::from([(
             directory,
             mcp_scope.clone(),
         )])));
         Ok(Self {
-            store: Arc::new(Store::open(
-                &crate::config::store_path(),
-                &crate::types::hex_id("ocm_"),
-            )?),
+            store,
             config: Arc::new(Mutex::new(config)),
             auth: Arc::new(AuthStore::load()),
             perms: PermissionState::default(),
@@ -198,20 +204,24 @@ impl App {
             usage: Arc::new(UsageDb::open()),
             always: Arc::new(Mutex::new(Default::default())),
             statuses: Arc::new(Mutex::new(Default::default())),
+            hooks,
         })
     }
 
     pub fn for_directory(&self, directory: &str) -> Result<Self, String> {
         let config = Config::load_for(directory)?;
+        let hooks = crate::hooks::Hooks::for_config(&config, directory)?;
+        hooks.attach_store(self.store.clone());
         let mut scopes = self.mcp_scopes.lock().unwrap();
         let scope = scopes
             .entry(directory.to_string())
-            .or_insert_with(|| Arc::new(McpScope::new(&config, directory)))
+            .or_insert_with(|| Arc::new(McpScope::new(&config, directory, hooks.clone())))
             .clone();
         let mut scoped = self.clone();
         scoped.mcp = scope.hub.clone();
         scoped.mcp_scope = scope;
         scoped.config = Arc::new(Mutex::new(config));
+        scoped.hooks = hooks;
         Ok(scoped)
     }
 
@@ -224,6 +234,31 @@ impl App {
 }
 
 pub trait EngineApi: Send + Sync + 'static {
+    fn begin_end_gate(
+        &self,
+        app: &App,
+        session_id: &str,
+    ) -> Result<Option<Arc<AtomicBool>>, String> {
+        Ok((!app.store.has_waiting(session_id)?).then(|| Arc::new(AtomicBool::new(false))))
+    }
+    fn allow_hook_continuation(&self, app: &App, session_id: &str) -> Result<bool, String> {
+        app.store.has_waiting(session_id).map(|waiting| !waiting)
+    }
+    fn finish_end_gate(&self, _session_id: &str, _token: &Arc<AtomicBool>) {}
+    fn admit<'a>(
+        &'a self,
+        app: App,
+        session_id: String,
+        request: PromptRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<oneshot::Receiver<serde_json::Value>, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.start_turn(app, session_id, request) })
+    }
     fn start_turn(
         &self,
         app: App,

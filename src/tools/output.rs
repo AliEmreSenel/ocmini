@@ -54,6 +54,46 @@ pub(super) async fn limit(
     .map_err(|e| failure(format!("Cannot save tool output: {e}")))?
 }
 
+pub(super) async fn relimit(
+    mut out: ToolOutput,
+    directory: PathBuf,
+) -> Result<ToolOutput, ToolError> {
+    if !out.metadata.is_object() {
+        out.metadata = serde_json::json!({});
+    }
+    let metadata = out.metadata.as_object_mut().unwrap();
+    let path = metadata
+        .remove("outputPath")
+        .and_then(|path| path.as_str().map(str::to_owned));
+    let log = if metadata
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        path.clone()
+    } else {
+        None
+    };
+    if let Some(path) = &path {
+        let suffix = format!(
+            "\n\n[Full tool output saved to {path}. Read or search this file for omitted content.]"
+        );
+        if out.output.ends_with(&suffix) {
+            out.output.truncate(out.output.len() - suffix.len());
+        }
+    }
+    metadata.remove("truncated");
+    let mut out = limit(out, directory).await?;
+    if let Some(log) = log {
+        if out.metadata["outputPath"].is_string() {
+            out.metadata["logPath"] = log.into();
+        } else {
+            out.metadata["outputPath"] = log.into();
+        }
+    }
+    Ok(out)
+}
+
 pub(super) fn cleanup(directory: &Path, retention: Duration) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -157,5 +197,57 @@ mod tests {
             .message
             .contains("Cannot save tool output"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+    }
+    #[tokio::test]
+    async fn transformed_output_replaces_stale_spill_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let text = "new output".repeat(MAX_OUTPUT);
+        let out = relimit(ToolOutput { output:text.clone(), title:"new".into(), metadata:json!({"outputPath":"/stale/output","truncated":true,"sessionId":"child"}) },root.path().to_owned()).await.unwrap();
+        assert_ne!(out.metadata["outputPath"], "/stale/output");
+        assert_eq!(
+            std::fs::read_to_string(out.metadata["outputPath"].as_str().unwrap()).unwrap(),
+            text
+        );
+        assert_eq!(out.metadata["sessionId"], "child");
+        let out = relimit(
+            ToolOutput {
+                output: "small".into(),
+                title: "new".into(),
+                metadata: out.metadata,
+            },
+            root.path().to_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(out.metadata.get("outputPath").is_none());
+        assert_eq!(out.metadata["truncated"], false);
+    }
+    #[tokio::test]
+    async fn background_log_remains_separate_from_transformed_output_spill() {
+        let root = tempfile::tempdir().unwrap();
+        let out = relimit(
+            ToolOutput {
+                output: "started".into(),
+                title: "background".into(),
+                metadata: json!({"background":true,"pid":123,"outputPath":"/runtime/log"}),
+            },
+            root.path().to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.metadata["outputPath"], "/runtime/log");
+        let out = relimit(
+            ToolOutput {
+                output: "large".repeat(MAX_OUTPUT),
+                title: out.title,
+                metadata: out.metadata,
+            },
+            root.path().to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.metadata["logPath"], "/runtime/log");
+        assert_ne!(out.metadata["outputPath"], "/runtime/log");
+        assert_eq!(out.metadata["pid"], 123);
     }
 }

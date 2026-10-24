@@ -83,7 +83,8 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
             continue;
         }
         if role == "assistant" && message["providerMetadata"]["provider"] == "openai-responses" {
-            if let Some(items) = message["providerMetadata"]["output"]
+            let metadata = super::hooks::replay_metadata(message)?;
+            if let Some(items) = metadata["output"]
                 .as_array()
                 .filter(|items| !items.is_empty())
             {
@@ -136,7 +137,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
     }
     if let Some(summary) = settings.options["reasoningSummary"].as_str() {
         body["reasoning"]["summary"] = json!(summary);
-    } else if body.get("reasoning").is_some() {
+    } else if body.get("reasoning").is_some() && body["reasoning"].get("summary").is_none() {
         body["reasoning"]["summary"] = json!("auto");
     }
     if let Some(verbosity) = settings.options["textVerbosity"].as_str() {
@@ -149,6 +150,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         body["max_output_tokens"] = json!(limit);
     }
     settings.overlay_body(&mut body);
+    super::hooks::apply_request_options(settings, req, super::Protocol::Responses, &mut body)?;
     body["model"] = json!(settings.api_model);
     body["stream"] = json!(true);
     if !settings.tools_supported {
@@ -463,6 +465,83 @@ impl ResponseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transformed_public_text_reaches_replay_without_changing_reasoning_or_calls() {
+        let settings = super::super::test_settings(json!({}));
+        let metadata = json!({"provider":"openai-responses","output":[{"type":"reasoning","id":"reason","encrypted_content":"opaque","summary":[]},{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"original","annotations":[]}]},{"type":"function_call","id":"fc","call_id":"call","name":"read","arguments":"{}"}]});
+        let mut req = ChatRequest {
+            messages: vec![
+                json!({"role":"assistant","content":"edited","providerMetadata":metadata,"ocminiTextTransformed":true}),
+                json!({"role":"tool","tool_call_id":"call","content":"result"}),
+            ],
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["input"][0], metadata["output"][0]);
+        assert_eq!(body["input"][1]["id"], "msg");
+        assert_eq!(body["input"][1]["content"][0]["text"], "edited");
+        assert_eq!(body["input"][2], metadata["output"][2]);
+        assert_eq!(body["input"][3]["call_id"], "call");
+        assert_eq!(req.messages[0]["providerMetadata"], metadata);
+        req.messages[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("ocminiTextTransformed");
+        assert_eq!(
+            request_body(&settings, &req).unwrap()["input"][1]["content"][0]["text"],
+            "original"
+        );
+        req.messages[0]["ocminiTextTransformed"] = json!(true);
+        req.messages[0]["content"] = json!("");
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["input"][1]["id"], "msg");
+        assert_eq!(body["input"][1]["content"][0]["text"], "");
+        assert_eq!(body["input"][0], metadata["output"][0]);
+    }
+
+    #[test]
+    fn replay_uses_effective_tool_arguments_without_replacing_call_ids() {
+        let settings = super::super::test_settings(json!({}));
+        let metadata = json!({"provider":"openai-responses","output":[{"type":"reasoning","id":"reason","encrypted_content":"opaque","summary":[]},{"type":"function_call","id":"item","call_id":"call","name":"read","arguments":"{\"filePath\":\"original\"}","opaque":"keep"}]});
+        let mut req = ChatRequest {
+            messages: vec![
+                json!({"role":"assistant","content":null,"providerMetadata":metadata,"tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"effective\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"call","content":"result"}),
+            ],
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["input"][0], metadata["output"][0]);
+        assert_eq!(
+            body["input"][1]["arguments"],
+            "{\"filePath\":\"effective\"}"
+        );
+        assert_eq!(body["input"][1]["id"], "item");
+        assert_eq!(body["input"][1]["call_id"], "call");
+        assert_eq!(body["input"][1]["opaque"], "keep");
+        assert_eq!(req.messages[0]["providerMetadata"], metadata);
+        req.messages[0]["tool_calls"][0]["id"] = json!("different-call");
+        assert!(request_body(&settings, &req).unwrap_err().contains("ID"));
+    }
+
+    #[test]
+    fn normalizes_request_parameters_and_rejects_unsupported_ones() {
+        let settings = super::super::test_settings(json!({"body":{"temperature":1.5}}));
+        let mut req = ChatRequest {
+            options: json!({"temperature":0.5,"maxOutputTokens":100,"reasoningEffort":"high","reasoning":{"summary":"concise"},"textVerbosity":"low","serviceTier":"priority"}),
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["max_output_tokens"], 100);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "concise");
+        assert_eq!(body["text"]["verbosity"], "low");
+        req.options = json!({"stopSequences":["stop"]});
+        assert!(request_body(&settings, &req)
+            .unwrap_err()
+            .contains("unsupported"));
+    }
     #[test]
     fn remote_files_use_file_url_and_unsupported_parts_fail() {
         let parts = content_parts(&json!([{"type":"file","file":{"file_data":"https://example.test/spec.pdf","filename":"spec.pdf"}}]), false).unwrap();

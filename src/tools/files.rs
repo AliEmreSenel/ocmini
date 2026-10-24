@@ -296,7 +296,10 @@ fn nonnegative(input: &Value, key: &str, default: u64) -> Result<u64, ToolError>
     }
 }
 
-fn edit(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
+pub(super) fn prepare_edit(
+    directory: &str,
+    input: &Value,
+) -> Result<(std::path::PathBuf, String, String, usize), ToolError> {
     let path = resolve_path(directory, super::required(input, "filePath")?);
     let old = super::required(input, "oldString")?;
     let new = super::required(input, "newString")?;
@@ -338,6 +341,12 @@ fn edit(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
     } else {
         changed
     };
+    Ok((path, original, changed, count))
+}
+
+fn edit(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
+    let (path, _original, changed, count) = prepare_edit(directory, input)?;
+    let all = input["replaceAll"].as_bool().unwrap_or(false);
     atomic_write(&path, changed.as_bytes()).map_err(failure)?;
     output(
         format!(

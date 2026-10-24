@@ -31,11 +31,11 @@ struct Hunk {
     deletions: usize,
 }
 
-struct Change {
-    path: PathBuf,
-    before: Option<Vec<u8>>,
-    after: Option<Vec<u8>>,
-    permissions: Option<std::fs::Permissions>,
+pub(super) struct Change {
+    pub(super) path: PathBuf,
+    pub(super) before: Option<Vec<u8>>,
+    pub(super) after: Option<Vec<u8>>,
+    pub(super) permissions: Option<std::fs::Permissions>,
 }
 
 pub fn affected_paths(directory: &str, patch: &str) -> Result<Vec<PathBuf>, String> {
@@ -64,6 +64,60 @@ pub(super) fn apply(
     patch: &str,
     cancel: &AtomicBool,
 ) -> Result<ToolOutput, ToolError> {
+    let (changes, summaries) = prepare(directory, patch, cancel)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(failure("Patch cancelled before writing"));
+    }
+    for (index, change) in changes.iter().enumerate() {
+        if let Err(error) = commit(change, false) {
+            let mut rollback_errors = Vec::new();
+            for change in changes[..=index].iter().rev() {
+                if let Err(error) = commit(change, true) {
+                    rollback_errors.push(error);
+                }
+            }
+            return Err(failure(if rollback_errors.is_empty() {
+                format!("Patch write failed and was rolled back: {error}")
+            } else {
+                format!(
+                    "Patch write failed: {error}; rollback errors: {}",
+                    rollback_errors.join("; ")
+                )
+            }));
+        }
+    }
+    let output = summaries
+        .iter()
+        .map(|item| {
+            let kind = match item["type"].as_str() {
+                Some("add") => "A",
+                Some("delete") => "D",
+                Some("move") => "R",
+                _ => "M",
+            };
+            let suffix = item["movePath"]
+                .as_str()
+                .map(|path| format!(" -> {path}"))
+                .unwrap_or_default();
+            format!(
+                "{kind} {}{suffix}",
+                item["path"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ToolOutput {
+        title: format!("Patched {} file(s)", summaries.len()),
+        output: format!("Success. Updated files:\n{output}"),
+        metadata: json!({"files":summaries}),
+    })
+}
+
+pub(super) fn prepare(
+    directory: &str,
+    patch: &str,
+    cancel: &AtomicBool,
+) -> Result<(Vec<Change>, Vec<serde_json::Value>), ToolError> {
     let operations = parse(patch).map_err(failure)?;
     let mut changes = Vec::new();
     let mut touched = HashSet::new();
@@ -169,55 +223,10 @@ pub(super) fn apply(
             }
         }
     }
-    if cancel.load(Ordering::Acquire) {
-        return Err(failure("Patch cancelled before writing"));
-    }
-    for (index, change) in changes.iter().enumerate() {
-        if let Err(error) = commit(change, false) {
-            let mut rollback_errors = Vec::new();
-            for change in changes[..=index].iter().rev() {
-                if let Err(error) = commit(change, true) {
-                    rollback_errors.push(error);
-                }
-            }
-            return Err(failure(if rollback_errors.is_empty() {
-                format!("Patch write failed and was rolled back: {error}")
-            } else {
-                format!(
-                    "Patch write failed: {error}; rollback errors: {}",
-                    rollback_errors.join("; ")
-                )
-            }));
-        }
-    }
-    let output = summaries
-        .iter()
-        .map(|item| {
-            let kind = match item["type"].as_str() {
-                Some("add") => "A",
-                Some("delete") => "D",
-                Some("move") => "R",
-                _ => "M",
-            };
-            let suffix = item["movePath"]
-                .as_str()
-                .map(|path| format!(" -> {path}"))
-                .unwrap_or_default();
-            format!(
-                "{kind} {}{suffix}",
-                item["path"].as_str().unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(ToolOutput {
-        title: format!("Patched {} file(s)", summaries.len()),
-        output: format!("Success. Updated files:\n{output}"),
-        metadata: json!({"files":summaries}),
-    })
+    Ok((changes, summaries))
 }
 
-fn commit(change: &Change, rollback: bool) -> Result<(), String> {
+pub(super) fn commit(change: &Change, rollback: bool) -> Result<(), String> {
     let content = if rollback {
         &change.before
     } else {

@@ -1234,13 +1234,15 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     let session = if args.resume {
         pick_session(&app, args.directory.as_deref()).await?
     } else {
-        crate::sessions::open(
-            &app.store,
+        crate::sessions::open_for_app(
+            &app,
             args.directory.as_deref(),
             args.session.as_deref(),
             args.continue_last,
-        )?
+        )
+        .await?
     };
+    crate::sessions::reject_correlated_reentry(&session.id)?;
     let mut app = app.for_directory(&session.directory)?;
     let mut session = session;
     let engine = Engine::new();
@@ -1366,6 +1368,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                         );
                                     }
                                     Ok(resumed) => {
+                                        crate::sessions::reject_correlated_reentry(&resumed.id)?;
                                         engine.abort(&session.id);
                                         app = app.for_directory(&resumed.directory)?;
                                         session = resumed;
@@ -1559,7 +1562,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                 parts,
                                 ..Default::default()
                             };
-                            if let Err(error) = engine.start_turn(app.clone(), session.id.clone(), request) {
+                            if let Err(error) = engine.admit(app.clone(), session.id.clone(), request).await {
                                 display.output(
                                     &format!("{RED}error:{RESET} {error}\n"),
                                     terminal_width(),

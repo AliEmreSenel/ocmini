@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod changes;
 mod files;
 mod output;
 pub mod patch;
@@ -26,6 +27,7 @@ pub struct ToolCtx {
     pub part_id: String,
     pub engine: Arc<dyn EngineApi>,
     pub cancel: Arc<AtomicBool>,
+    pub hook_context: Value,
 }
 
 impl ToolCtx {
@@ -144,6 +146,83 @@ async fn cancelled(flag: Arc<AtomicBool>) {
     }
 }
 
+pub(super) fn hook_context(ctx: &ToolCtx, tool: &str) -> Value {
+    let mut context = ctx.hook_context.clone();
+    if !context.is_object() {
+        context = json!({});
+    }
+    context["directory"] = json!(ctx.dir);
+    context["sessionID"] = json!(ctx.session_id);
+    context["messageID"] = json!(ctx.message_id);
+    context["callID"] = json!(ctx.call_id);
+    context["tool"] = json!(tool);
+    context
+}
+
+/// Resource transforms run before the engine authorizes and records effective input.
+pub async fn prepare_input(
+    ctx: &ToolCtx,
+    name: &str,
+    mut input: Value,
+) -> Result<Value, ToolError> {
+    let object = input
+        .as_object_mut()
+        .ok_or_else(|| failure("Tool input must be an object"))?;
+    object.remove(changes::KEY);
+    object.remove("_ocminiTaskModel");
+    if ctx.cancel.load(Ordering::Acquire) {
+        return Err(failure("Tool cancelled"));
+    }
+    match name {
+        "write" | "edit" | "apply_patch" | "patch"
+            if ctx
+                .app
+                .hooks
+                .matches("file.change.before", &hook_context(ctx, name)) =>
+        {
+            changes::prepare(ctx, name, input).await
+        }
+        "task" => prepare_task(ctx, input).await,
+        _ => Ok(input),
+    }
+}
+
+pub fn prepared_file_paths(input: &Value) -> Option<Vec<PathBuf>> {
+    changes::paths(input)
+}
+
+/// Rebuild derived spill metadata after a successful output transform.
+pub async fn limit_output(_directory: &str, out: ToolOutput) -> Result<ToolOutput, ToolError> {
+    output::relimit(out, output::directory()).await
+}
+
+async fn shell_environment(
+    ctx: &ToolCtx,
+    input: &Value,
+    directory: &Path,
+) -> Result<serde_json::Map<String, Value>, ToolError> {
+    if !ctx.app.hooks.has("shell.env") {
+        return Ok(Default::default());
+    }
+    let mut context = hook_context(ctx, "bash");
+    context["workdir"] = json!(directory);
+    let effective = ctx.app.hooks.run("shell.env", &context,
+        json!({"env":{},"command":input["command"],"background":input["background"].as_bool().unwrap_or(false)}), Some(&ctx.cancel)).await.map_err(failure)?.input;
+    let env = effective["env"]
+        .as_object()
+        .ok_or_else(|| failure("shell.env env must be an object"))?;
+    for (key, value) in env {
+        if key.is_empty()
+            || key.contains(['=', '\0'])
+            || key.starts_with("OCMINI_HOOK_")
+            || (!value.is_null() && value.as_str().is_none_or(|value| value.contains('\0')))
+        {
+            return Err(failure(format!("Invalid shell environment entry {key:?}")));
+        }
+    }
+    Ok(env.clone())
+}
+
 pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOutput, ToolError> {
     if !input.is_object() {
         return Err(failure("Tool input must be an object"));
@@ -161,12 +240,17 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                     .or_else(|| input["cwd"].as_str())
                     .unwrap_or("."),
             );
+            let env = shell_environment(ctx, input, &directory).await?;
+            if ctx.cancel.load(Ordering::Acquire) {
+                return Err(failure("Tool cancelled"));
+            }
             if input["background"].as_bool().unwrap_or(false) {
-                return process::shell_background(
+                return process::shell_background_with_env(
                     command,
                     &directory,
                     &ctx.session_id,
                     &output::directory(),
+                    &env,
                 )
                 .await;
             }
@@ -177,16 +261,24 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                     .filter(|v| *v > 0)
                     .ok_or_else(|| failure("timeout must be a positive integer in milliseconds"))?,
             };
-            process::shell(
+            process::shell_with_env(
                 command,
                 &directory,
                 Duration::from_millis(timeout),
                 ctx.cancel.clone(),
                 &output::directory(),
+                &env,
             )
             .await
         }
         "glob" | "grep" => search::run(&ctx.dir, name, input, ctx.cancel.clone()).await,
+        "write" | "edit" | "apply_patch" | "patch" if input.get(changes::KEY).is_some() => {
+            let input = input.clone();
+            let cancel = ctx.cancel.clone();
+            tokio::task::spawn_blocking(move || changes::commit(&input, &cancel))
+                .await
+                .map_err(|e| failure(e.to_string()))?
+        }
         "read" | "write" | "edit" => {
             let directory = ctx.dir.clone();
             let name = name.to_owned();
@@ -248,7 +340,36 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
                 .or_else(|| input["id"].as_str())
                 .ok_or_else(|| failure("name must be a string"))?;
             let paths = ctx.app.config.lock().unwrap().skill_paths();
-            skills::load(&ctx.dir, &paths, name)
+            let mut loaded = skills::load_content(&ctx.dir, &paths, name)?;
+            let mut context = hook_context(ctx, "skill");
+            context["name"] = json!(name);
+            context["path"] = loaded.metadata["location"].clone();
+            context["sourceFingerprint"] = loaded.metadata["sourceFingerprint"].clone();
+            if ctx.app.hooks.has("skill.load.after") {
+                let effective = ctx
+                    .app
+                    .hooks
+                    .run(
+                        "skill.load.after",
+                        &context,
+                        json!({"content":loaded.output}),
+                        Some(&ctx.cancel),
+                    )
+                    .await
+                    .map_err(failure)?
+                    .input;
+                loaded.output = effective["content"]
+                    .as_str()
+                    .ok_or_else(|| failure("Skill content must be a string"))?
+                    .into();
+            }
+            skills::render_content(&mut loaded);
+            ctx.app.hooks.emit(
+                "ocmini.skill.loaded",
+                &context,
+                json!({"name":name,"path":loaded.metadata["location"],"sourceFingerprint":loaded.metadata["sourceFingerprint"]}),
+            );
+            Ok(loaded)
         }
         _ => {
             let (server, tool) = ctx
@@ -284,6 +405,30 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
             })
         }
     }?;
+    if matches!(name, "write" | "edit" | "apply_patch" | "patch") {
+        let mut paths = prepared_file_paths(input).unwrap_or_default();
+        if paths.is_empty() {
+            if let Some(path) = result.metadata["filepath"].as_str() {
+                paths.push(resolve_path(&ctx.dir, path));
+            }
+            if let Some(files) = result.metadata["files"].as_array() {
+                for file in files {
+                    for key in ["path", "movePath"] {
+                        if let Some(path) = file[key].as_str() {
+                            paths.push(resolve_path(&ctx.dir, path));
+                        }
+                    }
+                }
+            }
+        }
+        for path in paths {
+            ctx.app.hooks.emit(
+                "file.edited",
+                &hook_context(ctx, name),
+                json!({"file":path,"tool":name}),
+            );
+        }
+    }
     output::limit(result, output::directory()).await
 }
 
@@ -314,13 +459,16 @@ impl Drop for QuestionGuard {
     }
 }
 
-async fn question(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
+fn validate_questions(input: &Value) -> Result<(), ToolError> {
     let questions = input["questions"]
         .as_array()
         .filter(|questions| !questions.is_empty())
         .ok_or_else(|| failure("questions must be a nonempty array"))?;
     for question in questions {
-        if !question["question"].is_string()
+        if ["multiple", "custom"]
+            .iter()
+            .any(|key| question.get(key).is_some_and(|value| !value.is_boolean()))
+            || !question["question"].is_string()
             || !question["header"].is_string()
             || !question["options"].as_array().is_some_and(|options| {
                 options
@@ -331,6 +479,37 @@ async fn question(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError>
             return Err(failure("Every question needs question/header strings and an options array containing label/description strings"));
         }
     }
+    Ok(())
+}
+
+async fn question(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
+    validate_questions(input)?;
+    let effective;
+    let input = if ctx.app.hooks.has("question.ask.before") {
+        effective = ctx
+            .app
+            .hooks
+            .run(
+                "question.ask.before",
+                &hook_context(ctx, "question"),
+                input.clone(),
+                Some(&ctx.cancel),
+            )
+            .await
+            .map_err(failure)?
+            .input;
+        validate_questions(&effective)?;
+        &effective
+    } else {
+        input
+    };
+    if ctx.cancel.load(Ordering::Acquire) {
+        return Err(failure("Question cancelled"));
+    }
+    let questions = input["questions"]
+        .as_array()
+        .filter(|questions| !questions.is_empty())
+        .ok_or_else(|| failure("questions must be a nonempty array"))?;
     let (request, receiver) = ctx.app.questions.ask_for_tool(
         &ctx.session_id,
         Value::Array(questions.clone()),
@@ -383,9 +562,12 @@ impl Drop for ChildGuard {
     }
 }
 
-async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
+fn task_options(
+    ctx: &ToolCtx,
+    input: &Value,
+) -> Result<(crate::types::Session, Option<ModelRef>), ToolError> {
     let prompt = required(input, "prompt")?;
-    let description = required(input, "description")?;
+    required(input, "description")?;
     let agent = required(input, "subagent_type")?;
     if prompt.trim().is_empty() {
         return Err(failure("prompt must not be empty"));
@@ -450,6 +632,79 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
             model_id: selected.into(),
         });
     }
+    if let Some(selected) = input.get("_ocminiTaskModel") {
+        model = Some(
+            serde_json::from_value(selected.clone())
+                .map_err(|e| failure(format!("Invalid task model: {e}")))?,
+        );
+    }
+    if let Some(selected) = &model {
+        if selected.provider_id.is_empty() || selected.model_id.is_empty() {
+            return Err(failure(
+                "Task model requires nonempty providerID and modelID",
+            ));
+        }
+        if !crate::engine_impl::model_available(&ctx.app.config.lock().unwrap(), selected) {
+            return Err(failure("Subagent provider or model is disabled"));
+        }
+    }
+    if let Some(id) = input.get("task_id") {
+        let id = id
+            .as_str()
+            .ok_or_else(|| failure("task_id must be a string"))?;
+        let child = ctx
+            .app
+            .store
+            .get_session(id)
+            .map_err(failure)?
+            .ok_or_else(|| failure("Task session not found"))?;
+        if child.parent_id.as_deref() != Some(ctx.session_id.as_str()) {
+            return Err(failure(
+                "task_id must identify a child of the current session",
+            ));
+        }
+    }
+    Ok((parent, model))
+}
+
+async fn prepare_task(ctx: &ToolCtx, mut input: Value) -> Result<Value, ToolError> {
+    let (_, model) = task_options(ctx, &input)?;
+    if !ctx.app.hooks.has("task.spawn.before") {
+        return Ok(input);
+    }
+    let original_agent = required(&input, "subagent_type")?.to_owned();
+    let mut payload = input.clone();
+    payload["model"] = json!(model);
+    let result = ctx
+        .app
+        .hooks
+        .run(
+            "task.spawn.before",
+            &hook_context(ctx, "task"),
+            payload,
+            Some(&ctx.cancel),
+        )
+        .await
+        .map_err(failure)?
+        .input;
+    for key in ["prompt", "description", "subagent_type"] {
+        input[key] = result[key].clone();
+    }
+    let effective_model = result["model"].clone();
+    if !effective_model.is_null()
+        && (input["subagent_type"] == original_agent || effective_model != json!(model))
+    {
+        input["_ocminiTaskModel"] = effective_model;
+    }
+    task_options(ctx, &input)?;
+    Ok(input)
+}
+
+async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
+    let prompt = required(input, "prompt")?;
+    let description = required(input, "description")?;
+    let agent = required(input, "subagent_type")?;
+    let (parent, model) = task_options(ctx, input)?;
     let child = if let Some(id) = input["task_id"].as_str() {
         let child = ctx
             .app
@@ -477,9 +732,9 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
             ..Default::default()
         };
         child.extra.clear();
-        ctx.app.store.create_session(&child).map_err(failure)?;
-        bus().emit("session.created", json!({"info":child}));
-        child
+        crate::sessions::create(&ctx.app, child)
+            .await
+            .map_err(failure)?
     };
     {
         let mut grants = ctx.app.always.lock().unwrap();
@@ -499,10 +754,25 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
         session_id: child.id.clone(),
         armed: true,
     };
-    let result = tokio::select! {
-        result = ctx.engine.run_sync(ctx.app.clone(), child.id.clone(), request) => result.map_err(failure)?,
+    let mut context = hook_context(ctx, "task");
+    context["childSessionID"] = json!(child.id);
+    let done = tokio::select! {
+        result = ctx.engine.admit(ctx.app.clone(), child.id.clone(), request) => result.map_err(failure)?,
         _ = cancelled(ctx.cancel.clone()) => return Err(failure("Subagent cancelled")),
     };
+    ctx.app.hooks.emit("ocmini.task.started", &context, json!({"parentSessionID":ctx.session_id,"childSessionID":child.id,"agent":agent,"model":model}));
+    let result = tokio::select! {
+        result = done => result.map_err(|_| "Subagent ended without a result".to_owned()),
+        _ = cancelled(ctx.cancel.clone()) => Err("Subagent cancelled".into()),
+    };
+    let status = match &result {
+        Ok(value) if value["info"].get("error").is_none_or(Value::is_null) => "completed",
+        Ok(_) => "failed",
+        Err(_) if ctx.cancel.load(Ordering::Acquire) => "cancelled",
+        Err(_) => "failed",
+    };
+    ctx.app.hooks.emit("ocmini.task.ended", &context, json!({"parentSessionID":ctx.session_id,"childSessionID":child.id,"status":status,"messageID":result.as_ref().ok().and_then(|value| value["info"]["id"].as_str())}));
+    let result = result.map_err(failure)?;
     guard.armed = false;
     if let Some(error) = result["info"].get("error").filter(|error| !error.is_null()) {
         return Err(failure(format!("Subagent failed: {error}")));

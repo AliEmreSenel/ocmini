@@ -27,6 +27,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         let mut message = message.clone();
         if let Some(map) = message.as_object_mut() {
             map.remove("is_error");
+            map.remove(super::TEXT_TRANSFORMED);
             if let Some(metadata) = map.remove("providerMetadata") {
                 if metadata["provider"] == "openai-chat" {
                     for key in [
@@ -59,6 +60,8 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         ("parallelToolCalls", "parallel_tool_calls"),
         ("user", "user"),
         ("reasoningEffort", "reasoning_effort"),
+        ("topK", "top_k"),
+        ("serviceTier", "service_tier"),
     ] {
         if let Some(value) = settings.options.get(input) {
             body[output] = value.clone();
@@ -136,6 +139,8 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
                 "setCacheKey",
                 "enterpriseUrl",
                 "thinking",
+                "topK",
+                "serviceTier",
             ]
             .contains(&key.as_str())
             {
@@ -144,6 +149,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         }
     }
     settings.overlay_body(&mut body);
+    super::hooks::apply_request_options(settings, req, super::Protocol::Chat, &mut body)?;
     body["model"] = json!(settings.api_model);
     body["stream"] = json!(true);
     if !settings.tools_supported {
@@ -394,6 +400,32 @@ impl ChatState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn request_options_override_presets_and_internal_markers_stay_local() {
+        let settings =
+            super::super::test_settings(json!({"body":{"temperature":1.5,"max_tokens":999}}));
+        let req = ChatRequest {
+            messages: vec![
+                json!({"role":"assistant","content":"edited","ocminiTextTransformed":true,"providerMetadata":{"provider":"openai-chat","message":{"reasoning_content":"opaque","reasoning_details":[{"signature":"signed"}]}}}),
+            ],
+            options: json!({"temperature":0.25,"topP":0.8,"topK":10,"maxTokens":100,"serviceTier":"priority"}),
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["top_k"], 10);
+        assert_eq!(body["max_tokens"], 100);
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["messages"][0]["content"], "edited");
+        assert_eq!(
+            body["messages"][0]["reasoning_details"][0]["signature"],
+            "signed"
+        );
+        assert!(body["messages"][0].get("ocminiTextTransformed").is_none());
+        assert!(body.get("topK").is_none());
+        assert!(body.get("serviceTier").is_none());
+    }
     #[test]
     fn assembles_parallel_calls_and_does_not_finish_truncated_streams() {
         let mut state = ChatState::default();

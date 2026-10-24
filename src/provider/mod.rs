@@ -1,10 +1,12 @@
 pub mod anthropic;
 mod catalog;
+mod hooks;
 pub mod openai_compat;
 pub mod responses;
 pub mod sse;
 pub use catalog::discover_models;
 pub(crate) use catalog::normalize_provider;
+pub use hooks::{complete_text, prepare_hooks, reconcile_text, TEXT_TRANSFORMED};
 
 use crate::auth::{configured_token, AuthEntry, AuthStore};
 use crate::config::{deep_merge, ProviderCfg};
@@ -14,6 +16,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+#[derive(Default)]
 pub struct ChatRequest {
     pub model: String,
     pub system: String,
@@ -21,6 +24,10 @@ pub struct ChatRequest {
     pub tools: Vec<Value>,
     pub variant: Option<String>,
     pub session_id: Option<String>,
+    /// Request-local generation options. Null is the empty/default value.
+    pub options: Value,
+    /// Request-local non-authentication headers; credentials stay in Settings.
+    pub headers: BTreeMap<String, String>,
 }
 
 pub type EventStream = Box<dyn futures::Stream<Item = ProviderEvent> + Send + Unpin>;
@@ -281,6 +288,32 @@ impl Adapter {
                 return Err(format!("model {} is disabled", req.model));
             }
         }
+        if model.is_none()
+            && req.variant.as_deref().is_some_and(|variant| {
+                ![
+                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+                ]
+                .contains(&variant)
+            })
+        {
+            return Err(format!(
+                "unknown model variant {} for {}",
+                req.variant.as_deref().unwrap(),
+                req.model
+            ));
+        }
+        hooks::validate_options(&req.options)?;
+        if let Some(request_options) = req.options.as_object() {
+            if request_options.contains_key("maxOutputTokens") {
+                options.as_object_mut().unwrap().remove("maxTokens");
+            }
+            if request_options.contains_key("maxTokens") {
+                options.as_object_mut().unwrap().remove("maxOutputTokens");
+            }
+            for (key, value) in request_options {
+                options[key] = value.clone();
+            }
+        }
         for key in ["headers", "body", "extraBody"] {
             if options
                 .get(key)
@@ -400,6 +433,7 @@ impl Adapter {
             .as_str()
             .or_else(|| options["api"].as_str());
         let protocol = protocol(&self.provider_id, npm, explicit, &req.model, codex)?;
+        hooks::validate_protocol_options(&req.options, protocol, codex)?;
         if base_url.is_empty() {
             base_url = default_base_url(&self.provider_id).ok_or_else(|| format!("provider {} has no supported default endpoint; configure provider.{}.options.baseURL", self.provider_id, self.provider_id))?.into();
         }
@@ -515,6 +549,10 @@ impl Adapter {
         let max_output = model
             .and_then(|m| m.limit.as_ref())
             .and_then(|v| v["output"].as_u64());
+        hooks::validate_limits(&req.options, &options, protocol, max_output)?;
+        for (name, value) in hooks::safe_headers(&req.headers)? {
+            headers.insert(name, value);
+        }
         let header_timeout = if options["headerTimeout"] == false {
             None
         } else {
@@ -878,8 +916,71 @@ pub(super) fn usage_openai(value: &Value, responses: bool) -> Tokens {
 }
 
 #[cfg(test)]
+pub(super) fn test_settings(options: Value) -> Settings {
+    Settings {
+        provider_id: "test".into(),
+        base_url: "http://localhost/v1".into(),
+        api_model: "wire-model".into(),
+        token: "test".into(),
+        headers: BTreeMap::new(),
+        bearer: true,
+        codex: false,
+        options,
+        max_output: Some(32_000),
+        tools_supported: true,
+        header_timeout: None,
+        total_timeout: None,
+        chunk_timeout: Duration::from_secs(1),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn request_options_and_safe_headers_override_presets_within_model_limits() {
+        let cfg: ProviderCfg = serde_json::from_value(json!({"options":{"baseURL":"http://localhost/v1","apiKey":"configured-secret","maxTokens":500},"headers":{"x-mode":"preset"},"models":{"m":{"limit":{"output":1000}}}})).unwrap();
+        let adapter = Adapter {
+            provider_id: "custom".into(),
+            cfg,
+            configured: true,
+            auth: AuthStore::from_json("{}").unwrap(),
+        };
+        let mut req = ChatRequest {
+            model: "m".into(),
+            options: json!({"maxOutputTokens":256,"temperature":0.25}),
+            headers: BTreeMap::from([("X-Mode".into(), "request".into())]),
+            ..Default::default()
+        };
+        let (_, settings) = adapter.prepare(&req).await.unwrap();
+        assert_eq!(settings.token, "configured-secret");
+        assert_eq!(settings.headers["x-mode"], "request");
+        assert_eq!(settings.options["maxOutputTokens"], 256);
+        assert!(settings.options.get("maxTokens").is_none());
+        req.options = json!({"maxOutputTokens":1001});
+        assert!(adapter
+            .prepare(&req)
+            .await
+            .err()
+            .unwrap()
+            .contains("model limit"));
+        req.options = json!({"model":"replacement"});
+        assert!(adapter.prepare(&req).await.is_err());
+        req.options = Value::Null;
+        req.headers = BTreeMap::from([("Authorization".into(), "replacement-secret".into())]);
+        let error = adapter.prepare(&req).await.err().unwrap();
+        assert!(error.contains("protected header"));
+        assert!(!error.contains("replacement-secret"));
+        req.headers.clear();
+        req.model = "unconfigured-model".into();
+        req.variant = Some("made-up-variant".into());
+        assert!(adapter
+            .prepare(&req)
+            .await
+            .err()
+            .unwrap()
+            .contains("unknown model variant"));
+    }
     #[tokio::test]
     async fn custom_variants_apply_options_without_sending_the_variant_name_as_effort() {
         let cfg: ProviderCfg = serde_json::from_value(json!({"options":{"baseURL":"http://localhost/v1","apiKey":"test"},"models":{"model":{"variants":{"focused":{"reasoningEffort":"high","headers":{"x-mode":"focused"}}}}}})).unwrap();
@@ -896,6 +997,7 @@ mod tests {
             tools: vec![],
             variant: Some("focused".into()),
             session_id: None,
+            ..Default::default()
         };
         let (_, settings) = adapter.prepare(&req).await.unwrap();
         assert_eq!(reasoning_effort(&settings, &req), Some("high"));

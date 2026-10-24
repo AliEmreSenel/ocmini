@@ -94,7 +94,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
                 json!({"type":"tool_result","tool_use_id":message["tool_call_id"],"content":content_blocks(&message["content"])?,"is_error":message["is_error"].as_bool().unwrap_or(false)}),
             ]
         } else if role == "assistant" && message["providerMetadata"]["provider"] == "anthropic" {
-            message["providerMetadata"]["content"]
+            super::hooks::replay_metadata(message)?["content"]
                 .as_array()
                 .cloned()
                 .ok_or("invalid stored Anthropic message metadata")?
@@ -175,11 +175,30 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
                 _ => 24576,
             };
             let max = max_output.max(budget + 1024);
+            if settings.max_output.is_some_and(|limit| max > limit) {
+                return Err(
+                    "Anthropic reasoning budget would exceed the model output limit".into(),
+                );
+            }
+            if (req.options.get("maxTokens").is_some()
+                || req.options.get("maxOutputTokens").is_some())
+                && max != max_output
+            {
+                return Err(
+                    "Anthropic reasoning budget exceeds the requested output token limit".into(),
+                );
+            }
             body["max_tokens"] = json!(max);
             body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
         }
     }
     if body["thinking"]["type"] == "enabled" {
+        if req.options["temperature"]
+            .as_f64()
+            .is_some_and(|value| value != 1.0)
+        {
+            return Err("Anthropic thinking requires temperature 1".into());
+        }
         body["temperature"] = json!(1);
         if body["thinking"]["budget_tokens"].as_u64().unwrap_or(0)
             >= body["max_tokens"].as_u64().unwrap_or(0)
@@ -188,6 +207,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         }
     }
     settings.overlay_body(&mut body);
+    super::hooks::apply_request_options(settings, req, super::Protocol::Anthropic, &mut body)?;
     body["model"] = json!(settings.api_model);
     body["stream"] = json!(true);
     if !settings.tools_supported {
@@ -414,6 +434,81 @@ impl MessageState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transformed_public_text_preserves_signed_and_redacted_blocks() {
+        let settings = super::super::test_settings(json!({}));
+        let metadata = json!({"provider":"anthropic","content":[{"type":"thinking","thinking":"private","signature":"signed"},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"original"},{"type":"tool_use","id":"call","name":"read","input":{}}]});
+        let mut req = ChatRequest {
+            messages: vec![
+                json!({"role":"assistant","content":"edited","providerMetadata":metadata,"ocminiTextTransformed":true}),
+                json!({"role":"tool","tool_call_id":"call","content":"result"}),
+            ],
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(blocks[0], metadata["content"][0]);
+        assert_eq!(blocks[1], metadata["content"][1]);
+        assert_eq!(blocks[2]["text"], "edited");
+        assert_eq!(blocks[3], metadata["content"][3]);
+        assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], "call");
+        assert_eq!(req.messages[0]["providerMetadata"], metadata);
+        req.messages[0]["content"] = json!("");
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(body["messages"][0]["content"][2], metadata["content"][3]);
+    }
+
+    #[test]
+    fn replay_uses_effective_tool_arguments_and_preserves_signed_identity() {
+        let settings = super::super::test_settings(json!({}));
+        let metadata = json!({"provider":"anthropic","content":[{"type":"thinking","thinking":"private","signature":"signed"},{"type":"tool_use","id":"call","name":"read","input":{"filePath":"original"},"opaque":"keep"}]});
+        let mut req = ChatRequest {
+            messages: vec![
+                json!({"role":"assistant","content":null,"providerMetadata":metadata,"tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"effective\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"call","content":"result"}),
+            ],
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["messages"][0]["content"][0], metadata["content"][0]);
+        assert_eq!(
+            body["messages"][0]["content"][1]["input"]["filePath"],
+            "effective"
+        );
+        assert_eq!(body["messages"][0]["content"][1]["id"], "call");
+        assert_eq!(body["messages"][0]["content"][1]["opaque"], "keep");
+        assert_eq!(req.messages[0]["providerMetadata"], metadata);
+        req.messages[0]["tool_calls"][0]["function"]["name"] = json!("write");
+        assert!(request_body(&settings, &req)
+            .unwrap_err()
+            .contains("identity"));
+    }
+
+    #[test]
+    fn request_generation_options_reach_wire_and_cannot_silently_change_limits() {
+        let settings = super::super::test_settings(json!({"body":{"temperature":0.9}}));
+        let mut req = ChatRequest {
+            options: json!({"temperature":0.5,"topP":0.8,"topK":8,"maxTokens":100,"stopSequences":["end"]}),
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["top_k"], 8);
+        assert_eq!(body["max_tokens"], 100);
+        assert_eq!(body["stop_sequences"], json!(["end"]));
+        req.options = json!({"reasoningEffort":"high","maxTokens":100});
+        assert!(request_body(&settings, &req).is_err());
+        req.options = json!({"thinking":{"type":"enabled","budgetTokens":1024},"maxTokens":2048});
+        let body = request_body(&settings, &req).unwrap();
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert_eq!(body["temperature"], 1);
+        req.options = json!({"frequencyPenalty":0.5});
+        assert!(request_body(&settings, &req)
+            .unwrap_err()
+            .contains("unsupported"));
+    }
     #[test]
     fn preserves_signed_thinking_and_split_tool_input() {
         let mut state = MessageState::default();

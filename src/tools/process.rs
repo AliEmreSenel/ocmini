@@ -129,12 +129,32 @@ enum Outcome {
     Cancelled,
 }
 
+#[cfg(test)]
 pub async fn shell(
     command: &str,
     directory: &Path,
     timeout: Duration,
     cancel: Arc<AtomicBool>,
     output_directory: &Path,
+) -> Result<ToolOutput, ToolError> {
+    shell_with_env(
+        command,
+        directory,
+        timeout,
+        cancel,
+        output_directory,
+        &serde_json::Map::new(),
+    )
+    .await
+}
+
+pub async fn shell_with_env(
+    command: &str,
+    directory: &Path,
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+    output_directory: &Path,
+    env: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<ToolOutput, ToolError> {
     // Let the OS capture output directly; only bounded previews enter memory.
     std::fs::create_dir_all(output_directory)
@@ -148,6 +168,13 @@ pub async fn shell(
     let (stdout, stderr) =
         capture().map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
     let mut process = shell_command(command, directory);
+    for (key, value) in env {
+        if let Some(value) = value.as_str() {
+            process.env(key, value);
+        } else {
+            process.env_remove(key);
+        }
+    }
     process
         .stdin(Stdio::null())
         .stdout(stdout.try_clone().map_err(|e| failure(e.to_string()))?)
@@ -253,11 +280,29 @@ pub fn cancel_background_jobs(session_id: &str) {
     }
 }
 
+#[cfg(test)]
 pub async fn shell_background(
     command: &str,
     directory: &Path,
     session_id: &str,
     output_directory: &Path,
+) -> Result<ToolOutput, ToolError> {
+    shell_background_with_env(
+        command,
+        directory,
+        session_id,
+        output_directory,
+        &serde_json::Map::new(),
+    )
+    .await
+}
+
+pub async fn shell_background_with_env(
+    command: &str,
+    directory: &Path,
+    session_id: &str,
+    output_directory: &Path,
+    env: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<ToolOutput, ToolError> {
     std::fs::create_dir_all(output_directory)
         .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
@@ -269,6 +314,13 @@ pub async fn shell_background(
         .keep()
         .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
     let mut process = shell_command(command, directory);
+    for (key, value) in env {
+        if let Some(value) = value.as_str() {
+            process.env(key, value);
+        } else {
+            process.env_remove(key);
+        }
+    }
     process
         .stdin(Stdio::null())
         .stdout(file.try_clone().map_err(|e| failure(e.to_string()))?)
@@ -621,5 +673,30 @@ mod tests {
         })
         .await
         .expect("Shell descendant survived process group termination");
+    }
+    #[tokio::test]
+    async fn shell_environment_is_local_to_each_process() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "OCMINI_TEST_PROCESS_LOCAL_ENV";
+        let env = serde_json::json!({(key):"private value"});
+        let first = shell_with_env(
+            r#"printf '%s' "$OCMINI_TEST_PROCESS_LOCAL_ENV""#,
+            root.path(),
+            Duration::from_secs(5),
+            Arc::new(AtomicBool::new(false)),
+            root.path(),
+            env.as_object().unwrap(),
+        );
+        let second = shell(
+            r#"printf '%s' "${OCMINI_TEST_PROCESS_LOCAL_ENV-unset}""#,
+            root.path(),
+            Duration::from_secs(5),
+            Arc::new(AtomicBool::new(false)),
+            root.path(),
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().output, "private value");
+        assert_eq!(second.unwrap().output, "unset");
+        assert!(std::env::var_os(key).is_none());
     }
 }

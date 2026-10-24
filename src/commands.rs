@@ -46,6 +46,7 @@ pub fn prepare(
         json!({"type":"text", "text":expand(template, arguments)}),
     );
     request.command = Some(name.to_owned());
+    request.command_arguments = Some(arguments.to_owned());
     Ok(request)
 }
 
@@ -84,5 +85,22 @@ pub fn expand(template: &str, arguments: &str) -> String {
             .to_owned()
     } else {
         expanded.trim().to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_commands_preserve_raw_arguments_for_admission_hooks() {
+        let cfg: Config =
+            serde_json::from_value(json!({"command":{"review":{"template":"Review $ARGUMENTS"}}}))
+                .unwrap();
+        let arguments = "\"two words\" $literal";
+        let request = prepare(&cfg, "review", arguments, PromptRequest::default()).unwrap();
+        assert_eq!(request.command.as_deref(), Some("review"));
+        assert_eq!(request.command_arguments.as_deref(), Some(arguments));
+        assert_eq!(request.parts[0]["text"], format!("Review {arguments}"));
     }
 }

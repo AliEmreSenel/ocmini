@@ -44,3 +44,6 @@ mod title;
 
 #[path = "contract/tool_output.rs"]
 mod tool_output;
+
+#[path = "contract/hooks.rs"]
+mod hooks;
