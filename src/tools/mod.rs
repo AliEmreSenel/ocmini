@@ -765,8 +765,18 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
         result = done => result.map_err(|_| "Subagent ended without a result".to_owned()),
         _ = cancelled(ctx.cancel.clone()) => Err("Subagent cancelled".into()),
     };
+    let child_error = result
+        .as_ref()
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .filter(|error| !error.is_null())
+                .or_else(|| value["info"].get("error").filter(|error| !error.is_null()))
+        })
+        .map(|error| format!("Subagent failed: {error}"));
     let status = match &result {
-        Ok(value) if value["info"].get("error").is_none_or(Value::is_null) => "completed",
+        Ok(_) if child_error.is_none() => "completed",
         Ok(_) => "failed",
         Err(_) if ctx.cancel.load(Ordering::Acquire) => "cancelled",
         Err(_) => "failed",
@@ -774,8 +784,8 @@ async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
     ctx.app.hooks.emit("ocmini.task.ended", &context, json!({"parentSessionID":ctx.session_id,"childSessionID":child.id,"status":status,"messageID":result.as_ref().ok().and_then(|value| value["info"]["id"].as_str())}));
     let result = result.map_err(failure)?;
     guard.armed = false;
-    if let Some(error) = result["info"].get("error").filter(|error| !error.is_null()) {
-        return Err(failure(format!("Subagent failed: {error}")));
+    if let Some(error) = child_error {
+        return Err(failure(error));
     }
     let text = result["parts"]
         .as_array()

@@ -323,6 +323,32 @@ fn model_matchers_require_a_known_model() {
     ));
 }
 
+#[test]
+fn task_event_relationships_do_not_replace_session_ancestry() {
+    let root: types::Matcher = serde_json::from_value(json!({"session":"root"})).unwrap();
+    let child: types::Matcher = serde_json::from_value(json!({"session":"child"})).unwrap();
+    for (context, is_child) in [
+        (
+            json!({"sessionID":"root","parentID":null,"parentSessionID":"root","childSessionID":"child"}),
+            false,
+        ),
+        (
+            json!({"sessionID":"child","parentID":"root","parentSessionID":"child","childSessionID":"grandchild"}),
+            true,
+        ),
+        (json!({"sessionID":"child","parentSessionID":"root"}), true),
+    ] {
+        assert_eq!(
+            root.matches("ocmini.task.ended", &context, false),
+            !is_child
+        );
+        assert_eq!(
+            child.matches("ocmini.task.ended", &context, false),
+            is_child
+        );
+    }
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn optional_failure_policy_cannot_swallow_cancellation() {

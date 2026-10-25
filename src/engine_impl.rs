@@ -684,6 +684,7 @@ impl EngineApi for Engine {
     ) -> Result<oneshot::Receiver<Value>, String> {
         crate::blocking::run(|| {
             let session = app.store.get_session(&sid)?.ok_or("Session not found")?;
+            crate::hooks::remember_session(&session);
             let mut guard = self.running.lock().unwrap();
             let mid = request.message_id.clone().unwrap_or_else(|| hex_id("msg_"));
             if mid.is_empty()
@@ -3168,6 +3169,7 @@ async fn execute_tool(
                         });
                     }
                 }
+                let output_changed = result.input["output"].as_str() != Some(out.output.as_str());
                 let out = ToolOutput {
                     output: result.input["output"]
                         .as_str()
@@ -3183,7 +3185,11 @@ async fn execute_tool(
                         .into(),
                     metadata,
                 };
-                tools::limit_output(&ctx.dir, out).await
+                if output_changed {
+                    tools::limit_output(&ctx.dir, out).await
+                } else {
+                    Ok(out)
+                }
             }
             .await;
             match convert {

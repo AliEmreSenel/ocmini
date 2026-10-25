@@ -30,6 +30,204 @@ fn answer(value: &Value) -> String {
 }
 
 #[tokio::test]
+async fn post_tool_hooks_preserve_unchanged_spills_and_bound_replacement_output() {
+    let original = format!(
+        "BEGIN\n{}\nMIDDLE_SENTINEL\n{}\nEND\n",
+        "x".repeat(35_000),
+        "y".repeat(35_000)
+    );
+    let replacement = format!(
+        "REPLACED\n{}\nNEW_MIDDLE\n{}\nDONE\n",
+        "a".repeat(35_000),
+        "b".repeat(35_000)
+    );
+    let code = r#"import json,sys
+r=json.load(sys.stdin)
+mode=sys.argv[1]
+if mode=='empty': sys.exit(0)
+changes={}
+if mode=='title': changes['title']='Hook title'
+if mode=='same-output': changes['output']=r['input']['output']
+if mode=='small': changes['output']='replacement'
+if mode=='large': changes['output']='REPLACED\n'+'a'*35000+'\nNEW_MIDDLE\n'+'b'*35000+'\nDONE\n'
+print(json.dumps({'set':changes}))"#;
+    for mode in ["empty", "allow", "title", "same-output", "small", "large"] {
+        let mut provider = Provider::start(vec![
+            tool_script(
+                "bash",
+                json!({"command":"cat input.txt"}),
+                "call_hook_spill",
+            ),
+            text_script("Done", ""),
+        ])
+        .await;
+        let mut handler = registration("tool.execute.after", code);
+        handler["command"].as_array_mut().unwrap().push(json!(mode));
+        let server = TestServer::start(&provider, hook_config(vec![handler])).await;
+        std::fs::write(server.directory.join("input.txt"), &original).unwrap();
+        let sid = server.session(allow()).await;
+        server
+            .post(
+                &format!("/session/{sid}/message"),
+                &prompt("msg_hook_spill", "Run the tool"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        provider.request().await;
+        let continuation = provider.request().await;
+        let sent = continuation["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let messages = server.messages(&sid).await;
+        let tool = messages
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .find(|part| part["callID"] == "call_hook_spill")
+            .unwrap();
+        assert_eq!(tool["state"]["output"], sent, "{mode}");
+        assert!(sent.len() < 52 * 1024, "{mode}");
+        if mode == "small" {
+            assert_eq!(sent, "replacement");
+            assert_eq!(tool["state"]["metadata"]["truncated"], false);
+            assert!(tool["state"]["metadata"].get("outputPath").is_none());
+        } else {
+            let path = tool["state"]["metadata"]["outputPath"].as_str().unwrap();
+            assert_eq!(tool["state"]["metadata"]["truncated"], true);
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                if mode == "large" {
+                    replacement.as_str()
+                } else {
+                    original.as_str()
+                },
+                "{mode}"
+            );
+            assert!(!sent.contains("MIDDLE"), "{mode}");
+            assert!(sent.contains(path), "{mode}");
+        }
+        if mode == "title" {
+            assert_eq!(tool["state"]["title"], "Hook title");
+        }
+        let files = server.root.path().join(".local/share/ocmini/tool-output");
+        assert_eq!(
+            std::fs::read_dir(files).unwrap().count(),
+            if mode == "large" { 2 } else { 1 },
+            "{mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn observers_match_session_ancestry_for_messages_and_parts_after_restart() {
+    let mut provider = Provider::start(vec![
+        text_script("Root response", ""),
+        text_script("Child response", ""),
+        text_script("Resumed child response", ""),
+    ])
+    .await;
+    let code = r#"import json,sys,pathlib
+r=json.load(sys.stdin)
+kind=sys.argv[1]
+for e in r['events']:
+ p=e['properties']
+ sid=p['sessionID']
+ with pathlib.Path(kind+'-'+sid+'.jsonl').open('a') as f: f.write(json.dumps(e)+'\n')
+ if e['type']=='ocmini.turn.ended': pathlib.Path(kind+'-'+p['turnID']+'-done').touch()"#;
+    let observers = ["root", "child"]
+        .into_iter()
+        .map(|kind| {
+            json!({
+                "id":format!("{kind}-messages"),
+                "on":["message.updated","message.part.updated","ocmini.turn.ended"],
+                "match":{"session":kind},
+                "command":["python3","-c",code,kind]
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut server = TestServer::start(
+        &provider,
+        json!({"ocmini":{"hooks":{"observers":observers}}}),
+    )
+    .await;
+    let root = server.session(allow()).await;
+    let child = server
+        .post("/session", &json!({"parentID":root,"permission":allow()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (index, sid, kind, other) in [
+        (0, &root, "root", "child"),
+        (1, &child, "child", "root"),
+        (2, &child, "child", "root"),
+    ] {
+        if index == 2 {
+            server.restart().await;
+        }
+        let mid = format!("msg_observer_scope_{index}");
+        server
+            .post(&format!("/session/{sid}/message"), &prompt(&mid, "Respond"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        provider.request().await;
+        wait_file(&server.directory.join(format!("{kind}-{mid}-done"))).await;
+        let recorded =
+            std::fs::read_to_string(server.directory.join(format!("{kind}-{sid}.jsonl"))).unwrap();
+        let events = recorded
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| event["type"] == "message.updated"
+                && event["properties"]["info"]["id"] == mid),
+            "missing user update for {mid}"
+        );
+        let assistant = events
+            .iter()
+            .find(|event| {
+                event["type"] == "message.updated"
+                    && event["properties"]["info"]["role"] == "assistant"
+                    && event["properties"]["info"]["parentID"] == mid
+            })
+            .unwrap_or_else(|| panic!("missing assistant update for {mid}"));
+        let assistant_id = &assistant["properties"]["info"]["id"];
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "message.part.updated"
+                    && event["properties"]["part"]["messageID"] == *assistant_id
+                    && event["properties"]["part"]["type"] == "text"),
+            "missing assistant part for {mid}"
+        );
+        assert!(
+            !server
+                .directory
+                .join(format!("{other}-{sid}.jsonl"))
+                .exists(),
+            "events for {sid} reached the {other} observer"
+        );
+    }
+}
+
+#[tokio::test]
 async fn file_payload_hook_transforms_large_text_without_large_control_json() {
     let original = "café 🦀\n".repeat(40_000);
     let mut provider = Provider::start(vec![text_script(&original, "")]).await;

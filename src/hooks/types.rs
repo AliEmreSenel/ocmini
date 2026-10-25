@@ -244,8 +244,10 @@ impl Matcher {
         } else {
             (None, None)
         };
-        let session = if context["parentID"].as_str().is_some()
-            || context["parentSessionID"].as_str().is_some()
+        let session = if context
+            .get("parentID")
+            .or_else(|| context.get("parentSessionID"))
+            .is_some_and(Value::is_string)
             || context["sessionKind"] == "child"
         {
             "child"

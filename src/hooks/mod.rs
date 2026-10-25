@@ -489,6 +489,14 @@ pub fn debug_config(config: &Config, directory: &str) -> Result<Value, String> {
         value
     })
 }
+pub fn remember_session(session: &crate::types::Session) {
+    events::remember(&json!({
+        "sessionID":session.id,
+        "directory":session.directory,
+        "parentID":session.parent_id
+    }));
+}
+
 pub fn observe(event: &Arc<crate::types::BusEvent>) {
     events::observe(event)
 }

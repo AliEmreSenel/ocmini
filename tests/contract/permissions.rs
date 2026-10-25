@@ -1,6 +1,58 @@
 use super::*;
 
 #[tokio::test]
+async fn child_provider_failures_reach_the_parent_tool_and_task_event() {
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "task",
+            json!({"description":"Child failure check","prompt":"Child work","subagent_type":"general"}),
+            "call_failed_child",
+        ),
+        Script::http_status_body(400, "CHILD_FAILURE_SENTINEL"),
+        text_script("Parent handled the failure", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{sid}/message"),
+            &prompt("msg_failed_child", "Delegate work"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let ended = events.through("ocmini.task.ended").await;
+    assert_eq!(ended.last().unwrap()["properties"]["status"], "failed");
+
+    let messages = server.messages(&sid).await;
+    let task = messages
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .find(|part| part["callID"] == "call_failed_child")
+        .unwrap();
+    assert_eq!(task["state"]["status"], "error");
+    assert!(task["state"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("CHILD_FAILURE_SENTINEL"));
+    provider.request().await;
+    provider.request().await;
+    let continuation = provider.request().await;
+    assert!(continuation["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("CHILD_FAILURE_SENTINEL"))));
+}
+
+#[tokio::test]
 async fn permissions_and_questions_resume_the_actual_tool_loop() {
     let provider = Provider::start(vec![
         tool_script("bash", json!({"command": "printf TOOL_SENTINEL", "description": "Print a test marker"}), "call_bash"),

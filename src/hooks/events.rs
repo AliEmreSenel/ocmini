@@ -49,19 +49,33 @@ struct ObserverContext<'a> {
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static DELTA_COUNT: AtomicUsize = AtomicUsize::new(0);
 static OBSERVERS: OnceLock<Mutex<Vec<Weak<Observer>>>> = OnceLock::new();
-static DIRECTORIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+#[derive(Clone)]
+struct SessionScope {
+    directory: String,
+    parent_id: Option<String>,
+}
+static SESSION_SCOPES: OnceLock<Mutex<HashMap<String, SessionScope>>> = OnceLock::new();
 
 pub fn remember(context: &Value) {
     if let (Some(session), Some(directory)) =
         (context["sessionID"].as_str(), context["directory"].as_str())
     {
-        let mut directories = DIRECTORIES.get_or_init(Default::default).lock().unwrap();
-        if directories.len() >= 8192 && !directories.contains_key(session) {
-            if let Some(old) = directories.keys().next().cloned() {
-                directories.remove(&old);
+        let mut scopes = SESSION_SCOPES.get_or_init(Default::default).lock().unwrap();
+        if scopes.len() >= 8192 && !scopes.contains_key(session) {
+            if let Some(old) = scopes.keys().next().cloned() {
+                scopes.remove(&old);
             }
         }
-        directories.insert(session.to_owned(), directory.to_owned());
+        let scope = scopes
+            .entry(session.to_owned())
+            .or_insert_with(|| SessionScope {
+                directory: directory.to_owned(),
+                parent_id: None,
+            });
+        scope.directory = directory.to_owned();
+        if let Some(parent) = context.get("parentID") {
+            scope.parent_id = parent.as_str().map(str::to_owned);
+        }
     }
 }
 
@@ -290,20 +304,19 @@ fn context_for(event: &BusEvent) -> Value {
                 None
             }
         });
+    let scope = session.and_then(|id| {
+        SESSION_SCOPES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+    });
     let directory = p["directory"]
         .as_str()
         .or(p["info"]["directory"].as_str())
         .map(str::to_owned)
-        .or_else(|| {
-            session.and_then(|id| {
-                DIRECTORIES
-                    .get_or_init(Default::default)
-                    .lock()
-                    .unwrap()
-                    .get(id)
-                    .cloned()
-            })
-        });
+        .or_else(|| scope.as_ref().map(|scope| scope.directory.clone()));
     let mut context = serde_json::Map::new();
     for key in [
         "turnKind",
@@ -327,8 +340,13 @@ fn context_for(event: &BusEvent) -> Value {
     if let Some(directory) = directory {
         context.insert("directory".into(), json!(directory));
     }
-    if let Some(parent) = p["info"].get("parentID") {
-        context.insert("parentID".into(), parent.clone());
+    // Message info.parentID identifies a prompt, not session ancestry.
+    if event.r#type.starts_with("session.") && p["info"]["id"].is_string() {
+        context.insert("parentID".into(), p["info"]["parentID"].clone());
+    } else if !context.contains_key("parentID") {
+        if let Some(scope) = scope {
+            context.insert("parentID".into(), json!(scope.parent_id));
+        }
     }
     let value = Value::Object(context);
     remember(&value);
