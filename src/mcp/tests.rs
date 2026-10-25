@@ -349,3 +349,32 @@ fn bounded_reader_rejects_unterminated_oversized_messages() {
     let bytes = vec![b'a'; 65];
     assert!(bounded_line(&mut BufReader::new(bytes.as_slice()), 64).is_err());
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn status_events_keep_scope_and_omit_connection_secrets() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_str().unwrap();
+    let hooks =
+        crate::hooks::Hooks::for_config(&crate::config::Config::default(), directory).unwrap();
+    let hub = McpHub::new();
+    hub.set_hooks(hooks, directory);
+    let name = crate::types::hex_id("status_");
+    let mut events = crate::engine::bus().subscribe();
+    let mut config = stdio_config();
+    config["environment"]["PRIVATE_TEST_SECRET"] = json!("must-not-appear-in-events");
+    hub.add_async(&name, config).await.unwrap();
+    hub.disconnect(&name).unwrap();
+    let mut states = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if event.r#type != "ocmini.mcp.status" || event.properties["server"] != name {
+            continue;
+        }
+        assert_eq!(event.properties["directory"], directory);
+        assert!(!serde_json::to_string(&*event)
+            .unwrap()
+            .contains("must-not-appear-in-events"));
+        states.push(event.properties["status"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(states, ["connecting", "connected", "disabled"]);
+}

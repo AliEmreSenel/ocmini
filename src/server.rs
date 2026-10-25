@@ -101,6 +101,7 @@ struct ScopeQuery {
     limit: Option<usize>,
     search: Option<String>,
     roots: Option<bool>,
+    types: Option<String>,
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -335,18 +336,16 @@ async fn session_create(
             ));
         }
     }
-    let mut session = st
-        .app
-        .store
-        .try_create_session_owned(title, &directory)
-        .map_err(ApiError::runtime)?;
-    session.permission = permission;
-    session.parent_id = parent.map(str::to_owned);
-    st.app
-        .store
-        .update_session(&session)
-        .map_err(ApiError::runtime)?;
-    bus().emit("session.created", json!({"info": session}));
+    let session = crate::sessions::create_owned_with_metadata(
+        &st.app,
+        title,
+        &directory,
+        parent.map(str::to_owned),
+        permission,
+        body.get("metadata"),
+    )
+    .await
+    .map_err(ApiError::runtime)?;
     Ok(Json(session))
 }
 
@@ -366,25 +365,16 @@ async fn session_patch(
     Query(query): Query<ScopeQuery>,
     Json(body): Json<Value>,
 ) -> Result<Json<Session>, ApiError> {
-    let mut session = scoped_session(&st, &id, &headers, &query)?;
+    let source = scoped_session(&st, &id, &headers, &query)?;
     if !body.is_object() {
         return Err(ApiError::invalid("Session body must be an object"));
     }
-    if let Some(title) = body.get("title") {
-        session.title = title
-            .as_str()
-            .ok_or_else(|| ApiError::invalid("title must be a string"))?
-            .to_owned();
-    }
     if let Some(permission) = body.get("permission") {
-        session.permission = Some(decode_rules(permission)?);
+        decode_rules(permission)?;
     }
-    session.time.updated = Some(now_ms());
-    st.app
-        .store
-        .update_session(&session)
+    let session = crate::sessions::update(&st.app, &source, body)
+        .await
         .map_err(ApiError::runtime)?;
-    bus().emit("session.updated", json!({"info": session}));
     Ok(Json(session))
 }
 
@@ -395,15 +385,9 @@ async fn session_delete(
     Query(query): Query<ScopeQuery>,
 ) -> Result<Json<bool>, ApiError> {
     let session = scoped_session(&st, &id, &headers, &query)?;
-    if st.app.store.is_busy(&id).map_err(ApiError::runtime)? {
-        return Err(ApiError::busy());
-    }
-    st.app
-        .store
-        .delete_session(&id)
+    crate::sessions::delete(&st.app, &session)
+        .await
         .map_err(ApiError::runtime)?;
-    crate::tools::cancel_background_jobs(&id);
-    bus().emit("session.deleted", json!({"info": session}));
     Ok(Json(true))
 }
 
@@ -515,9 +499,35 @@ async fn prompt_async(
     scoped_session(&st, &id, &headers, &query)?;
     validate_prompt(&request)?;
     st.engine
-        .start_turn(st.app.clone(), id, request)
+        .admit(st.app.clone(), id, request)
+        .await
         .map_err(ApiError::runtime)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn reject_hook_reentry(
+    st: &AppState,
+    session: &Session,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let Some(invocation) = headers.get("x-ocmini-hook-invocation-id") else {
+        return Ok(());
+    };
+    let invocation = invocation
+        .to_str()
+        .map_err(|_| ApiError::invalid("Invalid hook invocation ID"))?;
+    let app = st
+        .app
+        .for_directory(&session.directory)
+        .map_err(ApiError::runtime)?;
+    if app.hooks.is_active_invocation(invocation, &session.id) {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            name: "HookReentryError",
+            message: "A hook cannot synchronously wait for a prompt in its own session".into(),
+        });
+    }
+    Ok(())
 }
 
 async fn prompt_sync(
@@ -527,7 +537,8 @@ async fn prompt_sync(
     Query(query): Query<ScopeQuery>,
     Json(request): Json<PromptRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    scoped_session(&st, &id, &headers, &query)?;
+    let session = scoped_session(&st, &id, &headers, &query)?;
+    reject_hook_reentry(&st, &session, &headers)?;
     validate_prompt(&request)?;
     st.engine
         .run_sync(st.app.clone(), id, request)
@@ -544,6 +555,7 @@ async fn command_run(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let session = scoped_session(&st, &id, &headers, &query)?;
+    reject_hook_reentry(&st, &session, &headers)?;
     let name = body
         .get("command")
         .and_then(Value::as_str)
@@ -632,7 +644,8 @@ async fn summarize(
     Query(query): Query<ScopeQuery>,
     body: Option<Json<Value>>,
 ) -> Result<Json<bool>, ApiError> {
-    scoped_session(&st, &id, &headers, &query)?;
+    let session = scoped_session(&st, &id, &headers, &query)?;
+    reject_hook_reentry(&st, &session, &headers)?;
     let body = body.map(|body| body.0).unwrap_or_else(|| json!({}));
     if !body.is_object() {
         return Err(ApiError::invalid("Summarize body must be an object"));
@@ -706,25 +719,41 @@ async fn fork(
             return Err(ApiError::not_found("Fork boundary message not found"));
         }
     }
-    let fork = st
-        .app
-        .store
-        .try_fork(&session, boundary)
+    let fork = crate::sessions::fork(&st.app, &session, boundary)
+        .await
         .map_err(ApiError::runtime)?;
-    bus().emit("session.created", json!({"info": fork}));
     Ok(Json(fork))
+}
+
+fn explicit_event_directory(event: &BusEvent) -> Option<&str> {
+    event
+        .properties
+        .get("directory")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .properties
+                .get("info")
+                .and_then(|info| info.get("directory"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn event_types(csv: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    csv.map(|csv| {
+        csv.split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 fn event_in_directory(event: &BusEvent, app: &App, directory: Option<&str>) -> bool {
     let Some(directory) = directory else {
         return true;
     };
-    if let Some(event_directory) = event
-        .properties
-        .get("info")
-        .and_then(|info| info.get("directory"))
-        .and_then(Value::as_str)
-    {
+    if let Some(event_directory) = explicit_event_directory(event) {
         return normalized_directory(event_directory).is_ok_and(|value| value == directory);
     }
     let session_id = event
@@ -758,20 +787,22 @@ async fn event_stream(
     Query(query): Query<ScopeQuery>,
 ) -> Result<Response, ApiError> {
     let directory = requested_directory(&headers, &query)?;
+    let types = event_types(query.types.as_deref());
+    let selected = move |name: &str| types.as_ref().is_none_or(|types| types.contains(name));
     let mut receiver = bus().subscribe();
     let events = stream! {
-        yield Ok::<Event, std::convert::Infallible>(Event::default().data(json!({"id": hex_id("evt_"), "type": "server.connected", "properties": {}}).to_string()));
+        if selected("server.connected") { yield Ok::<Event, std::convert::Infallible>(Event::default().data(json!({"id": hex_id("evt_"), "type": "server.connected", "properties": {}}).to_string())); }
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
         heartbeat.tick().await;
         loop {
             tokio::select! {
                 _ = st.shutdown.cancelled() => break,
                 event = receiver.recv() => match event {
-                    Ok(event) => if event_in_directory(&event, &st.app, directory.as_deref()) { yield Ok(Event::default().data(serde_json::to_string(&*event).expect("serializable event"))); },
+                    Ok(event) => if selected(&event.r#type) && event_in_directory(&event, &st.app, directory.as_deref()) { yield Ok(Event::default().data(serde_json::to_string(&*event).expect("serializable event"))); },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                         // Losing text or tool events must fail visibly instead of completing a partial turn.
                         for id in st.app.store.busy_sessions().unwrap_or_default() {
-                            if st.app.store.get_session(&id).ok().flatten().is_some_and(|session| matches_directory(&session, directory.as_deref())) {
+                            if selected("session.error") && st.app.store.get_session(&id).ok().flatten().is_some_and(|session| matches_directory(&session, directory.as_deref())) {
                                 yield Ok(Event::default().data(json!({"id": hex_id("evt_"), "type": "session.error", "properties": {"sessionID": id, "error": {"name": "UnknownError", "data": {"message": format!("Event subscriber fell behind by {count} events; reconnect and reload the session")}}}}).to_string()));
                             }
                         }
@@ -779,7 +810,7 @@ async fn event_stream(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
-                _ = heartbeat.tick() => { yield Ok(Event::default().data(json!({"id": hex_id("evt_"), "type": "server.heartbeat", "properties": {}}).to_string())); }
+                _ = heartbeat.tick() => { if selected("server.heartbeat") { yield Ok(Event::default().data(json!({"id": hex_id("evt_"), "type": "server.heartbeat", "properties": {}}).to_string())); } }
             }
         }
     };
@@ -1369,6 +1400,22 @@ pub async fn serve(hostname: String, port: u16) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_filters_use_exact_csv_names_and_explicit_scope() {
+        assert!(event_types(None).is_none());
+        let types = event_types(Some(" file.edited,ocmini.task.ended,file.edited, ")).unwrap();
+        assert_eq!(types.len(), 2);
+        assert!(types.contains("file.edited"));
+        assert!(!types.contains("file"));
+        assert!(event_types(Some("")).unwrap().is_empty());
+        let event = BusEvent {
+            id: "event".into(),
+            r#type: "file.edited".into(),
+            properties: json!({"directory":"/one", "info":{"directory":"/two"}}),
+        };
+        assert_eq!(explicit_event_directory(&event), Some("/one"));
+    }
 
     #[test]
     fn command_arguments_are_literal_and_last_position_collects_remainder() {

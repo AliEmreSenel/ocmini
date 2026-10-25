@@ -23,20 +23,28 @@ enum Pending {
 pub async fn run(args: crate::RunArgs) -> Result<(), String> {
     let app = App::new()?;
     let mut session = if args.session.is_some() || args.continue_last {
-        sessions::open(
-            &app.store,
+        sessions::open_for_app(
+            &app,
             args.dir.as_deref(),
             args.session.as_deref(),
             args.continue_last,
-        )?
+        )
+        .await?
     } else {
         let directory = sessions::directory(args.dir.as_deref().unwrap_or("."))?;
-        app.store
-            .try_create_session_owned(args.title.as_deref().unwrap_or("run"), &directory)?
+        sessions::create_owned(
+            &app,
+            args.title.as_deref().unwrap_or("run"),
+            &directory,
+            None,
+            None,
+        )
+        .await?
     };
     if args.fork {
-        session = app.store.try_fork(&session, None)?;
+        session = sessions::fork(&app, &session, None).await?;
     }
+    sessions::reject_correlated_reentry(&session.id)?;
     let app = app.for_directory(&session.directory)?;
 
     let mut text = args.message.join(" ");
@@ -94,7 +102,9 @@ pub async fn run(args: crate::RunArgs) -> Result<(), String> {
         tty,
         &session.id,
         &user_mid,
-        engine.start_turn(app.clone(), session.id.clone(), request)?,
+        engine
+            .admit(app.clone(), session.id.clone(), request)
+            .await?,
         &mut events,
         &mut lines,
     )
@@ -137,7 +147,9 @@ pub async fn run(args: crate::RunArgs) -> Result<(), String> {
                 tty,
                 &session.id,
                 &user_mid,
-                engine.start_turn(app.clone(), session.id.clone(), request)?,
+                engine
+                    .admit(app.clone(), session.id.clone(), request)
+                    .await?,
                 &mut events,
                 &mut lines,
             )

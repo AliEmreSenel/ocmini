@@ -18,11 +18,48 @@ struct Running {
     app: App,
     cancel: Arc<AtomicBool>,
     waiters: HashMap<String, Vec<oneshot::Sender<Value>>>,
+    end_gate: Option<Arc<AtomicBool>>,
+}
+struct EndGateGuard {
+    engine: Arc<dyn EngineApi>,
+    session_id: String,
+    token: Arc<AtomicBool>,
+}
+impl Drop for EndGateGuard {
+    fn drop(&mut self) {
+        self.engine.finish_end_gate(&self.session_id, &self.token);
+    }
+}
+
+struct Admitting {
+    app: App,
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+}
+
+struct AdmissionGuard {
+    admissions: Arc<Mutex<HashMap<String, Admitting>>>,
+    app: App,
+    mid: String,
+    token: String,
+    cancel: Arc<AtomicBool>,
+}
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.admissions.lock().unwrap().remove(&self.mid);
+        let _ = self.app.store.reject_hook_admission(
+            &self.mid,
+            &self.token,
+            "Prompt admission interrupted",
+        );
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct Engine {
     running: Arc<Mutex<HashMap<String, Running>>>,
+    admissions: Arc<Mutex<HashMap<String, Admitting>>>,
 }
 
 impl Engine {
@@ -74,6 +111,7 @@ impl Engine {
         running.insert(
             sid.into(),
             Running {
+                end_gate: None,
                 app: app.clone(),
                 cancel: cancel.clone(),
                 waiters: waiter
@@ -90,13 +128,11 @@ impl Engine {
         // Keep the ownership lease fresh while this instance owns the session,
         // so a sibling instance's restart recovery ignores its live work.
         let heartbeat = {
-            let (app, sid, cancel) = (app.clone(), sid.clone(), cancel.clone());
+            let (app, sid) = (app.clone(), sid.clone());
             tokio::spawn(async move {
                 loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => { let _ = app.store.heartbeat(&sid); }
-                        _ = cancelled(&cancel) => break,
-                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    let _ = app.store.heartbeat(&sid);
                 }
             })
         };
@@ -109,6 +145,36 @@ impl Engine {
         let app = app.clone();
         let cancel = cancel.clone();
         loop {
+            if cancel.load(Ordering::Acquire) {
+                // Local admissions are fenced by Running.cancel under the
+                // running lock; the owner lease fences sibling instances.
+                // Keep both fences until every queued finalizer has settled.
+                let queued = app.store.queued_hook_prompts(&sid).unwrap_or_default();
+                for request in queued {
+                    let mid = request.message_id.as_deref().unwrap_or_default();
+                    let value = json!({"error":"Aborted"});
+                    let mut scoped = app.clone();
+                    if let Ok(Some(snapshot)) = app.store.turn_snapshot(mid) {
+                        let directory = app.store.directory_of(&sid).unwrap_or_default();
+                        scoped.hooks = crate::hooks::Hooks::from_snapshot(snapshot, &directory)
+                            .or_else(|_| crate::hooks::Hooks::disabled(&directory))
+                            .unwrap_or_else(|_| app.hooks.clone());
+                    }
+                    let _ =
+                        finalize_turn(&scoped, &sid, &request, &value, "cancelled", false).await;
+                    if let Some(waiters) = self
+                        .running
+                        .lock()
+                        .unwrap()
+                        .get_mut(&sid)
+                        .and_then(|s| s.waiters.remove(mid))
+                    {
+                        for waiter in waiters {
+                            let _ = waiter.send(value.clone());
+                        }
+                    }
+                }
+            }
             // Admission and the idle transition share this lock. A prompt cannot
             // land between the final inbox check and releasing session ownership.
             let request = crate::blocking::run(|| {
@@ -137,8 +203,36 @@ impl Engine {
                 return;
             };
             let mid = request.message_id.clone().unwrap_or_default();
-            let engine: Arc<dyn EngineApi> = Arc::new(self.clone());
-            let result = run_turn(app.clone(), engine, &sid, request, cancel.clone()).await;
+            let mut scoped = app.clone();
+            let directory = app.store.directory_of(&sid).unwrap_or_default();
+            let snapshot_error = match app.store.turn_snapshot(&mid) {
+                Ok(Some(snapshot)) => {
+                    match crate::hooks::Hooks::from_snapshot(snapshot, &directory) {
+                        Ok(hooks) => {
+                            scoped.hooks = hooks;
+                            None
+                        }
+                        Err(error) => Some(error),
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => Some(error),
+            };
+            let result = if let Some(error) = snapshot_error {
+                scoped.hooks =
+                    crate::hooks::Hooks::disabled(&directory).unwrap_or_else(|_| app.hooks.clone());
+                Err(error)
+            } else {
+                let engine: Arc<dyn EngineApi> = Arc::new(self.clone());
+                run_turn(
+                    scoped.clone(),
+                    engine,
+                    &sid,
+                    request.clone(),
+                    cancel.clone(),
+                )
+                .await
+            };
             let value = match result {
                 Ok(value) => value,
                 Err(error) => {
@@ -146,7 +240,34 @@ impl Engine {
                     json!({"error":error})
                 }
             };
-            if let Err(error) = app.store.finish_prompt(&mid) {
+            if request.command.as_deref() == Some("__ocmini_compact") && value["error"].is_string()
+            {
+                scoped.hooks.emit(
+                    "ocmini.compaction.failed",
+                    &turn_context(&scoped, &sid, &request),
+                    json!({"error":value["error"]}),
+                );
+            }
+            let reason = if cancel.load(Ordering::Acquire) {
+                "cancelled"
+            } else if value["error"].is_string() {
+                let error = value["error"].as_str().unwrap_or_default();
+                if error.contains("hook continuation limit") {
+                    "hook_limit"
+                } else if error.contains("step limit") {
+                    "step_limit"
+                } else if error.contains("rejected") {
+                    "hook_rejected"
+                } else {
+                    "error"
+                }
+            } else if app.store.has_waiting(&sid).unwrap_or(false) {
+                "steered"
+            } else {
+                "completed"
+            };
+            if let Err(error) = finalize_turn(&scoped, &sid, &request, &value, reason, true).await {
+                let _ = app.store.finish_prompt(&mid);
                 emit_error(&sid, &error, false);
             }
             let idle = crate::blocking::run(|| {
@@ -200,6 +321,115 @@ fn finish_running(app: &App, sid: &str, running: Option<Running>, error: Option<
     bus().emit("session.idle", json!({"sessionID":sid}));
 }
 
+async fn wait_for_finalization(store: Arc<Store>, mid: String, mut waiter: oneshot::Sender<Value>) {
+    loop {
+        if waiter.is_closed() {
+            return;
+        }
+        // Poll only the state column while a sibling finalizes. Do not rebuild
+        // a potentially large stored response on every wakeup.
+        match store.hook_turn_finalizing(&mid) {
+            Ok(true) => {}
+            Ok(false) => {
+                let value = match store.turn_result(&mid) {
+                    Ok(Some((value, _))) => value,
+                    Ok(None) => json!({"error":"Recorded turn result not found"}),
+                    Err(error) => json!({"error":error}),
+                };
+                let _ = waiter.send(value);
+                return;
+            }
+            Err(error) => {
+                let _ = waiter.send(json!({"error":error}));
+                return;
+            }
+        }
+        tokio::select! {
+            _ = waiter.closed() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+fn validate_message_id(mid: &str) -> Result<(), String> {
+    if mid.is_empty()
+        || mid.len() > 256
+        || !mid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return Err(
+            "messageID must contain 1–256 ASCII letters, digits, underscores or hyphens".into(),
+        );
+    }
+    Ok(())
+}
+
+fn turn_context(app: &App, sid: &str, request: &PromptRequest) -> Value {
+    let session = app.store.get_session(sid).ok().flatten();
+    json!({"directory":session.as_ref().map(|s|s.directory.as_str()).unwrap_or_default(),"sessionID":sid,"turnID":request.message_id,"turnKind":if request.command.as_deref()==Some("__ocmini_compact"){"compaction"}else{"primary"},"agent":request.agent.as_deref().unwrap_or("build"),"model":request.model,"parentID":session.and_then(|s|s.parent_id),"configFingerprint":app.hooks.fingerprint()})
+}
+
+async fn finalize_turn(
+    app: &App,
+    sid: &str,
+    request: &PromptRequest,
+    value: &Value,
+    reason: &str,
+    started: bool,
+) -> Result<(), String> {
+    let mid = request
+        .message_id
+        .as_deref()
+        .ok_or("Missing turn identity")?;
+    let mut context = turn_context(app, sid, request);
+    context["outcome"] = json!(reason);
+    let mut events = Vec::new();
+    if started && value["error"].is_null() {
+        if let Some(command) = request
+            .command
+            .as_deref()
+            .filter(|s| *s != "__ocmini_compact")
+        {
+            events.push(app.hooks.event("command.executed", &context, json!({"name":command,"arguments":request.command_arguments.as_deref().unwrap_or_default(),"messageID":value["info"]["id"]})));
+        }
+    }
+    events.push(app.hooks.event("ocmini.turn.ended", &context, json!({"reason":reason,"started":started,"responseID":value["info"]["id"],"error":value["error"],"finalizerError":null})));
+    for event in &mut events {
+        Arc::make_mut(event).id = format!("evt_{}_{}", mid, event.r#type.replace('.', "_"));
+    }
+    app.store
+        .settle_hook_turn(mid, sid, value, reason, started, &events)?;
+    let mut diagnostic = None;
+    if app.hooks.matches("turn.end.after", &context) {
+        app.store.finalizer_started(mid)?;
+        let input = json!({"reason":reason,"started":started,"responseID":value["info"]["id"],"error":value["error"]});
+        let hooks = app.hooks.run("turn.end.after", &context, input, None);
+        if let Err(error) = hooks.await {
+            diagnostic = Some(error);
+        }
+    }
+    for event in &mut events {
+        if event.r#type == "ocmini.turn.ended" {
+            Arc::make_mut(event).properties["finalizerError"] = json!(diagnostic);
+        }
+    }
+    let delivery_failures = app
+        .store
+        .finish_hook_turn(mid, diagnostic.as_deref(), &events)?;
+    for event in events {
+        bus().publish(event);
+    }
+    for error in delivery_failures {
+        app.hooks.emit(
+            "ocmini.hook.queue.overflow",
+            &context,
+            json!({"delivery":"durable","diagnostic":error.chars().take(512).collect::<String>()}),
+        );
+    }
+    Ok(())
+}
+
 fn update_status(app: &App, sid: &str, status: Value) {
     if status["type"] == "idle" {
         app.statuses.lock().unwrap().remove(sid);
@@ -213,6 +443,239 @@ fn update_status(app: &App, sid: &str, status: Value) {
 }
 
 impl EngineApi for Engine {
+    fn begin_end_gate(&self, app: &App, sid: &str) -> Result<Option<Arc<AtomicBool>>, String> {
+        crate::blocking::run(|| {
+            let mut running = self.running.lock().unwrap();
+            let Some(state) = running.get_mut(sid) else {
+                return Ok(None);
+            };
+            if state.cancel.load(Ordering::Acquire) || app.store.has_waiting(sid)? {
+                return Ok(None);
+            }
+            let token = Arc::new(AtomicBool::new(false));
+            state.end_gate = Some(token.clone());
+            Ok(Some(token))
+        })
+    }
+    fn finish_end_gate(&self, sid: &str, token: &Arc<AtomicBool>) {
+        crate::blocking::run(|| {
+            if let Some(state) = self.running.lock().unwrap().get_mut(sid) {
+                if state
+                    .end_gate
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, token))
+                {
+                    state.end_gate = None;
+                }
+            }
+        });
+    }
+    fn allow_hook_continuation(&self, app: &App, sid: &str) -> Result<bool, String> {
+        crate::blocking::run(|| {
+            let running = self.running.lock().unwrap();
+            Ok(running
+                .get(sid)
+                .is_some_and(|s| !s.cancel.load(Ordering::Acquire))
+                && !app.store.has_waiting(sid)?)
+        })
+    }
+    fn admit<'a>(
+        &'a self,
+        app: App,
+        sid: String,
+        mut request: PromptRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<oneshot::Receiver<Value>, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let session = app.store.get_session(&sid)?.ok_or("Session not found")?;
+            let app = app.for_directory(&session.directory)?;
+            let mid = request
+                .message_id
+                .get_or_insert_with(|| hex_id("msg_"))
+                .clone();
+            validate_message_id(&mid)?;
+            if !app.hooks.is_empty() {
+                request.hook_snapshot = Some(app.hooks.snapshot());
+            }
+            let input_hooks = app.hooks.has("prompt.accept.before")
+                || (request.command.is_some()
+                    && (app.hooks.has("command.execute.before")
+                        || app.hooks.has("command.expand.after")));
+            if !input_hooks || app.store.message_owner(&mid)?.is_some() {
+                return self.start_turn(app, sid, request);
+            }
+            let cfg = app.config.lock().unwrap().clone();
+            let agent = request
+                .agent
+                .get_or_insert_with(|| {
+                    cfg.extra
+                        .get("default_agent")
+                        .and_then(Value::as_str)
+                        .unwrap_or("build")
+                        .to_string()
+                })
+                .clone();
+            if !["build", "plan", "general", "explore", "subagent"].contains(&agent.as_str())
+                && !cfg.agent.contains_key(&agent)
+            {
+                return Err(format!("Unknown agent '{agent}'"));
+            }
+            if cfg.agent.get(&agent).is_some_and(|a| a["disable"] == true) {
+                return Err(format!("Agent '{agent}' is disabled"));
+            }
+            request.model = Some(resolve_model(
+                &cfg,
+                &app,
+                &sid,
+                request.model.as_ref(),
+                Some(&agent),
+            )?);
+            if !model_available(&cfg, request.model.as_ref().unwrap()) {
+                return Err("Provider or model is disabled".into());
+            }
+            if request.parts.is_empty() {
+                return Err("Prompt requires at least one text or file part".into());
+            }
+            for part in &request.parts {
+                let valid = match part["type"].as_str() {
+                    Some("text") => part["text"].is_string(),
+                    Some("file") => part["url"].is_string() && part["mime"].is_string(),
+                    Some("agent") => part["name"].is_string(),
+                    Some("compaction") => request.command.as_deref() == Some("__ocmini_compact"),
+                    _ => false,
+                };
+                if !valid {
+                    return Err("Invalid or unsupported prompt part".into());
+                }
+            }
+            let deadline = now_ms() + app.hooks.admission_timeout_ms() as i64;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let token = loop {
+                let reservation = crate::blocking::run(|| {
+                    let running = self.running.lock().unwrap();
+                    if running
+                        .get(&sid)
+                        .is_some_and(|state| state.cancel.load(Ordering::Acquire))
+                    {
+                        return Err("Session is busy aborting pending turns".into());
+                    }
+                    let reservation = app.store.reserve_hook_admission(&mid, &sid, deadline)?;
+                    if matches!(reservation, crate::store::AdmissionReservation::Acquired(_)) {
+                        self.admissions.lock().unwrap().insert(
+                            mid.clone(),
+                            Admitting {
+                                app: app.clone(),
+                                session_id: sid.clone(),
+                                cancel: cancel.clone(),
+                            },
+                        );
+                    }
+                    Ok::<_, String>(reservation)
+                })?;
+                match reservation {
+                    crate::store::AdmissionReservation::Acquired(token) => break token,
+                    crate::store::AdmissionReservation::Existing => {
+                        return self.start_turn(app, sid, request)
+                    }
+                    crate::store::AdmissionReservation::Rejected(error) => return Err(error),
+                    crate::store::AdmissionReservation::Waiting => {
+                        if now_ms() >= deadline {
+                            return Err("Prompt admission deadline exceeded".into());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            let _reservation_guard = AdmissionGuard {
+                admissions: self.admissions.clone(),
+                app: app.clone(),
+                mid: mid.clone(),
+                token: token.clone(),
+                cancel: cancel.clone(),
+            };
+            request.admission_token = Some(token.clone());
+            let prepare = async {
+                while !app.store.hook_admission_ready(&mid, &token)? {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err("Aborted".into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let cfg = app.config.lock().unwrap().clone();
+                let context = turn_context(&app, &sid, &request);
+                if let (Some(command), Some(arguments)) =
+                    (request.command.clone(), request.command_arguments.clone())
+                {
+                    if app.hooks.has("command.execute.before") {
+                        let out = app
+                            .hooks
+                            .run(
+                                "command.execute.before",
+                                &context,
+                                json!({"arguments":arguments,"command":command}),
+                                Some(&cancel),
+                            )
+                            .await?;
+                        let arguments = out.input["arguments"]
+                            .as_str()
+                            .ok_or("Command hook arguments must be a string")?;
+                        request = crate::commands::prepare(&cfg, &command, arguments, request)?;
+                        request.admission_token = Some(token.clone());
+                    }
+                    if app.hooks.has("command.expand.after") {
+                        let out = app
+                            .hooks
+                            .run(
+                                "command.expand.after",
+                                &context,
+                                json!({"parts":request.parts}),
+                                Some(&cancel),
+                            )
+                            .await?;
+                        request.parts = out.input["parts"]
+                            .as_array()
+                            .ok_or("Command hook parts must be an array")?
+                            .clone();
+                    }
+                }
+                if app.hooks.has("prompt.accept.before") {
+                    let out = app
+                        .hooks
+                        .run(
+                            "prompt.accept.before",
+                            &context,
+                            json!({"parts":request.parts}),
+                            Some(&cancel),
+                        )
+                        .await?;
+                    request.parts = out.input["parts"]
+                        .as_array()
+                        .ok_or("Prompt hook parts must be an array")?
+                        .clone();
+                }
+                if cancel.load(Ordering::Acquire) {
+                    return Err("Aborted".into());
+                }
+                self.start_turn(app.clone(), sid.clone(), request)
+            };
+            let remaining = std::time::Duration::from_millis(
+                u64::try_from((deadline - now_ms()).max(0)).unwrap_or(0),
+            );
+            let result = match tokio::time::timeout(remaining, prepare).await {
+                Ok(result) => result,
+                Err(_) => Err("Prompt admission deadline exceeded".into()),
+            };
+            self.admissions.lock().unwrap().remove(&mid);
+            if let Err(error) = &result {
+                let _ = app.store.reject_hook_admission(&mid, &token, error);
+                let context = json!({"directory":session.directory,"sessionID":sid,"turnID":mid});
+                app.hooks
+                    .emit("ocmini.prompt.rejected", &context, json!({"reason":error}));
+            }
+            result
+        })
+    }
     fn start_turn(
         &self,
         app: App,
@@ -221,6 +684,7 @@ impl EngineApi for Engine {
     ) -> Result<oneshot::Receiver<Value>, String> {
         crate::blocking::run(|| {
             let session = app.store.get_session(&sid)?.ok_or("Session not found")?;
+            crate::hooks::remember_session(&session);
             let mut guard = self.running.lock().unwrap();
             let mid = request.message_id.clone().unwrap_or_else(|| hex_id("msg_"));
             if mid.is_empty()
@@ -243,6 +707,22 @@ impl EngineApi for Engine {
                 if existing.info.role != "user" {
                     return Err("messageID already belongs to an assistant message".into());
                 }
+                if let Some((value, finalizing)) = app.store.turn_result(&mid)? {
+                    if finalizing {
+                        if let Some(state) = guard.get_mut(&sid) {
+                            state.waiters.entry(mid).or_default().push(tx);
+                            return Ok(rx);
+                        }
+                        // A sibling owns the finalizer. Its prepared result is
+                        // durable, but synchronous completion must still wait
+                        // for the finalizer's terminal commit.
+                        drop(guard);
+                        tokio::spawn(wait_for_finalization(app.store.clone(), mid, tx));
+                        return Ok(rx);
+                    }
+                    let _ = tx.send(value);
+                    return Ok(rx);
+                }
                 if app.store.is_pending_message(&mid)? {
                     if let Some(state) = guard.get_mut(&sid) {
                         state.waiters.entry(mid).or_default().push(tx);
@@ -261,7 +741,16 @@ impl EngineApi for Engine {
                 let _ = tx.send(serde_json::to_value(result).map_err(|e| e.to_string())?);
                 return Ok(rx);
             }
+            if guard
+                .get(&sid)
+                .is_some_and(|state| state.cancel.load(Ordering::Acquire))
+            {
+                return Err("Session is busy aborting pending turns".into());
+            }
             let app = app.for_directory(&session.directory)?;
+            if request.hook_snapshot.is_none() && !app.hooks.is_empty() {
+                request.hook_snapshot = Some(app.hooks.snapshot());
+            }
             let cfg = app.config.lock().unwrap().clone();
             request.message_id = Some(mid.clone());
             let agent = request
@@ -347,7 +836,13 @@ impl EngineApi for Engine {
             if claimed {
                 app.store.claim(&sid)?;
             }
-            if let Err(error) = app.store.admit(&request, &message) {
+            if let Err(error) = app.store.admit(&request, &message).and_then(|inserted| {
+                if inserted {
+                    Ok(())
+                } else {
+                    Err("Duplicate prompt admission race; retry the same messageID".into())
+                }
+            }) {
                 if claimed {
                     app.store.release(&sid);
                 }
@@ -357,6 +852,11 @@ impl EngineApi for Engine {
             for part in &message.parts {
                 emit_part(part);
             }
+            app.hooks.emit(
+                "ocmini.prompt.accepted",
+                &turn_context(&app, &sid, &request),
+                json!({"mode":if request.no_reply{"context"}else{"execution"},"messageID":mid}),
+            );
             // A launcher title ("tui session", "run") says nothing about the chat.
             // Name the session after its first prompt, with the model writing the
             // title in the background when `title_model` is configured.
@@ -368,6 +868,9 @@ impl EngineApi for Engine {
                 return Ok(rx);
             }
             if let Some(state) = guard.get_mut(&sid) {
+                if let Some(gate) = &state.end_gate {
+                    gate.store(true, Ordering::Release);
+                }
                 state.waiters.entry(mid).or_default().push(tx);
                 return Ok(rx);
             }
@@ -390,9 +893,25 @@ impl EngineApi for Engine {
                 if !visited.insert(id.clone()) {
                     continue;
                 }
+                for admission in self
+                    .admissions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|a| a.session_id == id)
+                {
+                    admission.cancel.store(true, Ordering::Release);
+                    let _ = admission.app.store.cancel_hook_admissions(&id);
+                }
                 crate::tools::cancel_background_jobs(&id);
                 if let Some(state) = running.get(&id) {
                     state.cancel.store(true, Ordering::Release);
+                    // This also rejects reservations held by sibling
+                    // instances, even when there are no local input hooks.
+                    let _ = state.app.store.cancel_hook_admissions(&id);
+                    if let Some(gate) = &state.end_gate {
+                        gate.store(true, Ordering::Release);
+                    }
                     state.app.perms.reject_all(&id);
                     state.app.questions.reject_all(&id);
                     queue.extend(
@@ -415,9 +934,9 @@ impl EngineApi for Engine {
         sid: String,
         request: PromptRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>> {
-        let admitted = self.start_turn(app, sid, request);
+        let engine = self.clone();
         Box::pin(async move {
-            let value = admitted?.await.map_err(|_| {
+            let value = engine.admit(app, sid, request).await?.await.map_err(|_| {
                 "Session execution stopped before a response was produced".to_string()
             })?;
             if let Some(error) = value["error"].as_str() {
@@ -704,6 +1223,80 @@ fn compaction_messages(
 /// persist it as a summary message. build_messages restarts history from the
 /// newest summary, so the next request carries the summary instead of the
 /// transcript that overflowed the provider's context window.
+async fn compaction_prompt(
+    app: &App,
+    context: &Value,
+    default: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    if !app.hooks.has("compaction.before") {
+        return Ok(default.into());
+    }
+    let result = app
+        .hooks
+        .run(
+            "compaction.before",
+            context,
+            json!({"context":[],"prompt":null}),
+            Some(cancel),
+        )
+        .await?;
+    let mut prompt = match &result.input["prompt"] {
+        Value::Null => default.to_string(),
+        Value::String(text) => text.clone(),
+        _ => return Err("Compaction hook prompt must be text or null".into()),
+    };
+    for value in result.input["context"]
+        .as_array()
+        .ok_or("Compaction context must be an array")?
+    {
+        prompt.push_str("\n\n");
+        prompt.push_str(
+            value
+                .as_str()
+                .ok_or("Compaction context entries must be text")?,
+        );
+    }
+    if prompt.trim().is_empty() {
+        return Err("Compaction hook prompt must not be empty".into());
+    }
+    Ok(prompt)
+}
+
+async fn compaction_summary(
+    app: &App,
+    context: &Value,
+    summary: String,
+    source_bytes: usize,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let text = if app.hooks.has("compaction.after") {
+        let result = app
+            .hooks
+            .run(
+                "compaction.after",
+                context,
+                json!({"summary":summary}),
+                Some(cancel),
+            )
+            .await?;
+        let text = result.input["summary"]
+            .as_str()
+            .ok_or("Compaction summary must be text")?
+            .to_string();
+        if context["turnKind"] != "compaction" && text.len() >= source_bytes {
+            return Err("Transformed compaction summary did not shrink the context".into());
+        }
+        text
+    } else {
+        summary
+    };
+    if text.trim().is_empty() {
+        return Err("Provider returned an empty compaction summary".into());
+    }
+    Ok(text)
+}
+
 async fn compact_history(
     app: &App,
     adapter: &dyn provider::ProviderAdapter,
@@ -712,6 +1305,42 @@ async fn compact_history(
     has_summary: bool,
     policy: &CompactionPolicy,
     cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let session = app.store.get_session(&current.session_id)?;
+    let context = json!({"directory":session.as_ref().map(|s|s.directory.as_str()),"parentID":session.and_then(|s|s.parent_id),"sessionID":current.session_id,"turnID":current.parent_id,"messageID":current.id,"agent":current.agent,"model":{"providerID":current.provider_id,"modelID":current.model_id},"turnKind":"primary","requestKind":"compaction","requestID":hex_id("req_")});
+    app.hooks.emit(
+        "ocmini.compaction.started",
+        &context,
+        json!({"mode":"automatic"}),
+    );
+    let result = compact_history_inner(
+        app,
+        adapter,
+        current,
+        messages,
+        has_summary,
+        policy,
+        cancel,
+        &context,
+    )
+    .await;
+    if let Err(error) = &result {
+        app.hooks
+            .emit("ocmini.compaction.failed", &context, json!({"error":error}));
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compact_history_inner(
+    app: &App,
+    adapter: &dyn provider::ProviderAdapter,
+    current: &MessageInfo,
+    messages: Vec<Value>,
+    has_summary: bool,
+    policy: &CompactionPolicy,
+    cancel: &Arc<AtomicBool>,
+    context: &Value,
 ) -> Result<(), String> {
     let sid = &current.session_id;
     let (mut request_messages, recent) = compaction_messages(messages, has_summary, policy);
@@ -730,14 +1359,17 @@ async fn compact_history(
     }
     request_messages
         .push(json!({"role": "user", "content": "Produce the continuation summary now."}));
-    let request = ChatRequest {
+    let source_bytes = request_messages.iter().map(|v| v.to_string().len()).sum();
+    let mut request = ChatRequest {
         model: current.model_id.clone().ok_or("Missing compaction model")?,
-        system: COMPACTION_PROMPT.into(),
+        system: compaction_prompt(app, context, COMPACTION_PROMPT, cancel).await?,
         messages: request_messages,
         tools: Vec::new(),
         variant: None,
         session_id: Some(sid.into()),
+        ..Default::default()
     };
+    provider::prepare_hooks(app, context, &mut request, Some(cancel)).await?;
     // The summary request carries most of the window, so it is the largest and
     // slowest request of the turn. OpenCode sends it through the same retry
     // policy as a model step; the transport deaths the main loop retries must
@@ -747,17 +1379,40 @@ async fn compact_history(
     let mut attempt = 0u32;
     'summary: loop {
         summary.clear();
+        app.hooks
+            .emit("ocmini.model.started", context, json!({"attempt":attempt}));
         let mut stream = match tokio::select! {
             result = adapter.stream(&request) => result,
             _ = cancelled(cancel) => return Err("Aborted".into()),
         } {
             Ok(stream) => stream,
             Err(error) if error.retryable && attempt < MAX_RETRIES => {
+                app.hooks.emit(
+                    "ocmini.model.failed",
+                    context,
+                    json!({"error":error.message,"attempt":attempt}),
+                );
                 attempt += 1;
-                wait_retry(app, sid, &error.message, error.retry_after, attempt, cancel).await?;
+                wait_retry(
+                    app,
+                    sid,
+                    &error.message,
+                    error.retry_after,
+                    attempt,
+                    cancel,
+                    context,
+                )
+                .await?;
                 continue 'summary;
             }
-            Err(error) => return Err(error.message),
+            Err(error) => {
+                app.hooks.emit(
+                    "ocmini.model.failed",
+                    context,
+                    json!({"error":error.message,"attempt":attempt}),
+                );
+                return Err(error.message);
+            }
         };
         let mut failure: Option<String> = None;
         let mut finished = false;
@@ -767,7 +1422,12 @@ async fn compact_history(
         } {
             match event {
                 ProviderEvent::TextDelta(delta) => summary.push_str(&delta),
-                ProviderEvent::Finished { .. } => {
+                ProviderEvent::Finished { finish, usage } => {
+                    app.hooks.emit(
+                        "ocmini.model.completed",
+                        context,
+                        json!({"finish":finish,"tokens":usage,"attempt":attempt}),
+                    );
                     finished = true;
                     break;
                 }
@@ -786,17 +1446,20 @@ async fn compact_history(
             None if finished => break 'summary,
             None => "provider compaction stream ended before a completion event".to_string(),
         };
+        app.hooks.emit(
+            "ocmini.model.failed",
+            context,
+            json!({"error":error,"attempt":attempt}),
+        );
         if provider::stream_retryable(&error) && attempt < MAX_RETRIES {
             attempt += 1;
-            wait_retry(app, sid, &error, None, attempt, cancel).await?;
+            wait_retry(app, sid, &error, None, attempt, cancel, context).await?;
             continue 'summary;
         }
         return Err(error);
     }
-    let text = summary.trim();
-    if text.is_empty() {
-        return Err("provider returned an empty compaction summary".into());
-    }
+    let summary = provider::complete_text(app, context, summary, Some(cancel)).await?;
+    let text = compaction_summary(app, context, summary, source_bytes, cancel).await?;
     let now = now_ms();
     let mid = hex_id("msg_");
     let mut part = json!({"id": hex_id("prt_"), "sessionID": sid, "messageID": mid, "type": "text", "text": text, "time": {"start": now, "end": now}});
@@ -842,7 +1505,9 @@ async fn run_turn(
     cancel: Arc<AtomicBool>,
 ) -> Result<Value, String> {
     let session = app.store.get_session(sid)?.ok_or("Session not found")?;
-    let app = app.for_directory(&session.directory)?;
+    let mut scoped = app.for_directory(&session.directory)?;
+    scoped.hooks = app.hooks.clone();
+    let app = scoped;
     let uid = request
         .message_id
         .as_deref()
@@ -851,6 +1516,31 @@ async fn run_turn(
         .model
         .as_ref()
         .ok_or("Admitted prompt has no model")?;
+    let mut hook_context = turn_context(&app, sid, &request);
+    let compact = request.command.as_deref() == Some("__ocmini_compact");
+    hook_context["requestKind"] = json!(if compact { "compaction" } else { "primary" });
+    app.hooks.emit(
+        "ocmini.turn.started",
+        &hook_context,
+        json!({"messageID":uid}),
+    );
+    let extra_context = if app.hooks.has("turn.start.before") {
+        let result = app
+            .hooks
+            .run(
+                "turn.start.before",
+                &hook_context,
+                json!({"context":""}),
+                Some(&cancel),
+            )
+            .await?;
+        result.input["context"]
+            .as_str()
+            .ok_or("Turn context must be a string")?
+            .to_string()
+    } else {
+        String::new()
+    };
     let mut cfg = app.config.lock().unwrap().clone();
     if cfg
         .provider(&model.provider_id)
@@ -876,12 +1566,21 @@ async fn run_turn(
         result=system_prompt(&cfg,&session.directory,agent,request.system.as_deref())=>result?,
         _=cancelled(&cancel)=>return Err("Aborted".into()),
     };
+    if !extra_context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&extra_context);
+    }
     if read_only {
         system.push_str("\n\nThis is a read-only analysis session. Use the supplied reading and search tools. Do not modify files or request execution tools.");
     }
     if compact {
+        app.hooks.emit(
+            "ocmini.compaction.started",
+            &hook_context,
+            json!({"mode":"manual"}),
+        );
         system.push_str("\n\n");
-        system.push_str(COMPACTION_PROMPT);
+        system.push_str(&compaction_prompt(&app, &hook_context, COMPACTION_PROMPT, &cancel).await?);
     }
     if request.command.is_some() && !compact {
         expand_shell_templates(&app, engine.clone(), &session, &request, &cfg, &cancel).await?;
@@ -901,6 +1600,7 @@ async fn run_turn(
         tools: Vec::new(),
         variant: request.variant.clone(),
         session_id: Some(sid.into()),
+        ..Default::default()
     };
     let chat = tokio::select! {
         result = adapter.protocol_of(&protocol_probe) => matches!(result, Ok(provider::Protocol::Chat)),
@@ -917,6 +1617,43 @@ async fn run_turn(
             && tool_enabled(name, agent, &cfg, &request)
             && !(read_only && (execution_tool(name) || app.mcp.route(name).is_some()))
     });
+    if app.hooks.has("tool.catalog.transform") {
+        let original = defs
+            .iter()
+            .filter_map(|d| Some((d["function"]["name"].as_str()?.to_string(), d.clone())))
+            .collect::<HashMap<_, _>>();
+        let result = app
+            .hooks
+            .run(
+                "tool.catalog.transform",
+                &hook_context,
+                json!({"tools":defs}),
+                Some(&cancel),
+            )
+            .await?;
+        defs = result.input["tools"]
+            .as_array()
+            .ok_or("Tool catalog hook must return an array")?
+            .clone();
+        let mut names = HashSet::new();
+        for def in &defs {
+            let name = def["function"]["name"]
+                .as_str()
+                .ok_or("Tool catalog has no name")?;
+            let prior = original
+                .get(name)
+                .ok_or("Tool catalog hook cannot expose an unavailable tool")?;
+            if !names.insert(name)
+                || def["function"]["parameters"] != prior["function"]["parameters"]
+                || def["type"] != prior["type"]
+                || !def["function"]["description"].is_string()
+            {
+                return Err(
+                    "Tool catalog hook changed an executable schema or duplicated a tool".into(),
+                );
+            }
+        }
+    }
     let allowed: HashSet<String> = defs
         .iter()
         .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
@@ -927,6 +1664,7 @@ async fn run_turn(
         .and_then(|a| a["steps"].as_u64().or_else(|| a["maxSteps"].as_u64()))
         .map(|steps| steps.max(1));
     let mut step = 0u64;
+    let mut end_continuations = 0u32;
     let mut recent_calls = VecDeque::new();
     let mut compaction = CompactionPolicy::for_model(&cfg, model);
     // A turn runs until completion, steering or cancellation unless the user
@@ -951,6 +1689,9 @@ async fn run_turn(
         }
         let now = now_ms();
         let amid = hex_id("msg_");
+        hook_context["step"] = json!(step);
+        hook_context["messageID"] = json!(amid);
+        hook_context["requestID"] = json!(hex_id("req_"));
         let mut info = MessageInfo {
             id: amid.clone(),
             session_id: sid.into(),
@@ -989,7 +1730,14 @@ async fn run_turn(
             tools: defs.clone(),
             variant: request.variant.clone(),
             session_id: Some(sid.into()),
+            ..Default::default()
         };
+        if let Err(error) =
+            provider::prepare_hooks(&app, &hook_context, &mut req, Some(&cancel)).await
+        {
+            fail_message(&app, &mut info, &error, cancel.load(Ordering::Acquire))?;
+            return Err(error);
+        }
         let (mut text_part, mut tool_parts, metadata, finished) = 'attempt: loop {
             let mut text_part: Option<StreamedPart> = None;
             let mut reasoning_part: Option<StreamedPart> = None;
@@ -997,10 +1745,23 @@ async fn run_turn(
             let mut metadata = Value::Null;
             let mut finished = None;
             let mut failure: Option<(String, bool)> = None; // (message, mid-stream)
+            hook_context["attempt"] = json!(attempt);
+            app.hooks.emit(
+                "ocmini.model.started",
+                &hook_context,
+                json!({"attempt":attempt,"step":step,"requestKind":hook_context["requestKind"]}),
+            );
             let opened = tokio::select! {
                 result = adapter.stream(&req) => result,
                 _ = cancelled(&cancel) => Err(crate::provider::ProviderError::fatal("Aborted")),
             };
+            if let Err(error) = &opened {
+                app.hooks.emit(
+                    "ocmini.model.failed",
+                    &hook_context,
+                    json!({"error":error.message,"retryable":error.retryable,"attempt":attempt}),
+                );
+            }
             match opened {
                 Ok(mut stream) => {
                     loop {
@@ -1075,6 +1836,11 @@ async fn run_turn(
                         Some(failure) => failure,
                         None => break 'attempt (text_part, tool_parts, metadata, finished),
                     };
+                    app.hooks.emit(
+                        "ocmini.model.failed",
+                        &hook_context,
+                        json!({"error":error,"attempt":attempt,"midStream":mid_stream}),
+                    );
                     // Flaky connections kill streams mid-body, usually right after
                     // headers arrive. Nothing executed yet, so a fresh request is safe.
                     let transient = mid_stream
@@ -1090,7 +1856,8 @@ async fn run_turn(
                         }
                         attempt += 1;
                         if let Err(error) =
-                            wait_retry(&app, sid, &error, None, attempt, &cancel).await
+                            wait_retry(&app, sid, &error, None, attempt, &cancel, &hook_context)
+                                .await
                         {
                             fail_message(&app, &mut info, &error, true)?;
                             return Err(error);
@@ -1122,6 +1889,7 @@ async fn run_turn(
                         error.retry_after,
                         attempt,
                         &cancel,
+                        &hook_context,
                     )
                     .await
                     {
@@ -1172,6 +1940,27 @@ async fn run_turn(
                                 if compact {
                                     req.messages.push(json!({"role":"user","content":"Produce the continuation summary now."}));
                                 }
+                                req.system = system.clone();
+                                req.options = Value::Null;
+                                req.headers.clear();
+                                req.variant = request.variant.clone();
+                                hook_context["requestID"] = json!(hex_id("req_"));
+                                if let Err(error) = provider::prepare_hooks(
+                                    &app,
+                                    &hook_context,
+                                    &mut req,
+                                    Some(&cancel),
+                                )
+                                .await
+                                {
+                                    fail_message(
+                                        &app,
+                                        &mut info,
+                                        &error,
+                                        cancel.load(Ordering::Acquire),
+                                    )?;
+                                    return Err(error);
+                                }
                                 continue 'attempt;
                             }
                             Err(compact_error) => {
@@ -1191,7 +1980,38 @@ async fn run_turn(
             }
         };
         drop(req);
+        if let Some(part) = &mut text_part {
+            if app.hooks.matches("message.text.complete", &hook_context) {
+                let before = part.part["text"].as_str().unwrap_or_default().to_string();
+                match provider::complete_text(&app, &hook_context, before.clone(), Some(&cancel))
+                    .await
+                {
+                    Ok(text) => {
+                        if text != before {
+                            part.part["text"] = json!(text);
+                            part.part["ocminiTextTransformed"] = json!(true);
+                            app.store.update_part(sid, &part.part)?;
+                            emit_part(&part.part);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some((finish, usage)) = &finished {
+                            record_failed_hook_step(
+                                &app, &cfg, model, &mut info, finish, usage, now,
+                            )?;
+                        }
+                        fail_message(&app, &mut info, &error, cancel.load(Ordering::Acquire))?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
         let (finish, usage) = finished.ok_or("Provider stream did not complete")?;
+        app.hooks.emit(
+            "ocmini.model.completed",
+            &hook_context,
+            json!({"finish":finish,"tokens":usage,"attempt":attempt}),
+        );
         let cost = cost_for(&cfg, model, &usage);
         info.tokens = Some(usage.clone());
         info.cost = Some(cost);
@@ -1208,12 +2028,10 @@ async fn run_turn(
                 continue;
             }
             let name = part["tool"].as_str().unwrap_or_default().to_string();
-            let input = part["state"]["input"].clone();
+            let original_input = part["state"]["input"].clone();
             let start = now_ms();
-            part["state"] = json!({"status":"running","input":input,"time":{"start":start}});
-            app.store.update_part(sid, part)?;
-            emit_part(part);
             let ctx = ToolCtx {
+                hook_context: hook_context.clone(),
                 dir: session.directory.clone(),
                 app: app.clone(),
                 session_id: sid.into(),
@@ -1223,13 +2041,29 @@ async fn run_turn(
                 call_id: part["callID"].as_str().unwrap_or_default().into(),
                 part_id: part["id"].as_str().unwrap_or_default().into(),
             };
-            let signature = format!("{name}:{}", input);
+            let prepared =
+                prepare_effective_input(&ctx, &name, original_input, &cfg, &request).await;
+            let (input, preparation_error) = match prepared {
+                Ok(input) => (input, None),
+                Err(error) => (part["state"]["input"].clone(), Some(error)),
+            };
+            let visible_input = public_tool_input(&input);
+            if visible_input.as_ref() != &part["state"]["input"] {
+                part["ocminiOriginalInput"] = part["state"]["input"].take();
+            }
+            part["state"] =
+                json!({"status":"running","input":visible_input,"time":{"start":start}});
+            app.store.update_part(sid, part)?;
+            emit_part(part);
+            let signature = format!("{name}:{}", visible_input);
             recent_calls.push_back(signature.clone());
             if recent_calls.len() > 3 {
                 recent_calls.pop_front();
             }
             let repeated = recent_calls.len() == 3 && recent_calls.iter().all(|s| s == &signature);
-            let output = if !allowed.contains(&name) {
+            let output = if let Some(error) = preparation_error {
+                Err(error)
+            } else if !allowed.contains(&name) {
                 Err(ToolError {
                     message: format!("Tool '{name}' is not enabled for agent '{agent}'"),
                 })
@@ -1252,14 +2086,15 @@ async fn run_turn(
                 .unwrap_or_else(|| json!({}));
             part["state"] = match output {
                 Ok(out) => {
-                    json!({"status":"completed","input":input,"output":out.output,"title":out.title,"metadata":out.metadata,"time":{"start":start,"end":now_ms()}})
+                    json!({"status":"completed","input":visible_input,"output":out.output,"title":out.title,"metadata":out.metadata,"time":{"start":start,"end":now_ms()}})
                 }
                 Err(error) => {
-                    json!({"status":"error","input":input,"error":error.message,"metadata":running_metadata,"time":{"start":start,"end":now_ms()}})
+                    json!({"status":"error","input":visible_input,"error":error.message,"metadata":running_metadata,"time":{"start":start,"end":now_ms()}})
                 }
             };
             app.store.update_part(sid, part)?;
             emit_part(part);
+            app.hooks.emit(if part["state"]["status"]=="completed"{"ocmini.tool.completed"}else{"ocmini.tool.failed"},&tool_context(&ctx,&name,&request),json!({"callID":ctx.call_id,"messageID":amid,"partID":ctx.part_id,"error":part["state"]["error"]}));
             if cancel.load(Ordering::Acquire) {
                 break;
             }
@@ -1276,6 +2111,28 @@ async fn run_turn(
             }
             fail_message(&app, &mut info, "Aborted", true)?;
             return Err("Aborted".into());
+        }
+        if compact {
+            if let Some(part) = &mut text_part {
+                let original = part.part["text"].as_str().unwrap_or_default().to_string();
+                let summary =
+                    match compaction_summary(&app, &hook_context, original, usize::MAX, &cancel)
+                        .await
+                    {
+                        Ok(text) => text,
+                        Err(error) => {
+                            record_failed_hook_step(
+                                &app, &cfg, model, &mut info, &finish, &usage, now,
+                            )?;
+                            fail_message(&app, &mut info, &error, false)?;
+                            return Err(error);
+                        }
+                    };
+                part.part["text"] = json!(summary);
+                part.part[provider::TEXT_TRANSFORMED] = json!(true);
+                app.store.update_part(sid, &part.part)?;
+                emit_part(&part.part);
+            }
         }
         let finish = match finish.as_str() {
             "tool_calls" | "tool_use" => "tool-calls",
@@ -1363,6 +2220,98 @@ async fn run_turn(
             }
         }
         if tool_parts.is_empty() || app.store.has_waiting(sid)? {
+            if tool_parts.is_empty()
+                && !app.store.has_waiting(sid)?
+                && !cancel.load(Ordering::Acquire)
+            {
+                hook_context["messageID"] = json!(amid);
+                hook_context["endAttempt"] = json!(end_continuations + 1);
+                app.hooks.emit(
+                    "ocmini.turn.end.requested",
+                    &hook_context,
+                    json!({"endAttempt":end_continuations+1,"messageID":amid}),
+                );
+                if app.hooks.has("turn.end.before") {
+                    let Some(gate_cancel) = engine.begin_end_gate(&app, sid)? else {
+                        if cancel.load(Ordering::Acquire) {
+                            return Err("Aborted".into());
+                        }
+                        return Ok(response);
+                    };
+                    let gate_guard = EndGateGuard {
+                        engine: engine.clone(),
+                        session_id: sid.to_owned(),
+                        token: gate_cancel.clone(),
+                    };
+                    let text = response["parts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| p["type"] == "text")
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let gate = app
+                        .hooks
+                        .run(
+                            "turn.end.before",
+                            &hook_context,
+                            json!({"reason":"completed","response":{"text":text,"messageID":amid}}),
+                            Some(&gate_cancel),
+                        )
+                        .await;
+                    drop(gate_guard);
+                    let feedback = match gate {
+                        Ok(value) => value.feedback,
+                        Err(ref error)
+                            if gate_cancel.load(Ordering::Acquire)
+                                && !cancel.load(Ordering::Acquire)
+                                && error
+                                    .lines()
+                                    .next()
+                                    .is_some_and(|line| line.ends_with(": hook cancelled"))
+                                && app.store.has_waiting(sid)? =>
+                        {
+                            None
+                        }
+                        Err(error) => {
+                            fail_message(&app, &mut info, &error, cancel.load(Ordering::Acquire))?;
+                            return Err(error);
+                        }
+                    };
+                    if let Some(feedback) = feedback {
+                        if cancel.load(Ordering::Acquire) {
+                            return Err("Aborted".into());
+                        }
+                        if engine.allow_hook_continuation(&app, sid)? {
+                            if app
+                                .hooks
+                                .max_end_continuations()
+                                .is_some_and(|limit| end_continuations >= limit)
+                            {
+                                let error = "Turn hook continuation limit reached";
+                                fail_message(&app, &mut info, error, false)?;
+                                return Err(error.into());
+                            }
+                            if max_steps.is_some_and(|limit| step >= limit) {
+                                let error = format!(
+                                    "Agent step limit ({step}) reached before hook continuation"
+                                );
+                                fail_message(&app, &mut info, &error, false)?;
+                                return Err(error);
+                            }
+                            end_continuations =
+                                app.store.append_hook_feedback(uid, &amid, &feedback)?;
+                            app.hooks.emit(
+                                "ocmini.turn.continued",
+                                &hook_context,
+                                json!({"endAttempt":end_continuations,"messageID":amid}),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
             if compaction.settings.prune == Some(true) {
                 let (store, sid_text, uid_text) =
                     (app.store.clone(), sid.to_string(), uid.to_string());
@@ -1439,8 +2388,30 @@ async fn wait_retry(
     retry_after: Option<std::time::Duration>,
     attempt: u32,
     cancel: &Arc<AtomicBool>,
+    context: &Value,
 ) -> Result<(), String> {
-    let delay = retry_delay(retry_after, attempt);
+    let mut delay = retry_delay(retry_after, attempt).min(std::time::Duration::from_secs(120));
+    if app.hooks.has("model.retry.before") {
+        let result = app
+            .hooks
+            .run(
+                "model.retry.before",
+                context,
+                json!({"delayMs":delay.as_millis() as u64,"attempt":attempt,"error":message}),
+                Some(cancel),
+            )
+            .await?;
+        let millis = result.input["delayMs"]
+            .as_u64()
+            .filter(|ms| *ms <= 120_000)
+            .ok_or("Retry hook delay must be 0–120000 milliseconds")?;
+        delay = std::time::Duration::from_millis(millis);
+    }
+    app.hooks.emit(
+        "ocmini.model.retrying",
+        context,
+        json!({"attempt":attempt,"delayMs":delay.as_millis() as u64}),
+    );
     update_status(
         app,
         sid,
@@ -1469,6 +2440,46 @@ fn retry_delay(retry_after: Option<std::time::Duration>, attempt: u32) -> std::t
     let jitter =
         std::time::Duration::from_millis(rand::random::<u64>() % (base.as_millis() as u64 / 4 + 1));
     delay + jitter
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_failed_hook_step(
+    app: &App,
+    cfg: &Config,
+    model: &ModelRef,
+    info: &mut MessageInfo,
+    finish: &str,
+    usage: &Tokens,
+    created: i64,
+) -> Result<(), String> {
+    let cost = cost_for(cfg, model, usage);
+    info.tokens = Some(usage.clone());
+    info.cost = Some(cost);
+    info.finish = Some(finish.into());
+    let step = json!({"id":hex_id("prt_"),"sessionID":info.session_id,"messageID":info.id,"type":"step-finish","reason":finish,"cost":cost,"tokens":usage});
+    app.store.update_part(&info.session_id, &step)?;
+    emit_part(&step);
+    app.usage.record(
+        &info.id,
+        &info.session_id,
+        &model.provider_id,
+        &model.model_id,
+        usage,
+        created,
+    );
+    record_session_usage(app, &info.session_id, usage, cost)?;
+    if let Some(message) = app.store.message(&info.session_id, &info.id)? {
+        for mut part in message.parts.into_iter().filter(|p| {
+            p["type"] == "tool"
+                && ["pending", "running"]
+                    .contains(&p["state"]["status"].as_str().unwrap_or_default())
+        }) {
+            part["state"] = json!({"status":"error","input":part["state"]["input"],"error":"Response processing failed before tool execution","metadata":{"executionOccurred":false},"time":{"start":now_ms(),"end":now_ms()}});
+            app.store.update_part(&info.session_id, &part)?;
+            emit_part(&part);
+        }
+    }
+    Ok(())
 }
 
 fn fail_message(
@@ -1717,12 +2728,12 @@ fn build_messages(
             tail.push(json!({"role":"user","content":attachments}));
         }
         if chat {
-            let run = run.get_or_insert_with(ChatRun::default);
+            let chat_run = run.get_or_insert_with(ChatRun::default);
             if !text.is_empty() {
-                run.texts.push(text);
+                chat_run.texts.push(text);
             }
             for part in &calls {
-                run.calls.push(json!({"id":part["callID"],"type":"function","function":{"name":part["tool"],"arguments":part["state"]["input"].to_string()}}));
+                chat_run.calls.push(json!({"id":part["callID"],"type":"function","function":{"name":part["tool"],"arguments":part["state"]["input"].to_string()}}));
             }
             if let Some(meta) = metadata
                 .as_ref()
@@ -1732,15 +2743,31 @@ fn build_messages(
                 for key in ["reasoning_content", "reasoning", "reasoning_text"] {
                     if let Some(value) = meta[key].as_str() {
                         if !value.is_empty() {
-                            run.reasoning.push((key.to_string(), value.to_string()));
+                            chat_run
+                                .reasoning
+                                .push((key.to_string(), value.to_string()));
                         }
                     }
                 }
                 if let Some(list) = meta["reasoning_details"].as_array() {
-                    run.details.extend(list.iter().cloned());
+                    chat_run.details.extend(list.iter().cloned());
                 }
             }
-            run.tail.extend(tail);
+            chat_run.tail.extend(tail);
+            if let Some(feedback) = message
+                .info
+                .extra
+                .get("ocminiHookFeedback")
+                .and_then(Value::as_array)
+            {
+                flush_chat_run(&mut out, run.take());
+                out.extend(
+                    feedback
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|text| json!({"role":"user","content":text})),
+                );
+            }
             continue;
         }
         if text.is_empty() && calls.is_empty() && metadata.is_none() {
@@ -1754,8 +2781,29 @@ fn build_messages(
         if let Some(metadata) = metadata {
             value["providerMetadata"] = metadata;
         }
+        if message
+            .parts
+            .iter()
+            .any(|part| part[provider::TEXT_TRANSFORMED] == true)
+        {
+            value[provider::TEXT_TRANSFORMED] = json!(true);
+            provider::reconcile_text(&mut value)?;
+        }
         out.push(value);
         out.extend(tail);
+        if let Some(feedback) = message
+            .info
+            .extra
+            .get("ocminiHookFeedback")
+            .and_then(Value::as_array)
+        {
+            out.extend(
+                feedback
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|text| json!({"role":"user","content":text})),
+            );
+        }
     }
     flush_chat_run(&mut out, run.take());
     Ok((out, summary.is_some()))
@@ -2013,7 +3061,168 @@ fn permission_rules(
     rules
 }
 
+fn public_tool_input(input: &Value) -> std::borrow::Cow<'_, Value> {
+    if !input
+        .as_object()
+        .is_some_and(|map| map.keys().any(|key| key.starts_with("_ocmini")))
+    {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut value = input.clone();
+    if let Some(map) = value.as_object_mut() {
+        map.retain(|key, _| !key.starts_with("_ocmini"));
+    }
+    std::borrow::Cow::Owned(value)
+}
+
+fn tool_context(ctx: &ToolCtx, name: &str, _request: &PromptRequest) -> Value {
+    let mut context = ctx.hook_context.clone();
+    context["tool"] = json!(name);
+    context["messageID"] = json!(ctx.message_id);
+    context["callID"] = json!(ctx.call_id);
+    context["requestKind"] = json!("primary");
+    context
+}
+
+async fn prepare_effective_input(
+    ctx: &ToolCtx,
+    name: &str,
+    mut input: Value,
+    cfg: &Config,
+    request: &PromptRequest,
+) -> Result<Value, ToolError> {
+    let fail = |message| ToolError { message };
+    let agent = request.agent.as_deref().unwrap_or("build");
+    if !input.is_object() {
+        return Err(fail("Tool input must be an object".into()));
+    }
+    if input
+        .as_object()
+        .is_some_and(|map| map.keys().any(|key| key.starts_with("_ocmini")))
+    {
+        return Err(fail("Reserved internal tool argument".into()));
+    }
+    if !tool_enabled(name, agent, cfg, request)
+        || (["plan", "explore"].contains(&agent)
+            && (execution_tool(name) || ctx.app.mcp.route(name).is_some()))
+    {
+        return Err(fail(format!("Tool '{name}' is disabled for this request")));
+    }
+    if ctx
+        .app
+        .hooks
+        .matches("tool.execute.before", &tool_context(ctx, name, request))
+    {
+        let result = ctx
+            .app
+            .hooks
+            .run(
+                "tool.execute.before",
+                &tool_context(ctx, name, request),
+                json!({"args":input}),
+                Some(&ctx.cancel),
+            )
+            .await
+            .map_err(fail)?;
+        input = result.input["args"].clone();
+        if !input.is_object()
+            || input
+                .as_object()
+                .is_some_and(|map| map.keys().any(|key| key.starts_with("_ocmini")))
+        {
+            return Err(fail("Invalid transformed tool arguments".into()));
+        }
+    }
+    tools::prepare_input(ctx, name, input).await
+}
+
 async fn execute_tool(
+    ctx: &ToolCtx,
+    name: &str,
+    input: &Value,
+    cfg: &Config,
+    request: &PromptRequest,
+    repeated: bool,
+) -> Result<ToolOutput, ToolError> {
+    let result = execute_authorized_tool(ctx, name, input, cfg, request, repeated).await;
+    let mut context = tool_context(ctx, name, request);
+    context["outcome"] = json!(if result.is_ok() { "completed" } else { "error" });
+    if !ctx.app.hooks.matches("tool.execute.after", &context) {
+        return result;
+    }
+    match result {
+        Ok(out) => {
+            let protected = out.metadata.clone();
+            let transformed=ctx.app.hooks.run("tool.execute.after",&context,json!({"status":"completed","args":public_tool_input(input),"output":out.output,"title":out.title,"metadata":out.metadata}),Some(&ctx.cancel)).await;
+            let convert = async {
+                let result = transformed.map_err(|e| ToolError { message: e })?;
+                let metadata = result.input["metadata"].clone();
+                if !metadata.is_object() {
+                    return Err(ToolError {
+                        message: "Tool hook metadata must be an object".into(),
+                    });
+                }
+                for &key in crate::hooks::protected_tool_metadata() {
+                    if metadata[key] != protected[key] {
+                        return Err(ToolError {
+                            message: format!("Tool hook cannot modify protected metadata '{key}'"),
+                        });
+                    }
+                }
+                let output_changed = result.input["output"].as_str() != Some(out.output.as_str());
+                let out = ToolOutput {
+                    output: result.input["output"]
+                        .as_str()
+                        .ok_or_else(|| ToolError {
+                            message: "Tool hook output must be text".into(),
+                        })?
+                        .into(),
+                    title: result.input["title"]
+                        .as_str()
+                        .ok_or_else(|| ToolError {
+                            message: "Tool hook title must be text".into(),
+                        })?
+                        .into(),
+                    metadata,
+                };
+                if output_changed {
+                    tools::limit_output(&ctx.dir, out).await
+                } else {
+                    Ok(out)
+                }
+            }
+            .await;
+            match convert {
+                Ok(out) => Ok(out),
+                Err(error) => {
+                    let mut metadata = protected;
+                    if !metadata.is_object() {
+                        metadata = json!({});
+                    }
+                    metadata["executionOccurred"] = json!(true);
+                    metadata["resultHookError"] = json!(error.message);
+                    let _ = ctx.update_metadata(metadata);
+                    Err(ToolError{message:format!("Tool effects already completed; result processing failed: {}. Do not repeat the operation solely to recover its output.",error.message)})
+                }
+            }
+        }
+        Err(error) => {
+            let _ = ctx
+                .app
+                .hooks
+                .run(
+                    "tool.execute.after",
+                    &context,
+                    json!({"status":"error","args":public_tool_input(input),"error":error.message}),
+                    Some(&ctx.cancel),
+                )
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn execute_authorized_tool(
     ctx: &ToolCtx,
     name: &str,
     input: &Value,
@@ -2087,6 +3296,11 @@ async fn execute_tool(
     for pattern in patterns {
         check_permission(ctx, &rules, permission, &pattern, name, input).await?;
     }
+    ctx.app.hooks.emit(
+        "ocmini.tool.started",
+        &tool_context(ctx, name, request),
+        json!({"callID":ctx.call_id,"messageID":ctx.message_id,"partID":ctx.part_id,"name":name}),
+    );
     tools::run_tool(ctx, name, input).await
 }
 
@@ -2101,7 +3315,47 @@ async fn check_permission(
     let denied = || ToolError {
         message: format!("Permission '{permission}' denied for {pattern}"),
     };
-    match crate::permission::decide(rules, permission, pattern) {
+    let original = crate::permission::decide(rules, permission, pattern);
+    let mut decision = original.to_string();
+    let mut context = ctx.hook_context.clone();
+    context["tool"] = json!(tool);
+    context["messageID"] = json!(ctx.message_id);
+    context["callID"] = json!(ctx.call_id);
+    context["requestKind"] = json!("primary");
+    if ctx.app.hooks.has("permission.decide") {
+        let result = ctx
+            .app
+            .hooks
+            .run(
+                "permission.decide",
+                &context,
+                json!({"permission":permission,"pattern":pattern,"decision":decision}),
+                Some(&ctx.cancel),
+            )
+            .await
+            .map_err(|message| ToolError { message })?;
+        let proposed = result.input["decision"].as_str().ok_or_else(|| ToolError {
+            message: "Invalid permission hook decision".into(),
+        })?;
+        let rank = |value: &str| match value {
+            "allow" => Some(0),
+            "ask" => Some(1),
+            "deny" => Some(2),
+            _ => None,
+        };
+        if rank(proposed).is_none() || rank(proposed) < rank(original) {
+            return Err(ToolError {
+                message: "Permission hook cannot broaden authorization".into(),
+            });
+        }
+        decision = proposed.into();
+    }
+    ctx.app.hooks.emit(
+        "ocmini.permission.decided",
+        &context,
+        json!({"permission":permission,"pattern":pattern,"decision":decision}),
+    );
+    match decision.as_str() {
         "allow" => return Ok(()),
         "deny" => return Err(denied()),
         _ => {}
@@ -2155,6 +3409,9 @@ async fn check_permission(
 }
 
 fn tool_paths(directory: &str, name: &str, input: &Value) -> Result<Vec<PathBuf>, String> {
+    if let Some(paths) = tools::prepared_file_paths(input) {
+        return Ok(paths);
+    }
     match name {
         "read" | "write" | "edit" => Ok(vec![tools::resolve_path(
             directory,
@@ -2240,6 +3497,11 @@ async fn expand_shell_templates(
                 return Err("Shell interpolation is disabled in read-only agents".into());
             }
             let ctx = ToolCtx {
+                hook_context: {
+                    let mut c = turn_context(app, &session.id, request);
+                    c["requestKind"] = json!("primary");
+                    c
+                },
                 dir: session.directory.clone(),
                 app: app.clone(),
                 session_id: session.id.clone(),
@@ -2250,6 +3512,9 @@ async fn expand_shell_templates(
                 part_id: part["id"].as_str().unwrap_or_default().into(),
             };
             let input = json!({"command":command,"timeout":120_000});
+            let input = prepare_effective_input(&ctx, "bash", input, cfg, request)
+                .await
+                .map_err(|e| e.message)?;
             let output = tokio::select! { result=execute_tool(&ctx,"bash",&input,cfg,request,false)=>result.map_err(|e|e.message)?, _=cancelled(cancel)=>return Err("Aborted".into()) };
             replaced.push_str(&original[offset..matched.start()]);
             replaced.push_str(&output.output);

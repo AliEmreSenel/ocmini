@@ -20,10 +20,39 @@ impl Bus {
             properties,
         };
         // Subscribers share immutable payloads, including large tool results.
-        let _ = self.tx.send(Arc::new(ev));
+        self.publish(Arc::new(ev));
+    }
+
+    pub fn publish(&self, ev: Arc<BusEvent>) {
+        if crate::hooks::has_observers() {
+            crate::hooks::observe(&ev);
+        }
+        let _ = self.tx.send(ev);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<BusEvent>> {
         self.tx.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn subscribers_share_one_payload_and_keep_the_sse_shape() {
+        let bus = Bus::new();
+        let mut a = bus.subscribe();
+        let mut b = bus.subscribe();
+        bus.emit(
+            "message.part.delta",
+            serde_json::json!({"sessionID":"ses","delta":"text"}),
+        );
+        let first = a.recv().await.unwrap();
+        let second = b.recv().await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let value = serde_json::to_value(first.as_ref()).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value["type"], "message.part.delta");
+        assert_eq!(value["properties"]["delta"], "text");
     }
 }

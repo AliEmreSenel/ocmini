@@ -230,6 +230,7 @@ async fn discover(
         tools: Vec::new(),
         variant: None,
         session_id: None,
+        ..Default::default()
     };
     let (protocol, settings) = adapter.prepare(&request).await?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

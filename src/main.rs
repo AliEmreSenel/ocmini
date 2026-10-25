@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod engine;
 mod engine_impl;
+mod hooks;
 mod mcp;
 mod permission;
 mod picker;
@@ -145,6 +146,11 @@ enum AgentCommand {
 #[derive(Subcommand)]
 enum DebugCommand {
     Skill,
+    /// Validate and inspect hook registrations without running commands
+    Hooks {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -247,6 +253,30 @@ async fn run(cli: Cli) -> Result<(), String> {
                         server::skills_json_for(&directory.to_string_lossy(), &config)
                     );
                 }
+                Command::Debug {
+                    command: DebugCommand::Hooks { json },
+                } => {
+                    let directory = std::env::current_dir().map_err(|e| e.to_string())?;
+                    let mut catalog = hooks::debug_config(&config, &directory.to_string_lossy())?;
+                    if config::store_path().exists() {
+                        catalog["deliveries"] =
+                            serde_json::json!(store::Store::inspect_hook_deliveries(
+                                &config::store_path(),
+                                &directory.to_string_lossy()
+                            )?);
+                    }
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&catalog).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?
+                        );
+                    }
+                }
                 _ => unreachable!("execution commands are handled above"),
             }
             Ok(())
@@ -274,7 +304,13 @@ fn main() {
         .enable_all()
         .build()
         .map_err(|error| format!("Cannot start runtime: {error}"))
-        .and_then(|runtime| runtime.block_on(run(cli)));
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let result = run(cli).await;
+                hooks::shutdown().await;
+                result
+            })
+        });
     // Background shell jobs outlive their tool call; they end with the runtime.
     tools::stop_background_jobs();
     if let Err(error) = result {
