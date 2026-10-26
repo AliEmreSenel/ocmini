@@ -1,4 +1,4 @@
-use super::types::{Matcher, Patterns, EVENT_NAMES, HOOK_NAMES};
+use super::types::{HookName, Matcher, Patterns, EVENT_NAMES};
 use super::{
     events::{Delivery, OverflowPolicy},
     payload::PayloadMode,
@@ -67,17 +67,18 @@ impl Default for Settings {
 #[serde(untagged)]
 pub enum ProjectPolicy {
     Bool(bool),
-    Directories(Vec<String>),
+    Directories(#[serde(deserialize_with = "directory_patterns")] Patterns),
 }
 impl ProjectPolicy {
     pub fn allows(&self, directory: &str) -> bool {
         match self {
             Self::Bool(v) => *v,
-            Self::Directories(p) => p
-                .iter()
-                .any(|p| glob::Pattern::new(p).is_ok_and(|p| p.matches(directory))),
+            Self::Directories(patterns) => patterns.matches(directory),
         }
     }
+}
+fn directory_patterns<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Patterns, D::Error> {
+    Patterns::try_from(Vec::<String>::deserialize(input)?).map_err(serde::de::Error::custom)
 }
 fn yes() -> bool {
     true
@@ -146,7 +147,7 @@ pub struct Registration {
     pub terminal_only: Option<bool>,
 }
 fn empty_patterns() -> Patterns {
-    Patterns::Many(vec![])
+    Patterns::empty()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -160,13 +161,11 @@ impl ResolvedRegistration {
     pub fn active(&self) -> bool {
         self.registration.enabled && self.blocked.is_none()
     }
-    pub fn timeout_ms(&self, observer: bool) -> u64 {
-        self.registration
-            .timeout_ms
-            .unwrap_or(if observer { 5000 } else { 30000 })
-    }
-    pub fn hook_timeout_ms(&self, name: &str) -> u64 {
-        self.timeout_ms(matches!(name, "event" | "turn.end.after"))
+    pub fn timeout_ms(&self, kind: super::InvocationKind) -> u64 {
+        self.registration.timeout_ms.unwrap_or(match kind {
+            super::InvocationKind::Observer | super::InvocationKind::Finalizer => 5000,
+            _ => 30000,
+        })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -201,22 +200,24 @@ impl Resolved {
                 .unwrap_or_default();
             &fallback
         };
+        let mut parsed = sources
+            .iter()
+            .map(|source| {
+                let settings: Settings = serde_json::from_value(source.value.clone())
+                    .map_err(|e| format!("hooks in {}: {e}", source.source))?;
+                validate_settings(&settings)?;
+                Ok((source, settings))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut settings = serde_json::to_value(Settings::default()).map_err(|e| e.to_string())?;
-        for source in sources.iter().filter(|s| s.trusted) {
-            let parsed: Settings = serde_json::from_value(source.value.clone())
-                .map_err(|e| format!("hooks in {}: {e}", source.source))?;
-            validate_settings(&parsed)?;
-            let mut options = source.value.clone();
-            let options = options.as_object_mut().ok_or("hooks must be an object")?;
-            options.remove("handlers");
-            options.remove("observers");
-            for (key, value) in options {
-                settings[key] = value.clone();
+        for (source, _) in parsed.iter().filter(|(source, _)| source.trusted) {
+            for (key, value) in source.value.as_object().ok_or("hooks must be an object")? {
+                if key != "handlers" && key != "observers" {
+                    settings[key] = value.clone();
+                }
             }
         }
-        let mut settings: Settings = serde_json::from_value(settings).map_err(|e| e.to_string())?;
-        settings.handlers.clear();
-        settings.observers.clear();
+        let settings: Settings = serde_json::from_value(settings).map_err(|e| e.to_string())?;
         validate_settings(&settings)?;
         let mut result = Self {
             version: 1,
@@ -225,14 +226,8 @@ impl Resolved {
             handlers: vec![],
             observers: vec![],
         };
-        for source in sources
-            .iter()
-            .filter(|s| s.trusted)
-            .chain(sources.iter().filter(|s| !s.trusted))
-        {
-            let parsed: Settings = serde_json::from_value(source.value.clone())
-                .map_err(|e| format!("hooks in {}: {e}", source.source))?;
-            validate_settings(&parsed)?;
+        parsed.sort_by_key(|(source, _)| !source.trusted);
+        for (source, parsed) in parsed {
             for (registrations, observer) in [(parsed.handlers, false), (parsed.observers, true)] {
                 let mut seen = HashSet::new();
                 for mut registration in registrations {
@@ -291,13 +286,11 @@ impl Resolved {
     }
     pub fn debug(&self) -> Value {
         let effective = self.handlers.iter().map(|r| {
-            let boundaries = r.registration.on.values().iter().map(|name| {
-                let chain = if super::types::is_admission(name) {
-                    Some(self.settings.admission_chain_timeout_ms)
-                } else if *name == "turn.end.after" {
-                    self.settings.finalizer_chain_timeout_ms
-                } else { self.settings.chain_timeout_ms };
-                json!({"hook":name,"executionTimeoutMs":r.hook_timeout_ms(name),"queueTimeoutMs":r.registration.queue_timeout_ms.unwrap_or(self.settings.queue_timeout_ms),"chainTimeoutMs":chain,"executionCeilingMs":chain.map(|n|n.min(r.hook_timeout_ms(name))).unwrap_or(r.hook_timeout_ms(name)),"chainIncludesQueue":true})
+            let boundaries = r.registration.on.values().map(|name| {
+                let hook = super::types::declarations().find(|h|h.name.as_str()==name).expect("validated hook");
+                let chain=hook.chain_timeout(&self.settings);
+                let timeout=r.timeout_ms(hook.kind);
+                json!({"hook":name,"executionTimeoutMs":timeout,"queueTimeoutMs":r.registration.queue_timeout_ms.unwrap_or(self.settings.queue_timeout_ms),"chainTimeoutMs":chain,"executionCeilingMs":chain.map(|n|n.min(timeout)).unwrap_or(timeout),"chainIncludesQueue":true})
             }).collect::<Vec<_>>();
             json!({"id":r.registration.id,"boundaries":boundaries})
         }).collect::<Vec<_>>();
@@ -309,8 +302,7 @@ pub fn normalize_directory(directory: &str) -> String {
         Path::new(directory),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
-    path.canonicalize()
-        .unwrap_or(path)
+    crate::config::directory_identity(&path)
         .to_string_lossy()
         .into_owned()
 }
@@ -414,18 +406,13 @@ pub fn validate_settings(s: &Settings) -> Result<(), String> {
             tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize) as u64,
         )?;
     }
-    if let ProjectPolicy::Directories(patterns) = &s.allow_project_hooks {
-        for p in patterns {
-            glob::Pattern::new(p).map_err(|e| format!("allowProjectHooks: {e}"))?;
-        }
-    }
     Ok(())
 }
 fn validate_registration(r: &Registration, observer: bool) -> Result<(), String> {
     if r.id.is_empty() || r.id.len() > 128 || r.id.chars().any(char::is_control) {
         return Err("hook id must contain 1..128 printable characters".into());
     }
-    if r.enabled && (r.command.is_empty() || r.command[0].is_empty() || r.on.values().is_empty()) {
+    if r.enabled && (r.command.is_empty() || r.command[0].is_empty() || r.on.values().len() == 0) {
         return Err(format!("hook {} requires on and command", r.id));
     }
     if r.command.len() > 256
@@ -440,11 +427,9 @@ fn validate_registration(r: &Registration, observer: bool) -> Result<(), String>
             return Err(format!("duplicate boundary {name} for hook {}", r.id));
         }
         if observer {
-            glob::Pattern::new(name).map_err(|e| format!("invalid event pattern: {e}"))?;
-            if !EVENT_NAMES
-                .iter()
-                .any(|event| glob::Pattern::new(name).is_ok_and(|p| p.matches(event)))
-            {
+            let pattern =
+                glob::Pattern::new(name).map_err(|e| format!("invalid event pattern: {e}"))?;
+            if !EVENT_NAMES.iter().any(|event| pattern.matches(event)) {
                 return Err(format!("unknown event name {name}"));
             }
             if name == "message.part.delta"
@@ -452,7 +437,7 @@ fn validate_registration(r: &Registration, observer: bool) -> Result<(), String>
             {
                 return Err("delta subscriptions require batchSize >= 2 and batchMs > 0".into());
             }
-        } else if !HOOK_NAMES.contains(&name) {
+        } else if !HookName::ALL.iter().any(|h| h.as_str() == name) {
             return Err(format!("unknown hook name {name}"));
         }
     }
@@ -483,8 +468,7 @@ fn validate_registration(r: &Registration, observer: bool) -> Result<(), String>
         if !observer
             || r.on
                 .values()
-                .iter()
-                .any(|n| !matches!(*n, "ocmini.turn.ended" | "command.executed"))
+                .any(|n| !matches!(n, "ocmini.turn.ended" | "command.executed"))
         {
             return Err("durable delivery requires exact ocmini.turn.ended or command.executed subscriptions".into());
         }

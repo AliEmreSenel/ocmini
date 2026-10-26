@@ -1,4 +1,4 @@
-use super::{Attachment, PendingPrompt, RowKind, Ui, Visibility, BOLD, RESET};
+use super::{Attachment, Key, PendingPrompt, RowKind, Ui, Visibility, BOLD, RESET};
 use std::cell::{Ref, RefCell};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -20,6 +20,45 @@ pub(super) struct Draft {
     typing: bool,
     /// Invalidated by externally assigned cursor positions or history recall.
     position: Option<(usize, usize)>,
+}
+
+/// Ordinary editing applies to either the prompt or the active answer draft.
+pub(super) fn edit(key: &Key, draft: &mut Draft, killring: &mut KillRing) -> bool {
+    match key {
+        Key::Char(ch) => draft.insert(*ch),
+        Key::NewLine => draft.insert('\n'),
+        Key::Backspace => draft.backspace(),
+        Key::Delete => draft.delete(),
+        Key::Undo => draft.undo(),
+        Key::KillLine | Key::KillWord => {
+            let killed = if matches!(key, Key::KillLine) {
+                draft.kill_line()
+            } else {
+                draft.kill_word()
+            };
+            if let Some(text) = killed {
+                killring.push(text);
+            }
+        }
+        Key::Yank => {
+            if let Some(text) = killring.top() {
+                draft.insert_str(text);
+            }
+        }
+        Key::Move(motion, selecting) => draft.motion(*motion, *selecting),
+        _ => return false,
+    }
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Motion {
+    Left,
+    Right,
+    Home,
+    End,
+    WordLeft,
+    WordRight,
 }
 
 const MAX_UNDO_BYTES: usize = 1024 * 1024;
@@ -226,44 +265,39 @@ impl Draft {
         self.cursor.min(graphemes(&self.text))
     }
 
-    fn left_impl(&mut self) {
+    pub fn motion(&mut self, motion: Motion, selecting: bool) {
+        if selecting {
+            self.anchor_here();
+        } else {
+            self.anchor = None;
+        }
         self.typing = false;
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn right_impl(&mut self) {
-        self.typing = false;
-        self.cursor = (self.cursor + 1).min(graphemes(&self.text));
-    }
-
-    /// Start of the current line; 0 for the first line.
-    fn home_impl(&mut self) {
-        self.typing = false;
-        let bytes = byte_index(&self.text, self.clamped());
-        let start = self.text[..bytes].rfind('\n').map_or(0, |i| i + 1);
-        self.cursor = graphemes(&self.text[..start]);
-    }
-
-    /// End of the current line; the text end for the last line.
-    fn end_impl(&mut self) {
-        self.typing = false;
-        let bytes = byte_index(&self.text, self.clamped());
-        let end = self.text[bytes..]
-            .find('\n')
-            .map_or(self.text.len(), |i| bytes + i);
-        self.cursor = graphemes(&self.text[..end]);
-    }
-
-    fn word_left_impl(&mut self) {
-        self.typing = false;
-        let chars: Vec<&str> = self.text.graphemes(true).collect();
-        self.cursor = word_start(&chars, self.clamped());
-    }
-
-    fn word_right_impl(&mut self) {
-        self.typing = false;
-        let chars: Vec<&str> = self.text.graphemes(true).collect();
-        self.cursor = word_end(&chars, self.clamped());
+        let cursor = self.clamped();
+        self.cursor = match motion {
+            Motion::Left => cursor.saturating_sub(1),
+            Motion::Right => (cursor + 1).min(graphemes(&self.text)),
+            Motion::Home => {
+                let bytes = byte_index(&self.text, cursor);
+                let start = self.text[..bytes].rfind('\n').map_or(0, |i| i + 1);
+                graphemes(&self.text[..start])
+            }
+            Motion::End => {
+                let bytes = byte_index(&self.text, cursor);
+                let end = self.text[bytes..]
+                    .find('\n')
+                    .map_or(self.text.len(), |i| bytes + i);
+                graphemes(&self.text[..end])
+            }
+            Motion::WordLeft | Motion::WordRight => {
+                let chars: Vec<&str> = self.text.graphemes(true).collect();
+                if matches!(motion, Motion::WordLeft) {
+                    word_start(&chars, cursor)
+                } else {
+                    word_end(&chars, cursor)
+                }
+            }
+        };
+        self.settle_anchor();
     }
 
     /// Move the caret to the same column on the row above (negative) or
@@ -300,75 +334,9 @@ impl Draft {
         }
     }
 
-    pub fn left(&mut self) {
-        self.anchor = None;
-        self.left_impl();
-    }
-
-    pub fn right(&mut self) {
-        self.anchor = None;
-        self.right_impl();
-    }
-
-    pub fn home(&mut self) {
-        self.anchor = None;
-        self.home_impl();
-    }
-
-    pub fn end(&mut self) {
-        self.anchor = None;
-        self.end_impl();
-    }
-
-    pub fn word_left(&mut self) {
-        self.anchor = None;
-        self.word_left_impl();
-    }
-
-    pub fn word_right(&mut self) {
-        self.anchor = None;
-        self.word_right_impl();
-    }
-
     pub fn move_row(&mut self, prefix: &str, width: usize, delta: isize) {
         self.anchor = None;
         self.move_row_impl(prefix, width, delta);
-    }
-
-    pub fn select_left(&mut self) {
-        self.anchor_here();
-        self.left_impl();
-        self.settle_anchor();
-    }
-
-    pub fn select_right(&mut self) {
-        self.anchor_here();
-        self.right_impl();
-        self.settle_anchor();
-    }
-
-    pub fn select_home(&mut self) {
-        self.anchor_here();
-        self.home_impl();
-        self.settle_anchor();
-    }
-
-    pub fn select_end(&mut self) {
-        self.anchor_here();
-        self.end_impl();
-        self.settle_anchor();
-    }
-
-    pub fn select_word_left(&mut self) {
-        self.anchor_here();
-        self.word_left_impl();
-        self.settle_anchor();
-    }
-
-    pub fn select_word_right(&mut self) {
-        self.anchor_here();
-        self.word_right_impl();
-        self.settle_anchor();
     }
 
     /// Kill from the caret to the end of the line (the newline itself when
@@ -454,22 +422,20 @@ impl Draft {
     }
 }
 
-/// Recently killed text, newest first; Ctrl+Y yanks the newest.
+/// Most recently killed text, retrieved by Ctrl+Y.
 #[derive(Default)]
 pub(super) struct KillRing {
-    entries: VecDeque<String>,
+    latest: Option<String>,
 }
 
 impl KillRing {
     pub fn push(&mut self, text: String) {
-        if text.is_empty() || self.entries.front().is_some_and(|top| *top == text) {
-            return;
+        if !text.is_empty() {
+            self.latest = Some(text);
         }
-        self.entries.push_front(text);
     }
-
     pub fn top(&self) -> Option<&str> {
-        self.entries.front().map(String::as_str)
+        self.latest.as_deref()
     }
 }
 
@@ -576,19 +542,22 @@ pub(super) fn input_prefix(ui: &Ui, draft: &Draft) -> String {
 /// What the input row shows: its prefix plus the active draft's text, caret
 /// and selection. A pending question draws the draft of the question being
 /// answered; the prompt draft stays hidden underneath until it settles.
-fn active_input(ui: &Ui, draft: &Draft) -> (String, String, usize, Option<(usize, usize)>) {
+fn active_input<'a>(
+    ui: &'a Ui,
+    draft: &'a Draft,
+) -> (String, &'a str, usize, Option<(usize, usize)>) {
     let prefix = input_prefix(ui, draft);
     match &ui.prompt {
         Some(PendingPrompt::Question {
             drafts, current, ..
         }) => {
             let draft = drafts.get(*current).unwrap_or(draft);
-            (prefix, draft.text.clone(), draft.cursor, draft.selection())
+            (prefix, &draft.text, draft.cursor, draft.selection())
         }
         Some(PendingPrompt::Permission(_)) => {
-            (prefix, "[o]nce [a]lways [r]eject".into(), usize::MAX, None)
+            (prefix, "[o]nce [a]lways [r]eject", usize::MAX, None)
         }
-        _ => (prefix, draft.text.clone(), draft.cursor, draft.selection()),
+        _ => (prefix, &draft.text, draft.cursor, draft.selection()),
     }
 }
 
@@ -821,6 +790,18 @@ pub(super) struct Display {
     /// Ctrl+T / Ctrl+O state: which kinds are painted.
     visibility: Visibility,
     wrapped: RefCell<WrappedRows>,
+    input: Option<InputPaint>,
+}
+
+struct InputPaint {
+    prefix: String,
+    text: String,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+    width: usize,
+    height: usize,
+    header: String,
+    layout: std::rc::Rc<Layout>,
 }
 
 /// Only new logical rows need wrapping between paints. Resizing or changing
@@ -857,6 +838,7 @@ impl Display {
             tail_kind: RowKind::Plain,
             visibility: Visibility::default(),
             wrapped: RefCell::new(WrappedRows::default()),
+            input: None,
         }
     }
 
@@ -1087,16 +1069,45 @@ impl Display {
 
     pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize, model: &str) {
         let (prefix, text, cursor, sel) = active_input(ui, draft);
-        let mut layout = layout(&prefix, &text, cursor, width, sel);
-        // Status belongs to the editable block, never the transcript. Clip it
-        // to one row even when the provider/model name is very long.
         let header = super::prompt_header(model, ui.visibility);
-        let row = wrap_row(&header, width)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        layout.rows.insert(0, format!("{row}{RESET}"));
-        layout.cursor.0 += 1;
+        let (_, height) = terminal_size();
+        let changed = self.input.as_ref().is_none_or(|cache| {
+            cache.prefix != prefix
+                || cache.text != text
+                || cache.cursor != cursor
+                || cache.selection != sel
+                || cache.width != width
+                || cache.height != height
+                || cache.header != header
+        });
+        if changed {
+            let mut layout = layout(&prefix, text, cursor, width, sel);
+            // Follow the caret within a bounded editor window. Leave a status
+            // row and transcript space even for a draft taller than the terminal.
+            let available = height.saturating_sub(2).max(1);
+            let top = layout.cursor.0.saturating_sub(available - 1);
+            layout.rows = layout.rows.into_iter().skip(top).take(available).collect();
+            layout.cursor.0 -= top;
+            if height > 1 {
+                let row = wrap_row(&header, width)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                layout.rows.insert(0, format!("{row}{RESET}"));
+                layout.cursor.0 += 1;
+            }
+            self.input = Some(InputPaint {
+                prefix,
+                text: text.into(),
+                cursor,
+                selection: sel,
+                width,
+                height,
+                header,
+                layout: std::rc::Rc::new(layout),
+            });
+        }
+        let layout = self.input.as_ref().unwrap().layout.clone();
         if self.fullscreen {
             self.draw_screen(&layout);
             return;
@@ -1201,25 +1212,25 @@ mod tests {
     fn cursor_keys_edit_the_middle_of_the_draft() {
         let mut draft = Draft::default();
         draft.insert_str("abd");
-        draft.left();
+        draft.motion(Motion::Left, false);
         draft.insert('c');
         assert_eq!(draft.text, "abcd");
         assert_eq!(draft.cursor, 3);
-        draft.home();
-        draft.right();
+        draft.motion(Motion::Home, false);
+        draft.motion(Motion::Right, false);
         draft.backspace();
         assert_eq!(draft.text, "bcd");
         assert_eq!(draft.cursor, 0);
-        draft.end();
-        draft.right();
+        draft.motion(Motion::End, false);
+        draft.motion(Motion::Right, false);
         draft.backspace();
         assert_eq!(draft.text, "bc");
         // Moving and deleting stay on grapheme boundaries with wide characters.
         draft.insert_str("👩‍💻中");
-        draft.left();
+        draft.motion(Motion::Left, false);
         draft.backspace();
         assert_eq!(draft.text, "bc中");
-        draft.right();
+        draft.motion(Motion::Right, false);
         draft.backspace();
         assert_eq!(draft.text, "bc");
         draft.clear();
@@ -1230,7 +1241,7 @@ mod tests {
     fn paste_inserts_at_the_cursor() {
         let mut draft = Draft::default();
         draft.insert_str("ab");
-        draft.home();
+        draft.motion(Motion::Home, false);
         draft.insert_str("1\n2");
         assert_eq!(draft.text, "1\n2ab");
         assert_eq!(draft.cursor, 3);
@@ -1242,35 +1253,35 @@ mod tests {
         let mut draft = Draft::default();
         draft.insert_str("let x = 1\nlet y = foo()");
         assert_eq!(draft.cursor, 23);
-        draft.home();
+        draft.motion(Motion::Home, false);
         assert_eq!(draft.cursor, 10); // start of the second line
-        draft.home();
+        draft.motion(Motion::Home, false);
         assert_eq!(draft.cursor, 10); // Home is per line, so it stays
-        draft.end();
+        draft.motion(Motion::End, false);
         assert_eq!(draft.cursor, 23); // end of the second line
         draft.cursor = 0;
-        draft.end();
+        draft.motion(Motion::End, false);
         assert_eq!(draft.cursor, 9); // per-line End: first line's end
-        draft.end();
+        draft.motion(Motion::End, false);
         assert_eq!(draft.cursor, 9);
         // Word motion across the whole draft.
         draft.cursor = 0;
-        draft.word_right();
+        draft.motion(Motion::WordRight, false);
         assert_eq!(draft.cursor, 3); // over "let"
-        draft.word_right();
-        draft.word_right();
-        draft.word_right();
+        draft.motion(Motion::WordRight, false);
+        draft.motion(Motion::WordRight, false);
+        draft.motion(Motion::WordRight, false);
         assert_eq!(draft.cursor, 13); // past the newline, over "let"
-        draft.word_right();
+        draft.motion(Motion::WordRight, false);
         assert_eq!(draft.cursor, 15); // over "y"
-        draft.word_right();
+        draft.motion(Motion::WordRight, false);
         assert_eq!(draft.cursor, 21); // over "foo"
-        draft.word_right();
+        draft.motion(Motion::WordRight, false);
         assert_eq!(draft.cursor, 23); // trailing "( )" is one non-word run
-        draft.word_left();
+        draft.motion(Motion::WordLeft, false);
         assert_eq!(draft.cursor, 18); // start of "foo"
                                       // Forward delete removes at the caret, backspace behind it.
-        draft.home();
+        draft.motion(Motion::Home, false);
         assert_eq!(draft.cursor, 10); // second line start
         draft.delete();
         assert_eq!(draft.text, "let x = 1\net y = foo()");
@@ -1301,7 +1312,7 @@ mod tests {
         draft.insert('\n');
         assert_eq!(draft.text, "ab\n\ncd");
         assert_eq!(draft.cursor, 3);
-        draft.home();
+        draft.motion(Motion::Home, false);
         assert_eq!(draft.cursor, 3); // the middle empty line starts at 3
     }
 
@@ -1326,8 +1337,8 @@ mod tests {
     fn selection_is_replaced_and_deleted_as_a_unit() {
         let mut draft = Draft::default();
         draft.insert_str("remove this keep");
-        draft.home();
-        draft.select_word_right();
+        draft.motion(Motion::Home, false);
+        draft.motion(Motion::WordRight, true);
         assert_eq!(draft.selection(), Some((0, 6)));
         draft.insert('X'); // typing replaces the selection
         assert_eq!(draft.text, "X this keep");
@@ -1335,18 +1346,18 @@ mod tests {
         draft.undo(); // replacing a selection is ONE undo step
         assert_eq!(draft.text, "remove this keep");
         assert_eq!(draft.cursor, 6); // caret returns to where typing replaced it
-        draft.home();
-        draft.select_word_right();
+        draft.motion(Motion::Home, false);
+        draft.motion(Motion::WordRight, true);
         draft.insert('X');
-        draft.select_end();
+        draft.motion(Motion::End, true);
         assert_eq!(draft.selection(), Some((1, 11)));
         draft.backspace(); // backspace deletes the selection
         assert_eq!(draft.text, "X");
         assert!(draft.selection().is_none());
         // Plain motion drops the selection that Shift starts.
-        draft.select_left();
+        draft.motion(Motion::Left, true);
         assert_eq!(draft.selection(), Some((0, 1)));
-        draft.left();
+        draft.motion(Motion::Left, false);
         assert!(draft.selection().is_none());
     }
 
@@ -1372,10 +1383,10 @@ mod tests {
         ring.push(draft.kill_line().unwrap());
         assert_eq!(draft.text, "yanked ");
         assert_eq!(ring.top(), Some("\n"));
-        // Nothing left to kill: the ring keeps its three entries.
-        draft.end();
+        // Nothing left to kill: the last killed value remains available.
+        draft.motion(Motion::End, false);
         assert!(draft.kill_line().is_none());
-        assert_eq!(ring.entries.len(), 3);
+        assert_eq!(ring.top(), Some("\n"));
     }
 
     #[test]
@@ -1476,7 +1487,8 @@ mod tests {
         // The question's own draft is what the input row draws; the prompt
         // draft stays hidden underneath it.
         let ui = Ui {
-            part_kind: std::collections::HashMap::new(),
+            interactions: Default::default(),
+            text: crate::client::TextState::default(),
             headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: Some(PendingPrompt::Question {
@@ -1496,7 +1508,7 @@ mod tests {
         let mut prompt = Draft::default();
         prompt.insert_str("hidden prompt");
         let (prefix, text, cursor, _) = active_input(&ui, &prompt);
-        assert_eq!((prefix.as_str(), text.as_str(), cursor), ("[1/1] ", "2", 1));
+        assert_eq!((prefix.as_str(), text, cursor), ("[1/1] ", "2", 1));
     }
 
     #[test]
@@ -1526,7 +1538,8 @@ mod tests {
     #[test]
     fn erasing_the_draft_starts_at_the_caret_row() {
         let ui = Ui {
-            part_kind: std::collections::HashMap::new(),
+            interactions: Default::default(),
+            text: crate::client::TextState::default(),
             headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
@@ -1613,7 +1626,8 @@ mod tests {
     #[test]
     fn a_hidden_streaming_row_never_peeks_above_the_draft() {
         let ui = Ui {
-            part_kind: std::collections::HashMap::new(),
+            interactions: Default::default(),
+            text: crate::client::TextState::default(),
             headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
@@ -1637,7 +1651,8 @@ mod tests {
     #[test]
     fn fullscreen_repaint_keeps_the_streaming_tail_uncommitted() {
         let ui = crate::tui::Ui {
-            part_kind: std::collections::HashMap::new(),
+            interactions: Default::default(),
+            text: crate::client::TextState::default(),
             headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
@@ -1663,7 +1678,7 @@ mod tests {
     fn clearing_the_help_command_keeps_attachments_and_resets_selection() {
         let mut draft = Draft::default();
         draft.insert_str("/help");
-        draft.select_home();
+        draft.motion(Motion::Home, true);
         draft.attachments.push(crate::tui::Attachment {
             filename: "image.png".into(),
             url: "data:image/png;base64,test".into(),
@@ -1689,7 +1704,8 @@ mod tests {
     #[test]
     fn status_redraws_stay_one_row_and_never_enter_the_transcript() {
         let mut ui = Ui {
-            part_kind: std::collections::HashMap::new(),
+            interactions: Default::default(),
+            text: crate::client::TextState::default(),
             headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
@@ -1837,8 +1853,8 @@ mod tests {
         draft.undo();
         assert!(draft.text.is_empty());
         draft.insert_str("a👩‍💻z");
-        draft.left();
-        draft.select_left();
+        draft.motion(Motion::Left, false);
+        draft.motion(Motion::Left, true);
         draft.insert_str("中");
         assert_eq!(draft.text, "a中z");
         draft.undo();

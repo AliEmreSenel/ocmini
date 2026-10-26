@@ -1,14 +1,21 @@
+mod attachments;
 mod auth;
 mod blocking;
 mod bus;
+mod client;
 mod commands;
 mod config;
 mod engine;
 mod engine_impl;
+mod events;
 mod hooks;
+mod http;
+mod inventory;
 mod mcp;
+mod messages;
 mod permission;
 mod picker;
+mod process;
 mod provider;
 mod run;
 mod server;
@@ -174,10 +181,20 @@ fn parse_hostname(value: &str) -> Result<String, String> {
     Ok(hostname.to_owned())
 }
 
+async fn with_app<F: std::future::Future<Output = Result<(), String>>>(
+    run: impl FnOnce(engine::App) -> F,
+) -> Result<(), String> {
+    let app = engine::App::new()?;
+    let runtime = app.hook_runtime.clone();
+    let result = run(app).await;
+    runtime.shutdown().await;
+    result
+}
+
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command.unwrap_or(Command::Tui(cli.tui)) {
-        Command::Tui(args) => tui::run(args).await,
-        Command::Run(args) => run::run(args).await,
+        Command::Tui(args) => with_app(|app| tui::run(app, args)).await,
+        Command::Run(args) => with_app(|app| run::run(app, args)).await,
         Command::Session {
             command: SessionCommand::List { directory },
         } => {
@@ -188,7 +205,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Serve { hostname, port } => server::serve(hostname, port).await,
+        Command::Serve { hostname, port } => {
+            with_app(|app| server::serve(app, hostname, port)).await
+        }
         Command::Version => {
             println!("{OPENCODE_COMPAT_VERSION}");
             Ok(())
@@ -205,7 +224,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     for error in errors {
                         eprintln!("ocmini: model discovery: {error}");
                     }
-                    let inventory = server::provider_inventory(&config, &auth);
+                    let inventory = inventory::provider_inventory(&config, &auth);
                     let connected = inventory["connected"]
                         .as_array()
                         .cloned()
@@ -234,7 +253,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 Command::Agent {
                     command: AgentCommand::List,
                 } => {
-                    let agents = server::agents_json(&config);
+                    let agents = inventory::agents_json(&config);
                     for agent in agents.as_array().into_iter().flatten() {
                         println!(
                             "{} ({})",
@@ -250,7 +269,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     let directory = std::env::current_dir().map_err(|error| error.to_string())?;
                     println!(
                         "{}",
-                        server::skills_json_for(&directory.to_string_lossy(), &config)
+                        inventory::skills_json_for(&directory.to_string_lossy(), &config)
                     );
                 }
                 Command::Debug {
@@ -304,13 +323,7 @@ fn main() {
         .enable_all()
         .build()
         .map_err(|error| format!("Cannot start runtime: {error}"))
-        .and_then(|runtime| {
-            runtime.block_on(async {
-                let result = run(cli).await;
-                hooks::shutdown().await;
-                result
-            })
-        });
+        .and_then(|runtime| runtime.block_on(run(cli)));
     // Background shell jobs outlive their tool call; they end with the runtime.
     tools::stop_background_jobs();
     if let Err(error) = result {

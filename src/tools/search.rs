@@ -1,27 +1,45 @@
-use super::{cancelled, failure, process::ProcessGroup, required, resolve_path};
-use crate::types::{ToolError, ToolOutput};
+use super::{failure, resolve_path};
+use crate::types::{OperationError, ToolOutput};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio_util::sync::CancellationToken;
 
 const MAX_RESULTS: usize = 100;
 const MAX_RECORD: usize = 64 * 1024;
 const MAX_ERROR: usize = 8 * 1024;
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct Input {
+    pub pattern: String,
+    pub path: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct GrepInput {
+    #[serde(flatten)]
+    pub search: Input,
+    pub include: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode<'a> {
+    Glob,
+    Grep(Option<&'a str>),
+}
+
 pub(super) async fn run(
     directory: &str,
-    name: &str,
-    input: &Value,
-    cancel: Arc<AtomicBool>,
-) -> Result<ToolOutput, ToolError> {
-    let base = resolve_path(directory, input["path"].as_str().unwrap_or("."));
+    mode: Mode<'_>,
+    input: &Input,
+    cancel: CancellationToken,
+) -> Result<ToolOutput, OperationError> {
+    let base = resolve_path(directory, input.path.as_deref().unwrap_or("."));
     let metadata = std::fs::metadata(&base)
         .map_err(|error| failure(format!("Cannot search {}: {error}", base.display())))?;
-    let pattern = required(input, "pattern")?;
-    let glob = name == "glob";
+    let pattern = &input.pattern;
+    let glob = matches!(mode, Mode::Glob);
     if !glob && pattern.is_empty() {
         return Err(failure("pattern is required"));
     }
@@ -42,7 +60,7 @@ pub(super) async fn run(
             .arg(format!("--glob={pattern}"));
     } else {
         command.args(["--json", "--hidden", "--no-messages"]);
-        if let Some(include) = input["include"].as_str() {
+        if let Mode::Grep(Some(include)) = mode {
             command.arg(format!("--glob={include}"));
         }
     }
@@ -73,11 +91,11 @@ pub(super) async fn run(
             failure(format!("Cannot start ripgrep: {error}"))
         }
     })?;
-    let group = ProcessGroup {
-        id: child
+    let group = crate::process::Group::new(
+        child
             .id()
             .ok_or_else(|| failure("ripgrep has no process id"))?,
-    };
+    );
     let stdout = child
         .stdout
         .take()
@@ -163,13 +181,13 @@ pub(super) async fn run(
                     &buffer[..count.min(MAX_ERROR.saturating_sub(errors.len()))],
                 );
             }
-            Ok::<_, ToolError>(String::from_utf8_lossy(&errors).trim().to_string())
+            Ok::<_, OperationError>(String::from_utf8_lossy(&errors).trim().to_string())
         };
         tokio::try_join!(output, errors)
     };
     let result = tokio::select! {
         result = operation => result,
-        _ = cancelled(cancel) => Err(failure("Search cancelled")),
+        _ = cancel.cancelled() => Err(failure("Search cancelled")),
     };
     drop(group);
     let status = child
@@ -207,6 +225,30 @@ pub(super) async fn run(
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+    async fn run(
+        directory: &str,
+        name: &str,
+        input: &Value,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, OperationError> {
+        match name {
+            "glob" => {
+                super::run(directory, Mode::Glob, &crate::tools::decode(input)?, cancel).await
+            }
+            "grep" => {
+                let input: GrepInput = crate::tools::decode(input)?;
+                super::run(
+                    directory,
+                    Mode::Grep(input.include.as_deref()),
+                    &input.search,
+                    cancel,
+                )
+                .await
+            }
+            _ => panic!("unknown search tool"),
+        }
+    }
+
     struct Directory(tempfile::TempDir);
     impl Directory {
         fn new() -> Self {
@@ -229,7 +271,7 @@ mod tests {
             directory.dir(),
             "grep",
             &json!({"pattern":"needle"}),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -240,21 +282,15 @@ mod tests {
             ("grep", json!({"pattern":"["})),
             ("glob", json!({"pattern":"["})),
         ] {
-            assert!(run(
-                directory.dir(),
-                name,
-                &input,
-                Arc::new(AtomicBool::new(false))
-            )
-            .await
-            .is_err());
+            assert!(run(directory.dir(), name, &input, CancellationToken::new())
+                .await
+                .is_err());
         }
-        assert!(run(
-            directory.dir(),
-            "grep",
-            &json!({"pattern":"needle"}),
-            Arc::new(AtomicBool::new(true))
-        )
+        assert!(run(directory.dir(), "grep", &json!({"pattern":"needle"}), {
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            cancel
+        })
         .await
         .unwrap_err()
         .message
@@ -282,7 +318,7 @@ mod tests {
             directory.dir(),
             "grep",
             &json!({"pattern":"^STARTé+END$","include":"long.txt"}),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -292,7 +328,7 @@ mod tests {
             directory.dir(),
             "grep",
             &json!({"pattern":"needle","include":"*.rs"}),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -310,7 +346,7 @@ mod tests {
             directory.dir(),
             "grep",
             &json!({"pattern":"needle"}),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -329,7 +365,7 @@ mod tests {
             directory.dir(),
             "glob",
             &json!({"pattern": format!("{{{choices}}}.rs")}),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
         .await
         .unwrap();

@@ -1,6 +1,6 @@
 # Hooks and events reference
 
-Start with [HOOKS.md](HOOKS.md) for common tasks. This document contains the complete contracts, advanced options, and delivery guarantees. [HOOKS-PLAN.md](HOOKS-PLAN.md) describes internal ownership; [HOOKS-RESEARCH.md](HOOKS-RESEARCH.md) records the upstream comparisons and rationale.
+Start with [hooks guide](hooks.md) for common tasks. This document contains the complete contracts, advanced options, and delivery guarantees.
 
 All names and settings below belong to the existing `ocmini.hooks` interface. The four families in the guide are navigation categories, not additional configuration keys or execution modes. `ocmini debug hooks --json` is the executable catalog: it shows schemas, writable fields, registrations, provenance, effective budgets, and read-only delivery metadata without executing scripts.
 

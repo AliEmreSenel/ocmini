@@ -163,8 +163,8 @@ cargo build --release --locked
 
 Tests use temporary state and local provider/MCP fixtures; no paid credentials are needed. Unit tests stay inline beside the code they cover. Integration tests are grouped by behavior under `tests/contract/`.
 
-See [SPEC-CONTRACT.md](SPEC-CONTRACT.md) for API details and [VALIDATION.md](VALIDATION.md) for checks and coverage.
+See the [API contract](docs/api-contract.md) for API details.
 
 ## Hooks and event subscriptions
 
-Extensions use hooks to validate or transform operations and event subscriptions to observe execution. Register commands under `ocmini.hooks`, or consume the directory-scoped SSE stream through `GET /event`. Start with [HOOKS.md](HOOKS.md) and the documentation-only [hook recipes](HOOKS-EXAMPLES.md); [HOOKS-REFERENCE.md](HOOKS-REFERENCE.md) contains all 26 hooks, 49 events, and advanced settings, while [HOOKS-PLAN.md](HOOKS-PLAN.md) describes internal architecture. Inspect the active configuration with `ocmini debug hooks --json`. OpenCode JavaScript plugins use a separate interface.
+Extensions use hooks to validate or transform operations and event subscriptions to observe execution. Register commands under `ocmini.hooks`, or consume the directory-scoped SSE stream through `GET /event`. Start with [hooks guide](docs/hooks.md) and the documentation-only [hook recipes](docs/hooks-examples.md); [hook reference](docs/hooks-reference.md) contains all 26 hooks, 49 events, and advanced settings. Inspect the active configuration with `ocmini debug hooks --json`. OpenCode JavaScript plugins use a separate interface.

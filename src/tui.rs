@@ -2,8 +2,7 @@
 use crate::config::ScrollMode;
 use crate::engine::{self, App, EngineApi};
 use crate::engine_impl::Engine;
-use crate::types::{MessageWithParts, PromptRequest};
-use base64::Engine as _;
+use crate::types::PromptRequest;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -13,13 +12,25 @@ use crossterm::{
 };
 use futures::{poll, StreamExt};
 use serde_json::Value;
+mod clipboard;
 mod input;
+mod render;
+use crate::attachments::Attachment;
+use crate::client::{parse_answer, shutdown_signal, TextState};
+#[cfg(test)]
+use clipboard::image_attachment;
+use clipboard::{file_attachment, paste_clipboard, pasted_image_path};
+pub(crate) use input::Motion;
 use input::{
     clean_input, input_prefix, page_move, terminal_width, Display, Draft, History, KillRing,
 };
-use std::collections::HashMap;
+use render::{
+    answer_line, option_labels, render_event, render_history, render_question, session_prompts,
+};
+pub(crate) use render::{display_model, summarize_input};
+#[cfg(test)]
+use render::{expand, tool_line, tool_result, MAX_EXPANDED};
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
 use std::task::Poll;
 
 struct RawMode {
@@ -137,23 +148,10 @@ impl Visibility {
     }
 }
 
-/// Transcript text split by the kind that hides it, so the renderer filters per
-/// row instead of per call: one event can emit a visible tool line and a
-/// hideable result line.
 #[derive(Default)]
-struct Transcript(Vec<(RowKind, String)>);
-
-impl Transcript {
-    fn text(&mut self, kind: RowKind) -> &mut String {
-        if self.0.last().is_none_or(|(last, _)| *last != kind) {
-            self.0.push((kind, String::new()));
-        }
-        &mut self.0.last_mut().unwrap().1
-    }
-}
-
 struct Ui {
-    part_kind: HashMap<String, &'static str>, // partID -> text | reasoning
+    interactions: crate::client::Interactions,
+    text: TextState,
     headered: std::collections::HashSet<String>, // part ids that printed their header
     tool_done: std::collections::HashSet<String>,
     // Prompt interaction routed from the terminal: lines when idle, keys while a request is pending.
@@ -182,13 +180,6 @@ enum PendingPrompt {
         // answer, while the prompt draft waits untouched underneath the set.
         drafts: Vec<Draft>,
     },
-}
-
-impl Drop for Ui {
-    fn drop(&mut self) {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-    }
 }
 
 fn prompt_header(model: &str, visibility: Visibility) -> String {
@@ -234,362 +225,11 @@ fn help_text(fullscreen: bool) -> String {
     )
 }
 
-/// The parts that identify a tool call, in the order shown. Newlines survive,
-/// so an expanded multi-line command reads as typed.
-fn input_summary(input: &Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(command) = input["command"].as_str() {
-        parts.push(command.to_string());
-    }
-    if let Some(path) = input["filePath"].as_str() {
-        parts.push(path.to_string());
-    }
-    if let Some(pattern) = input["pattern"].as_str() {
-        parts.push(pattern.to_string());
-    }
-    if let Some(url) = input["url"].as_str() {
-        parts.push(url.to_string());
-    }
-    if let Some(prompt) = input["prompt"].as_str() {
-        parts.push(prompt.to_string());
-    }
-    if parts.is_empty() {
-        parts.push(input.to_string());
-    }
-    parts.join(" ")
-}
-
-/// The collapsed transcript line for a tool call.
-pub(crate) fn summarize_input(input: &Value) -> String {
-    truncate(&input_summary(input), 120)
-}
-
-/// Text one expanded tool call paints. The tool layer already caps a result at
-/// 50 KiB and points at the file it saved (`tools/output.rs`), so this is that
-/// same bound used as a display guard: a tool that ever handed over a 1 GiB
-/// result cannot flood the transcript and the terminal's scrollback.
-const MAX_EXPANDED: usize = 50 * 1024;
-
-/// Whole tool text for the expanded view, capped at `MAX_EXPANDED` and indented
-/// two columns, so a multi-line command or result reads as one block under its
-/// marker. A cut-off block names what it left out, so truncation never reads as
-/// a complete answer.
-fn expand(text: &str) -> String {
-    let shown: String = text.chars().take(MAX_EXPANDED).collect();
-    let omitted = text.chars().count() - shown.chars().count();
-    let note = if omitted == 0 {
-        String::new()
-    } else {
-        format!("\n… {omitted} more characters not shown")
-    };
-    format!("{shown}{note}").replace('\n', "\n  ")
-}
-
-/// A tool call's opening row in the two forms `Ctrl+O` switches between:
-/// `(collapsed, expanded)` — the input summary truncated to one line, and the
-/// whole command. Shared by the live event stream and the resumed history, so a
-/// session reads the same after `--continue` as it did while running, and a
-/// saved call expands just like a live one.
-fn tool_line(part: &Value) -> (String, String) {
-    let mark = format!("{CYAN}● {}{RESET}", part["tool"].as_str().unwrap_or("tool"));
-    let input = input_summary(&part["state"]["input"]);
-    (
-        format!("{mark} {DIM}{}{RESET}", truncate(&input, 120)),
-        format!("{mark} {DIM}{}{RESET}", expand(&input)),
-    )
-}
-
-/// The result row of a finished tool call, in both forms: `✓` with an output
-/// preview, `✗` with the error. `None` while the call is still pending or
-/// running. A failure shows in both forms, so collapsing a call can never make
-/// it look like it succeeded.
-fn tool_result(part: &Value) -> Option<(String, String)> {
-    let state = &part["state"];
-    let (mark, text) = match state["status"].as_str() {
-        // The preview is dim as a secondary line; a failure is not.
-        Some("completed") => (
-            format!("{GREEN}✓{RESET} {DIM}"),
-            state["output"].as_str().unwrap_or_default(),
-        ),
-        Some("error") => (
-            format!("{RED}✗{RESET} "),
-            state["error"].as_str().unwrap_or("failed"),
-        ),
-        _ => return None,
-    };
-    Some((
-        format!("  {mark}{}{RESET}", truncate(text, 160)),
-        format!("  {mark}{}{RESET}", expand(text)),
-    ))
-}
-
-/// One saved tool call in both forms: its row plus its result, or the status it
-/// stopped at when it never finished.
-fn tool_block(part: &Value) -> (String, String) {
-    let (line, full_line) = tool_line(part);
-    match tool_result(part) {
-        Some((result, full_result)) => (
-            format!("\n{line}\n{result}\n"),
-            format!("\n{full_line}\n{full_result}\n"),
-        ),
-        // A call that never finished has no result, so both forms show the
-        // status it stopped at.
-        None => {
-            let status = part["state"]["status"].as_str().unwrap_or_default();
-            (
-                format!("\n{line} {DIM}· {status}{RESET}\n"),
-                format!("\n{full_line} {DIM}· {status}{RESET}\n"),
-            )
-        }
-    }
-}
-
-/// Option label and description in the order shown to the user.
-fn option_values(options: &Value) -> Vec<(String, String)> {
-    options
-        .as_array()
-        .map(|list| list.as_slice())
-        .unwrap_or(&[][..])
-        .iter()
-        .map(|option| {
-            (
-                option["label"].as_str().unwrap_or_default().to_string(),
-                option["description"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
-fn option_labels(options: &Value) -> Vec<String> {
-    option_values(options)
-        .into_iter()
-        .map(|(label, _)| label)
-        .collect()
-}
-
-/// The question being answered with its numbered options, so the prompt always
-/// shows what a typed number refers to. Shown when the user reaches a question,
-/// including a revisit; a saved answer stays visible when navigating back.
-fn render_question(questions: &[Value], answers: &[Vec<String>], which: usize) -> String {
-    let question = &questions[which];
-    let mut out = format!(
-        "\n{YELLOW}? {}/{}: {}{RESET}",
-        which + 1,
-        questions.len(),
-        question["question"].as_str().unwrap_or_default(),
-    );
-    if let Some(header) = question["header"]
-        .as_str()
-        .filter(|header| !header.is_empty())
-    {
-        out.push_str(&format!(" {DIM}{header}{RESET}"));
-    }
-    if question["multiple"] == true {
-        out.push_str(&format!(" {DIM}(one or more){RESET}"));
-    }
-    out.push('\n');
-    for (index, (label, description)) in option_values(&question["options"]).iter().enumerate() {
-        out.push_str(&format!(
-            "  {CYAN}{}{RESET}. {label} {DIM}{description}{RESET}\n",
-            index + 1
-        ));
-    }
-    if let Some(answer) = answers.get(which).filter(|answer| !answer.is_empty()) {
-        out.push_str(&format!("  {GREEN}✓{RESET} {}\n", answer.join(", ")));
-    }
-    out.push_str(&format!("{DIM}number(s) + Enter answers · Tab: next question · Shift+Tab: previous · Esc: dismiss{RESET}\n"));
-    out
-}
-
-/// A saved answer as a fresh input line: option labels become their numbers, so
-/// Enter keeps the answer unchanged and typing replaces it.
-fn answer_line(answer: &[String], labels: &[String]) -> String {
-    answer
-        .iter()
-        .map(|answer| {
-            labels
-                .iter()
-                .position(|label| label == answer)
-                .map(|index| (index + 1).to_string())
-                .unwrap_or_else(|| answer.clone())
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Transcript text for one bus event, split into runs that the Ctrl+T / Ctrl+O
-/// toggles can hide independently.
-fn render_event(
-    ui: &mut Ui,
-    event: &crate::types::BusEvent,
-    session_id: &str,
-) -> Vec<(RowKind, String)> {
-    use std::fmt::Write as _;
-    let mut transcript = Transcript::default();
-    macro_rules! print {
-        ($kind:expr, $($arg:tt)*) => {{ let _ = write!(transcript.text($kind), $($arg)*); }};
-    }
-    macro_rules! println {
-        ($kind:expr, $($arg:tt)*) => {{ let _ = writeln!(transcript.text($kind), $($arg)*); }};
-    }
-    let properties = &event.properties;
-    if properties["sessionID"]
-        .as_str()
-        .or_else(|| properties["part"]["sessionID"].as_str())
-        .is_some_and(|id| id != session_id)
-    {
-        return Vec::new();
-    }
-    match event.r#type.as_str() {
-        "message.part.updated" => {
-            let part = &properties["part"];
-            let part_id = part["id"].as_str().unwrap_or_default().to_string();
-            match part["type"].as_str() {
-                Some("text") | Some("reasoning") => {
-                    let kind = if part["type"] == "text" {
-                        "text"
-                    } else {
-                        "reasoning"
-                    };
-                    let is_new = ui.part_kind.insert(part_id.clone(), kind).is_none();
-                    if is_new {
-                        if kind == "reasoning" {
-                            println!(RowKind::Thinking, "\n{DIM}◦ thinking{RESET}");
-                        } else {
-                            println!(RowKind::Plain, "\n{BOLD}assistant{RESET}");
-                        }
-                    }
-                }
-                Some("tool") => {
-                    // Both forms are emitted and Ctrl+O picks which one is
-                    // painted, so expanding shows a call that already ran.
-                    let (line, full_line) = tool_line(part);
-                    if ui.headered.insert(format!("{part_id}:start")) {
-                        println!(RowKind::ToolBrief, "\n{line}");
-                        println!(RowKind::ToolFull, "\n{full_line}");
-                    }
-                    if let Some((result, full_result)) = tool_result(part) {
-                        if ui.tool_done.insert(part_id) {
-                            println!(RowKind::ToolBrief, "{result}");
-                            println!(RowKind::ToolFull, "{full_result}");
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        "message.part.delta" => {
-            let part_id = properties["partID"].as_str().unwrap_or_default();
-            let delta = properties["delta"].as_str().unwrap_or_default();
-            match ui.part_kind.get(part_id).copied() {
-                Some("text") => print!(RowKind::Plain, "{delta}"),
-                Some("reasoning") => print!(RowKind::Thinking, "{DIM}{delta}{RESET}"),
-                _ => {}
-            }
-        }
-        "permission.asked" => {
-            let id = properties["id"].as_str().unwrap_or_default().to_string();
-            println!(
-                RowKind::Plain,
-                "\n{YELLOW}⚠ permission{}: {}{RESET} {DIM}[o]nce [a]lways [r]eject{RESET}",
-                properties["permission"]
-                    .as_str()
-                    .map(|p| format!(" {p}"))
-                    .unwrap_or_default(),
-                truncate(
-                    properties["patterns"]
-                        .as_array()
-                        .map(|list| list
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_default()
-                        .as_str(),
-                    120
-                )
-            );
-            ui.prompt = Some(PendingPrompt::Permission(id));
-        }
-        "question.asked" => {
-            let id = properties["id"].as_str().unwrap_or_default().to_string();
-            let questions = properties["questions"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let answers: Vec<Vec<String>> = vec![Vec::new(); questions.len()];
-            ui.prompt = Some(PendingPrompt::Question {
-                id,
-                questions: questions.clone(),
-                answers: answers.clone(),
-                current: 0,
-                confirm: false,
-                drafts: (0..questions.len()).map(|_| Draft::default()).collect(),
-            });
-            // Questions appear one at a time: the first is shown now, each
-            // next when the user reaches it.
-            if !questions.is_empty() {
-                print!(
-                    RowKind::Plain,
-                    "{}",
-                    render_question(&questions, &answers, 0)
-                );
-            }
-        }
-        "session.error" => {
-            let message = properties["error"]["data"]["message"]
-                .as_str()
-                .unwrap_or("unknown error");
-            println!(RowKind::Plain, "\n{RED}error:{RESET} {message}");
-        }
-        "session.idle" => {
-            println!(RowKind::Plain, "\n{DIM}└ idle{RESET}");
-        }
-        "session.title" => match properties["state"].as_str() {
-            Some("start") => println!(RowKind::Plain, "\n{DIM}◦ generating title…{RESET}"),
-            Some("done") => println!(
-                RowKind::Plain,
-                "{DIM}◦ title: {}{RESET}",
-                truncate(properties["title"].as_str().unwrap_or_default(), 60)
-            ),
-            _ => {}
-        },
-        _ => {}
-    }
-    transcript.0
-}
-
 /// One answer line for one question. A line of option numbers ("2", "1 3" for
 /// multiple) answers with those options' labels: the question contract and the
 /// model both expect labels, so the displayed index must not reach the tool
 /// output. Any other line - prose, an out-of-range number - is one custom
 /// answer, kept exactly as typed.
-fn parse_answer(line: &str, labels: &[String]) -> Vec<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    let numbers: Option<Vec<usize>> = trimmed
-        .split_ascii_whitespace()
-        .map(|token| {
-            token
-                .parse::<usize>()
-                .ok()
-                .filter(|number| (1..=labels.len()).contains(number))
-        })
-        .collect();
-    match numbers {
-        Some(numbers) => numbers
-            .iter()
-            .map(|number| labels[number - 1].clone())
-            .collect(),
-        None => vec![trimmed.to_string()],
-    }
-}
-
 /// The draft the keyboard edits: a pending question's own answer draft, so
 /// answering gets the full input editor while the prompt draft waits untouched
 /// and returns when the question settles.
@@ -627,7 +267,7 @@ fn answer_question(state: &mut PendingPrompt) -> (bool, String) {
     if choices.is_empty() {
         return (false, String::new());
     }
-    if question["multiple"] != true && choices.len() > 1 {
+    if crate::types::validate_answer(question, &choices).is_err() {
         // The reply contract takes one answer per single-choice question;
         // accepting a list here would stall the tool.
         return (false, format!("{YELLOW}one answer only{RESET}\n"));
@@ -680,8 +320,7 @@ fn confirm_question(app: &App, state: &mut PendingPrompt) -> bool {
     let PendingPrompt::Question { id, answers, .. } = state else {
         return false;
     };
-    app.questions.reply(id, std::mem::take(answers));
-    true
+    app.questions.reply(id, answers.clone())
 }
 
 /// Move to the next (positive) or previous (negative) question, wrapping.
@@ -734,25 +373,13 @@ pub(crate) enum Key {
     /// Move by N rows; page keys report a full page.
     Up(usize),
     Down(usize),
-    Left,
-    Right,
-    /// Word-wise motion with Alt or Ctrl held.
-    WordLeft,
-    WordRight,
-    /// Motion with Shift held extends the selection.
-    SelectLeft,
-    SelectRight,
-    SelectHome,
-    SelectEnd,
-    SelectWordLeft,
-    SelectWordRight,
+    /// Shared caret motion; Shift extends the selection.
+    Move(Motion, bool),
     Undo,
     /// Ctrl+K: caret to line end. Ctrl+W: word behind the caret. Ctrl+Y: yank.
     KillLine,
     KillWord,
     Yank,
-    Home,
-    End,
     Tab,
     /// Shift+Tab: the previous question (Tab is the next-question motion).
     PreviousQuestion,
@@ -800,10 +427,10 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => Key::ToggleThinking,
             (KeyCode::Char('o'), KeyModifiers::CONTROL) => Key::ToggleTools,
             // Readline aliases for the line-start / line-end motion.
-            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Key::Home,
-            (KeyCode::Char('e'), KeyModifiers::CONTROL) => Key::End,
-            (KeyCode::Char('b'), KeyModifiers::ALT) => Key::WordLeft,
-            (KeyCode::Char('f'), KeyModifiers::ALT) => Key::WordRight,
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Key::Move(Motion::Home, false),
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => Key::Move(Motion::End, false),
+            (KeyCode::Char('b'), KeyModifiers::ALT) => Key::Move(Motion::WordLeft, false),
+            (KeyCode::Char('f'), KeyModifiers::ALT) => Key::Move(Motion::WordRight, false),
             (KeyCode::Backspace, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                 Key::RemoveAttachment
             }
@@ -826,46 +453,26 @@ pub(crate) fn decode_event(event: Event) -> Key {
             }),
             (KeyCode::PageUp, _) => Key::PageUp,
             (KeyCode::PageDown, _) => Key::PageDown,
-            (KeyCode::Left, modifiers)
-                if modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-            {
-                Key::SelectWordLeft
+            (KeyCode::Left | KeyCode::Right, modifiers) => {
+                let word = modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+                let motion = match (key.code, word) {
+                    (KeyCode::Left, true) => Motion::WordLeft,
+                    (KeyCode::Right, true) => Motion::WordRight,
+                    (KeyCode::Left, false) => Motion::Left,
+                    _ => Motion::Right,
+                };
+                Key::Move(motion, modifiers.contains(KeyModifiers::SHIFT))
             }
-            (KeyCode::Right, modifiers)
-                if modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-            {
-                Key::SelectWordRight
+            (KeyCode::Home | KeyCode::End, modifiers) => {
+                match (key.code, modifiers.contains(KeyModifiers::CONTROL)) {
+                    (KeyCode::Home, true) => Key::ScrollTop,
+                    (_, true) => Key::ScrollBottom,
+                    (KeyCode::Home, false) => {
+                        Key::Move(Motion::Home, modifiers.contains(KeyModifiers::SHIFT))
+                    }
+                    _ => Key::Move(Motion::End, modifiers.contains(KeyModifiers::SHIFT)),
+                }
             }
-            (KeyCode::Left, modifiers)
-                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-            {
-                Key::WordLeft
-            }
-            (KeyCode::Right, modifiers)
-                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-            {
-                Key::WordRight
-            }
-            (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                Key::SelectLeft
-            }
-            (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                Key::SelectRight
-            }
-            (KeyCode::Left, _) => Key::Left,
-            (KeyCode::Right, _) => Key::Right,
-            (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                Key::ScrollTop
-            }
-            (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                Key::ScrollBottom
-            }
-            (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                Key::SelectHome
-            }
-            (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => Key::SelectEnd,
-            (KeyCode::Home, _) => Key::Home,
-            (KeyCode::End, _) => Key::End,
             (KeyCode::Tab, _) => Key::Tab,
             (KeyCode::BackTab, _) => Key::PreviousQuestion,
             (KeyCode::Char(ch), modifiers)
@@ -884,336 +491,6 @@ pub(crate) fn decode_event(event: Event) -> Key {
     }
 }
 
-/// A pending image. Clipboard images use data URLs so removing a draft leaves
-/// no temporary files and saved sessions can still read the image later.
-struct Attachment {
-    filename: String,
-    url: String,
-    mime: &'static str,
-}
-
-const MAX_ATTACHMENT: u64 = 20 * 1024 * 1024;
-
-fn file_attachment(path: &Path) -> Result<Attachment, String> {
-    let path =
-        std::fs::canonicalize(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-    if size > MAX_ATTACHMENT {
-        return Err("Image exceeds the 20 MiB attachment limit".into());
-    }
-    let mime = crate::tools::media_type(&std::fs::read(&path).map_err(|e| e.to_string())?)
-        .filter(|mime| mime.starts_with("image/"))
-        .ok_or_else(|| format!("{} is not a PNG, JPEG, GIF or WebP image", path.display()))?;
-    Ok(Attachment {
-        filename: path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "image".into()),
-        url: reqwest::Url::from_file_path(&path)
-            .map_err(|_| format!("{} is not an absolute path", path.display()))?
-            .to_string(),
-        mime,
-    })
-}
-
-/// Retain supported clipboard images in the message itself, without temp files.
-fn image_attachment(bytes: Vec<u8>) -> Option<Attachment> {
-    let mime = crate::tools::media_type(&bytes).filter(|mime| mime.starts_with("image/"))?;
-    if bytes.len() as u64 > MAX_ATTACHMENT {
-        return None;
-    }
-    let ext = mime.rsplit('/').next().unwrap_or("png");
-    Some(Attachment {
-        filename: format!("clipboard.{ext}"),
-        url: format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        ),
-        mime,
-    })
-}
-
-/// A paste that is only a quoted, file: or ~/ path to an image file. Many
-/// terminals paste dragged or copied files as paths, so those become
-/// attachments; anything else stays plain text.
-fn pasted_image_path(text: &str) -> Option<PathBuf> {
-    let trimmed = text.trim();
-    if trimmed.contains(['\n', '\r']) {
-        return None;
-    }
-    let unquoted = trimmed
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-        })
-        .unwrap_or(trimmed);
-    let path = if unquoted.starts_with("file:") {
-        reqwest::Url::parse(unquoted).ok()?.to_file_path().ok()?
-    } else {
-        PathBuf::from(unquoted.replace("\\ ", " "))
-    };
-    let expanded = match path.to_str()?.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))?,
-        None => path,
-    };
-    is_image_file(&expanded).then_some(expanded)
-}
-
-// Sniff only the header: pasting a path to a huge file must not read it all.
-fn is_image_file(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
-        return false;
-    }
-    let mut head = [0u8; 16];
-    let read = file.read(&mut head).unwrap_or(0);
-    crate::tools::media_type(&head[..read]).is_some_and(|mime| mime.starts_with("image/"))
-}
-
-async fn paste_clipboard(draft: &mut Draft, display: &mut Display) {
-    let result = tokio::time::timeout(std::time::Duration::from_secs(3), clipboard_image()).await;
-    let message = match result {
-        Ok(Ok(Some(attachment))) => {
-            draft.attachments.push(attachment);
-            return;
-        }
-        Ok(Ok(None)) => {
-            "Clipboard has no supported image. Paste an image file path to attach it.".into()
-        }
-        Ok(Err(message)) => message,
-        Err(_) => "Clipboard read timed out. Paste an image file path to attach it.".into(),
-    };
-    display.output(&format!("\n{YELLOW}{message}{RESET}\n"), terminal_width());
-}
-
-#[cfg(target_os = "linux")]
-async fn clipboard_image() -> Result<Option<Attachment>, String> {
-    use tokio::process::Command;
-    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let x11 = std::env::var_os("DISPLAY").is_some();
-    if !wayland && !x11 {
-        return Err(
-            if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
-            {
-                "SSH does not forward your local image clipboard. Copy the image to this host (for example with scp), then paste its remote path; X11 clipboard forwarding also works with a forwarded DISPLAY and xclip.".into()
-            } else {
-                "No desktop clipboard is available. Paste an image file path, or use wl-paste (Wayland) / xclip (X11) in a desktop session.".into()
-            },
-        );
-    }
-    let mut available = false;
-    for (program, enabled) in [("wl-paste", wayland), ("xclip", x11)] {
-        if !enabled {
-            continue;
-        }
-        for mime in [
-            "image/png",
-            "image/jpeg",
-            "image/webp",
-            "image/gif",
-            "text/uri-list",
-        ] {
-            let mut command = Command::new(program);
-            if program == "wl-paste" {
-                // --no-newline keeps binary payloads byte-exact.
-                command.args(["--type", mime, "--no-newline"]);
-            } else {
-                command.args(["-selection", "clipboard", "-t", mime, "-o"]);
-            }
-            match command.kill_on_drop(true).output().await {
-                Ok(out) => {
-                    available = true;
-                    if out.status.success() {
-                        if mime == "text/uri-list" {
-                            if let Ok(text) = std::str::from_utf8(&out.stdout) {
-                                let paths: Vec<_> = text
-                                    .lines()
-                                    .filter(|line| {
-                                        !line.starts_with('#') && !line.trim().is_empty()
-                                    })
-                                    .collect();
-                                if let [path] = paths.as_slice() {
-                                    if let Some(path) = pasted_image_path(path) {
-                                        return file_attachment(&path).map(Some);
-                                    }
-                                }
-                            }
-                        } else if let Some(attachment) = image_attachment(out.stdout) {
-                            return Ok(Some(attachment));
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error) => {
-                    return Err(format!("Cannot read clipboard using {program}: {error}"))
-                }
-            }
-        }
-    }
-    if !available {
-        return Err("Image paste needs wl-paste (Wayland) or xclip (X11); neither helper could be started. You can also paste an image file path.".into());
-    }
-    Ok(None)
-}
-
-#[cfg(target_os = "macos")]
-async fn clipboard_image() -> Result<Option<Attachment>, String> {
-    use tokio::process::Command;
-    let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let file = directory.path().join("clipboard.png");
-    let out = Command::new("osascript")
-        .args([
-            "-e",
-            &format!(
-                "set f to open for access POSIX file \"{}\" with write permission",
-                file.display()
-            ),
-            "-e",
-            "write (the clipboard as «class PNGf») to f starting at 1",
-            "-e",
-            "close access f",
-        ])
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|e| format!("Cannot run osascript: {e}"))?;
-    let bytes = std::fs::read(&file).ok();
-    let _ = std::fs::remove_file(&file);
-    if !out.status.success() {
-        return Ok(None);
-    }
-    Ok(bytes.and_then(image_attachment))
-}
-
-#[cfg(windows)]
-async fn clipboard_image() -> Result<Option<Attachment>, String> {
-    use tokio::process::Command;
-    let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let file = directory.path().join("clipboard.png");
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; if ($i = [System.Windows.Forms.Clipboard]::GetImage()) {{ $i.Save('{}') }}",
-        file.display()
-    );
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|e| format!("Cannot run powershell: {e}"))?;
-    let bytes = std::fs::read(&file).ok();
-    let _ = std::fs::remove_file(&file);
-    if !out.status.success() {
-        return Ok(None);
-    }
-    Ok(bytes.and_then(image_attachment))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-async fn clipboard_image() -> Result<Option<Attachment>, String> {
-    Err("Image paste is not supported on this platform".into())
-}
-
-#[cfg(unix)]
-fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut hangup = signal(SignalKind::hangup())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut quit = signal(SignalKind::quit())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    Ok(async move {
-        tokio::select! {
-            _ = hangup.recv() => {},
-            _ = interrupt.recv() => {},
-            _ = quit.recv() => {},
-            _ = terminate.recv() => {},
-        }
-    })
-}
-
-#[cfg(not(unix))]
-fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
-    Ok(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-}
-
-fn render_history(display: &mut Display, history: &[MessageWithParts]) {
-    let width = terminal_width();
-    for message in history {
-        display.output(&format!("\n{BOLD}{}{RESET}\n", message.info.role), width);
-        for part in &message.parts {
-            match part["type"].as_str() {
-                Some("text") => display.output(
-                    &format!("{}\n", part["text"].as_str().unwrap_or_default()),
-                    width,
-                ),
-                // A resumed call takes part in the Ctrl+O toggle, so it
-                // expands exactly like the live transcript did.
-                Some("tool") => {
-                    let (line, full_line) = tool_block(part);
-                    display.output_as(&line, width, RowKind::ToolBrief);
-                    display.output_as(&full_line, width, RowKind::ToolFull);
-                }
-                Some("file") => display.output(
-                    &format!(
-                        "{DIM}attachment: {}{RESET}\n",
-                        part["filename"]
-                            .as_str()
-                            .or_else(|| part["url"].as_str())
-                            .unwrap_or("file")
-                    ),
-                    width,
-                ),
-                _ => {}
-            }
-        }
-        if let Some(error) = &message.info.error {
-            display.output(
-                &format!(
-                    "{RED}error: {}{RESET}\n",
-                    error["data"]["message"].as_str().unwrap_or("interrupted")
-                ),
-                width,
-            );
-        }
-    }
-}
-
-/// The session's user prompts in order, for Up/Down recall.
-fn session_prompts(messages: &[MessageWithParts]) -> impl Iterator<Item = String> + '_ {
-    messages
-        .iter()
-        .filter(|message| message.info.role == "user")
-        .filter_map(|message| {
-            message
-                .parts
-                .iter()
-                .find(|part| part["type"].as_str() == Some("text"))
-                .and_then(|part| part["text"].as_str())
-                .map(str::to_string)
-        })
-}
-
-pub(crate) fn display_model(
-    model_ref: Option<&crate::types::ModelRef>,
-    config_model: &str,
-) -> String {
-    let display = model_ref
-        .map(|model| format!("{}/{}", model.provider_id, model.model_id))
-        .unwrap_or_else(|| config_model.to_string());
-    if display.is_empty() {
-        "unconfigured".into()
-    } else {
-        display
-    }
-}
-
 /// Interactive resume path for `--resume`: needs a real terminal because it
 /// enters raw mode and reads keys before the chat loop exists.
 async fn pick_session(app: &App, directory: Option<&str>) -> Result<crate::types::Session, String> {
@@ -1229,8 +506,94 @@ async fn pick_session(app: &App, directory: Option<&str>) -> Result<crate::types
         .ok_or_else(|| "No session selected".to_string())
 }
 
-pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
-    let app = App::new()?;
+impl Ui {
+    /// Resolve dialog keys before ordinary draft editing. Global controls stay in the main loop.
+    fn prompt_key(&mut self, app: &App, key: &Key) -> Option<String> {
+        if matches!(
+            key,
+            Key::CtrlD
+                | Key::CtrlC
+                | Key::CtrlL
+                | Key::CtrlU
+                | Key::Help
+                | Key::ToggleThinking
+                | Key::ToggleTools
+        ) {
+            return None;
+        }
+        let state = self.prompt.as_mut()?;
+        if let PendingPrompt::Permission(id) = state {
+            let reply = match key {
+                Key::Char('o' | 'O') => "once",
+                Key::Char('a' | 'A') => "always",
+                Key::Char(_) | Key::Esc => "reject",
+                Key::Enter => return Some(String::new()),
+                _ => return None,
+            };
+            if app.perms.reply(id, reply) {
+                self.prompt = None;
+            }
+            return Some(String::new());
+        }
+        let confirming = matches!(state, PendingPrompt::Question { confirm: true, .. });
+        match key {
+            Key::Enter if confirming => {
+                if confirm_question(app, state) {
+                    self.prompt = None;
+                }
+                Some(String::new())
+            }
+            Key::Enter => {
+                let (finished, text) = answer_question(state);
+                if finished {
+                    self.prompt = None;
+                }
+                Some(text)
+            }
+            Key::Backspace => {
+                if let PendingPrompt::Question {
+                    current, drafts, ..
+                } = state
+                {
+                    if !drafts[*current].text.is_empty() {
+                        drafts[*current].backspace();
+                    } else if *current > 0 {
+                        return switch_question(state, -1);
+                    }
+                }
+                Some(String::new())
+            }
+            Key::Tab | Key::PreviousQuestion => Some(
+                switch_question(state, if matches!(key, Key::Tab) { 1 } else { -1 })
+                    .unwrap_or_default(),
+            ),
+            Key::Esc => {
+                if let PendingPrompt::Question { id, .. } = state {
+                    app.questions.reject(id);
+                }
+                self.prompt = None;
+                Some(String::new())
+            }
+            _ if confirming => {
+                if let PendingPrompt::Question {
+                    confirm,
+                    current,
+                    questions,
+                    answers,
+                    ..
+                } = state
+                {
+                    *confirm = false;
+                    return Some(render_question(questions, answers, *current));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
     let session = if args.resume {
         pick_session(&app, args.directory.as_deref()).await?
     } else {
@@ -1242,27 +605,17 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
         )
         .await?
     };
-    crate::sessions::reject_correlated_reentry(&session.id)?;
-    let mut app = app.for_directory(&session.directory)?;
     let mut session = session;
     let engine = Engine::new();
-    let history = app.store.messages(&session.id)?;
-    let previous = history
-        .iter()
-        .rev()
-        .find(|message| message.info.role == "user");
     let model_override = args.model.clone();
-    let mut model_ref = args
-        .model
-        .or_else(|| previous.and_then(|message| message.info.model.clone()));
-    let mut agent = previous.and_then(|message| message.info.agent.clone());
-    let mut variant = previous.and_then(|message| message.info.variant.clone());
-    let mut model_display = display_model(model_ref.as_ref(), &app.config.lock().unwrap().model);
+    let mut selected = PromptRequest {
+        model: args.model,
+        ..Default::default()
+    };
+    let (mut app, history) = crate::client::activate(&app, &session, &mut selected)?;
+    let mut model_display = display_model(selected.model.as_ref(), &app.config.model);
 
-    let fullscreen = matches!(
-        app.config.lock().unwrap().ui.scroll_mode,
-        ScrollMode::Fullscreen
-    );
+    let fullscreen = matches!(app.config.as_ref().ui.scroll_mode, ScrollMode::Fullscreen);
     let shutdown =
         shutdown_signal().map_err(|error| format!("Cannot listen for shutdown: {error}"))?;
     let _raw = RawMode::enter(fullscreen)
@@ -1276,13 +629,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
     let mut prompt_history = History::default();
     prompt_history.load(session_prompts(&history));
     let mut display = Display::new(fullscreen);
-    let mut ui = Ui {
-        part_kind: HashMap::new(),
-        headered: std::collections::HashSet::new(),
-        tool_done: std::collections::HashSet::new(),
-        prompt: None,
-        visibility: Visibility::default(),
-    };
+    let mut ui = Ui::default();
     let width = terminal_width();
     display.output(
         &format!(
@@ -1298,7 +645,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
         ),
         width,
     );
-    render_history(&mut display, &history);
+    render_history(&mut display, &mut ui, &history);
     display.draw(&ui, &draft, terminal_width(), &model_display);
 
     loop {
@@ -1314,12 +661,15 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                 let key = decode_event(event);
                 let pending_permission = matches!(ui.prompt, Some(PendingPrompt::Permission(_)));
                 let pending_question = matches!(ui.prompt, Some(PendingPrompt::Question { .. }));
-                let confirming =
-                    matches!(ui.prompt, Some(PendingPrompt::Question { confirm: true, .. }));
+                if let Some(text) = ui.prompt_key(&app, &key) {
+                    if !text.is_empty() { display.output(&text, terminal_width()); }
+                    display.draw(&ui, &draft, terminal_width(), &model_display);
+                    continue;
+                }
                 match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
-                    Key::CtrlC => { engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
+                    Key::CtrlC => { ui.prompt = None; engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
                     Key::CtrlL => display.clear_screen(),
                     Key::Help => {
                         display.finish_line();
@@ -1368,25 +718,17 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                         );
                                     }
                                     Ok(resumed) => {
-                                        crate::sessions::reject_correlated_reentry(&resumed.id)?;
+                                        selected = PromptRequest { model: model_override.clone(), ..Default::default() };
+                                        let (scoped, history) = crate::client::activate(&app, &resumed, &mut selected)?;
                                         engine.abort(&session.id);
-                                        app = app.for_directory(&resumed.directory)?;
+                                        app = scoped;
                                         session = resumed;
-                                        let history = app.store.messages(&session.id)?;
-                                        let previous = history.iter().rev().find(|message| {
-                                            message.info.role == "user"
-                                        });
-                                        model_ref = model_override.clone().or_else(|| {
-                                            previous.and_then(|message| message.info.model.clone())
-                                        });
-                                        agent = previous
-                                            .and_then(|message| message.info.agent.clone());
-                                        variant = previous
-                                            .and_then(|message| message.info.variant.clone());
-                                        model_display = display_model(
-                                            model_ref.as_ref(),
-                                            &app.config.lock().unwrap().model,
-                                        );
+                                        ui.interactions.clear();
+                                        ui.text = TextState::default();
+                                        ui.headered.clear();
+                                        ui.tool_done.clear();
+                                        ui.prompt = None;
+                                        model_display = display_model(selected.model.as_ref(), &app.config.model);
                                         draft = Draft::default();
                                         prompt_history.load(session_prompts(&history));
                                         display.output(
@@ -1396,105 +738,10 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                             ),
                                             terminal_width(),
                                         );
-                                        render_history(&mut display, &history);
+                                        render_history(&mut display, &mut ui, &history);
                                     }
                                 }
                             }
-                        }
-                    }
-                    Key::Char(ch) if pending_permission => {
-                        if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() {
-                            match ch {
-                                'o' | 'O' => { app.perms.reply(&id, "once"); }
-                                'a' | 'A' => { app.perms.reply(&id, "always"); }
-                                _ => { app.perms.reply(&id, "reject"); }
-                            }
-                        }
-                    }
-                    Key::Enter if confirming => {
-                        // The confirmation screen is up; Enter sends.
-                        if let Some(state) = ui.prompt.as_mut() {
-                            if confirm_question(&app, state) {
-                                ui.prompt = None;
-                            }
-                        }
-                    }
-                    Key::Enter if pending_question => {
-                        // The answer's draft is the active input; the prompt
-                        // draft stays untouched underneath it.
-                        if let Some(state) = ui.prompt.as_mut() {
-                            let (finished, out) = answer_question(state);
-                            if !out.is_empty() {
-                                display.output(&out, terminal_width());
-                            }
-                            if finished {
-                                ui.prompt = None;
-                            }
-                        }
-                    }
-                    Key::Backspace if pending_question => {
-                        // Backspace edits the answer; on the empty line it
-                        // returns to the previous question. Shift+Tab does
-                        // that from any draft, keeping the typed text.
-                        if let Some(PendingPrompt::Question {
-                            questions,
-                            answers,
-                            current,
-                            drafts,
-                            ..
-                        }) = ui.prompt.as_mut()
-                        {
-                            if drafts
-                                .get(*current)
-                                .is_some_and(|draft| !draft.text.is_empty())
-                            {
-                                drafts[*current].backspace();
-                            } else if *current > 0 {
-                                *current -= 1;
-                                let labels = option_labels(&questions[*current]["options"]);
-                                drafts[*current]
-                                    .insert_str(&answer_line(&answers[*current], &labels));
-                                let out = render_question(questions, answers, *current);
-                                display.output(&out, terminal_width());
-                            }
-                        }
-                    }
-                    Key::Tab if pending_question => {
-                        // Tab walks the questions forward; each keeps its own
-                        // draft, so a half-typed answer survives the trip.
-                        if let Some(state) = ui.prompt.as_mut() {
-                            if let Some(out) = switch_question(state, 1) {
-                                display.output(&out, terminal_width());
-                            }
-                        }
-                    }
-                    Key::PreviousQuestion if pending_question => {
-                        if let Some(state) = ui.prompt.as_mut() {
-                            if let Some(out) = switch_question(state, -1) {
-                                display.output(&out, terminal_width());
-                            }
-                        }
-                    }
-                    Key::Esc if pending_question => {
-                        if let Some(PendingPrompt::Question { id, .. }) = ui.prompt.take() {
-                            app.questions.reject(&id);
-                        }
-                    }
-                    _key if confirming => {
-                        // Any other key steps out of the confirmation screen
-                        // back to editing; the keystroke is swallowed so a
-                        // stray tap can never send.
-                        if let Some(PendingPrompt::Question {
-                            questions,
-                            answers,
-                            current,
-                            confirm,
-                            ..
-                        }) = ui.prompt.as_mut()
-                        {
-                            *confirm = false;
-                            let out = render_question(questions, answers, *current);
-                            display.output(&out, terminal_width());
                         }
                     }
                     Key::Paste(_) if pending_permission => {}
@@ -1546,21 +793,13 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                             parts.push(serde_json::json!({"type": "text", "text": text}));
                         }
                         for attachment in files {
-                            parts.push(serde_json::json!({
-                                "type": "file",
-                                "url": attachment.url,
-                                "mime": attachment.mime,
-                                "filename": attachment.filename,
-                            }));
+                            parts.push(attachment.part());
                         }
                         if !parts.is_empty() {
                             let request = PromptRequest {
                                 message_id: Some(crate::types::hex_id("msg_")),
-                                model: model_ref.clone(),
-                                agent: agent.clone(),
-                                variant: variant.clone(),
                                 parts,
-                                ..Default::default()
+                                ..selected.clone()
                             };
                             if let Err(error) = engine.admit(app.clone(), session.id.clone(), request).await {
                                 display.output(
@@ -1570,47 +809,7 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                             }
                         }
                     }
-                    Key::Backspace if !pending_permission => { draft.backspace(); }
-                    Key::Char(ch) => { active_draft(&mut ui.prompt, &mut draft).insert(ch); }
-                    Key::NewLine if !pending_permission => {
-                        active_draft(&mut ui.prompt, &mut draft).insert('\n');
-                    }
-                    // While a question is pending the active input is its
-                    // answer draft, so every motion, selection, kill, yank,
-                    // paste and undo works on the answer.
-                    Key::Delete if !pending_permission => {
-                        active_draft(&mut ui.prompt, &mut draft).delete()
-                    }
-                    Key::Undo if !pending_permission => {
-                        active_draft(&mut ui.prompt, &mut draft).undo()
-                    }
-                    Key::KillLine if !pending_permission => {
-                        if let Some(killed) = active_draft(&mut ui.prompt, &mut draft).kill_line() {
-                            killring.push(killed);
-                        }
-                    }
-                    Key::KillWord if !pending_permission => {
-                        if let Some(killed) = active_draft(&mut ui.prompt, &mut draft).kill_word() {
-                            killring.push(killed);
-                        }
-                    }
-                    Key::Yank if !pending_permission => {
-                        if let Some(text) = killring.top() {
-                            active_draft(&mut ui.prompt, &mut draft).insert_str(text);
-                        }
-                    }
-                    Key::Left => active_draft(&mut ui.prompt, &mut draft).left(),
-                    Key::Right => active_draft(&mut ui.prompt, &mut draft).right(),
-                    Key::WordLeft => active_draft(&mut ui.prompt, &mut draft).word_left(),
-                    Key::WordRight => active_draft(&mut ui.prompt, &mut draft).word_right(),
-                    Key::Home => active_draft(&mut ui.prompt, &mut draft).home(),
-                    Key::End => active_draft(&mut ui.prompt, &mut draft).end(),
-                    Key::SelectLeft => active_draft(&mut ui.prompt, &mut draft).select_left(),
-                    Key::SelectRight => active_draft(&mut ui.prompt, &mut draft).select_right(),
-                    Key::SelectHome => active_draft(&mut ui.prompt, &mut draft).select_home(),
-                    Key::SelectEnd => active_draft(&mut ui.prompt, &mut draft).select_end(),
-                    Key::SelectWordLeft => active_draft(&mut ui.prompt, &mut draft).select_word_left(),
-                    Key::SelectWordRight => active_draft(&mut ui.prompt, &mut draft).select_word_right(),
+                    key if !pending_permission && input::edit(&key, active_draft(&mut ui.prompt, &mut draft), &mut killring) => {}
                     Key::Up(n) if !pending_permission => {
                         // Row math uses the same prefix the input row draws.
                         let prefix = input_prefix(&ui, &draft);
@@ -1672,13 +871,12 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                                     PAGE as isize,
                                 ),
                                 Key::ScrollTop => {
-                                    active_draft(&mut ui.prompt, &mut draft).home();
+                                    active_draft(&mut ui.prompt, &mut draft).motion(Motion::Home, false);
                                 }
-                                _ => active_draft(&mut ui.prompt, &mut draft).end(),
+                                _ => active_draft(&mut ui.prompt, &mut draft).motion(Motion::End, false),
                             }
                         }
                     }
-                    Key::Esc if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
                     _ => {}
                 }
                 display.draw(&ui, &draft, terminal_width(), &model_display);
@@ -1687,11 +885,22 @@ pub async fn run(args: crate::TuiArgs) -> Result<(), String> {
                 display.erase();
                 match event {
                     Ok(event) => {
-                        for (kind, text) in render_event(&mut ui, &event, &session.id) {
+                        if !crate::client::accepts(&app.store, &session.id, &event) { continue; }
+                        let event_session = crate::client::event_session(&event).unwrap_or(&session.id);
+                        for (kind, text) in render_event(&mut ui, &event, event_session) {
                             display.output_as(&text, terminal_width(), kind);
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => display.output(&format!("\n{YELLOW}⚠ some events were skipped{RESET}\n"), terminal_width()),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let history = app.store.messages(&session.id)?;
+                        ui = Ui { visibility: ui.visibility, ..Default::default() };
+                        display.clear_screen();
+                        display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), terminal_width());
+                        render_history(&mut display, &mut ui, &history);
+                        for pending in crate::client::pending_events(&app, &session.id) {
+                            for (kind, text) in render_event(&mut ui, &pending, &session.id) { display.output_as(&text, terminal_width(), kind); }
+                        }
+                    },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
                 display.draw(&ui, &draft, terminal_width(), &model_display);
@@ -1710,13 +919,12 @@ mod tests {
     use super::{
         answer_line, decode_event, expand, file_attachment, help_text, image_attachment,
         parse_answer, pasted_image_path, prompt_header, render_confirmation, render_event,
-        render_question, switch_question, tool_block, tool_line, tool_result, Draft, Key,
+        render_question, switch_question, tool_line, tool_result, Draft, Key, Motion,
         PendingPrompt, RowKind, Ui, Visibility, MAX_EXPANDED, WHEEL,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     };
-    use std::collections::{HashMap, HashSet};
 
     pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
 
@@ -1781,29 +989,65 @@ mod tests {
             (KeyCode::Char('k'), KeyModifiers::CONTROL, Key::KillLine),
             (KeyCode::Char('w'), KeyModifiers::CONTROL, Key::KillWord),
             (KeyCode::Char('y'), KeyModifiers::CONTROL, Key::Yank),
-            (KeyCode::Char('a'), KeyModifiers::CONTROL, Key::Home),
-            (KeyCode::Char('e'), KeyModifiers::CONTROL, Key::End),
-            (KeyCode::Char('f'), KeyModifiers::ALT, Key::WordRight),
-            (KeyCode::Char('b'), KeyModifiers::ALT, Key::WordLeft),
-            (KeyCode::Left, KeyModifiers::SHIFT, Key::SelectLeft),
-            (KeyCode::Right, KeyModifiers::SHIFT, Key::SelectRight),
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                Key::Move(Motion::Home, false),
+            ),
+            (
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                Key::Move(Motion::End, false),
+            ),
+            (
+                KeyCode::Char('f'),
+                KeyModifiers::ALT,
+                Key::Move(Motion::WordRight, false),
+            ),
+            (
+                KeyCode::Char('b'),
+                KeyModifiers::ALT,
+                Key::Move(Motion::WordLeft, false),
+            ),
+            (
+                KeyCode::Left,
+                KeyModifiers::SHIFT,
+                Key::Move(Motion::Left, true),
+            ),
+            (
+                KeyCode::Right,
+                KeyModifiers::SHIFT,
+                Key::Move(Motion::Right, true),
+            ),
             (KeyCode::Tab, KeyModifiers::NONE, Key::Tab),
             (KeyCode::BackTab, KeyModifiers::SHIFT, Key::PreviousQuestion),
-            (KeyCode::Home, KeyModifiers::SHIFT, Key::SelectHome),
-            (KeyCode::End, KeyModifiers::SHIFT, Key::SelectEnd),
+            (
+                KeyCode::Home,
+                KeyModifiers::SHIFT,
+                Key::Move(Motion::Home, true),
+            ),
+            (
+                KeyCode::End,
+                KeyModifiers::SHIFT,
+                Key::Move(Motion::End, true),
+            ),
             (
                 KeyCode::Left,
                 KeyModifiers::ALT | KeyModifiers::SHIFT,
-                Key::SelectWordLeft,
+                Key::Move(Motion::WordLeft, true),
             ),
             (
                 KeyCode::Right,
                 KeyModifiers::ALT | KeyModifiers::SHIFT,
-                Key::SelectWordRight,
+                Key::Move(Motion::WordRight, true),
             ),
             (KeyCode::Enter, KeyModifiers::ALT, Key::NewLine),
             (KeyCode::Enter, KeyModifiers::empty(), Key::Enter),
-            (KeyCode::Left, KeyModifiers::empty(), Key::Left),
+            (
+                KeyCode::Left,
+                KeyModifiers::empty(),
+                Key::Move(Motion::Left, false),
+            ),
             (KeyCode::Delete, KeyModifiers::empty(), Key::Delete),
         ] {
             assert_eq!(
@@ -1821,9 +1065,21 @@ mod tests {
             (KeyCode::Home, KeyModifiers::CONTROL, Key::ScrollTop),
             (KeyCode::End, KeyModifiers::CONTROL, Key::ScrollBottom),
             // Plain Home/End stay draft motion; Ctrl+A/E keep their aliases.
-            (KeyCode::Home, KeyModifiers::empty(), Key::Home),
-            (KeyCode::End, KeyModifiers::empty(), Key::End),
-            (KeyCode::Char('a'), KeyModifiers::CONTROL, Key::Home),
+            (
+                KeyCode::Home,
+                KeyModifiers::empty(),
+                Key::Move(Motion::Home, false),
+            ),
+            (
+                KeyCode::End,
+                KeyModifiers::empty(),
+                Key::Move(Motion::End, false),
+            ),
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                Key::Move(Motion::Home, false),
+            ),
         ] {
             assert_eq!(
                 decode_event(Event::Key(KeyEvent::new(code, modifiers))),
@@ -2027,20 +1283,60 @@ mod tests {
     }
 
     /// A `Ui` with no pending prompt, for transcript rendering.
+    fn tool_block(part: &serde_json::Value) -> (String, String) {
+        let rows = super::render::render_part(&mut Ui::default(), part);
+        (
+            painted(&rows, RowKind::ToolBrief),
+            painted(&rows, RowKind::ToolFull),
+        )
+    }
+
     fn new_ui() -> Ui {
-        Ui {
-            part_kind: HashMap::new(),
-            headered: HashSet::new(),
-            tool_done: HashSet::new(),
-            prompt: None,
-            visibility: Visibility::default(),
-        }
+        Ui::default()
+    }
+
+    #[test]
+    fn descendant_interactions_settle_by_request_id_and_user_text_has_no_assistant_heading() {
+        let mut ui = new_ui();
+        let question = bus_event(
+            "question.asked",
+            serde_json::json!({"sessionID":"child","id":"question","questions":[{"question":"Choose","header":"Choice","options":[]}]}),
+        );
+        assert!(!render_event(&mut ui, &question, "root").is_empty());
+        assert!(matches!(ui.prompt, Some(PendingPrompt::Question { .. })));
+        render_event(
+            &mut ui,
+            &bus_event(
+                "question.rejected",
+                serde_json::json!({"sessionID":"child","requestID":"unrelated"}),
+            ),
+            "root",
+        );
+        assert!(ui.prompt.is_some());
+        render_event(
+            &mut ui,
+            &bus_event(
+                "question.replied",
+                serde_json::json!({"sessionID":"child","requestID":"question"}),
+            ),
+            "root",
+        );
+        assert!(ui.prompt.is_none());
+        render_event(
+            &mut ui,
+            &bus_event(
+                "message.updated",
+                serde_json::json!({"info":{"id":"user","sessionID":"root","role":"user"}}),
+            ),
+            "root",
+        );
+        assert!(render_event(&mut ui, &bus_event("message.part.updated", serde_json::json!({"part":{"id":"part","messageID":"user","sessionID":"root","type":"text","text":"prompt"}})), "root").is_empty());
     }
 
     fn bus_event(type_: &str, properties: serde_json::Value) -> crate::types::BusEvent {
         crate::types::BusEvent {
             id: "e1".into(),
-            r#type: type_.into(),
+            kind: serde_json::from_value(serde_json::json!(type_)).expect("known event"),
             properties,
         }
     }

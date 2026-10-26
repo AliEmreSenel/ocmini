@@ -1,6 +1,10 @@
 use crate::config::data_home;
-use crate::types::Tokens;
+use crate::config::Config;
+use crate::engine::App;
+use crate::events as event;
+use crate::types::{ModelRef, Tokens};
 use rusqlite::{params, Connection};
+use serde_json::json;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -79,6 +83,66 @@ impl UsageDb {
         }
         })
     }
+}
+
+/// All paid requests, including titles and summaries, use the same sidecar and
+/// session totals. The returned cost also belongs on the persisted model step.
+pub fn record(
+    app: &App,
+    cfg: &Config,
+    model: &ModelRef,
+    sid: &str,
+    request_id: &str,
+    usage: &Tokens,
+    created: i64,
+) -> Result<f64, crate::types::OperationError> {
+    let cost = cost_for(cfg, model, usage);
+    app.usage.record(
+        request_id,
+        sid,
+        &model.provider_id,
+        &model.model_id,
+        usage,
+        created,
+    );
+    let Some(session) = app.store.mutate_session(sid, |session| {
+        session.cost += cost;
+        session.tokens.input += usage.input;
+        session.tokens.output += usage.output;
+        session.tokens.reasoning += usage.reasoning;
+        session.tokens.cache.read += usage.cache.read;
+        session.tokens.cache.write += usage.cache.write;
+        Ok(true)
+    })?
+    else {
+        return Ok(cost);
+    };
+    app.hooks.emit(
+        event::Session::Updated { info: &session },
+        &app.session_context(sid, json!({})),
+    );
+    Ok(cost)
+}
+
+pub fn cost_for(cfg: &Config, model: &ModelRef, usage: &Tokens) -> f64 {
+    let Some(info) = cfg
+        .provider(&model.provider_id)
+        .and_then(|p| p.models.get(&model.model_id))
+    else {
+        return 0.0;
+    };
+    let rates = info.extra.get("cost").cloned().unwrap_or_default();
+    let price = |name: &str| {
+        rates[name]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .unwrap_or(0.0)
+    };
+    (usage.input as f64 * price("input")
+        + (usage.output + usage.reasoning) as f64 * price("output")
+        + usage.cache.read as f64 * price("cache_read")
+        + usage.cache.write as f64 * price("cache_write"))
+        / 1_000_000.0
 }
 
 #[cfg(test)]

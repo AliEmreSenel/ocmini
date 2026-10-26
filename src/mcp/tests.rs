@@ -1,4 +1,7 @@
 use super::*;
+use crate::events as event;
+use std::io::BufReader;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 fn stdio_config() -> Value {
@@ -44,7 +47,7 @@ async fn stdio_connects_discovers_routes_and_calls_with_environment() {
             "server_with_underscores",
             "echo_value",
             json!({}),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -179,12 +182,7 @@ async fn remote_streamable_http_negotiates_session_and_reads_sse() {
     assert_eq!(status["status"], "connected", "{status}");
     assert_eq!(hub.tool_defs().len(), 2);
     let result = hub
-        .call_result_async(
-            "remote",
-            "echo",
-            json!({}),
-            Arc::new(AtomicBool::new(false)),
-        )
+        .call_result_async("remote", "echo", json!({}), CancellationToken::new())
         .await
         .unwrap();
     let result = render_result(&result);
@@ -192,12 +190,7 @@ async fn remote_streamable_http_negotiates_session_and_reads_sse() {
     assert!(result.contains("resource_link"));
     assert!(result.contains("42"));
     let error = hub
-        .call_result_async(
-            "remote",
-            "failure",
-            json!({}),
-            Arc::new(AtomicBool::new(false)),
-        )
+        .call_result_async("remote", "failure", json!({}), CancellationToken::new())
         .await
         .unwrap_err();
     assert_eq!(error, "fixture tool failed");
@@ -286,6 +279,10 @@ async fn disconnect_during_remote_refresh_keeps_disabled_status_and_empty_catalo
         .unwrap()["status"],
         "connected"
     );
+    hub.server("refresh")
+        .unwrap()
+        .changed
+        .store(true, Ordering::Release);
     let refreshing = hub.clone();
     let refresh = tokio::spawn(async move { refreshing.tool_defs_async().await });
     tokio::time::timeout(Duration::from_secs(2), fixture.entered.notified())
@@ -367,7 +364,9 @@ async fn status_events_keep_scope_and_omit_connection_secrets() {
     hub.disconnect(&name).unwrap();
     let mut states = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if event.r#type != "ocmini.mcp.status" || event.properties["server"] != name {
+        if event.kind != event::EventKind::Mcp(event::McpKind::Status)
+            || event.properties["server"] != name
+        {
             continue;
         }
         assert_eq!(event.properties["directory"], directory);
@@ -377,4 +376,102 @@ async fn status_events_keep_scope_and_omit_connection_secrets() {
         states.push(event.properties["status"].as_str().unwrap().to_owned());
     }
     assert_eq!(states, ["connecting", "connected", "disabled"]);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn ambiguous_pairs_have_unique_routes_and_exact_names_beat_legacy_aliases() {
+    let hub = McpHub::new();
+    for (server, tool) in [
+        ("a", "b_c_d"),
+        ("a_b", "c_d"),
+        ("a_b_c", "d"),
+        ("mcp_a", "b_c_d"),
+    ] {
+        let mut config = stdio_config();
+        config["command"][2] = json!(config["command"][2]
+            .as_str()
+            .unwrap()
+            .replace("echo_value", tool));
+        assert_eq!(
+            hub.add_async(server, config).await.unwrap()["status"],
+            "connected"
+        );
+    }
+    let defs = hub.tool_defs();
+    let mut targets = HashSet::new();
+    for tool in defs {
+        let alias = tool["function"]["name"].as_str().unwrap();
+        targets.insert(hub.route(alias).unwrap());
+    }
+    assert_eq!(targets.len(), 4);
+    assert_eq!(
+        hub.route("mcp_a_b_c_d"),
+        Some(("mcp_a".into(), "b_c_d".into()))
+    );
+}
+
+#[tokio::test]
+async fn refresh_shares_failures_retains_tools_and_recovers_without_reconnect() {
+    use axum::{extract::State, routing::post, Json, Router};
+    use std::sync::atomic::AtomicUsize;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(false));
+    async fn endpoint(
+        State((calls, fail)): State<(Arc<AtomicUsize>, Arc<AtomicBool>)>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let result = match request["method"].as_str().unwrap() {
+            "initialize" => {
+                json!({"protocolVersion":PROTOCOL,"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
+            }
+            "tools/list" => {
+                let index = calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if fail.load(Ordering::Relaxed) {
+                    return Json(
+                        json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32603,"message":"transient catalog failure"}}),
+                    );
+                }
+                json!({"tools":[{"name":if index == 0 {"old"} else {"new"},"inputSchema":{"type":"object"}}]})
+            }
+            "tools/call" => json!({"content":[{"type":"text","text":"retained tool works"}]}),
+            _ => json!({}),
+        };
+        Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route("/mcp", post(endpoint))
+        .with_state((calls.clone(), fail.clone()));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let hub = McpHub::new();
+    hub.add_async("fixture", json!({"type":"remote","url":url,"oauth":false}))
+        .await
+        .unwrap();
+    let owner = hub.server("fixture").unwrap();
+    fail.store(true, Ordering::Relaxed);
+    owner.changed.store(true, Ordering::Release);
+    let refreshes = (0..12).map(|_| hub.tool_defs_async());
+    let results = futures::future::join_all(refreshes).await;
+    assert!(results
+        .iter()
+        .all(|tools| tools[0]["function"]["name"] == "fixture_old"));
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(hub.status()["fixture"]["status"], "connected");
+    let result = hub
+        .call_result_async("fixture", "old", json!({}), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(render_result(&result), "retained tool works");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    fail.store(false, Ordering::Relaxed);
+    owner.refresh.lock().await.attempted = None;
+    assert_eq!(
+        hub.tool_defs_async().await[0]["function"]["name"],
+        "fixture_new"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    server.abort();
 }

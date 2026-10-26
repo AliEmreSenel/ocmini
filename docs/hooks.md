@@ -5,9 +5,9 @@ ocmini extensions have two interfaces:
 - **Hooks** run during an operation. Their boundary defines what they may validate, change, or reject. `turn.end.after` is an awaited, read-only finalizer.
 - **Event subscriptions** receive facts about operations. External clients use SSE; local commands register as observers. Observers cannot change the operation.
 
-All 26 hooks and 49 events are available. Start with the task below that matches your integration; detailed contracts and tuning live in [HOOKS-REFERENCE.md](HOOKS-REFERENCE.md). OpenCode JavaScript plugins use a separate interface.
+All 26 hooks and 49 events are available. Start with the task below that matches your integration; detailed contracts and tuning live in [hook reference](hooks-reference.md). OpenCode JavaScript plugins use a separate interface.
 
-For copyable recipes, see [HOOKS-EXAMPLES.md](HOOKS-EXAMPLES.md): run your own script on completion, show a desktop notification, require passing tests, add branch context, or adjust shell environments. These examples are documentation only.
+For copyable recipes, see [hook examples](hooks-examples.md): run your own script on completion, show a desktop notification, require passing tests, add branch context, or adjust shell environments. These examples are documentation only.
 
 ## Run a command before or after a turn ends
 
@@ -65,7 +65,7 @@ The catalog has four families. These are documentation groups; use the existing 
 - **Models:** `model.context.transform`, `model.params.transform`, `model.headers.transform`, `model.retry.before`, `message.text.complete`, `compaction.before`, `compaction.after`.
 - **Resources:** `session.create.before`, `session.update.before`, `session.fork.before`, `session.delete.before`, `task.spawn.before`, `skill.load.after`, `file.change.before`.
 
-Each hook permits specific fields. Mutation responses use `set`; accepted changes are validated before the next handler receives them. Tool arguments and file paths are authorized after preparation. Hooks cannot broaden permissions or replace runtime-owned identity, measured usage, or execution results. See the [hook catalog](HOOKS-REFERENCE.md#hook-catalog) for each boundary's contract.
+Each hook permits specific fields. Mutation responses use `set`; accepted changes are validated before the next handler receives them. Tool arguments and file paths are authorized after preparation. Hooks cannot broaden permissions or replace runtime-owned identity, measured usage, or execution results. See the [hook catalog](hooks-reference.md#hook-catalog) for each boundary's contract.
 
 ## Subscribe to facts about execution
 
@@ -97,7 +97,7 @@ To run a local command asynchronously, add an observer:
 
 Observers read an `events` array even for one event. Their output can acknowledge processing but cannot mutate events. Observer `on` patterns support `"*"`; hook names are exact. A turn-ended event describes one prompt; session idle means the queue drained and does not imply success.
 
-Ordinary observers and SSE are best-effort. For restart-safe terminal notifications, an observer can opt into `delivery: "durable"` for exact `ocmini.turn.ended` and/or `command.executed` names. Consumers deduplicate by event ID. See [delivery and recovery](HOOKS-REFERENCE.md#durable-terminal-notifications) for acknowledgement, retry, quota, and retention behavior.
+Ordinary observers and SSE are best-effort. For restart-safe terminal notifications, an observer can opt into `delivery: "durable"` for exact `ocmini.turn.ended` and/or `command.executed` names. Consumers deduplicate by event ID. See [delivery and recovery](hooks-reference.md#durable-terminal-notifications) for acknowledgement, retry, quota, and retention behavior.
 
 ## Add options when your integration needs them
 
@@ -121,4 +121,4 @@ ocmini debug hooks --json
 
 Inspection validates configuration and shows the catalog, allowed fields, registrations, trust sources, effective budgets, and bounded delivery metadata. It does not execute commands or recover turns.
 
-Use [HOOKS-REFERENCE.md](HOOKS-REFERENCE.md) for protocol details, all event names, limits, and advanced delivery policy; [HOOKS-PLAN.md](HOOKS-PLAN.md) for internal architecture; and [HOOKS-RESEARCH.md](HOOKS-RESEARCH.md) for research and upstream comparisons.
+Use the [hook reference](hooks-reference.md) for protocol details, all event names, limits, and advanced delivery policy.

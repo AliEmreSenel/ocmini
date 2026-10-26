@@ -89,7 +89,7 @@ for event in request["events"]:
     )
 ```
 
-The observer receives an `events` array, even for a single delivery. Empty stdout acknowledges successful processing. This registration uses best-effort delivery; for notifications that need retry/restart support, exact `ocmini.turn.ended` subscriptions can add `delivery: "durable"`. Durable consumers must deduplicate by event ID because redelivery can repeat external effects. See the [delivery contract](HOOKS-REFERENCE.md#durable-terminal-notifications).
+The observer receives an `events` array, even for a single delivery. Empty stdout acknowledges successful processing. This registration uses best-effort delivery; for notifications that need retry/restart support, exact `ocmini.turn.ended` subscriptions can add `delivery: "durable"`. Durable consumers must deduplicate by event ID because redelivery can repeat external effects. See the [delivery contract](hooks-reference.md#durable-terminal-notifications).
 
 ## Keep working until the tests pass
 
@@ -220,4 +220,4 @@ print(json.dumps({"set": {"env": env}}))
 
 The returned map is an overlay: strings set values and `null` removes inherited values. It is not a dump of the runtime's environment. This boundary also applies to command shell interpolation and background shell launch. Tools that do not honor these color variables may still emit color.
 
-For registration, matching, and inspection, start with [HOOKS.md](HOOKS.md). All allowed fields and advanced options are in [HOOKS-REFERENCE.md](HOOKS-REFERENCE.md).
+For registration, matching, and inspection, start with [hooks guide](hooks.md). All allowed fields and advanced options are in [hook reference](hooks-reference.md).

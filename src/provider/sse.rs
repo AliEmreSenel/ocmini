@@ -118,22 +118,25 @@ impl Decoder {
 
 pub fn frames(
     response: reqwest::Response,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Pin<Box<dyn Stream<Item = Result<Frame, String>> + Send>> {
     Box::pin(stream! {
         let mut bytes = response.bytes_stream();
         let mut decoder = Decoder::new();
         loop {
-            let chunk = match tokio::time::timeout(timeout, bytes.next()).await {
-                Ok(chunk) => chunk,
-                Err(_) => { yield Err(format!("provider stream timed out waiting for a chunk after {} seconds", timeout.as_secs())); return; }
+            let chunk = match timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, bytes.next()).await {
+                    Ok(chunk) => chunk,
+                    Err(_) => { yield Err(format!("provider stream timed out waiting for a chunk after {} seconds", timeout.as_secs())); return; }
+                },
+                None => bytes.next().await,
             };
             match chunk {
                 Some(Ok(chunk)) => match decoder.feed(&chunk) {
                     Ok(frames) => { for frame in frames { yield Ok(frame); } }
                     Err(error) => { yield Err(error); return; }
                 },
-                Some(Err(error)) => { yield Err(format!("provider stream failed: {error}")); return; }
+                Some(Err(error)) => { yield Err(format!("provider stream failed: {}", error.without_url())); return; }
                 None => {
                     match decoder.finish() {
                         Ok(frames) => { for frame in frames { yield Ok(frame); } }

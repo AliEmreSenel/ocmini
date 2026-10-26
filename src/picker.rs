@@ -2,7 +2,7 @@
 // keyboard-driven viewport over the saved sessions.
 use crate::println;
 use crate::store::Store;
-use crate::tui::{decode_event, truncate, Key, BOLD, DIM, RESET, YELLOW};
+use crate::tui::{decode_event, truncate, Key, Motion, BOLD, DIM, RESET, YELLOW};
 use crate::types::{now_ms, Session};
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::EventStream;
@@ -67,6 +67,13 @@ fn title_key(session: &Session) -> (String, String) {
 }
 
 fn sort_sessions(rows: &mut [&Session], sort: Sort) {
+    if matches!(sort, Sort::TitleAsc | Sort::TitleDesc) {
+        rows.sort_by_cached_key(|session| title_key(session));
+        if sort == Sort::TitleDesc {
+            rows.reverse();
+        }
+        return;
+    }
     rows.sort_by(|a, b| match sort {
         Sort::UpdatedDesc => updated(b).cmp(&updated(a)).then_with(|| b.id.cmp(&a.id)),
         Sort::UpdatedAsc => updated(a).cmp(&updated(b)).then_with(|| b.id.cmp(&a.id)),
@@ -80,8 +87,7 @@ fn sort_sessions(rows: &mut [&Session], sort: Sort) {
             .created
             .cmp(&b.time.created)
             .then_with(|| b.id.cmp(&a.id)),
-        Sort::TitleAsc => title_key(a).cmp(&title_key(b)),
-        Sort::TitleDesc => title_key(b).cmp(&title_key(a)),
+        Sort::TitleAsc | Sort::TitleDesc => unreachable!(),
     });
 }
 
@@ -179,13 +185,18 @@ pub(crate) async fn select(
     let mut sort = Sort::UpdatedDesc;
     let mut cursor = 0usize;
     let mut drawn = 0usize;
+    let mut view = None;
+    let mut rows = Vec::new();
     loop {
-        let rows: Vec<&Session> = all
-            .iter()
-            .filter(|session| matches(session, &query))
-            .collect();
-        let mut rows = rows;
-        sort_sessions(&mut rows, sort);
+        let key = (query.clone(), sort);
+        if view.as_ref() != Some(&key) {
+            rows = all
+                .iter()
+                .filter(|session| matches(session, &query))
+                .collect();
+            sort_sessions(&mut rows, sort);
+            view = Some(key);
+        }
         cursor = cursor.min(rows.len().saturating_sub(1));
         drawn = draw(store, scope, &rows, &query, sort, cursor, drawn)?;
         let event = keys
@@ -194,7 +205,7 @@ pub(crate) async fn select(
             .ok_or_else(|| "Terminal input closed".to_string())?
             .map_err(|error| error.to_string())?;
         match decode_event(event) {
-            Key::Enter => return Ok(rows.into_iter().nth(cursor).cloned()),
+            Key::Enter => return Ok(rows.get(cursor).copied().cloned()),
             Key::Esc | Key::CtrlC | Key::CtrlD => return Ok(None),
             Key::Tab => {
                 sort = sort.next();
@@ -210,8 +221,10 @@ pub(crate) async fn select(
             }
             Key::Up(steps) => cursor = cursor.saturating_sub(steps),
             Key::Down(steps) => cursor = (cursor + steps).min(rows.len().saturating_sub(1)),
-            Key::Home => cursor = 0,
-            Key::End => cursor = rows.len().saturating_sub(1),
+            Key::PageUp => cursor = cursor.saturating_sub(VISIBLE),
+            Key::PageDown => cursor = (cursor + VISIBLE).min(rows.len().saturating_sub(1)),
+            Key::Move(Motion::Home, false) => cursor = 0,
+            Key::Move(Motion::End, false) => cursor = rows.len().saturating_sub(1),
             _ => {}
         }
     }

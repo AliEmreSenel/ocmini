@@ -3,11 +3,13 @@ use crate::types::{ModelRef, PromptRequest};
 use serde_json::json;
 
 /// Construct the same command prompt for terminal and HTTP clients.
+/// Structured CLI arguments preserve shell grouping; other clients supply raw text.
 pub fn prepare(
     config: &Config,
     name: &str,
     arguments: &str,
     mut request: PromptRequest,
+    argv: Option<&[String]>,
 ) -> Result<PromptRequest, String> {
     let command = config
         .command
@@ -43,29 +45,44 @@ pub fn prepare(
     request.parts.retain(|part| part["type"] != "text");
     request.parts.insert(
         0,
-        json!({"type":"text", "text":expand(template, arguments)}),
+        json!({"type":"text", "text":expand_with(template, arguments, argv)}),
     );
     request.command = Some(name.to_owned());
     request.command_arguments = Some(arguments.to_owned());
     Ok(request)
 }
 
+#[cfg(test)]
 pub fn expand(template: &str, arguments: &str) -> String {
-    let argument_pattern = regex::Regex::new(r#"(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)"#)
-        .expect("constant regex");
-    let arguments_list: Vec<String> = argument_pattern
+    expand_with(template, arguments, None)
+}
+fn expand_with(template: &str, arguments: &str, argv: Option<&[String]>) -> String {
+    static ARGUMENT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let argument_pattern = ARGUMENT.get_or_init(|| {
+        regex::Regex::new(r#"(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)"#)
+            .expect("constant regex")
+    });
+    let parsed: Vec<String> = argument_pattern
         .find_iter(arguments)
         .map(|item| item.as_str().trim_matches(['\'', '"']).to_owned())
         .collect();
-    let placeholder = regex::Regex::new(r"\$(\d+)").expect("constant regex");
-    let has_numbered = placeholder.is_match(template);
+    let arguments_list = argv.unwrap_or(&parsed);
+    static PLACEHOLDER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let placeholder = PLACEHOLDER
+        .get_or_init(|| regex::Regex::new(r"\$(?:ARGUMENTS|(\d+))").expect("constant regex"));
+    let has_numbered = placeholder
+        .captures_iter(template)
+        .any(|c| c.get(1).is_some());
     let last = placeholder
         .captures_iter(template)
-        .filter_map(|capture| capture[1].parse::<usize>().ok())
+        .filter_map(|capture| capture.get(1)?.as_str().parse::<usize>().ok())
         .max()
         .unwrap_or(0);
     let expanded = placeholder.replace_all(template, |capture: &regex::Captures<'_>| {
-        let position = capture[1].parse::<usize>().unwrap_or(0);
+        let Some(number) = capture.get(1) else {
+            return arguments.to_owned();
+        };
+        let position = number.as_str().parse::<usize>().unwrap_or(0);
         let Some(index) = position.checked_sub(1) else {
             return String::new();
         };
@@ -78,7 +95,6 @@ pub fn expand(template: &str, arguments: &str) -> String {
             arguments_list[index].clone()
         }
     });
-    let expanded = expanded.replace("$ARGUMENTS", arguments);
     if !has_numbered && !template.contains("$ARGUMENTS") && !arguments.trim().is_empty() {
         format!("{}\n\n{}", expanded.trim(), arguments)
             .trim()
@@ -98,9 +114,21 @@ mod tests {
             serde_json::from_value(json!({"command":{"review":{"template":"Review $ARGUMENTS"}}}))
                 .unwrap();
         let arguments = "\"two words\" $literal";
-        let request = prepare(&cfg, "review", arguments, PromptRequest::default()).unwrap();
+        let request = prepare(&cfg, "review", arguments, PromptRequest::default(), None).unwrap();
         assert_eq!(request.command.as_deref(), Some("review"));
         assert_eq!(request.command_arguments.as_deref(), Some(arguments));
         assert_eq!(request.parts[0]["text"], format!("Review {arguments}"));
+    }
+    #[test]
+    fn replacements_do_not_reexpand_user_text_and_argv_keeps_grouping() {
+        assert_eq!(
+            expand("Wrapped: $1", "$ARGUMENTS tail"),
+            "Wrapped: $ARGUMENTS tail"
+        );
+        let args = vec!["alpha beta".into(), "gamma delta".into()];
+        assert_eq!(
+            expand_with("First $1. Rest $2.", &args.join(" "), Some(&args)),
+            "First alpha beta. Rest gamma delta."
+        );
     }
 }

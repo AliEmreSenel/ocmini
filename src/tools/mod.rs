@@ -1,8 +1,11 @@
-use crate::engine::{bus, App, EngineApi};
-use crate::types::{hex_id, ModelRef, PromptRequest, ToolError, ToolOutput};
+use crate::events as event;
+use tokio_util::sync::CancellationToken;
+pub(crate) mod hooks;
+use crate::engine::{App, EngineApi};
+use crate::types::{OperationError, ToolOutput};
+pub(crate) use changes::target as canonical_target;
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,10 +17,14 @@ pub mod patch;
 pub(crate) use files::media_type;
 pub use process::{cancel_background_jobs, stop_background_jobs};
 mod process;
+mod question;
 mod search;
 mod skills;
+mod task;
+mod todo;
 mod web;
 
+#[derive(Clone)]
 pub struct ToolCtx {
     pub dir: String,
     pub app: App,
@@ -26,17 +33,16 @@ pub struct ToolCtx {
     pub call_id: String,
     pub part_id: String,
     pub engine: Arc<dyn EngineApi>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: CancellationToken,
     pub hook_context: Value,
 }
 
 impl ToolCtx {
-    pub fn update_metadata(&self, metadata: Value) -> Result<(), ToolError> {
+    pub fn update_metadata(&self, metadata: Value) -> Result<(), OperationError> {
         let message = self
             .app
             .store
-            .message(&self.session_id, &self.message_id)
-            .map_err(failure)?
+            .message(&self.session_id, &self.message_id)?
             .ok_or_else(|| failure("Tool message no longer exists"))?;
         let mut part = message
             .parts
@@ -44,62 +50,84 @@ impl ToolCtx {
             .find(|part| part["id"].as_str() == Some(self.part_id.as_str()))
             .ok_or_else(|| failure("Tool part no longer exists"))?;
         part["state"]["metadata"] = metadata;
-        self.app
-            .store
-            .update_part(&self.session_id, &part)
-            .map_err(failure)?;
-        bus().emit("message.part.updated", json!({"part":part}));
+        crate::messages::update_part(&self.app, &part)?;
         Ok(())
     }
 }
 
-pub fn tool_defs() -> Vec<Value> {
-    vec![
-        fn_def("bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once and keeps running across tool calls, ending when its session is aborted or deleted, or when ocmini exits. A timed-out command completes with the output captured before the limit and a shell_metadata timeout notice.", json!({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"},"timeout":{"type":"integer","minimum":1},"description":{"type":"string"},"background":{"type":"boolean"}},"required":["command"]})),
-        fn_def("read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", json!({"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["filePath"]})),
-        fn_def("write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", json!({"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]})),
-        fn_def("edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", json!({"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string","minLength":1},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}},"required":["filePath","oldString","newString"]})),
-        fn_def("apply_patch", "Apply a patch using *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, optional *** Move to:, @@ context hunks, and *** End Patch. All files are validated before any are changed.", json!({"type":"object","properties":{"patchText":{"type":"string"}},"required":["patchText"]})),
-        fn_def("glob", "Find files using ripgrep and glob patterns (including ** and {a,b}), honoring gitignore. Returns up to 100 files. Relative path uses the session directory.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})),
-        fn_def("grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})),
-        fn_def("webfetch", "Fetch an HTTP(S) text resource up to 5 MiB. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds (default 30, maximum 120).", json!({"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["text","markdown","html"]},"timeout":{"type":"integer","minimum":1,"maximum":120}},"required":["url"]})),
-        fn_def("todowrite", "Replace and persist the session's todo list.", json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status","priority"]}}},"required":["todos"]})),
-        fn_def("question", "Ask one or more questions, with options, and wait for the user's answers.", json!({"type":"object","properties":{"questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"multiple":{"type":"boolean"},"custom":{"type":"boolean"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label","description"]}}},"required":["question","header","options"]}}},"required":["questions"]})),
-        fn_def("task", "Delegate to a subagent session. subagent_type selects an available subagent; task_id resumes a child from this session. Returns the child's session ID and result.", json!({"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"},"subagent_type":{"type":"string"},"task_id":{"type":"string"}},"required":["description","prompt","subagent_type"]})),
-        fn_def("skill", "Load the complete instructions and resource directory of an available skill by name.", json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]})),
-    ]
+/// The built-in catalog and its closed Rust identity share one spelling table.
+macro_rules! builtin_tools {
+    ($($variant:ident => $name:literal, $description:literal, $parameters:ty;)+) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum Builtin { $($variant),+ }
+        impl Builtin {
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)+
+                    "patch" => Some(Self::ApplyPatch),
+                    _ => None,
+                }
+            }
+            pub fn is_execution(self) -> bool {
+                matches!(self, Self::Bash | Self::Write | Self::Edit | Self::ApplyPatch | Self::Task)
+            }
+        }
+        pub fn tool_defs() -> Vec<Value> {
+            static DEFINITIONS: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
+            DEFINITIONS.get_or_init(|| vec![$(definition::<$parameters>($name, $description)),+]).clone()
+        }
+    };
+}
+builtin_tools! {
+    Bash => "bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once and keeps running across tool calls, ending when its session is aborted or deleted, or when ocmini exits. A timed-out command completes with the output captured before the limit and a shell_metadata timeout notice.", process::Input;
+    Read => "read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", files::ReadInput;
+    Write => "write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", changes::WriteInput;
+    Edit => "edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", changes::EditInput;
+    ApplyPatch => "apply_patch", "Apply a patch using *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, optional *** Move to:, @@ context hunks, and *** End Patch. All files are validated before any are changed.", changes::PatchInput;
+    Glob => "glob", "Find files using ripgrep and glob patterns (including ** and {a,b}), honoring gitignore. Returns up to 100 files. Relative path uses the session directory.", search::Input;
+    Grep => "grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob.", search::GrepInput;
+    WebFetch => "webfetch", "Fetch an HTTP(S) text resource up to 5 MiB. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds (default 30, maximum 120).", web::Input;
+    TodoWrite => "todowrite", "Replace and persist the session's todo list.", todo::Input;
+    Question => "question", "Ask one or more questions, with options, and wait for the user's answers.", question::Input;
+    Task => "task", "Delegate to a subagent session. subagent_type selects an available subagent; task_id resumes a child from this session. Returns the child's session ID and result.", task::Input;
+    Skill => "skill", "Load the complete instructions and resource directory of an available skill by name.", skills::Input;
 }
 
-fn fn_def(name: &str, description: &str, parameters: Value) -> Value {
+fn definition<T: schemars::JsonSchema>(name: &str, description: &str) -> Value {
+    let mut parameters = schemars::generate::SchemaSettings::draft07()
+        .with(|settings| {
+            settings.inline_subschemas = true;
+            settings.meta_schema = None;
+        })
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .to_value();
+    parameters.as_object_mut().unwrap().remove("title");
     json!({"type":"function","function":{"name":name,"description":description,"parameters":parameters}})
 }
 
-fn failure(message: impl Into<String>) -> ToolError {
-    ToolError {
-        message: message.into(),
+fn failure(message: impl Into<String>) -> OperationError {
+    OperationError::new(crate::types::FailureKind::Error, message)
+}
+
+/// Decode once at a tool or hook boundary; execution consumes ordinary Rust fields.
+fn decode<T: serde::de::DeserializeOwned>(input: &Value) -> Result<T, OperationError> {
+    T::deserialize(input).map_err(|e| failure(format!("Invalid tool input: {e}")))
+}
+
+/// Compatibility aliases use the canonical string when both spellings are supplied.
+fn alias<'a>(input: &'a Value, key: &str, fallback: &str) -> std::borrow::Cow<'a, Value> {
+    if !input[key].is_string() && input[fallback].is_string() {
+        let mut input = input.clone();
+        input[key] = input[fallback].clone();
+        std::borrow::Cow::Owned(input)
+    } else {
+        std::borrow::Cow::Borrowed(input)
     }
 }
 
-fn required<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| failure(format!("{key} must be a string")))
-}
-
 pub fn resolve_path(directory: &str, path: &str) -> PathBuf {
-    let expanded = if path == "~" || path.starts_with("~/") {
-        std::env::var("HOME")
-            .map(|home| PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or("")))
-            .unwrap_or_else(|_| PathBuf::from(path))
-    } else {
-        PathBuf::from(path)
-    };
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else {
-        Path::new(directory).join(expanded)
-    };
+    let absolute = crate::config::absolute_path(Path::new(path), Path::new(directory));
     let absolute = if absolute.is_absolute() {
         absolute
     } else {
@@ -107,17 +135,7 @@ pub fn resolve_path(directory: &str, path: &str) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(absolute)
     };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
+    crate::config::normalize_path(&absolute)
 }
 
 fn cap_out(value: &str, max: usize) -> String {
@@ -140,13 +158,7 @@ fn cap_out(value: &str, max: usize) -> String {
     )
 }
 
-async fn cancelled(flag: Arc<AtomicBool>) {
-    while !flag.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-pub(super) fn hook_context(ctx: &ToolCtx, tool: &str) -> Value {
+pub(crate) fn hook_context(ctx: &ToolCtx, tool: &str) -> Value {
     let mut context = ctx.hook_context.clone();
     if !context.is_object() {
         context = json!({});
@@ -156,233 +168,171 @@ pub(super) fn hook_context(ctx: &ToolCtx, tool: &str) -> Value {
     context["messageID"] = json!(ctx.message_id);
     context["callID"] = json!(ctx.call_id);
     context["tool"] = json!(tool);
+    context["requestKind"] = json!("primary");
     context
 }
 
-/// Resource transforms run before the engine authorizes and records effective input.
+/// Public arguments and prepared effects travel separately, without private JSON fields.
+pub struct PreparedTool {
+    args: Value,
+    tool: Tool,
+}
+
+enum Tool {
+    Bash(process::Input),
+    Read(files::ReadInput),
+    File(Arc<changes::Plan>),
+    Task(Box<task::Plan>),
+    Glob(search::Input),
+    Grep(search::GrepInput),
+    WebFetch(web::Input),
+    TodoWrite(todo::Input),
+    Question(question::Input),
+    Skill(skills::Input),
+    Mcp { server: String, tool: String },
+}
+impl PreparedTool {
+    pub fn args(&self) -> &Value {
+        &self.args
+    }
+    pub fn file_paths(&self) -> Option<impl Iterator<Item = &Path>> {
+        match &self.tool {
+            Tool::File(plan) => Some(plan.paths()),
+            _ => None,
+        }
+    }
+    pub fn paths(&self, directory: &str) -> Vec<PathBuf> {
+        let path = match &self.tool {
+            Tool::File(plan) => return plan.paths().map(Path::to_path_buf).collect(),
+            Tool::Read(input) => Some(input.file_path.as_str()),
+            Tool::Glob(input) => input.path.as_deref(),
+            Tool::Grep(input) => input.search.path.as_deref(),
+            Tool::Bash(input) => input.workdir.as_deref(),
+            Tool::Task(_)
+            | Tool::WebFetch(_)
+            | Tool::TodoWrite(_)
+            | Tool::Question(_)
+            | Tool::Skill(_)
+            | Tool::Mcp { .. } => return vec![],
+        };
+        vec![resolve_path(directory, path.unwrap_or("."))]
+    }
+    pub fn permission<'a>(&self, name: &'a str, paths: &[PathBuf]) -> (&'a str, Vec<String>) {
+        let permission = if matches!(self.tool, Tool::File(_)) {
+            "edit"
+        } else {
+            name
+        };
+        let patterns = match &self.tool {
+            Tool::File(_) | Tool::Read(_) => paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            Tool::Bash(input) => vec![input.command.clone()],
+            Tool::Glob(input) => vec![input.pattern.clone()],
+            Tool::Grep(input) => vec![input.search.pattern.clone()],
+            Tool::WebFetch(input) => vec![input.url.clone()],
+            Tool::Task(plan) => vec![plan.input.subagent_type.clone()],
+            Tool::Skill(input) => vec![input.name.clone()],
+            Tool::TodoWrite(_) | Tool::Question(_) | Tool::Mcp { .. } => vec!["*".into()],
+        };
+        (permission, patterns)
+    }
+}
+
 pub async fn prepare_input(
     ctx: &ToolCtx,
     name: &str,
-    mut input: Value,
-) -> Result<Value, ToolError> {
-    let object = input
-        .as_object_mut()
-        .ok_or_else(|| failure("Tool input must be an object"))?;
-    object.remove(changes::KEY);
-    object.remove("_ocminiTaskModel");
-    if ctx.cancel.load(Ordering::Acquire) {
-        return Err(failure("Tool cancelled"));
-    }
-    match name {
-        "write" | "edit" | "apply_patch" | "patch"
-            if ctx
-                .app
-                .hooks
-                .matches("file.change.before", &hook_context(ctx, name)) =>
-        {
-            changes::prepare(ctx, name, input).await
-        }
-        "task" => prepare_task(ctx, input).await,
-        _ => Ok(input),
-    }
-}
-
-pub fn prepared_file_paths(input: &Value) -> Option<Vec<PathBuf>> {
-    changes::paths(input)
-}
-
-/// Rebuild derived spill metadata after a successful output transform.
-pub async fn limit_output(_directory: &str, out: ToolOutput) -> Result<ToolOutput, ToolError> {
-    output::relimit(out, output::directory()).await
-}
-
-async fn shell_environment(
-    ctx: &ToolCtx,
-    input: &Value,
-    directory: &Path,
-) -> Result<serde_json::Map<String, Value>, ToolError> {
-    if !ctx.app.hooks.has("shell.env") {
-        return Ok(Default::default());
-    }
-    let mut context = hook_context(ctx, "bash");
-    context["workdir"] = json!(directory);
-    let effective = ctx.app.hooks.run("shell.env", &context,
-        json!({"env":{},"command":input["command"],"background":input["background"].as_bool().unwrap_or(false)}), Some(&ctx.cancel)).await.map_err(failure)?.input;
-    let env = effective["env"]
-        .as_object()
-        .ok_or_else(|| failure("shell.env env must be an object"))?;
-    for (key, value) in env {
-        if key.is_empty()
-            || key.contains(['=', '\0'])
-            || key.starts_with("OCMINI_HOOK_")
-            || (!value.is_null() && value.as_str().is_none_or(|value| value.contains('\0')))
-        {
-            return Err(failure(format!("Invalid shell environment entry {key:?}")));
-        }
-    }
-    Ok(env.clone())
-}
-
-pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOutput, ToolError> {
+    input: Value,
+) -> Result<PreparedTool, OperationError> {
     if !input.is_object() {
         return Err(failure("Tool input must be an object"));
     }
-    if ctx.cancel.load(Ordering::Acquire) {
+    if ctx.cancel.is_cancelled() {
         return Err(failure("Tool cancelled"));
     }
-    let result = match name {
-        "bash" => {
-            let command = required(input, "command")?;
-            let directory = resolve_path(
-                &ctx.dir,
-                input["workdir"]
-                    .as_str()
-                    .or_else(|| input["cwd"].as_str())
-                    .unwrap_or("."),
-            );
-            let env = shell_environment(ctx, input, &directory).await?;
-            if ctx.cancel.load(Ordering::Acquire) {
-                return Err(failure("Tool cancelled"));
-            }
-            if input["background"].as_bool().unwrap_or(false) {
-                return process::shell_background_with_env(
-                    command,
-                    &directory,
-                    &ctx.session_id,
-                    &output::directory(),
-                    &env,
-                )
-                .await;
-            }
-            let timeout = match input.get("timeout") {
-                None | Some(Value::Null) => 120_000,
-                Some(value) => value
-                    .as_u64()
-                    .filter(|v| *v > 0)
-                    .ok_or_else(|| failure("timeout must be a positive integer in milliseconds"))?,
-            };
-            process::shell_with_env(
-                command,
-                &directory,
-                Duration::from_millis(timeout),
-                ctx.cancel.clone(),
-                &output::directory(),
-                &env,
-            )
-            .await
+    let mut args = input;
+    let tool = match Builtin::from_name(name) {
+        Some(Builtin::Write | Builtin::Edit | Builtin::ApplyPatch) => {
+            let (effective, plan) = changes::prepare(ctx, name, args).await?;
+            args = effective;
+            Tool::File(Arc::new(plan))
         }
-        "glob" | "grep" => search::run(&ctx.dir, name, input, ctx.cancel.clone()).await,
-        "write" | "edit" | "apply_patch" | "patch" if input.get(changes::KEY).is_some() => {
-            let input = input.clone();
-            let cancel = ctx.cancel.clone();
-            tokio::task::spawn_blocking(move || changes::commit(&input, &cancel))
+        Some(Builtin::Task) => {
+            let (effective, plan) = task::prepare(ctx, args).await?;
+            args = effective;
+            Tool::Task(Box::new(plan))
+        }
+        Some(Builtin::Bash) => Tool::Bash(decode(&alias(&args, "workdir", "cwd"))?),
+        Some(Builtin::Read) => Tool::Read(decode(&args)?),
+        Some(Builtin::Glob) => Tool::Glob(decode(&args)?),
+        Some(Builtin::Grep) => Tool::Grep(decode(&args)?),
+        Some(Builtin::WebFetch) => Tool::WebFetch(decode(&args)?),
+        Some(Builtin::TodoWrite) => Tool::TodoWrite(todo::parse(&args)?),
+        Some(Builtin::Question) => Tool::Question(question::parse(&args)?),
+        Some(Builtin::Skill) => Tool::Skill(decode(&alias(&args, "name", "id"))?),
+        None => {
+            let (server, tool) = ctx
+                .app
+                .mcp()
+                .route(name)
+                .ok_or_else(|| failure(format!("Unknown tool {name:?}")))?;
+            Tool::Mcp { server, tool }
+        }
+    };
+    Ok(PreparedTool { args, tool })
+}
+
+/// Rebuild derived spill metadata after a successful output transform.
+pub async fn limit_output(out: ToolOutput) -> Result<ToolOutput, OperationError> {
+    output::relimit(out, output::directory()).await
+}
+
+pub async fn run_tool(
+    ctx: &ToolCtx,
+    name: &str,
+    prepared: &PreparedTool,
+) -> Result<ToolOutput, OperationError> {
+    if ctx.cancel.is_cancelled() {
+        return Err(failure("Tool cancelled"));
+    }
+    let result = match &prepared.tool {
+        Tool::File(plan) => {
+            let (plan, cancel) = (plan.clone(), ctx.cancel.clone());
+            tokio::task::spawn_blocking(move || plan.commit(&cancel))
                 .await
                 .map_err(|e| failure(e.to_string()))?
         }
-        "read" | "write" | "edit" => {
-            let directory = ctx.dir.clone();
-            let name = name.to_owned();
-            let input = input.clone();
-            let cancel = ctx.cancel.clone();
-            tokio::task::spawn_blocking(move || files::run(&directory, &name, &input, &cancel))
+        Tool::Task(plan) => task::run(ctx, plan).await,
+        Tool::Bash(input) => process::run(ctx, input).await,
+        Tool::Glob(input) => {
+            search::run(&ctx.dir, search::Mode::Glob, input, ctx.cancel.clone()).await
+        }
+        Tool::Grep(input) => {
+            search::run(
+                &ctx.dir,
+                search::Mode::Grep(input.include.as_deref()),
+                &input.search,
+                ctx.cancel.clone(),
+            )
+            .await
+        }
+        Tool::Read(input) => {
+            let (directory, input, cancel) = (ctx.dir.clone(), input.clone(), ctx.cancel.clone());
+            tokio::task::spawn_blocking(move || files::read(&directory, &input, &cancel))
                 .await
-                .map_err(|e| failure(format!("File operation failed: {e}")))?
+                .map_err(|e| failure(e.to_string()))?
         }
-        "apply_patch" | "patch" => {
-            let text = input["patchText"]
-                .as_str()
-                .or_else(|| input["patch"].as_str())
-                .ok_or_else(|| failure("patchText must be a string"))?
-                .to_owned();
-            let directory = ctx.dir.clone();
-            let cancel = ctx.cancel.clone();
-            tokio::task::spawn_blocking(move || patch::apply(&directory, &text, &cancel))
-                .await
-                .map_err(|e| failure(format!("Patch operation failed: {e}")))?
-        }
-        "webfetch" => web::fetch(input, ctx.cancel.clone()).await,
-        "todowrite" => {
-            let todos = input["todos"]
-                .as_array()
-                .ok_or_else(|| failure("todos must be an array"))?;
-            for todo in todos {
-                if todo["content"]
-                    .as_str()
-                    .is_none_or(|text| text.trim().is_empty())
-                    || !matches!(
-                        todo["status"].as_str(),
-                        Some("pending" | "in_progress" | "completed" | "cancelled")
-                    )
-                    || !matches!(todo["priority"].as_str(), Some("high" | "medium" | "low"))
-                {
-                    return Err(failure("Each todo needs nonempty content, a valid status, and high/medium/low priority"));
-                }
-            }
-            ctx.app
-                .store
-                .set_todos(&ctx.session_id, &input["todos"])
-                .map_err(failure)?;
-            bus().emit(
-                "todo.updated",
-                json!({"sessionID":ctx.session_id,"todos":todos}),
-            );
-            Ok(ToolOutput {
-                output: serde_json::to_string_pretty(todos).map_err(|e| failure(e.to_string()))?,
-                title: format!("{} todos", todos.len()),
-                metadata: json!({"todos":todos}),
-            })
-        }
-        "question" => question(ctx, input).await,
-        "task" => task(ctx, input).await,
-        "skill" => {
-            let name = input["name"]
-                .as_str()
-                .or_else(|| input["id"].as_str())
-                .ok_or_else(|| failure("name must be a string"))?;
-            let paths = ctx.app.config.lock().unwrap().skill_paths();
-            let mut loaded = skills::load_content(&ctx.dir, &paths, name)?;
-            let mut context = hook_context(ctx, "skill");
-            context["name"] = json!(name);
-            context["path"] = loaded.metadata["location"].clone();
-            context["sourceFingerprint"] = loaded.metadata["sourceFingerprint"].clone();
-            if ctx.app.hooks.has("skill.load.after") {
-                let effective = ctx
-                    .app
-                    .hooks
-                    .run(
-                        "skill.load.after",
-                        &context,
-                        json!({"content":loaded.output}),
-                        Some(&ctx.cancel),
-                    )
-                    .await
-                    .map_err(failure)?
-                    .input;
-                loaded.output = effective["content"]
-                    .as_str()
-                    .ok_or_else(|| failure("Skill content must be a string"))?
-                    .into();
-            }
-            skills::render_content(&mut loaded);
-            ctx.app.hooks.emit(
-                "ocmini.skill.loaded",
-                &context,
-                json!({"name":name,"path":loaded.metadata["location"],"sourceFingerprint":loaded.metadata["sourceFingerprint"]}),
-            );
-            Ok(loaded)
-        }
-        _ => {
-            let (server, tool) = ctx
-                .app
-                .mcp
-                .route(name)
-                .ok_or_else(|| failure(format!("Unknown tool {name:?}")))?;
+        Tool::WebFetch(input) => web::fetch(input, ctx.cancel.clone()).await,
+        Tool::TodoWrite(input) => todo::run(ctx, input),
+        Tool::Question(input) => question::run(ctx, input, &prepared.args).await,
+        Tool::Skill(input) => skills::run(ctx, input).await,
+        Tool::Mcp { server, tool } => {
             let result = ctx
                 .app
-                .mcp
-                .call_result_async(&server, &tool, input.clone(), ctx.cancel.clone())
-                .await
-                .map_err(failure)?;
+                .mcp()
+                .call_result_async(server, tool, prepared.args.clone(), ctx.cancel.clone())
+                .await?;
             let output = crate::mcp::render_result(&result);
             let attachments: Vec<Value> = result["content"]
                 .as_array()
@@ -405,27 +355,15 @@ pub async fn run_tool(ctx: &ToolCtx, name: &str, input: &Value) -> Result<ToolOu
             })
         }
     }?;
-    if matches!(name, "write" | "edit" | "apply_patch" | "patch") {
-        let mut paths = prepared_file_paths(input).unwrap_or_default();
-        if paths.is_empty() {
-            if let Some(path) = result.metadata["filepath"].as_str() {
-                paths.push(resolve_path(&ctx.dir, path));
-            }
-            if let Some(files) = result.metadata["files"].as_array() {
-                for file in files {
-                    for key in ["path", "movePath"] {
-                        if let Some(path) = file[key].as_str() {
-                            paths.push(resolve_path(&ctx.dir, path));
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(paths) = prepared.file_paths() {
+        let context = hook_context(ctx, name);
         for path in paths {
             ctx.app.hooks.emit(
-                "file.edited",
-                &hook_context(ctx, name),
-                json!({"file":path,"tool":name}),
+                event::File::Edited {
+                    file: path,
+                    tool: name,
+                },
+                &context,
             );
         }
     }
@@ -449,365 +387,7 @@ pub fn cleanup_outputs() -> Result<(), String> {
     Ok(())
 }
 
-struct QuestionGuard {
-    state: crate::engine::question::QuestionState,
-    id: String,
-}
-impl Drop for QuestionGuard {
-    fn drop(&mut self) {
-        self.state.reject(&self.id);
-    }
-}
-
-fn validate_questions(input: &Value) -> Result<(), ToolError> {
-    let questions = input["questions"]
-        .as_array()
-        .filter(|questions| !questions.is_empty())
-        .ok_or_else(|| failure("questions must be a nonempty array"))?;
-    for question in questions {
-        if ["multiple", "custom"]
-            .iter()
-            .any(|key| question.get(key).is_some_and(|value| !value.is_boolean()))
-            || !question["question"].is_string()
-            || !question["header"].is_string()
-            || !question["options"].as_array().is_some_and(|options| {
-                options
-                    .iter()
-                    .all(|option| option["label"].is_string() && option["description"].is_string())
-            })
-        {
-            return Err(failure("Every question needs question/header strings and an options array containing label/description strings"));
-        }
-    }
-    Ok(())
-}
-
-async fn question(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
-    validate_questions(input)?;
-    let effective;
-    let input = if ctx.app.hooks.has("question.ask.before") {
-        effective = ctx
-            .app
-            .hooks
-            .run(
-                "question.ask.before",
-                &hook_context(ctx, "question"),
-                input.clone(),
-                Some(&ctx.cancel),
-            )
-            .await
-            .map_err(failure)?
-            .input;
-        validate_questions(&effective)?;
-        &effective
-    } else {
-        input
-    };
-    if ctx.cancel.load(Ordering::Acquire) {
-        return Err(failure("Question cancelled"));
-    }
-    let questions = input["questions"]
-        .as_array()
-        .filter(|questions| !questions.is_empty())
-        .ok_or_else(|| failure("questions must be a nonempty array"))?;
-    let (request, receiver) = ctx.app.questions.ask_for_tool(
-        &ctx.session_id,
-        Value::Array(questions.clone()),
-        Some(json!({"messageID":ctx.message_id,"callID":ctx.call_id})),
-    );
-    let _guard = QuestionGuard {
-        state: ctx.app.questions.clone(),
-        id: request.id.clone(),
-    };
-    bus().emit(
-        "question.asked",
-        serde_json::to_value(&request).map_err(|e| failure(e.to_string()))?,
-    );
-    let answers = tokio::select! {
-        answers = receiver => answers.map_err(|_| failure("Question cancelled"))?,
-        _ = cancelled(ctx.cancel.clone()) => return Err(failure("Question cancelled")),
-    }
-    .ok_or_else(|| ToolError {
-        message: "User dismissed the question".into(),
-    })?;
-    let text = questions
-        .iter()
-        .zip(&answers)
-        .map(|(question, answer)| {
-            format!(
-                "{}: {}",
-                question["question"].as_str().unwrap_or_default(),
-                answer.join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(ToolOutput {
-        output: text,
-        title: "User answered".into(),
-        metadata: json!({"questions":questions,"answers":answers}),
-    })
-}
-
-struct ChildGuard {
-    engine: Arc<dyn EngineApi>,
-    session_id: String,
-    armed: bool,
-}
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.engine.abort(&self.session_id);
-        }
-    }
-}
-
-fn task_options(
-    ctx: &ToolCtx,
-    input: &Value,
-) -> Result<(crate::types::Session, Option<ModelRef>), ToolError> {
-    let prompt = required(input, "prompt")?;
-    required(input, "description")?;
-    let agent = required(input, "subagent_type")?;
-    if prompt.trim().is_empty() {
-        return Err(failure("prompt must not be empty"));
-    }
-    {
-        let config = ctx.app.config.lock().unwrap();
-        if !matches!(agent, "general" | "explore") && !config.agent.contains_key(agent) {
-            return Err(failure(format!("Unknown subagent {agent:?}")));
-        }
-        if let Some(config) = config.agent.get(agent) {
-            if config["disable"] == true || config["mode"] == "primary" {
-                return Err(failure(format!(
-                    "Agent {agent:?} is unavailable as a subagent"
-                )));
-            }
-        }
-    }
-    let parent = ctx
-        .app
-        .store
-        .get_session(&ctx.session_id)
-        .map_err(failure)?
-        .ok_or_else(|| failure("Parent session does not exist"))?;
-    let mut ancestor = parent.parent_id.clone();
-    let max_depth = ctx.app.config.lock().unwrap().subagent_depth.unwrap_or(8);
-    let mut depth = 0u64;
-    let mut ancestors = std::collections::HashSet::from([parent.id.clone()]);
-    while let Some(id) = ancestor {
-        if !ancestors.insert(id.clone()) {
-            return Err(failure("Subagent session ancestry contains a cycle"));
-        }
-        depth += 1;
-        ancestor = ctx
-            .app
-            .store
-            .get_session(&id)
-            .map_err(failure)?
-            .ok_or_else(|| failure(format!("Ancestor session {id} does not exist")))?
-            .parent_id;
-    }
-    if depth >= max_depth {
-        return Err(failure(format!("Subagent nesting limit ({max_depth}) reached. Increase subagent_depth to allow more levels.")));
-    }
-    let mut model = ctx.app.store.last_model(&ctx.session_id).map_err(failure)?;
-    if let Some(selected) = ctx
-        .app
-        .config
-        .lock()
-        .unwrap()
-        .agent
-        .get(agent)
-        .and_then(|value| value["model"].as_str())
-    {
-        let (provider, selected) = selected
-            .split_once('/')
-            .ok_or_else(|| failure("Subagent model must use provider/model syntax"))?;
-        if provider.is_empty() || selected.is_empty() {
-            return Err(failure("Subagent model must use provider/model syntax"));
-        }
-        model = Some(ModelRef {
-            provider_id: provider.into(),
-            model_id: selected.into(),
-        });
-    }
-    if let Some(selected) = input.get("_ocminiTaskModel") {
-        model = Some(
-            serde_json::from_value(selected.clone())
-                .map_err(|e| failure(format!("Invalid task model: {e}")))?,
-        );
-    }
-    if let Some(selected) = &model {
-        if selected.provider_id.is_empty() || selected.model_id.is_empty() {
-            return Err(failure(
-                "Task model requires nonempty providerID and modelID",
-            ));
-        }
-        if !crate::engine_impl::model_available(&ctx.app.config.lock().unwrap(), selected) {
-            return Err(failure("Subagent provider or model is disabled"));
-        }
-    }
-    if let Some(id) = input.get("task_id") {
-        let id = id
-            .as_str()
-            .ok_or_else(|| failure("task_id must be a string"))?;
-        let child = ctx
-            .app
-            .store
-            .get_session(id)
-            .map_err(failure)?
-            .ok_or_else(|| failure("Task session not found"))?;
-        if child.parent_id.as_deref() != Some(ctx.session_id.as_str()) {
-            return Err(failure(
-                "task_id must identify a child of the current session",
-            ));
-        }
-    }
-    Ok((parent, model))
-}
-
-async fn prepare_task(ctx: &ToolCtx, mut input: Value) -> Result<Value, ToolError> {
-    let (_, model) = task_options(ctx, &input)?;
-    if !ctx.app.hooks.has("task.spawn.before") {
-        return Ok(input);
-    }
-    let original_agent = required(&input, "subagent_type")?.to_owned();
-    let mut payload = input.clone();
-    payload["model"] = json!(model);
-    let result = ctx
-        .app
-        .hooks
-        .run(
-            "task.spawn.before",
-            &hook_context(ctx, "task"),
-            payload,
-            Some(&ctx.cancel),
-        )
-        .await
-        .map_err(failure)?
-        .input;
-    for key in ["prompt", "description", "subagent_type"] {
-        input[key] = result[key].clone();
-    }
-    let effective_model = result["model"].clone();
-    if !effective_model.is_null()
-        && (input["subagent_type"] == original_agent || effective_model != json!(model))
-    {
-        input["_ocminiTaskModel"] = effective_model;
-    }
-    task_options(ctx, &input)?;
-    Ok(input)
-}
-
-async fn task(ctx: &ToolCtx, input: &Value) -> Result<ToolOutput, ToolError> {
-    let prompt = required(input, "prompt")?;
-    let description = required(input, "description")?;
-    let agent = required(input, "subagent_type")?;
-    let (parent, model) = task_options(ctx, input)?;
-    let child = if let Some(id) = input["task_id"].as_str() {
-        let child = ctx
-            .app
-            .store
-            .get_session(id)
-            .map_err(failure)?
-            .ok_or_else(|| failure(format!("Task session {id:?} does not exist")))?;
-        if child.parent_id.as_deref() != Some(ctx.session_id.as_str()) {
-            return Err(failure(
-                "task_id must identify a child of the current session",
-            ));
-        }
-        child
-    } else {
-        let mut child = parent.clone();
-        child.id = hex_id("ses_");
-        child.slug = crate::types::slug();
-        child.title = description.chars().take(160).collect();
-        child.parent_id = Some(parent.id.clone());
-        child.cost = 0.0;
-        child.tokens = Default::default();
-        child.time = crate::types::Time {
-            created: crate::types::now_ms(),
-            updated: Some(crate::types::now_ms()),
-            ..Default::default()
-        };
-        child.extra.clear();
-        crate::sessions::create(&ctx.app, child)
-            .await
-            .map_err(failure)?
-    };
-    {
-        let mut grants = ctx.app.always.lock().unwrap();
-        if let Some(inherited) = grants.get(&ctx.session_id).cloned() {
-            grants.insert(child.id.clone(), inherited);
-        }
-    }
-    ctx.update_metadata(json!({"sessionId":child.id,"model":model,"agent":agent}))?;
-    let request = PromptRequest {
-        model: model.clone(),
-        parts: vec![json!({"type":"text","text":prompt})],
-        agent: Some(agent.into()),
-        ..Default::default()
-    };
-    let mut guard = ChildGuard {
-        engine: ctx.engine.clone(),
-        session_id: child.id.clone(),
-        armed: true,
-    };
-    let mut context = hook_context(ctx, "task");
-    context["childSessionID"] = json!(child.id);
-    let done = tokio::select! {
-        result = ctx.engine.admit(ctx.app.clone(), child.id.clone(), request) => result.map_err(failure)?,
-        _ = cancelled(ctx.cancel.clone()) => return Err(failure("Subagent cancelled")),
-    };
-    ctx.app.hooks.emit("ocmini.task.started", &context, json!({"parentSessionID":ctx.session_id,"childSessionID":child.id,"agent":agent,"model":model}));
-    let result = tokio::select! {
-        result = done => result.map_err(|_| "Subagent ended without a result".to_owned()),
-        _ = cancelled(ctx.cancel.clone()) => Err("Subagent cancelled".into()),
-    };
-    let child_error = result
-        .as_ref()
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .filter(|error| !error.is_null())
-                .or_else(|| value["info"].get("error").filter(|error| !error.is_null()))
-        })
-        .map(|error| format!("Subagent failed: {error}"));
-    let status = match &result {
-        Ok(_) if child_error.is_none() => "completed",
-        Ok(_) => "failed",
-        Err(_) if ctx.cancel.load(Ordering::Acquire) => "cancelled",
-        Err(_) => "failed",
-    };
-    ctx.app.hooks.emit("ocmini.task.ended", &context, json!({"parentSessionID":ctx.session_id,"childSessionID":child.id,"status":status,"messageID":result.as_ref().ok().and_then(|value| value["info"]["id"].as_str())}));
-    let result = result.map_err(failure)?;
-    guard.armed = false;
-    if let Some(error) = child_error {
-        return Err(failure(error));
-    }
-    let text = result["parts"]
-        .as_array()
-        .map(|parts| {
-            parts
-                .iter()
-                .filter(|part| part["type"] == "text")
-                .filter_map(|part| part["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    Ok(ToolOutput {
-        output: format!("Task session: {}\n\n{text}", child.id),
-        title: description.into(),
-        metadata: json!({"sessionId":child.id,"model":model,"agent":agent}),
-    })
-}
-
-pub fn skill_list_with_paths(directory: Option<&str>, paths: &[String]) -> Vec<Value> {
-    skills::list(directory, paths)
-}
+pub use skills::list as skill_list_with_paths;
 
 #[cfg(test)]
 mod tests {

@@ -1,13 +1,16 @@
 use super::{config::ResolvedRegistration, config::Settings, process, ActiveInvocations};
+use crate::events as event;
 use crate::types::BusEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -46,41 +49,25 @@ struct ObserverContext<'a> {
     directory: &'a str,
 }
 
-static COUNT: AtomicUsize = AtomicUsize::new(0);
-static DELTA_COUNT: AtomicUsize = AtomicUsize::new(0);
-static OBSERVERS: OnceLock<Mutex<Vec<Weak<Observer>>>> = OnceLock::new();
-#[derive(Clone)]
-struct SessionScope {
-    directory: String,
-    parent_id: Option<String>,
+#[derive(Default)]
+pub struct Registry {
+    count: AtomicUsize,
+    deltas: AtomicUsize,
+    observers: Mutex<Vec<Weak<Observer>>>,
 }
-static SESSION_SCOPES: OnceLock<Mutex<HashMap<String, SessionScope>>> = OnceLock::new();
-
-pub fn remember(context: &Value) {
-    if let (Some(session), Some(directory)) =
-        (context["sessionID"].as_str(), context["directory"].as_str())
-    {
-        let mut scopes = SESSION_SCOPES.get_or_init(Default::default).lock().unwrap();
-        if scopes.len() >= 8192 && !scopes.contains_key(session) {
-            if let Some(old) = scopes.keys().next().cloned() {
-                scopes.remove(&old);
-            }
-        }
-        let scope = scopes
-            .entry(session.to_owned())
-            .or_insert_with(|| SessionScope {
-                directory: directory.to_owned(),
-                parent_id: None,
-            });
-        scope.directory = directory.to_owned();
-        if let Some(parent) = context.get("parentID") {
-            scope.parent_id = parent.as_str().map(str::to_owned);
-        }
+impl Registry {
+    fn matching(&self, event: &BusEvent) -> Vec<Arc<Observer>> {
+        let mut observers = self.observers.lock().unwrap();
+        observers.retain(|observer| observer.strong_count() > 0);
+        observers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|observer| observer.accepts(event, &event.properties))
+            .collect()
     }
-}
-
-pub fn has_observers() -> bool {
-    COUNT.load(Ordering::Relaxed) > 0
+    pub fn observe(&self, event: &Arc<BusEvent>) {
+        observe_in(self, event);
+    }
 }
 
 pub fn subscription_key(directory: &str, reg: &ResolvedRegistration) -> String {
@@ -90,30 +77,21 @@ pub fn subscription_key(directory: &str, reg: &ResolvedRegistration) -> String {
     format!("{}:{}:{}", norm, reg.registration.id, fp)
 }
 
-pub fn persist_committed(
-    tx: &rusqlite::Transaction<'_>,
+pub fn prepare_committed_in(
+    registry: &Registry,
     event: &BusEvent,
-) -> Result<Vec<String>, String> {
-    if event.r#type != "ocmini.turn.ended" && event.r#type != "command.executed" {
+) -> Result<Vec<crate::store::OutboxIntent>, String> {
+    if event.kind != event::EventKind::Turn(event::TurnKind::Ended)
+        && event.kind != event::EventKind::Command(event::CommandKind::Executed)
+    {
         return Ok(Vec::new());
     }
-    let context = context_for(event);
-    let subscribers = {
-        let mut registry = OBSERVERS.get_or_init(Default::default).lock().unwrap();
-        registry.retain(|o| o.strong_count() > 0);
-        registry
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|o| o.registration.registration.delivery == Delivery::Durable)
-            .filter(|o| o.registration.active())
-            .filter(|o| o.accepts(event, &context))
-            .collect::<Vec<_>>()
-    };
-    persist_subscriptions(
-        tx,
+    let subscribers = registry.matching(event);
+    prepare_subscriptions(
         event,
         subscribers
             .iter()
+            .filter(|o| o.registration.registration.delivery == Delivery::Durable)
             .map(|o| (&o.registration, o.settings.as_ref(), o.directory.as_str())),
     )
 }
@@ -121,13 +99,15 @@ pub fn persist_committed(
 /// Recovery must not depend on which directory has live observer workers.
 /// Record deliveries from the admitted snapshot; only a worker with the same
 /// current registration key can later execute them.
-pub fn persist_recovered(
-    tx: &rusqlite::Transaction<'_>,
+pub fn prepare_recovered(
     event: &BusEvent,
     snapshot: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<crate::store::OutboxIntent>, String> {
     let Some(snapshot) = snapshot else {
-        return persist_committed(tx, event);
+        #[cfg(test)]
+        return prepare_committed_in(&super::test_runtime().registry, event);
+        #[cfg(not(test))]
+        return Ok(Vec::new());
     };
     let resolved: super::config::Resolved = serde_json::from_str(snapshot)
         .map_err(|e| format!("invalid recovered hook snapshot: {e}"))?;
@@ -135,9 +115,8 @@ pub fn persist_recovered(
         .as_str()
         .ok_or("recovered hook event has no directory")?;
     resolved.validate_snapshot(directory)?;
-    let context = context_for(event);
-    persist_subscriptions(
-        tx,
+    let context = &event.properties;
+    prepare_subscriptions(
         event,
         resolved
             .observers
@@ -145,20 +124,22 @@ pub fn persist_recovered(
             .filter(|r| {
                 r.active()
                     && r.registration.delivery == Delivery::Durable
-                    && r.registration.on.values().contains(&event.r#type.as_str())
+                    && r.registration
+                        .on
+                        .values()
+                        .any(|name| name == event.kind.as_str())
                     && r.registration
                         .matcher
-                        .matches(&event.r#type, &context, false)
+                        .matches_context(context, super::types::Defaults::default())
             })
             .map(|r| (r, &resolved.settings, resolved.directory.as_str())),
     )
 }
 
-fn persist_subscriptions<'a>(
-    tx: &rusqlite::Transaction<'_>,
+fn prepare_subscriptions<'a>(
     event: &BusEvent,
     subscriptions: impl Iterator<Item = (&'a ResolvedRegistration, &'a Settings, &'a str)>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<crate::store::OutboxIntent>, String> {
     let mut subscriptions = subscriptions.peekable();
     if subscriptions.peek().is_none() {
         return Ok(Vec::new());
@@ -166,7 +147,7 @@ fn persist_subscriptions<'a>(
     let event_json =
         serde_json::to_string(event).map_err(|e| format!("cannot serialize event: {e}"))?;
 
-    let mut rejected = Vec::new();
+    let mut intents = Vec::new();
     for (registration, settings, directory) in subscriptions {
         let r = &registration.registration;
         let count_limit = r.queue_count.unwrap_or(settings.observer_queue_count);
@@ -180,51 +161,34 @@ fn persist_subscriptions<'a>(
             total_count: settings.observer_outbox_count,
             total_bytes: settings.observer_outbox_bytes,
         };
-        // Database errors may have ended the SQLite transaction. Propagate
-        // immediately so no later enqueue or cleanup can autocommit.
-        let accepted = crate::store::Store::persist_hook_delivery_tx(
-            tx,
-            &subscription_key(directory, registration),
-            &event.id,
-            directory,
-            &event_json,
-            &budget,
-        )?;
-
-        if !accepted {
-            rejected.push(format!(
-                "observer outbox quota exceeded for subscription {}",
-                r.id
-            ));
-        }
+        intents.push(crate::store::OutboxIntent {
+            subscription_key: subscription_key(directory, registration),
+            event_id: event.id.clone(),
+            directory: directory.to_owned(),
+            event_json: event_json.clone(),
+            budget,
+        });
     }
 
-    Ok(rejected)
+    Ok(intents)
 }
 
-pub fn observe(event: &Arc<BusEvent>) {
-    if !has_observers() {
+pub fn observe_in(registry: &Registry, event: &Arc<BusEvent>) {
+    if registry.count.load(Ordering::Relaxed) == 0 {
         return;
     }
-    if event.r#type == "message.part.delta" && DELTA_COUNT.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    if event.r#type == "server.heartbeat"
-        || event.r#type == "server.connected"
-        || event.r#type == "ocmini.hook.queue.overflow"
+    if event.kind == event::EventKind::Part(event::PartKind::Delta)
+        && registry.deltas.load(Ordering::Relaxed) == 0
     {
         return;
     }
-    let context = context_for(event);
-    let subscribers = {
-        let mut registry = OBSERVERS.get_or_init(Default::default).lock().unwrap();
-        registry.retain(|o| o.strong_count() > 0);
-        registry
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|o| o.accepts(event, &context))
-            .collect::<Vec<_>>()
-    };
+    if event.kind == event::EventKind::Server(event::ServerKind::Heartbeat)
+        || event.kind == event::EventKind::Server(event::ServerKind::Connected)
+        || event.kind == event::EventKind::Hook(event::HookKind::Overflow)
+    {
+        return;
+    }
+    let subscribers = registry.matching(event);
     if subscribers.is_empty() {
         return;
     }
@@ -251,132 +215,24 @@ pub fn observe(event: &Arc<BusEvent>) {
         .and_then(|limit| encoded_size(event.as_ref(), limit));
     for observer in subscribers {
         if observer.registration.registration.delivery == Delivery::Durable {
-            observer.durable_notify.notify_one();
+            observer.wake();
         } else {
             observer.enqueue(event, size);
         }
     }
 }
 
-fn is_nonterminal_part_updated(event: &BusEvent) -> bool {
-    if event.r#type != "message.part.updated" {
-        return false;
-    }
-    let part = &event.properties["part"];
-    let terminal = match part["type"].as_str() {
-        Some("text" | "reasoning") => part["time"]["end"].is_number(),
-        Some("tool") => matches!(
-            part["state"]["status"].as_str(),
-            Some("completed" | "error")
-        ),
-        _ => true,
-    };
-    !terminal
-}
-
-fn coalesce_key(event: &BusEvent) -> Option<String> {
-    if event.r#type == "session.status" {
-        let sid = event.properties["sessionID"]
-            .as_str()
-            .or_else(|| event.properties["info"]["id"].as_str())?;
-        Some(format!("session.status:{sid}"))
-    } else if is_nonterminal_part_updated(event) {
-        let part = &event.properties["part"];
-        let sid = part["sessionID"].as_str().unwrap_or("");
-        let mid = part["messageID"].as_str().unwrap_or("");
-        let pid = part["id"].as_str().unwrap_or("");
-        Some(format!("part.updated:{sid}:{mid}:{pid}"))
-    } else {
-        None
-    }
-}
-
-fn context_for(event: &BusEvent) -> Value {
-    let p = &event.properties;
-    let session = p["sessionID"]
-        .as_str()
-        .or(p["info"]["sessionID"].as_str())
-        .or(p["part"]["sessionID"].as_str())
-        .or_else(|| {
-            if event.r#type.starts_with("session.") {
-                p["info"]["id"].as_str()
-            } else {
-                None
-            }
-        });
-    let scope = session.and_then(|id| {
-        SESSION_SCOPES
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-    });
-    let directory = p["directory"]
-        .as_str()
-        .or(p["info"]["directory"].as_str())
-        .map(str::to_owned)
-        .or_else(|| scope.as_ref().map(|scope| scope.directory.clone()));
-    let mut context = serde_json::Map::new();
-    for key in [
-        "turnKind",
-        "requestKind",
-        "agent",
-        "model",
-        "parentID",
-        "parentSessionID",
-        "tool",
-        "toolName",
-        "outcome",
-        "reason",
-    ] {
-        if let Some(value) = p.get(key) {
-            context.insert(key.to_owned(), value.clone());
-        }
-    }
-    if let Some(session) = session {
-        context.insert("sessionID".into(), json!(session));
-    }
-    if let Some(directory) = directory {
-        context.insert("directory".into(), json!(directory));
-    }
-    // Message info.parentID identifies a prompt, not session ancestry.
-    if event.r#type.starts_with("session.") && p["info"]["id"].is_string() {
-        context.insert("parentID".into(), p["info"]["parentID"].clone());
-    } else if !context.contains_key("parentID") {
-        if let Some(scope) = scope {
-            context.insert("parentID".into(), json!(scope.parent_id));
-        }
-    }
-    let value = Value::Object(context);
-    remember(&value);
-    value
-}
-
-struct SizeWriter {
-    size: usize,
-    limit: usize,
-}
-impl Write for SizeWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.size = self.size.saturating_add(bytes.len());
-        if self.size > self.limit {
-            return Err(io::Error::other("event preview bound"));
-        }
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 // Only return exact sizes; an exceeded counting bound is not a retained size.
 fn encoded_size(value: &impl Serialize, limit: usize) -> Option<usize> {
-    let mut writer = SizeWriter { size: 0, limit };
+    let mut writer = super::payload::BoundedWriter {
+        writer: std::io::sink(),
+        bytes: 0,
+        limit,
+    };
     if serde_json::to_writer(&mut writer, value).is_err() {
         None
     } else {
-        Some(writer.size)
+        Some(writer.bytes)
     }
 }
 
@@ -394,10 +250,53 @@ struct Queue {
     gaps: u64,
 }
 
+impl Queue {
+    fn drop_event(&mut self) {
+        self.dropped += 1;
+        self.gaps += 1;
+    }
+    fn insert(&mut self, item: Item, policy: OverflowPolicy, count: usize, bytes: usize) -> bool {
+        if policy == OverflowPolicy::Coalesce {
+            if let Some(position) = item.coalesce_key.as_ref().and_then(|key| {
+                self.items
+                    .iter()
+                    .position(|old| old.coalesce_key.as_ref() == Some(key))
+            }) {
+                let total = self.bytes - self.items[position].bytes + item.bytes;
+                if total > bytes {
+                    self.drop_event();
+                    return false;
+                }
+                self.items.remove(position);
+                self.items.push_back(item);
+                self.bytes = total;
+                self.gaps += 1;
+                return true;
+            }
+        }
+        if policy == OverflowPolicy::DropOldest {
+            while !self.items.is_empty()
+                && (self.items.len() >= count || item.bytes > bytes.saturating_sub(self.bytes))
+            {
+                self.bytes -= self.items.pop_front().unwrap().bytes;
+                self.drop_event();
+            }
+        }
+        if self.items.len() >= count || item.bytes > bytes.saturating_sub(self.bytes) {
+            self.drop_event();
+            return false;
+        }
+        self.bytes += item.bytes;
+        self.items.push_back(item);
+        true
+    }
+}
+
 pub struct Observer {
+    process: Arc<process::Runtime>,
+    registry: Arc<Registry>,
     pub registration: ResolvedRegistration,
     pub subscription_key: String,
-    on: Vec<glob::Pattern>,
     deltas: bool,
     pub settings: Arc<Settings>,
     pub directory: String,
@@ -406,10 +305,8 @@ pub struct Observer {
     queue: Mutex<Queue>,
     notify: Arc<Notify>,
     started: AtomicBool,
-    retired: Arc<AtomicBool>,
+    retired: CancellationToken,
     store: Mutex<Weak<crate::store::Store>>,
-    durable_started: AtomicBool,
-    durable_notify: Arc<Notify>,
 }
 
 impl Drop for Observer {
@@ -418,33 +315,32 @@ impl Drop for Observer {
     }
 }
 
-pub fn retire_scope(directory: &str) {
-    if let Some(registry) = OBSERVERS.get() {
-        let observers = registry
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|o| o.directory == directory)
-            .collect::<Vec<_>>();
-        for observer in observers {
-            observer.retire();
-        }
+pub fn retire_scope(registry: &Registry, directory: &str) {
+    let observers = registry
+        .observers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|o| o.directory == directory)
+        .collect::<Vec<_>>();
+    for observer in observers {
+        observer.retire();
     }
 }
 
 impl Observer {
     fn retire(&self) {
-        if !self.retired.swap(true, Ordering::AcqRel) {
-            COUNT.fetch_sub(1, Ordering::Relaxed);
+        let mut queue = self.queue.lock().unwrap();
+        if !self.retired.is_cancelled() {
+            self.retired.cancel();
+            self.registry.count.fetch_sub(1, Ordering::Relaxed);
             if self.deltas {
-                DELTA_COUNT.fetch_sub(1, Ordering::Relaxed);
+                self.registry.deltas.fetch_sub(1, Ordering::Relaxed);
             }
-            let mut queue = self.queue.lock().unwrap();
             queue.items.clear();
             queue.bytes = 0;
             self.notify.notify_one();
-            self.durable_notify.notify_one();
         }
     }
 
@@ -453,42 +349,44 @@ impl Observer {
             return;
         }
         *self.store.lock().unwrap() = Arc::downgrade(&store);
-        self.start_durable_worker();
-        self.durable_notify.notify_one();
+        self.wake();
     }
 
-    fn start_durable_worker(self: &Arc<Self>) {
-        if !self.durable_started.swap(true, Ordering::AcqRel) {
+    fn wake(self: &Arc<Self>) {
+        if !self.started.load(Ordering::Acquire) {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                let weak = Arc::downgrade(self);
-                runtime.spawn(async move {
-                    durable_worker(weak).await;
-                });
+                if !self.started.swap(true, Ordering::AcqRel) {
+                    let weak = Arc::downgrade(self);
+                    let delivery = self.registration.registration.delivery;
+                    runtime.spawn(async move {
+                        match delivery {
+                            Delivery::Durable => durable_worker(weak).await,
+                            Delivery::BestEffort => worker(weak).await,
+                        }
+                    });
+                }
             }
         }
+        self.notify.notify_one();
     }
 
-    pub fn register(
+    pub fn register_in(
+        registry: Arc<Registry>,
+        process: Arc<process::Runtime>,
         registration: ResolvedRegistration,
         settings: Arc<Settings>,
         directory: &str,
         capacity: Arc<Semaphore>,
         active: ActiveInvocations,
     ) -> Arc<Self> {
-        let on = registration
-            .registration
-            .on
-            .values()
-            .iter()
-            .filter_map(|p| glob::Pattern::new(p).ok())
-            .collect::<Vec<_>>();
         let deltas = registration.registration.batch_size.unwrap_or(1) >= 2
             && registration.registration.batch_ms.unwrap_or(0) > 0
-            && on.iter().any(|p| p.matches("message.part.delta"));
+            && registration.registration.on.matches("message.part.delta");
         let sub_key = subscription_key(directory, &registration);
         let observer = Arc::new(Self {
+            process,
+            registry: registry.clone(),
             subscription_key: sub_key,
-            on,
             deltas,
             registration,
             settings,
@@ -498,63 +396,48 @@ impl Observer {
             queue: Mutex::new(Queue::default()),
             notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
-            retired: Arc::new(AtomicBool::new(false)),
+            retired: CancellationToken::new(),
             store: Mutex::new(Weak::new()),
-            durable_started: AtomicBool::new(false),
-            durable_notify: Arc::new(Notify::new()),
         });
-        OBSERVERS
-            .get_or_init(Default::default)
+        registry
+            .observers
             .lock()
             .unwrap()
             .push(Arc::downgrade(&observer));
-        COUNT.fetch_add(1, Ordering::Relaxed);
+        registry.count.fetch_add(1, Ordering::Relaxed);
         if observer.deltas {
-            DELTA_COUNT.fetch_add(1, Ordering::Relaxed);
+            registry.deltas.fetch_add(1, Ordering::Relaxed);
         }
         observer
     }
 
     fn accepts(&self, event: &BusEvent, context: &Value) -> bool {
         let r = &self.registration.registration;
-        if self.retired.load(Ordering::Acquire)
-            || !r.enabled
-            || !self.on.iter().any(|p| p.matches(&event.r#type))
-        {
+        if self.retired.is_cancelled() || !r.enabled || !r.on.matches(event.kind.as_str()) {
             return false;
         }
-        if event.r#type.starts_with("ocmini.hook.")
+        if matches!(event.kind, event::EventKind::Hook(_))
             && (event.properties["observer"] == true
-                || !r.on.values().contains(&event.r#type.as_str())
+                || !r.on.values().any(|name| name == event.kind.as_str())
                 || event.properties["handlerID"] == r.id)
         {
             return false;
         }
-        if event.r#type == "message.part.delta"
+        if event.kind == event::EventKind::Part(event::PartKind::Delta)
             && (r.batch_size.unwrap_or(1) < 2 || r.batch_ms.unwrap_or(0) == 0)
         {
             return false;
         }
         if context["directory"].as_str() != Some(self.directory.as_str())
-            && !event.r#type.starts_with("ocmini.runtime.")
+            && !matches!(event.kind, event::EventKind::Runtime(_))
         {
             return false;
         }
-        if event.r#type == "message.part.updated" && r.terminal_only.unwrap_or(true) {
-            let part = &event.properties["part"];
-            let terminal = match part["type"].as_str() {
-                Some("text" | "reasoning") => part["time"]["end"].is_number(),
-                Some("tool") => matches!(
-                    part["state"]["status"].as_str(),
-                    Some("completed" | "error")
-                ),
-                _ => true,
-            };
-            if !terminal {
-                return false;
-            }
+        if r.terminal_only.unwrap_or(true) && event.is_nonterminal_part_update() {
+            return false;
         }
-        r.matcher.matches(&event.r#type, context, false)
+        r.matcher
+            .matches_context(context, super::types::Defaults::default())
     }
 
     fn enqueue(self: &Arc<Self>, event: &Arc<BusEvent>, size: Option<usize>) {
@@ -577,7 +460,7 @@ impl Observer {
                     .saturating_sub(1024),
             );
             if size.is_none_or(|size| size > limit) {
-                let context = context_for(event);
+                let context = &event.properties;
                 let mut properties = json!({
                     "directory": self.directory,
                     "sessionID": context["sessionID"],
@@ -590,15 +473,9 @@ impl Observer {
                         properties[key] = value.clone();
                     }
                 }
-                if let Some(part) = event.properties.get("part") {
-                    properties["messageID"] = part["messageID"].clone();
-                    properties["partID"] = part["id"].clone();
-                } else if event.r#type == "message.updated" {
-                    properties["messageID"] = event.properties["info"]["id"].clone();
-                }
                 let event = Arc::new(BusEvent {
                     id: event.id.clone(),
-                    r#type: event.r#type.clone(),
+                    kind: event.kind,
                     properties,
                 });
                 let size = encoded_size(event.as_ref(), bytes_limit);
@@ -608,171 +485,136 @@ impl Observer {
             }
         };
 
-        let Some(size) = size else {
+        let dropped = {
             let mut queue = self.queue.lock().unwrap();
-            queue.dropped += 1;
-            queue.gaps += 1;
-            let dropped = queue.dropped;
-            drop(queue);
+            let accepted = match size {
+                Some(bytes) => {
+                    let coalesce_key = (r.overflow == OverflowPolicy::Coalesce)
+                        .then(|| event.coalesce_key())
+                        .flatten();
+                    queue.insert(
+                        Item {
+                            event,
+                            bytes,
+                            coalesce_key,
+                        },
+                        r.overflow,
+                        count_limit,
+                        bytes_limit,
+                    )
+                }
+                None => {
+                    queue.drop_event();
+                    false
+                }
+            };
+            (!accepted).then_some(queue.dropped)
+        };
+        if let Some(dropped) = dropped {
             if dropped.is_power_of_two() {
                 crate::engine::bus().emit(
-                    "ocmini.hook.queue.overflow",
-                    json!({
-                        "version": 1,
-                        "directory": self.directory,
-                        "time": crate::types::now_ms(),
-                        "subscriptionID": r.id,
-                        "dropped": dropped
-                    }),
-                );
-            }
-            return;
-        };
-
-        let overflow = {
-            let mut queue = self.queue.lock().unwrap();
-            match r.overflow {
-                OverflowPolicy::DropNewest => {
-                    if queue.items.len() >= count_limit
-                        || size > bytes_limit.saturating_sub(queue.bytes)
-                    {
-                        queue.dropped += 1;
-                        queue.gaps += 1;
-                        Some(queue.dropped)
-                    } else {
-                        queue.bytes += size;
-                        queue.items.push_back(Item {
-                            event,
-                            bytes: size,
-                            coalesce_key: None,
-                        });
-                        None
-                    }
-                }
-                OverflowPolicy::DropOldest => {
-                    while (queue.items.len() >= count_limit
-                        || size > bytes_limit.saturating_sub(queue.bytes))
-                        && !queue.items.is_empty()
-                    {
-                        let old = queue.items.pop_front().unwrap();
-                        queue.bytes -= old.bytes;
-                        queue.dropped += 1;
-                        queue.gaps += 1;
-                    }
-                    if queue.items.len() < count_limit
-                        && size <= bytes_limit.saturating_sub(queue.bytes)
-                    {
-                        queue.bytes += size;
-                        queue.items.push_back(Item {
-                            event,
-                            bytes: size,
-                            coalesce_key: None,
-                        });
-                        None
-                    } else {
-                        queue.dropped += 1;
-                        queue.gaps += 1;
-                        Some(queue.dropped)
-                    }
-                }
-                OverflowPolicy::Coalesce => {
-                    let key = coalesce_key(&event);
-                    if let Some(key) = key {
-                        if let Some(pos) = queue
-                            .items
-                            .iter()
-                            .position(|i| i.coalesce_key.as_deref() == Some(&key))
-                        {
-                            let old_bytes = queue.items[pos].bytes;
-                            let new_total_bytes = queue.bytes - old_bytes + size;
-                            if new_total_bytes <= bytes_limit {
-                                queue.bytes = new_total_bytes;
-                                queue.items.remove(pos);
-                                queue.items.push_back(Item {
-                                    event,
-                                    bytes: size,
-                                    coalesce_key: Some(key),
-                                });
-                                queue.gaps += 1;
-                                None
-                            } else {
-                                queue.dropped += 1;
-                                queue.gaps += 1;
-                                Some(queue.dropped)
-                            }
-                        } else if queue.items.len() >= count_limit
-                            || size > bytes_limit.saturating_sub(queue.bytes)
-                        {
-                            queue.dropped += 1;
-                            queue.gaps += 1;
-                            Some(queue.dropped)
-                        } else {
-                            queue.bytes += size;
-                            queue.items.push_back(Item {
-                                event,
-                                bytes: size,
-                                coalesce_key: Some(key),
-                            });
-                            None
-                        }
-                    } else if queue.items.len() >= count_limit
-                        || size > bytes_limit.saturating_sub(queue.bytes)
-                    {
-                        queue.dropped += 1;
-                        queue.gaps += 1;
-                        Some(queue.dropped)
-                    } else {
-                        queue.bytes += size;
-                        queue.items.push_back(Item {
-                            event,
-                            bytes: size,
-                            coalesce_key: None,
-                        });
-                        None
-                    }
-                }
-            }
-        };
-
-        if let Some(dropped) = overflow {
-            if dropped.is_power_of_two() {
-                crate::engine::bus().emit(
-                    "ocmini.hook.queue.overflow",
-                    json!({
-                        "version": 1,
-                        "directory": self.directory,
-                        "time": crate::types::now_ms(),
-                        "subscriptionID": r.id,
-                        "dropped": dropped
-                    }),
+                    event::Hook::Overflow {
+                        data: event::Overflow::BestEffort {
+                            subscription_id: &r.id,
+                            dropped,
+                        },
+                    },
+                    json!({"version":1,"directory":self.directory,"time":crate::types::now_ms()}),
                 );
             }
             return;
         }
-
-        if !self.started.load(Ordering::Acquire) {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                if !self.started.swap(true, Ordering::AcqRel) {
-                    let weak = Arc::downgrade(self);
-                    runtime.spawn(async move {
-                        worker(weak).await;
-                    });
-                }
-            }
-        }
-        self.notify.notify_one();
+        self.wake();
     }
+}
+
+async fn invoke_observer(
+    observer: &Observer,
+    events: &[&BusEvent],
+    gaps: u64,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    let invocation = crate::types::hex_id("hki_");
+    let context = events
+        .first()
+        .map(|e| e.properties.clone())
+        .unwrap_or_else(|| json!({"directory": observer.directory}));
+    let guard = super::InvocationGuard::new(
+        observer.active.clone(),
+        &invocation,
+        context["sessionID"].as_str().unwrap_or(""),
+    );
+    let start = Instant::now();
+    super::diagnostic(
+        event::HookPhase::Started,
+        &observer.registration,
+        event::HookTarget::Observer,
+        &context,
+        &invocation,
+        start,
+        None,
+    );
+
+    let envelope = ObserverEnvelope {
+        version: 1,
+        subscription_id: &observer.registration.registration.id,
+        invocation_id: &invocation,
+        context: ObserverContext {
+            directory: &observer.directory,
+        },
+        events,
+        dropped: if gaps > 0 { Some(gaps) } else { None },
+        gaps: if gaps > 0 { Some(gaps) } else { None },
+    };
+
+    let result = observer
+        .process
+        .run(
+            &observer.registration,
+            &observer.settings,
+            &observer.directory,
+            &envelope,
+            Some(&observer.retired),
+            deadline,
+            observer.capacity.clone(),
+            super::InvocationKind::Observer,
+            &invocation,
+            context["sessionID"].as_str().unwrap_or(""),
+        )
+        .await;
+
+    let ack_res = match &result {
+        Ok(outcome) => validate_outcome_ack(outcome, observer.settings.max_payload_bytes),
+        Err(e) => Err(e.summary().to_string()),
+    };
+
+    let err_msg = ack_res.as_ref().err().map(|s| s.as_str());
+    let diagnostic_context =
+        observer_diagnostic_context(&context, &result, ack_res.is_err(), &invocation);
+    super::diagnostic(
+        if ack_res.is_ok() {
+            event::HookPhase::Completed
+        } else {
+            event::HookPhase::Failed
+        },
+        &observer.registration,
+        event::HookTarget::Observer,
+        &diagnostic_context,
+        &invocation,
+        start,
+        err_msg,
+    );
+    drop(guard);
+    ack_res
 }
 
 async fn worker(weak: Weak<Observer>) {
     loop {
-        if process::is_shutdown() {
-            return;
-        }
         let Some(observer) = weak.upgrade() else {
             return;
         };
-        if observer.retired.load(Ordering::Acquire) {
+        let process = observer.process.clone();
+        if process.is_shutdown() || observer.retired.is_cancelled() {
             return;
         }
         let notify = observer.notify.clone();
@@ -783,14 +625,14 @@ async fn worker(weak: Weak<Observer>) {
             drop(observer);
             tokio::select! {
                 _ = notify.notified() => {},
-                _ = process::cancelled(None) => return,
+                _ = process.cancelled(None) => return,
             };
             continue;
         }
         if batch_ms > 0 {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(batch_ms)) => {},
-                _ = process::cancelled(None) => return,
+                _ = process.cancelled(None) => return,
             };
         }
         let (events, gaps) = {
@@ -825,97 +667,27 @@ async fn worker(weak: Weak<Observer>) {
             q.gaps = 0;
             (events, gaps)
         };
-        let invocation = crate::types::hex_id("hki_");
-        let context = events
-            .first()
-            .map(|e| context_for(e))
-            .unwrap_or_else(|| json!({"directory": observer.directory}));
-        let guard = super::InvocationGuard::new(
-            observer.active.clone(),
-            &invocation,
-            context["sessionID"].as_str().unwrap_or(""),
-        );
-        let start = Instant::now();
-        super::diagnostic(
-            "started",
-            &observer.registration,
-            "event",
-            &context,
-            &invocation,
-            start,
-            None,
-        );
-
         let event_refs: Vec<&BusEvent> = events.iter().map(Arc::as_ref).collect();
-        let envelope = ObserverEnvelope {
-            version: 1,
-            subscription_id: &observer.registration.registration.id,
-            invocation_id: &invocation,
-            context: ObserverContext {
-                directory: &observer.directory,
-            },
-            events: &event_refs,
-            dropped: if gaps > 0 { Some(gaps) } else { None },
-            gaps: if gaps > 0 { Some(gaps) } else { None },
-        };
-
-        let result = process::run(
-            &observer.registration,
-            &observer.settings,
-            &observer.directory,
-            &envelope,
-            Some(&observer.retired),
-            None,
-            observer.capacity.clone(),
-            "event",
-            &invocation,
-            context["sessionID"].as_str().unwrap_or(""),
-        )
-        .await;
-
-        let ack_res = match &result {
-            Ok(outcome) => validate_outcome_ack(outcome, observer.settings.max_payload_bytes),
-            Err(e) => Err(e.summary().to_string()),
-        };
-
-        let err_msg = ack_res.as_ref().err().map(|s| s.as_str());
-        let diagnostic_context =
-            observer_diagnostic_context(&context, &result, ack_res.is_err(), &invocation);
-        super::diagnostic(
-            if ack_res.is_ok() {
-                "completed"
-            } else {
-                "failed"
-            },
-            &observer.registration,
-            "event",
-            &diagnostic_context,
-            &invocation,
-            start,
-            err_msg,
-        );
-        drop(guard);
+        let _ = invoke_observer(&observer, &event_refs, gaps, None).await;
     }
 }
 
 async fn durable_worker(weak: Weak<Observer>) {
     loop {
-        if process::is_shutdown() {
-            return;
-        }
         let Some(observer) = weak.upgrade() else {
             return;
         };
-        if observer.retired.load(Ordering::Acquire) {
+        let process = observer.process.clone();
+        if process.is_shutdown() || observer.retired.is_cancelled() {
             return;
         }
         let store = observer.store.lock().unwrap().upgrade();
         let Some(store) = store else {
-            let notify = observer.durable_notify.clone();
+            let notify = observer.notify.clone();
             drop(observer);
             tokio::select! {
                 _ = notify.notified() => {},
-                _ = process::cancelled(None) => return,
+                _ = process.cancelled(None) => return,
             };
             continue;
         };
@@ -924,7 +696,9 @@ async fn durable_worker(weak: Weak<Observer>) {
         let queue_timeout_ms = r
             .queue_timeout_ms
             .unwrap_or(observer.settings.queue_timeout_ms);
-        let cmd_timeout_ms = observer.registration.timeout_ms(true);
+        let cmd_timeout_ms = observer
+            .registration
+            .timeout_ms(super::InvocationKind::Observer);
         let lease_ms = (queue_timeout_ms
             .saturating_add(cmd_timeout_ms)
             .saturating_add(10_000))
@@ -940,7 +714,7 @@ async fn durable_worker(weak: Weak<Observer>) {
                     .next_hook_delivery_at(&observer.subscription_key)
                     .ok()
                     .flatten();
-                let notify = observer.durable_notify.clone();
+                let notify = observer.notify.clone();
                 drop(observer);
                 drop(store);
 
@@ -956,7 +730,7 @@ async fn durable_worker(weak: Weak<Observer>) {
                 tokio::select! {
                     _ = notify.notified() => {},
                     _ = tokio::time::sleep(sleep_duration) => {},
-                    _ = process::cancelled(None) => return,
+                    _ = process.cancelled(None) => return,
                 };
                 continue;
             }
@@ -967,7 +741,7 @@ async fn durable_worker(weak: Weak<Observer>) {
         };
 
         let lease_token = rec.lease_owner.clone().unwrap_or_default();
-        if observer.retired.load(Ordering::Acquire) || process::is_shutdown() {
+        if observer.retired.is_cancelled() || observer.process.is_shutdown() {
             let _ = store.release_hook_delivery(&rec.subscription_key, &rec.event_id, &lease_token);
             return;
         }
@@ -978,80 +752,13 @@ async fn durable_worker(weak: Weak<Observer>) {
             continue;
         };
 
-        let invocation = crate::types::hex_id("hki_");
-        let context = context_for(&event);
-        let guard = super::InvocationGuard::new(
-            observer.active.clone(),
-            &invocation,
-            context["sessionID"].as_str().unwrap_or(""),
-        );
-        let start = Instant::now();
-        super::diagnostic(
-            "started",
-            &observer.registration,
-            "event",
-            &context,
-            &invocation,
-            start,
-            None,
-        );
+        let deadline = Instant::now()
+            + Duration::from_millis(
+                rec.expires.saturating_sub(crate::types::now_ms()).max(0) as u64
+            );
+        let ack_res = invoke_observer(&observer, &[&event], 0, Some(deadline)).await;
 
-        let event_slice = [&event];
-        let envelope = ObserverEnvelope {
-            version: 1,
-            subscription_id: &observer.registration.registration.id,
-            invocation_id: &invocation,
-            context: ObserverContext {
-                directory: &observer.directory,
-            },
-            events: &event_slice,
-            dropped: None,
-            gaps: None,
-        };
-
-        let result = process::run(
-            &observer.registration,
-            &observer.settings,
-            &observer.directory,
-            &envelope,
-            Some(&observer.retired),
-            Some(
-                start
-                    + Duration::from_millis(
-                        rec.expires.saturating_sub(crate::types::now_ms()).max(0) as u64,
-                    ),
-            ),
-            observer.capacity.clone(),
-            "event",
-            &invocation,
-            context["sessionID"].as_str().unwrap_or(""),
-        )
-        .await;
-
-        let ack_res = match &result {
-            Ok(outcome) => validate_outcome_ack(outcome, observer.settings.max_payload_bytes),
-            Err(e) => Err(e.summary().to_string()),
-        };
-
-        let err_msg = ack_res.as_ref().err().map(|s| s.as_str());
-        let diagnostic_context =
-            observer_diagnostic_context(&context, &result, ack_res.is_err(), &invocation);
-        super::diagnostic(
-            if ack_res.is_ok() {
-                "completed"
-            } else {
-                "failed"
-            },
-            &observer.registration,
-            "event",
-            &diagnostic_context,
-            &invocation,
-            start,
-            err_msg,
-        );
-        drop(guard);
-
-        if observer.retired.load(Ordering::Acquire) || process::is_shutdown() {
+        if observer.retired.is_cancelled() || observer.process.is_shutdown() {
             let _ = store.release_hook_delivery(&rec.subscription_key, &rec.event_id, &lease_token);
             return;
         }
@@ -1147,6 +854,35 @@ fn validate_ack_value(value: &Value) -> Result<(), String> {
 }
 
 #[cfg(test)]
+fn observe(event: &Arc<BusEvent>) {
+    observe_in(&super::test_runtime().registry, event);
+}
+#[cfg(test)]
+fn prepare_committed(event: &BusEvent) -> Result<Vec<crate::store::OutboxIntent>, String> {
+    prepare_committed_in(&super::test_runtime().registry, event)
+}
+#[cfg(test)]
+impl Observer {
+    fn register(
+        registration: ResolvedRegistration,
+        settings: Arc<Settings>,
+        directory: &str,
+        capacity: Arc<Semaphore>,
+        active: ActiveInvocations,
+    ) -> Arc<Self> {
+        Self::register_in(
+            super::test_runtime().registry.clone(),
+            super::test_runtime().process.clone(),
+            registration,
+            settings,
+            directory,
+            capacity,
+            active,
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::config::Resolved;
     use super::*;
@@ -1176,7 +912,7 @@ mod tests {
     fn event(name: &str, properties: Value) -> Arc<BusEvent> {
         Arc::new(BusEvent {
             id: crate::types::hex_id("evt_"),
-            r#type: name.into(),
+            kind: serde_json::from_value(serde_json::json!(name)).expect("known event"),
             properties,
         })
     }
@@ -1200,7 +936,9 @@ mod tests {
         drop(q);
         let mut found = false;
         while let Ok(ev) = bus.try_recv() {
-            if ev.r#type == "ocmini.hook.queue.overflow" && ev.properties["directory"] == dir {
+            if ev.kind == event::EventKind::Hook(event::HookKind::Overflow)
+                && ev.properties["directory"] == dir
+            {
                 found = true;
             }
         }
@@ -1298,13 +1036,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let dir = directory.path().to_str().unwrap();
         let cfg: Config = serde_json::from_value(json!({"ocmini":{"hooks":{"observers":[{"id":"batch","on":"ocmini.turn.ended","batchSize":8,"batchMs":40,"command":["sh","-c","cat > observed.json"]}]}}})).unwrap();
-        let hooks =
-            super::super::Hooks::build(Resolved::from_config(&cfg, dir).unwrap(), true).unwrap();
+        let hooks = super::super::test_runtime()
+            .build(Resolved::from_config(&cfg, dir).unwrap(), true)
+            .unwrap();
         let bus = crate::bus::Bus::new();
+        bus.register_observers(&super::super::test_runtime().registry);
         let mut first = bus.subscribe();
         let mut second = bus.subscribe();
         for n in 0..3 {
-            bus.emit("ocmini.turn.ended", json!({"directory":dir,"sequence":n}));
+            bus.publish(event(
+                "ocmini.turn.ended",
+                json!({"directory":dir,"sequence":n}),
+            ));
         }
         let a = first.recv().await.unwrap();
         let b = second.recv().await.unwrap();
@@ -1660,10 +1403,21 @@ mod tests {
         {
             let mut conn = rusqlite::Connection::open(&db_path).unwrap();
             let tx = conn.transaction().unwrap();
-            assert!(persist_committed(&tx, &ev1).is_ok());
-            assert!(persist_committed(&tx, &ev1).is_ok());
-            assert!(persist_committed(&tx, &ev2).is_ok());
-            let rejected = persist_committed(&tx, &ev3).unwrap();
+            assert!(
+                crate::store::Store::persist_outbox_tx(&tx, &prepare_committed(&ev1).unwrap())
+                    .is_ok()
+            );
+            assert!(
+                crate::store::Store::persist_outbox_tx(&tx, &prepare_committed(&ev1).unwrap())
+                    .is_ok()
+            );
+            assert!(
+                crate::store::Store::persist_outbox_tx(&tx, &prepare_committed(&ev2).unwrap())
+                    .is_ok()
+            );
+            let rejected =
+                crate::store::Store::persist_outbox_tx(&tx, &prepare_committed(&ev3).unwrap())
+                    .unwrap();
             assert!(rejected.join("; ").contains("outbox quota exceeded"));
             tx.commit().unwrap();
         }
@@ -1799,7 +1553,7 @@ mod tests {
         {
             let mut conn = rusqlite::Connection::open(&db_path).unwrap();
             let tx = conn.transaction().unwrap();
-            persist_committed(&tx, &ev).unwrap();
+            crate::store::Store::persist_outbox_tx(&tx, &prepare_committed(&ev).unwrap()).unwrap();
             tx.commit().unwrap();
         }
 
@@ -1825,5 +1579,48 @@ mod tests {
         assert_ne!(sub_key1, sub_key2);
         let claimed_under_v2 = store.claim_hook_delivery(sub_key2, 30_000, 3).unwrap();
         assert!(claimed_under_v2.is_none());
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn durable_delivery_can_be_attached_before_entering_a_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().to_str().unwrap();
+        let db = directory.path().join("state.db");
+        let store = Arc::new(crate::store::Store::open(&db, "observer-start").unwrap());
+        let observer = observer(
+            dir,
+            json!({"on":"ocmini.turn.ended","delivery":"durable","command":["sh","-c","cat > delivery.json; printf '{}'"]}),
+        );
+        let event = event(
+            "ocmini.turn.ended",
+            json!({"directory":dir,"sessionID":"session"}),
+        );
+        let mut connection = rusqlite::Connection::open(&db).unwrap();
+        let tx = connection.transaction().unwrap();
+        crate::store::Store::persist_outbox_tx(
+            &tx,
+            &prepare_committed_in(&observer.registry, &event).unwrap(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let (outside, storage) = (observer.clone(), store.clone());
+        std::thread::spawn(move || outside.attach_store(storage))
+            .join()
+            .unwrap();
+        observer.attach_store(store.clone());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !directory.path().join("delivery.json").exists()
+                || !store.hook_deliveries(dir).unwrap().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let delivered: Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("delivery.json")).unwrap())
+                .unwrap();
+        assert_eq!(delivered["events"][0]["id"], event.id);
+        observer.retire();
     }
 }

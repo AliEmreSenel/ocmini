@@ -2,7 +2,7 @@ use super::*;
 use crate::config::HookConfigSource;
 use serde_json::json;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use tokio_util::sync::CancellationToken;
 
 fn source(value: Value, name: &str, trusted: bool) -> HookConfigSource {
     HookConfigSource {
@@ -20,11 +20,12 @@ fn sources(values: Vec<HookConfigSource>) -> Config {
 }
 fn runtime(value: Value, directory: &Path) -> Arc<Hooks> {
     let config: Config = serde_json::from_value(json!({"ocmini":{"hooks":value}})).unwrap();
-    Hooks::build(
-        Resolved::from_config(&config, directory.to_str().unwrap()).unwrap(),
-        false,
-    )
-    .unwrap()
+    super::test_runtime()
+        .build(
+            Resolved::from_config(&config, directory.to_str().unwrap()).unwrap(),
+            false,
+        )
+        .unwrap()
 }
 fn context(directory: &Path) -> Value {
     json!({"directory":directory,"sessionID":"ses_test","turnID":"msg_turn","turnKind":"primary"})
@@ -306,6 +307,38 @@ async fn optional_invalid_environment_and_runtime_metadata_are_discarded() {
         1
     );
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn invalid_model_replacements_do_not_reach_the_next_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, input, replacement) in [
+        (
+            "model.params.transform",
+            json!({"options":{"temperature":0.5},"variant":null}),
+            json!({"options":{"temperature":"cold"}}),
+        ),
+        (
+            "model.headers.transform",
+            json!({"headers":{"x-trace":"original"}}),
+            json!({"headers":{"x-custom-token":"secret"}}),
+        ),
+    ] {
+        let mut first = handler(
+            "optional",
+            name,
+            &format!("printf '%s' '{}'", json!({"set":replacement})),
+        );
+        first["failurePolicy"] = json!("continue");
+        let second = json!({"id":"verify","on":name,"command":["python3","-c",format!("import json,sys; assert json.load(sys.stdin)['input']==json.loads({:?}); print('{{}}')",input.to_string())]});
+        let hooks = runtime(json!({"handlers":[first,second]}), dir.path());
+        let result = hooks
+            .run(name, &context(dir.path()), input.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.input, input);
+    }
+}
 #[test]
 fn model_matchers_require_a_known_model() {
     let matcher: types::Matcher = serde_json::from_value(json!({"model":"*"})).unwrap();
@@ -356,11 +389,11 @@ async fn optional_failure_policy_cannot_swallow_cancellation() {
     let mut h = handler("optional", "turn.start.before", "cat >/dev/null; sleep 30");
     h["failurePolicy"] = json!("continue");
     let hooks = runtime(json!({"handlers":[h]}), dir.path());
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = CancellationToken::new();
     let flag = cancel.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        flag.store(true, Ordering::Release);
+        flag.cancel();
     });
     assert!(hooks
         .run(
@@ -634,7 +667,7 @@ async fn cancellation_and_active_invocation_identity_are_scoped() {
         json!({"handlers":[handler("cancel","turn.start.before","echo $OCMINI_HOOK_INVOCATION_ID > invocation; sleep 30")]}),
         dir.path(),
     );
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = CancellationToken::new();
     let h = hooks.clone();
     let flag = cancel.clone();
     let ctx = context(dir.path());
@@ -653,7 +686,7 @@ async fn cancellation_and_active_invocation_identity_are_scoped() {
     let id = id.trim();
     assert!(hooks.is_active_invocation(id, "ses_test"));
     assert!(!hooks.is_active_invocation(id, "ses_other"));
-    cancel.store(true, Ordering::Release);
+    cancel.cancel();
     assert!(tokio::time::timeout(Duration::from_secs(1), task)
         .await
         .unwrap()

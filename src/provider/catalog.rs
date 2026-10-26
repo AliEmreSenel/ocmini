@@ -2,7 +2,7 @@ use super::{Adapter, ChatRequest, Protocol};
 use crate::auth::AuthStore;
 use crate::config::{deep_merge, Config, ModelInfo, ProviderCfg};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -78,7 +78,12 @@ pub(crate) fn normalize_provider(id: &str, source: &ProviderCfg) -> ProviderCfg 
         else {
             continue;
         };
-        let protocol = model_protocol(id, &npm_default, &provider_options, model);
+        let effective = super::merge_model_options(provider_options.clone(), Some(model));
+        let protocol = effective
+            .and_then(|options| {
+                super::model_protocol(id, &npm_default, &options, Some(model), &model.id, false)
+            })
+            .unwrap_or(Protocol::Chat);
         let Some(generated) = reasoning_variants(&options, protocol, model) else {
             continue;
         };
@@ -101,33 +106,6 @@ fn apply_reasoning_options(config: &mut Config) {
     for (id, provider) in &mut config.provider {
         *provider = normalize_provider(id, provider);
     }
-}
-
-/// The protocol requests to this model use, mirroring `Adapter::prepare`.
-fn model_protocol(
-    provider: &str,
-    npm_default: &str,
-    provider_options: &Value,
-    model: &ModelInfo,
-) -> Protocol {
-    let npm = model
-        .extra
-        .get("provider")
-        .and_then(|v| v.get("npm"))
-        .and_then(Value::as_str)
-        .unwrap_or(npm_default);
-    let mut options = provider_options.clone();
-    for key in ["options", "settings", "request"] {
-        if let Some(value) = model.extra.get(key).filter(|value| value.is_object()) {
-            deep_merge(&mut options, value.clone());
-        }
-    }
-    let endpoint = options["endpoint"]
-        .as_str()
-        .or_else(|| options["api"].as_str());
-    // Discovery cannot know about an OAuth login, so `codex` is unknown here;
-    // it only selects Responses, which maps efforts exactly like Chat.
-    super::protocol(provider, npm, endpoint, &model.id, false).unwrap_or(Protocol::Chat)
 }
 
 /// Variants from a model's `reasoning_options`, mirroring upstream's
@@ -198,18 +176,10 @@ fn reasoning_variants(
 
 fn effort_variant(protocol: Protocol, effort: &str) -> Value {
     if protocol == Protocol::Anthropic {
-        adaptive_effort(effort)
+        json!({"thinking":{"type":"adaptive"},"output_config":{"effort":effort}})
     } else {
-        openai_effort(effort)
+        json!({"reasoningEffort":effort})
     }
-}
-
-fn adaptive_effort(effort: &str) -> Value {
-    json!({"thinking":{"type":"adaptive"},"output_config":{"effort":effort}})
-}
-
-fn openai_effort(effort: &str) -> Value {
-    json!({"reasoningEffort":effort})
 }
 
 async fn discover(
@@ -223,15 +193,7 @@ async fn discover(
         configured: config.provider(id).is_some(),
         auth: auth.clone(),
     };
-    let request = ChatRequest {
-        model: String::new(),
-        system: String::new(),
-        messages: Vec::new(),
-        tools: Vec::new(),
-        variant: None,
-        session_id: None,
-        ..Default::default()
-    };
+    let request = ChatRequest::default();
     let (protocol, settings) = adapter.prepare(&request).await?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
@@ -256,34 +218,24 @@ async fn discover(
             break;
         }
     }
-    let client = super::client();
     let mut models = HashMap::new();
     let mut after: Option<String> = None;
-    for _ in 0..10 {
-        let mut request = client
-            .get(format!("{}/models", base.trim_end_matches('/')))
-            .header("User-Agent", "ocmini");
-        if !settings.token.is_empty() {
-            request = if protocol == Protocol::Anthropic && !settings.bearer {
-                request.header("x-api-key", &settings.token)
-            } else {
-                request.bearer_auth(&settings.token)
-            };
-        }
-        if protocol == Protocol::Anthropic {
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-        for (name, value) in &settings.headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
+    let mut seen = HashSet::new();
+    loop {
+        let mut request = settings.request(
+            reqwest::Method::GET,
+            &format!("{}/models", base.trim_end_matches('/')),
+            protocol,
+        );
         if let Some(after) = &after {
             request = request.query(&[("after_id", after.as_str()), ("limit", "100")]);
         }
-        let response = request.send().await.map_err(|e| e.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!("GET /models returned HTTP {}", response.status()));
-        }
-        let bytes = super::read_response(response, Duration::from_secs(6), 8 * 1024 * 1024).await?;
+        let response = settings
+            .send_request(request)
+            .await
+            .map_err(|error| error.message)?;
+        let bytes =
+            crate::http::read_body(response, Some(Duration::from_secs(6)), 8 * 1024 * 1024).await?;
         let data: Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("invalid model catalog JSON: {e}"))?;
         models.extend(parse_models(id, &data)?);
@@ -295,7 +247,7 @@ async fn discover(
             .filter(|value| !value.is_empty())
             .ok_or("paginated model catalog has no last_id")?
             .to_string();
-        if after.as_ref() == Some(&next) {
+        if !seen.insert(next.clone()) {
             return Err("model catalog returned a repeated pagination cursor".into());
         }
         after = Some(next);
@@ -418,12 +370,12 @@ fn parse_models(provider: &str, data: &Value) -> Result<HashMap<String, ModelInf
             let mut variants = serde_json::Map::new();
             for effort in efforts {
                 if let Some(effort) = effort.as_str().or_else(|| effort["effort"].as_str()) {
-                    let variant = if supports["adaptive_thinking"] == true {
-                        adaptive_effort(effort)
+                    let protocol = if supports["adaptive_thinking"] == true {
+                        Protocol::Anthropic
                     } else {
-                        openai_effort(effort)
+                        Protocol::Chat
                     };
-                    variants.insert(effort.into(), variant);
+                    variants.insert(effort.into(), effort_variant(protocol, effort));
                 }
             }
             if !variants.is_empty() {
@@ -573,5 +525,55 @@ mod tests {
         // high variant is the midpoint floor clamped up to the configured min.
         assert_eq!(variants["high"]["thinking"]["budgetTokens"], 6000);
         assert_eq!(variants["max"]["thinking"]["budgetTokens"], 11999);
+    }
+
+    #[tokio::test]
+    async fn discovery_reaches_all_pages_and_rejects_nonconsecutive_cursor_cycles() {
+        use axum::{
+            extract::{Query, State},
+            routing::get,
+            Json, Router,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        async fn endpoint(
+            State(calls): State<Arc<AtomicUsize>>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            let page = query
+                .get("after_id")
+                .and_then(|id| id.parse::<usize>().ok())
+                .unwrap_or(0)
+                + 1;
+            calls.fetch_add(1, Ordering::Relaxed);
+            Json(
+                json!({"data":[{"id":format!("model-{page}")}],"has_more":page<12,"last_id":page.to_string()}),
+            )
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/models", get(endpoint))
+            .route("/cycle/models", get(|Query(query): Query<HashMap<String,String>>| async move {
+                let cursor = match query.get("after_id").map(String::as_str) { Some("a") => "b", _ => "a" };
+                Json(json!({"data":[{"id":format!("model-{cursor}")}],"has_more":true,"last_id":cursor}))
+            }))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let auth = AuthStore::from_json("{}").unwrap();
+        for (base, cycle) in [(url.clone(), false), (format!("{url}/cycle"), true)] {
+            let cfg: Config = serde_json::from_value(json!({"provider":{"fixture":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":base,"apiKey":"fixture"}}}})).unwrap();
+            let result = discover("fixture", &cfg, &auth).await;
+            if cycle {
+                assert!(result.unwrap_err().contains("repeated pagination cursor"));
+            } else {
+                assert_eq!(result.unwrap().len(), 12);
+            }
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 12);
+        server.abort();
     }
 }

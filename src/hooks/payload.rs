@@ -72,13 +72,13 @@ impl Files {
     }
 }
 
-struct BoundedFileWriter<W: Write> {
-    writer: W,
-    bytes: usize,
-    limit: usize,
+pub(super) struct BoundedWriter<W: Write> {
+    pub writer: W,
+    pub bytes: usize,
+    pub limit: usize,
 }
 
-impl<W: Write> Write for BoundedFileWriter<W> {
+impl<W: Write> Write for BoundedWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() > self.limit.saturating_sub(self.bytes) {
             return Err(io::Error::other("hook payload exceeds byte budget"));
@@ -138,7 +138,7 @@ pub fn spool<T: Serialize>(
         .open(&payload_path)
         .map_err(|e| ProcessError::io(format!("cannot create hook payload file: {e}")))?;
 
-    let mut writer = BoundedFileWriter {
+    let mut writer = BoundedWriter {
         writer: std::io::BufWriter::new(file),
         bytes: 0,
         limit: max_payload_bytes,

@@ -79,6 +79,21 @@ async fn session_scoping_and_validation_are_consistent() {
     let provider = Provider::start(vec![]).await;
     let server = TestServer::start(&provider, json!({})).await;
     let id = server.session(allow()).await;
+    for body in [
+        json!([]),
+        json!({"permission": "allow"}),
+        json!({"permission": [{"permission":"", "action":"allow"}]}),
+        json!({"permission": [{"permission":"bash", "action":"invalid"}]}),
+    ] {
+        let response = server
+            .client
+            .patch(format!("{}/session/{id}", server.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{body}");
+    }
     let session: Value = server
         .get(&format!("/session/{id}"))
         .send()
@@ -453,4 +468,69 @@ async fn health_stays_responsive_while_a_sibling_holds_the_sqlite_write_lock() {
     connection.execute_batch("ROLLBACK").unwrap();
     assert!(health.unwrap().unwrap().status().is_success());
     assert!(pending.await.unwrap().unwrap().status().is_success());
+}
+
+#[tokio::test]
+async fn deleting_a_parent_with_a_busy_child_returns_a_conflict_without_removing_either() {
+    let (release, gate) = oneshot::channel();
+    let mut script = text_script("child finished", "");
+    script.gate = Some(gate);
+    let mut provider = Provider::start(vec![script]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let root = server.session(allow()).await;
+    let child: Value = server
+        .post("/session", &json!({"parentID":root,"permission":allow()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = child["id"].as_str().unwrap();
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{sid}/prompt_async"),
+            &prompt("msg_busy_child_delete", "Wait"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let response = server
+        .client
+        .delete(format!("{}/session/{root}", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let failure: Value = response.json().await.unwrap();
+    assert_eq!(failure["name"], "SessionBusyError");
+    for id in [&root, sid] {
+        assert_eq!(
+            server
+                .get(&format!("/session/{id}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    release.send(()).unwrap();
+    events.through("session.idle").await;
+    assert_eq!(
+        server
+            .client
+            .delete(format!("{}/session/{root}", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 }

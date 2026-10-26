@@ -228,3 +228,50 @@ async fn unreachable_mcp_is_never_reported_as_connected() {
         .unwrap();
     assert!(status.get("unreachable").is_none());
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn changed_mcp_configuration_replaces_the_lazy_scope_after_cache_expiry() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, local_mcp()).await;
+    server
+        .get("/mcp")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(mcp_spawns(&server).len(), 1);
+    std::fs::write(
+        server.directory.join("opencode.json"),
+        json!({"mcp":{"probe":{"environment":{"MCP_TEST_VALUE":"reloaded"}}}}).to_string(),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    // Inventory/config resolution must not itself start the new process.
+    let session = server.session(allow()).await;
+    assert!(!session.is_empty());
+    assert_eq!(mcp_spawns(&server).len(), 1);
+    let status: Value = server
+        .get("/mcp")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["probe"]["status"], "connected");
+    let spawns = mcp_spawns(&server);
+    assert_eq!(spawns.len(), 2);
+    assert_eq!(spawns[1][2], "reloaded");
+    server
+        .get("/mcp")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(mcp_spawns(&server).len(), 2);
+}

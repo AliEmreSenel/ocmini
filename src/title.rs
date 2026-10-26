@@ -1,11 +1,12 @@
+use crate::events as event;
+use tokio_util::sync::CancellationToken;
 // Session titles from the first prompt: deterministic, model-written, with
 // the deterministic form as the safety net.
 use crate::config::Config;
-use crate::engine::{bus, App};
+use crate::engine::App;
 use crate::provider::{self, ChatRequest};
 use crate::sessions;
-use crate::types::{hex_id, ModelRef, ProviderEvent, Session};
-use futures::StreamExt;
+use crate::types::{hex_id, ModelRef, Session};
 use serde_json::{json, Value};
 
 /// Ask for a title, not an answer: the framing keeps small models from
@@ -49,12 +50,12 @@ pub(crate) fn launch(app: App, sid: String, parts: &[Value], session_model: &Mod
     let Ok(Some(session)) = app.store.get_session(&sid) else {
         return;
     };
-    if !sessions::is_placeholder(&session.title) {
+    if !sessions::can_auto_title(&session) {
         return;
     }
-    let chain = chain(&app.config.lock().unwrap(), session_model);
+    let chain = chain(&app.config, session_model);
     if chain.is_empty() {
-        apply(sessions::auto_title(&app.store, &sid, parts), &sid);
+        apply(&app, sessions::auto_title(&app.store, &sid, parts), &sid);
         return;
     }
     let prompt: String = sessions::prompt_text(parts)
@@ -66,32 +67,35 @@ pub(crate) fn launch(app: App, sid: String, parts: &[Value], session_model: &Mod
     }
     let parts = parts.to_vec();
     tokio::spawn(async move {
-        bus().emit(
-            "session.title",
-            json!({"sessionID": &sid, "state": "start"}),
+        app.hooks.emit(
+            event::Session::Title {
+                session_id: &sid,
+                state: event::Title::Start,
+            },
+            &app.session_context(&sid, json!({})),
         );
         let mut generated = None;
         for model in chain {
-            let cfg = app.config.lock().unwrap().clone();
-            if !crate::engine_impl::model_available(&cfg, &model) {
+            let cfg = app.config.as_ref().clone();
+            if !cfg.model_available(&model.provider_id, &model.model_id) {
                 eprintln!("ocmini: title model {model} is unavailable, trying the next");
                 continue;
             }
             match request(&app, &sid, &cfg, &model, &prompt).await {
-                Ok(Some(reply)) => {
+                Ok(reply) => {
                     generated = sessions::title_from_reply(&reply);
                     if generated.is_some() {
                         break;
                     }
                     eprintln!("ocmini: title model {model} returned no usable title");
                 }
-                Ok(None) => eprintln!("ocmini: title model {model} ended without a reply"),
                 Err(error) => eprintln!("ocmini: title request to {model} failed: {error}"),
             }
         }
         // The deterministic title is the safety net: a dead side request
         // cannot leave "tui session" in the resume list.
         apply(
+            &app,
             match generated {
                 Some(title) => sessions::set_title(&app.store, &sid, &title),
                 None => sessions::auto_title(&app.store, &sid, &parts),
@@ -101,15 +105,20 @@ pub(crate) fn launch(app: App, sid: String, parts: &[Value], session_model: &Mod
     });
 }
 
-fn apply(result: Result<Option<Session>, String>, sid: &str) {
+fn apply(app: &App, result: Result<Option<Session>, crate::types::OperationError>, sid: &str) {
     if let Ok(Some(session)) = result {
-        bus().emit(
-            "session.title",
-            json!({"sessionID": sid, "state": "done", "title": session.title}),
+        app.hooks.emit(
+            event::Session::Title {
+                session_id: sid,
+                state: event::Title::Done {
+                    title: &session.title,
+                },
+            },
+            &app.session_context(sid, json!({})),
         );
-        bus().emit(
-            "session.updated",
-            json!({"sessionID": sid, "info": session}),
+        app.hooks.emit(
+            event::Session::Updated { info: &session },
+            &app.session_context(sid, json!({})),
         );
     }
 }
@@ -123,87 +132,46 @@ async fn request(
     cfg: &Config,
     model: &ModelRef,
     prompt: &str,
-) -> Result<Option<String>, String> {
+) -> Result<String, String> {
     let adapter = provider::build(
         &model.provider_id,
         cfg.provider(&model.provider_id),
         &app.auth,
     );
-    let context = json!({
-        "sessionID":sid,
-        "directory":app.store.get_session(sid)?.map(|s| s.directory).unwrap_or_default(),
-        "requestID":hex_id("req_"),
-        "requestKind":"title",
-        "turnKind":"primary",
-        "attempt":1,
-        "model":{"providerID":model.provider_id,"modelID":model.model_id}
-    });
+    let context = app.session_context(
+        sid,
+        json!({
+            "requestID":hex_id("req_"),
+            "requestKind":"title",
+            "turnKind":"primary",
+            "attempt":1,
+            "model":{"providerID":model.provider_id,"modelID":model.model_id}
+        }),
+    );
     let mut chat = ChatRequest {
         model: model.model_id.clone(),
         system: TITLE_PROMPT.into(),
         messages: vec![json!({"role": "user", "content": prompt})],
-        tools: Vec::new(),
-        variant: None,
         session_id: Some(sid.into()),
         ..Default::default()
     };
     provider::prepare_hooks(app, &context, &mut chat, None).await?;
-    app.hooks
-        .emit("ocmini.model.started", &context, json!({"attempt":1}));
-    let mut stream = match adapter.stream(&chat).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            app.hooks.emit(
-                "ocmini.model.failed",
-                &context,
-                json!({"error":error.message,"retryable":false}),
-            );
-            return Err(error.message);
-        }
-    };
-    let mut reply = String::new();
-    let mut failed = None;
-    let mut completed = None;
-    while let Some(event) = stream.next().await {
-        match event {
-            ProviderEvent::TextDelta(delta) => reply.push_str(&delta),
-            ProviderEvent::Finished { finish, usage } => {
-                completed = Some((finish, usage));
-                break;
-            }
-            ProviderEvent::Error(error) => {
-                failed = Some(error);
-                break;
-            }
-            _ => {}
-        }
-    }
-    drop(stream);
-    if let Some(error) = failed {
-        app.hooks.emit(
-            "ocmini.model.failed",
-            &context,
-            json!({"error":error,"retryable":false}),
-        );
-        return Err(error);
-    }
-    let Some((finish, usage)) = completed else {
-        let error = "title provider stream ended before completion";
-        app.hooks.emit(
-            "ocmini.model.failed",
-            &context,
-            json!({"error":error,"retryable":false}),
-        );
-        return Err(error.into());
-    };
-    app.hooks.emit(
-        "ocmini.model.completed",
-        &context,
-        json!({"finish":finish,"usage":usage}),
-    );
-    Ok(Some(
-        provider::complete_text(app, &context, reply, None).await?,
-    ))
+    let cancel = CancellationToken::new();
+    let completion = provider::request_text(app, adapter.as_ref(), &context, &chat, &cancel)
+        .await
+        .map_err(|e| e.message)?;
+    crate::usage_db::record(
+        app,
+        cfg,
+        model,
+        sid,
+        context["requestID"].as_str().unwrap(),
+        &completion.usage,
+        crate::types::now_ms(),
+    )?;
+    provider::complete_text(app, &context, completion.text, None)
+        .await
+        .map_err(String::from)
 }
 
 #[cfg(test)]

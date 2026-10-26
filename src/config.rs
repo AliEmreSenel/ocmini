@@ -5,68 +5,54 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct ModelInfo {
-    #[serde(default)]
     pub id: String,
-    #[serde(default)]
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Value>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct ProviderCfg {
-    #[serde(default)]
     pub npm: String,
-    #[serde(default)]
     pub name: String,
-    #[serde(default)]
     pub options: ProviderOptions,
-    #[serde(default)]
     pub models: HashMap<String, ModelInfo>,
-    #[serde(default)]
     pub env: Vec<String>,
-    #[serde(default)]
     pub headers: HashMap<String, String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct ProviderOptions {
-    #[serde(rename = "baseURL", default)]
+    #[serde(rename = "baseURL")]
     pub base_url: String,
-    #[serde(rename = "apiKey", default)]
+    #[serde(rename = "apiKey")]
     pub api_key: String,
-    #[serde(default)]
     pub headers: HashMap<String, String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
 pub struct McpLocal {
-    #[serde(default)]
     pub r#type: String,
-    #[serde(default)]
     pub command: Vec<String>,
-    #[serde(default)]
     pub enabled: Option<bool>,
-    #[serde(default)]
     pub url: String,
-    #[serde(default)]
     pub headers: HashMap<String, String>,
-    #[serde(default)]
     pub environment: HashMap<String, String>,
-    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
     pub timeout: Option<u64>,
-    #[serde(default)]
     pub oauth: Value,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -140,41 +126,28 @@ pub struct HookConfigSource {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct Config {
     /// Source-preserving hooks are kept outside the generic config merge.
     #[serde(skip)]
     pub hook_sources: Option<std::sync::Arc<Vec<HookConfigSource>>>,
-    #[serde(default)]
     pub provider: HashMap<String, ProviderCfg>,
-    #[serde(default)]
     pub model: String,
-    #[serde(default)]
     pub small_model: String,
     /// Model that writes session titles: `provider/model`, `small`, or empty
     /// (default) to name sessions from the first prompt line with no model.
-    #[serde(default)]
     pub title_model: String,
-    #[serde(default)]
     pub permission: Value,
-    #[serde(default)]
     pub instructions: Vec<String>,
-    #[serde(default)]
     pub mcp: HashMap<String, McpLocal>,
-    #[serde(default)]
     pub agent: HashMap<String, Value>,
-    #[serde(default)]
     pub command: HashMap<String, Value>,
-    #[serde(default)]
     pub skills: Value,
-    #[serde(default)]
     pub compaction: CompactionCfg,
-    #[serde(default)]
     pub ui: UiCfg,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_depth: Option<u64>,
-    #[serde(default)]
     pub disabled_providers: Vec<String>,
-    #[serde(default)]
     pub enabled_providers: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -190,6 +163,12 @@ impl Config {
     /// sessions this is a hot disk path, so entries are cached briefly; T3
     /// config overlays take effect within the TTL.
     pub fn load_for(directory: &str) -> Result<Config, String> {
+        let directory = directory_identity(&absolute_path(
+            Path::new(directory),
+            &std::env::current_dir().unwrap_or_default(),
+        ));
+        let directory = directory.to_string_lossy();
+        let directory = directory.as_ref();
         static CACHE: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Config)>>,
         > = std::sync::OnceLock::new();
@@ -200,8 +179,10 @@ impl Config {
             }
         }
         let config = Self::load_uncached(directory)?;
-        cache.lock().unwrap().insert(
-            directory.to_string(),
+        let mut cache = cache.lock().unwrap();
+        cache.retain(|_, (created, _)| created.elapsed() < std::time::Duration::from_secs(3));
+        cache.insert(
+            directory.to_owned(),
             (std::time::Instant::now(), config.clone()),
         );
         Ok(config)
@@ -308,7 +289,12 @@ impl Config {
             .map_err(|e| format!("invalid OpenCode configuration: {e}"))?;
         cfg.hook_sources = Some(std::sync::Arc::new(hook_sources));
         crate::hooks::validate_config(&cfg, &directory.to_string_lossy())?;
-        validate_permission(&cfg.permission)?;
+        parse_permission_rules(&cfg.permission)?;
+        for agent in cfg.agent.values() {
+            if let Some(permission) = agent.get("permission") {
+                parse_permission_rules(permission)?;
+            }
+        }
         for (pid, p) in cfg.provider.iter_mut() {
             if p.name.is_empty() {
                 p.name = pid.clone();
@@ -334,6 +320,21 @@ impl Config {
                 .unwrap_or(true)
     }
 
+    /// Inventory, admission and child tools share one model availability policy.
+    pub fn model_available(&self, provider_id: &str, model_id: &str) -> bool {
+        self.provider_enabled(provider_id)
+            && self.provider(provider_id).is_none_or(|provider| {
+                let listed = |key: &str| provider.extra.get(key).and_then(Value::as_array);
+                !listed("blacklist").is_some_and(|models| models.iter().any(|id| id == model_id))
+                    && listed("whitelist")
+                        .is_none_or(|models| models.iter().any(|id| id == model_id))
+                    && provider
+                        .models
+                        .get(model_id)
+                        .is_none_or(|model| model.extra.get("disabled") != Some(&Value::Bool(true)))
+            })
+    }
+
     pub fn catalog(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for (pid, p) in &self.provider {
@@ -341,17 +342,8 @@ impl Config {
                 continue;
             }
             let p = crate::provider::normalize_provider(pid, p);
-            let whitelist = p.extra.get("whitelist").and_then(Value::as_array);
-            let blacklist = p.extra.get("blacklist").and_then(Value::as_array);
             for (mid, m) in &p.models {
-                if blacklist
-                    .map(|list| list.iter().any(|v| v == mid))
-                    .unwrap_or(false)
-                    || whitelist
-                        .map(|list| !list.iter().any(|v| v == mid))
-                        .unwrap_or(false)
-                    || m.extra.get("disabled").and_then(Value::as_bool) == Some(true)
-                {
+                if !self.model_available(pid, mid) {
                     continue;
                 }
                 let mut model = serde_json::to_value(m).unwrap_or_else(|_| json!({}));
@@ -376,6 +368,22 @@ impl Config {
         permission_rules(&self.permission)
     }
 
+    pub fn agent_permission_rules(&self, name: &str) -> Vec<PermissionRule> {
+        let mut rules = crate::permission::default_rules();
+        rules.extend(self.permission_rules());
+        if matches!(name, "plan" | "explore") {
+            rules.push(PermissionRule {
+                permission: "edit".into(),
+                pattern: "*".into(),
+                action: crate::types::PermissionAction::Deny,
+            });
+        }
+        if let Some(value) = self.agent.get(name).and_then(|a| a.get("permission")) {
+            rules.extend(permission_rules(value));
+        }
+        rules
+    }
+
     pub fn skill_paths(&self) -> Vec<String> {
         let paths = if self.skills.is_array() {
             Some(&self.skills)
@@ -396,57 +404,47 @@ impl Config {
 }
 
 pub fn permission_rules(value: &Value) -> Vec<PermissionRule> {
-    let mut out = Vec::new();
-    if let Some(action) = value.as_str() {
-        out.push(PermissionRule {
-            permission: "*".into(),
-            pattern: "*".into(),
-            action: action.into(),
-        });
+    parse_permission_rules(value).unwrap_or_default()
+}
+
+fn parse_permission_rules(value: &Value) -> Result<Vec<PermissionRule>, String> {
+    if value.is_null() {
+        return Ok(Vec::new());
     }
-    if let Some(rules) = value.as_object() {
-        for (permission, patterns) in rules {
-            if let Some(action) = patterns.as_str() {
-                out.push(PermissionRule {
-                    permission: permission.clone(),
-                    pattern: "*".into(),
-                    action: action.into(),
-                });
-            }
-            if let Some(patterns) = patterns.as_object() {
-                for (pattern, action) in patterns {
-                    if let Some(action) = action.as_str() {
-                        out.push(PermissionRule {
-                            permission: permission.clone(),
-                            pattern: pattern.clone(),
-                            action: action.into(),
-                        });
+    let mut rules = Vec::new();
+    let mut add = |permission: &str, pattern: &str, action: &Value| -> Result<(), String> {
+        rules.push(PermissionRule {
+            permission: permission.into(),
+            pattern: pattern.into(),
+            action: serde_json::from_value(action.clone())
+                .map_err(|error| format!("invalid permission action: {error}"))?,
+        });
+        Ok(())
+    };
+    match value {
+        Value::String(_) => add("*", "*", value)?,
+        Value::Array(_) => return crate::permission::parse_rules(value),
+        Value::Object(permissions) => {
+            for (permission, patterns) in permissions {
+                if let Some(patterns) = patterns.as_object() {
+                    for (pattern, action) in patterns {
+                        add(permission, pattern, action)?;
                     }
+                } else {
+                    add(permission, "*", patterns)?;
                 }
             }
         }
-    }
-    out
-}
-
-fn validate_permission(value: &Value) -> Result<(), String> {
-    if value.is_null() {
-        return Ok(());
-    }
-    if let Some(action) = value.as_str() {
-        return if ["allow", "ask", "deny"].contains(&action) {
-            Ok(())
-        } else {
-            Err(format!("invalid permission action: {action}"))
-        };
-    }
-    if let Some(map) = value.as_object() {
-        for child in map.values() {
-            validate_permission(child)?;
+        _ => {
+            return Err(
+                "permission must be allow, ask, deny, or an object of permission rules".into(),
+            )
         }
-        return Ok(());
     }
-    Err("permission must be allow, ask, deny, or an object of permission rules".into())
+    if rules.iter().any(|rule| rule.permission.is_empty()) {
+        return Err("permission requires a name".into());
+    }
+    Ok(rules)
 }
 
 fn merge_file(
@@ -458,7 +456,7 @@ fn merge_file(
     trusted: bool,
 ) -> Result<(), String> {
     let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !seen.insert(key.clone()) {
+    if seen.contains(&key) {
         if trusted {
             for source in hook_sources.iter_mut() {
                 if Path::new(&source.source)
@@ -477,6 +475,7 @@ fn merge_file(
         Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
     };
+    seen.insert(key);
     let source = path.display().to_string();
     let directory = path.parent().unwrap_or(Path::new("."));
     let overlay = parse_config(&text, &source, directory)?;
@@ -613,11 +612,13 @@ fn load_markdown(value: &mut Value, root: &Path, kind: &str, body_key: &str) -> 
         if !directory.is_dir() {
             continue;
         }
-        for entry in walkdir::WalkDir::new(&directory)
-            .max_depth(8)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in walkdir::WalkDir::new(&directory).into_iter() {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot discover {kind} files in {}: {error}",
+                    directory.display()
+                )
+            })?;
             if !entry.file_type().is_file()
                 || entry.path().extension().and_then(|e| e.to_str()) != Some("md")
             {
@@ -651,7 +652,8 @@ fn load_markdown(value: &mut Value, root: &Path, kind: &str, body_key: &str) -> 
     Ok(())
 }
 
-fn markdown_frontmatter(content: &str) -> Result<(Map<String, Value>, &str), String> {
+pub(crate) fn markdown_frontmatter(content: &str) -> Result<(Map<String, Value>, &str), String> {
+    let content = content.trim_start_matches('\u{feff}');
     let Some(rest) = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))
@@ -691,6 +693,27 @@ pub fn data_home() -> String {
 }
 pub fn store_path() -> PathBuf {
     Path::new(&data_home()).join("ocmini").join("ocmini.db")
+}
+
+/// Collapse lexical components without resolving symlinks or requiring existence.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Stable scope identity, including paths whose final components do not exist yet.
+pub fn directory_identity(path: &Path) -> PathBuf {
+    let path = normalize_path(path);
+    path.canonicalize().unwrap_or(path)
 }
 
 pub fn absolute_path(path: &Path, base: &Path) -> PathBuf {
@@ -877,5 +900,27 @@ mod tests {
             .unwrap()
             .get("hook_sources")
             .is_none());
+    }
+    #[test]
+    fn command_discovery_keeps_deep_paths_and_reports_frontmatter_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("commands/a/b/c/d/e/f/g/h/i/j");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("review.md");
+        std::fs::write(
+            &path,
+            "---\ndescription: deep command\n---\nReview $ARGUMENTS",
+        )
+        .unwrap();
+        let mut config = json!({});
+        load_markdown(&mut config, root.path(), "command", "template").unwrap();
+        assert_eq!(
+            config["command"]["a/b/c/d/e/f/g/h/i/j/review"]["template"],
+            "Review $ARGUMENTS"
+        );
+        std::fs::write(&path, "---\ninvalid: [\n---\ncontent").unwrap();
+        let error = load_markdown(&mut json!({}), root.path(), "command", "template").unwrap_err();
+        assert!(error.contains("invalid frontmatter"));
+        assert!(error.contains("review.md"));
     }
 }

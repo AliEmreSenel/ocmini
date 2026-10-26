@@ -1,10 +1,6 @@
-use super::{
-    error_message, json_response, read_response, usage_openai, ChatRequest, EventStream,
-    ProviderError, Settings,
-};
+use super::stream::Decoder;
+use super::{error_message, usage_openai, ChatRequest, EventStream, ProviderError, Settings};
 use crate::types::{ProviderEvent, Tokens};
-use async_stream::stream;
-use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -50,112 +46,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
     if settings.tools_supported && !req.tools.is_empty() {
         body["tools"] = json!(req.tools);
     }
-    for (input, output) in [
-        ("temperature", "temperature"),
-        ("topP", "top_p"),
-        ("frequencyPenalty", "frequency_penalty"),
-        ("presencePenalty", "presence_penalty"),
-        ("seed", "seed"),
-        ("stopSequences", "stop"),
-        ("parallelToolCalls", "parallel_tool_calls"),
-        ("user", "user"),
-        ("reasoningEffort", "reasoning_effort"),
-        ("topK", "top_k"),
-        ("serviceTier", "service_tier"),
-    ] {
-        if let Some(value) = settings.options.get(input) {
-            body[output] = value.clone();
-        }
-    }
-    let max_tokens = settings.options["maxTokens"]
-        .as_u64()
-        .or_else(|| settings.options["maxOutputTokens"].as_u64());
-    if let Some(max_tokens) = max_tokens {
-        let key = if settings.provider_id == "openai" {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        };
-        body[key] = json!(max_tokens);
-    }
-    if body.get("reasoning_effort").is_none() {
-        if let Some(effort) = super::reasoning_effort(settings, req) {
-            body["reasoning_effort"] = json!(effort);
-        }
-    }
-    if settings.options["includeUsage"] == false {
-        body.as_object_mut().unwrap().remove("stream_options");
-    }
-    for key in [
-        "reasoning_effort",
-        "max_tokens",
-        "max_completion_tokens",
-        "enable_thinking",
-        "chat_template_kwargs",
-        "min_p",
-        "top_k",
-        "repetition_penalty",
-        "response_format",
-        "tool_choice",
-        "stream_options",
-        "reasoning",
-        "provider",
-        "plugins",
-        "transforms",
-    ] {
-        if let Some(value) = settings.options.get(key) {
-            body[key] = value.clone();
-        }
-    }
-    if let Some(options) = settings.options.as_object() {
-        for (key, value) in options {
-            if ![
-                "baseURL",
-                "apiKey",
-                "authToken",
-                "accessToken",
-                "headers",
-                "body",
-                "extraBody",
-                "timeout",
-                "headerTimeout",
-                "chunkTimeout",
-                "endpoint",
-                "api",
-                "transport",
-                "encoding",
-                "disabled",
-                "includeUsage",
-                "reasoningEffort",
-                "textVerbosity",
-                "reasoningSummary",
-                "maxTokens",
-                "maxOutputTokens",
-                "topP",
-                "frequencyPenalty",
-                "presencePenalty",
-                "stopSequences",
-                "parallelToolCalls",
-                "setCacheKey",
-                "enterpriseUrl",
-                "thinking",
-                "topK",
-                "serviceTier",
-            ]
-            .contains(&key.as_str())
-            {
-                body[key] = value.clone();
-            }
-        }
-    }
-    settings.overlay_body(&mut body);
-    super::hooks::apply_request_options(settings, req, super::Protocol::Chat, &mut body)?;
-    body["model"] = json!(settings.api_model);
-    body["stream"] = json!(true);
-    if !settings.tools_supported {
-        body.as_object_mut().unwrap().remove("tools");
-        body.as_object_mut().unwrap().remove("tool_choice");
-    }
+    super::options::configure_body(settings, req, super::Protocol::Chat, &mut body)?;
     Ok(body)
 }
 
@@ -163,50 +54,7 @@ pub(super) async fn stream(
     settings: Settings,
     req: &ChatRequest,
 ) -> Result<EventStream, ProviderError> {
-    let response = settings
-        .send(
-            "chat/completions",
-            &request_body(&settings, req).map_err(ProviderError::fatal)?,
-        )
-        .await?;
-    let json = json_response(&response);
-    let stream = stream! {
-        let mut state = ChatState::default();
-        if json {
-            let value = match read_response(response, settings.chunk_timeout, 16 * 1024 * 1024).await.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("invalid provider JSON response: {e}"))) {
-                Ok(value) => value,
-                Err(error) => { yield ProviderEvent::Error(error); return; }
-            };
-            match state.consume(&value) {
-                Ok(events) => { for event in events { yield event; } }
-                Err(error) => { yield ProviderEvent::Error(error); return; }
-            }
-            state.terminal = true;
-        } else {
-            let mut frames = super::sse::frames(response, settings.chunk_timeout);
-            while let Some(frame) = frames.next().await {
-                let frame = match frame { Ok(frame) => frame, Err(error) => { yield ProviderEvent::Error(error); return; } };
-                if frame.data.trim() == "[DONE]" {
-                    if state.finish.is_none() { yield ProviderEvent::Error("provider stream ended before a finish reason".into()); return; }
-                    state.terminal = true; break;
-                }
-                if frame.data.trim().is_empty() { continue; }
-                let value: Value = match serde_json::from_str(&frame.data) {
-                    Ok(value) => value,
-                    Err(error) => { yield ProviderEvent::Error(format!("invalid chat completion SSE JSON: {error}")); return; }
-                };
-                match state.consume(&value) {
-                    Ok(events) => { for event in events { yield event; } }
-                    Err(error) => { yield ProviderEvent::Error(error); return; }
-                }
-            }
-        }
-        match state.finish() {
-            Ok(events) => { for event in events { yield event; } }
-            Err(error) => yield ProviderEvent::Error(error),
-        }
-    };
-    Ok(Box::new(Box::pin(stream)))
+    super::stream::request::<ChatState>(settings, req, "chat/completions", request_body).await
 }
 
 #[derive(Default)]
@@ -229,7 +77,17 @@ struct ChatState {
     seen: bool,
 }
 
-impl ChatState {
+impl Decoder for ChatState {
+    const PROTOCOL: super::Protocol = super::Protocol::Chat;
+    fn json(&mut self, value: Value) -> Result<Vec<ProviderEvent>, String> {
+        self.consume(&value)
+    }
+    fn terminal(&self) -> bool {
+        false
+    } // Chat may send usage after its finish reason.
+    fn end(&mut self) {
+        self.terminal = true;
+    }
     fn consume(&mut self, value: &Value) -> Result<Vec<ProviderEvent>, String> {
         if value
             .get("error")
@@ -284,12 +142,7 @@ impl ChatState {
                     for (key, value) in map {
                         if ["text", "data", "signature"].contains(&key.as_str()) {
                             if let Some(text) = value.as_str() {
-                                let mut joined = self.reasoning_details[index][key]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string();
-                                joined.push_str(text);
-                                self.reasoning_details[index][key] = json!(joined);
+                                super::append_text(&mut self.reasoning_details[index][key], text);
                                 continue;
                             }
                         }
@@ -332,8 +185,8 @@ impl ChatState {
         Ok(events)
     }
 
-    fn finish(mut self) -> Result<Vec<ProviderEvent>, String> {
-        if !self.terminal && self.finish.is_none() {
+    fn finish(mut self, _model: &str) -> Result<Vec<ProviderEvent>, String> {
+        if self.finish.is_none() {
             return Err("provider stream ended before a finish reason or [DONE] marker".into());
         }
         if !self.seen {
@@ -384,13 +237,7 @@ impl ChatState {
             json!({"provider":"openai-chat","message":message}),
         ));
         events.push(ProviderEvent::Finished {
-            finish: self.finish.take().unwrap_or_else(|| {
-                if calls.is_empty() {
-                    "stop".into()
-                } else {
-                    "tool-calls".into()
-                }
-            }),
+            finish: self.finish.take().unwrap(),
             usage: self.usage,
         });
         Ok(events)
@@ -431,14 +278,14 @@ mod tests {
         let mut state = ChatState::default();
         state.consume(&json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"two","function":{"name":"read","arguments":"{\"file"}},{"index":0,"id":"one","function":{"name":"glob","arguments":"{}"}}]}}]})).unwrap();
         state.consume(&json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"Path\":\"a\"}"}}]},"finish_reason":"tool_calls"}]})).unwrap();
-        let events = state.finish().unwrap();
+        let events = state.finish("test-model").unwrap();
         assert!(
             matches!(&events[0], ProviderEvent::ToolCallStart { call_id, .. } if call_id == "one")
         );
         assert!(
             matches!(&events[1], ProviderEvent::ToolCallStart { call_id, args, .. } if call_id == "two" && args == "{\"filePath\":\"a\"}")
         );
-        assert!(ChatState::default().finish().is_err());
+        assert!(ChatState::default().finish("test-model").is_err());
     }
     #[test]
     fn api_errors_and_bad_arguments_never_become_success() {
@@ -447,6 +294,6 @@ mod tests {
             .is_err());
         let mut state = ChatState::default();
         state.consume(&json!({"choices":[{"delta":{"tool_calls":[{"function":{"name":"write","arguments":"{"}}]},"finish_reason":"tool_calls"}]})).unwrap();
-        assert!(state.finish().is_err());
+        assert!(state.finish("test-model").is_err());
     }
 }

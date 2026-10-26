@@ -1,9 +1,52 @@
-use super::{failure, resolve_path};
-use crate::types::{ToolError, ToolOutput};
+use super::{failure, hook_context, resolve_path, ToolCtx};
+use crate::events as event;
+use crate::types::{OperationError, ToolOutput};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct Input {
+    pub name: String,
+}
+
+pub(super) async fn run(ctx: &ToolCtx, input: &Input) -> Result<ToolOutput, OperationError> {
+    let name = &input.name;
+    let paths = ctx.app.config.as_ref().skill_paths();
+    let mut loaded = crate::blocking::run(|| load_content(&ctx.dir, &paths, name))?;
+    let mut context = hook_context(ctx, "skill");
+    context["name"] = json!(name);
+    context["path"] = loaded.metadata["location"].clone();
+    context["sourceFingerprint"] = loaded.metadata["sourceFingerprint"].clone();
+    if ctx.app.hooks.has(crate::tools::hooks::SKILL_LOAD_AFTER) {
+        let effective = ctx
+            .app
+            .hooks
+            .run(
+                crate::tools::hooks::SKILL_LOAD_AFTER,
+                &context,
+                json!({"content":loaded.output}),
+                Some(&ctx.cancel),
+            )
+            .await?
+            .input;
+        loaded.output = effective["content"]
+            .as_str()
+            .ok_or_else(|| failure("Skill content must be a string"))?
+            .into();
+    }
+    render_content(&mut loaded);
+    ctx.app.hooks.emit(
+        event::Skill::Loaded {
+            name,
+            path: &(loaded.metadata["location"]),
+            source_fingerprint: &(loaded.metadata["sourceFingerprint"]),
+        },
+        &context,
+    );
+    Ok(loaded)
+}
 
 pub fn list(directory: Option<&str>, extra: &[String]) -> Vec<Value> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -39,34 +82,23 @@ pub fn list(directory: Option<&str>, extra: &[String]) -> Vec<Value> {
 }
 
 fn discover(root: &Path) -> Vec<PathBuf> {
-    if root.is_file() {
-        return if root.file_name().is_some_and(|name| name == "SKILL.md") {
-            vec![root.to_owned()]
-        } else {
-            Vec::new()
-        };
-    }
-    let mut stack = vec![(root.to_owned(), 0)];
-    let mut seen = HashSet::new();
     let mut files = Vec::new();
-    while let Some((path, depth)) = stack.pop() {
-        let Ok(canonical) = path.canonicalize() else {
-            continue;
-        };
-        if !seen.insert(canonical) || depth > 12 || files.len() >= 2000 {
-            continue;
-        }
-        let skill = path.join("SKILL.md");
-        if skill.is_file() {
-            files.push(skill);
-        }
-        let Ok(entries) = std::fs::read_dir(path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry.path().is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
-                stack.push((entry.path(), depth + 1));
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(true)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+        })
+    {
+        match entry {
+            Ok(entry) if entry.file_type().is_file() && entry.file_name() == "SKILL.md" => {
+                files.push(entry.into_path())
             }
+            Err(error) if root.exists() => eprintln!(
+                "ocmini: cannot discover skills in {}: {error}",
+                root.display()
+            ),
+            _ => {}
         }
     }
     files.sort();
@@ -74,17 +106,15 @@ fn discover(root: &Path) -> Vec<PathBuf> {
 }
 
 fn read_skill(path: &Path) -> Option<Value> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() > 2 * 1024 * 1024 {
-        return None;
-    }
     let raw = std::fs::read_to_string(path).ok()?;
-    let (fields, content) = frontmatter(&raw);
+    let (fields, content) = crate::config::markdown_frontmatter(&raw)
+        .unwrap_or_else(|_| (Default::default(), raw.as_str()));
     let fallback = path.parent()?.file_name()?.to_str()?;
     let name = fields
         .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(String::as_str)
         .unwrap_or(fallback);
     if name.trim().is_empty() {
         return None;
@@ -94,46 +124,16 @@ fn read_skill(path: &Path) -> Option<Value> {
     raw.hash(&mut hash);
     let fingerprint = format!("{:016x}", hash.finish());
     Some(
-        json!({"name":name,"id":name,"description":fields.get("description").cloned().unwrap_or_default(),"location":path,"content":content.trim(),"sourceFingerprint":fingerprint}),
+        json!({"name":name,"id":name,"description":fields.get("description").and_then(Value::as_str).unwrap_or_default().trim(),"location":path,"content":content.trim(),"sourceFingerprint":fingerprint}),
     )
 }
 
-fn frontmatter(raw: &str) -> (BTreeMap<String, String>, &str) {
-    let raw = raw.trim_start_matches('\u{feff}');
-    let Some(rest) = raw
-        .strip_prefix("---\n")
-        .or_else(|| raw.strip_prefix("---\r\n"))
-    else {
-        return (BTreeMap::new(), raw);
-    };
-    let mut consumed = 0;
-    let mut header = String::new();
-    let mut found = false;
-    for line in rest.split_inclusive('\n') {
-        consumed += line.len();
-        if line.trim_end_matches(['\r', '\n']) == "---" {
-            found = true;
-            break;
-        }
-        header.push_str(line);
-    }
-    if !found {
-        return (BTreeMap::new(), raw);
-    }
-    let parsed = yaml_serde::from_str::<Value>(&header).unwrap_or(Value::Null);
-    let fields = ["name", "description"]
-        .into_iter()
-        .filter_map(|key| {
-            parsed[key]
-                .as_str()
-                .map(|value| (key.to_owned(), value.trim().to_owned()))
-        })
-        .collect();
-    (fields, &rest[consumed..])
-}
-
 #[cfg(test)]
-pub(super) fn load(directory: &str, extra: &[String], name: &str) -> Result<ToolOutput, ToolError> {
+pub(super) fn load(
+    directory: &str,
+    extra: &[String],
+    name: &str,
+) -> Result<ToolOutput, OperationError> {
     let mut out = load_content(directory, extra, name)?;
     render_content(&mut out);
     Ok(out)
@@ -143,7 +143,7 @@ pub(super) fn load_content(
     directory: &str,
     extra: &[String],
     name: &str,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<ToolOutput, OperationError> {
     let skills = list(Some(directory), extra);
     let skill = skills
         .iter()
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn parses_yaml_quotes_folded_descriptions_and_body() {
-        let (fields, body) = frontmatter("---\nname: 'code-review'\ndescription: >-\n  Read and improve\n  code carefully.\n---\n# Instructions\nAct.\n");
+        let (fields, body) = crate::config::markdown_frontmatter("---\nname: 'code-review'\ndescription: >-\n  Read and improve\n  code carefully.\n---\n# Instructions\nAct.\n").unwrap();
         assert_eq!(fields["name"], "code-review");
         assert_eq!(fields["description"], "Read and improve code carefully.");
         assert_eq!(body, "# Instructions\nAct.\n");
@@ -254,5 +254,17 @@ mod tests {
             .as_str()
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn discovery_does_not_silently_hide_deep_skills() {
+        let root = tempfile::tempdir().unwrap();
+        let mut path = root.path().to_owned();
+        for _ in 0..14 {
+            path.push("nested");
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        let skill = path.join("SKILL.md");
+        std::fs::write(&skill, "---\nname: deep-skill\n---\nInstructions").unwrap();
+        assert!(discover(root.path()).contains(&skill));
     }
 }
