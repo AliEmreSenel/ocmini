@@ -1,22 +1,33 @@
 use super::{failure, resolve_path};
-use crate::types::{ToolError, ToolOutput};
+use crate::types::{OperationError, ToolOutput};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT: usize = 50 * 1024;
 const MAX_LINE: usize = 2000;
 
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReadInput {
+    pub file_path: String,
+    #[schemars(range(min = 1))]
+    offset: Option<u64>,
+    #[schemars(range(min = 1))]
+    limit: Option<u64>,
+}
+
+#[cfg(test)]
 pub(super) fn run(
     directory: &str,
     name: &str,
     input: &Value,
-    cancel: &AtomicBool,
-) -> Result<ToolOutput, ToolError> {
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, OperationError> {
     let check = || {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             Err(failure("Tool cancelled"))
         } else {
             Ok(())
@@ -24,28 +35,24 @@ pub(super) fn run(
     };
     check()?;
     match name {
-        "read" => read(directory, input, cancel),
-        "write" => {
-            let path = resolve_path(directory, super::required(input, "filePath")?);
-            let content = super::required(input, "content")?;
-            atomic_write(&path, content.as_bytes()).map_err(failure)?;
-            output(
-                format!("Wrote {} ({} bytes)", path.display(), content.len()),
-                &path,
-                json!({"filepath":path,"bytes":content.len()}),
-            )
+        "read" => read(directory, &super::decode(input)?, cancel),
+        "write" | "edit" => {
+            super::changes::prepare_sync(directory, name, input, cancel)?.commit(cancel)
         }
-        "edit" => edit(directory, input),
         _ => Err(failure(format!("Unknown file tool {name}"))),
     }
 }
 
-fn read(directory: &str, input: &Value, cancel: &AtomicBool) -> Result<ToolOutput, ToolError> {
-    let path = resolve_path(directory, super::required(input, "filePath")?);
+pub(super) fn read(
+    directory: &str,
+    input: &ReadInput,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, OperationError> {
+    let path = resolve_path(directory, &input.file_path);
     let metadata = std::fs::metadata(&path)
         .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
-    let offset = nonnegative(input, "offset", 1)?.max(1) as usize;
-    let limit = nonnegative(input, "limit", 2000)? as usize;
+    let offset = input.offset.unwrap_or(1).max(1) as usize;
+    let limit = input.limit.unwrap_or(2000) as usize;
     if metadata.is_dir() {
         let mut entries = std::fs::read_dir(&path)
             .map_err(|e| failure(format!("Cannot list {}: {e}", path.display())))?
@@ -82,7 +89,10 @@ fn read(directory: &str, input: &Value, cancel: &AtomicBool) -> Result<ToolOutpu
     if !metadata.is_file() {
         return Err(failure("Read supports regular files and directories"));
     }
-    let mut reader = text_reader(&path)?;
+    let mut reader = BufReader::new(
+        std::fs::File::open(&path)
+            .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?,
+    );
     let header = reader
         .fill_buf()
         .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
@@ -147,28 +157,14 @@ fn read(directory: &str, input: &Value, cancel: &AtomicBool) -> Result<ToolOutpu
     output(text, &path, metadata)
 }
 
-fn text_reader(path: &Path) -> Result<BufReader<std::fs::File>, ToolError> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
-    if !metadata.is_file() {
-        return Err(failure(format!(
-            "{} is not a regular text file",
-            path.display()
-        )));
-    }
-    std::fs::File::open(path)
-        .map(BufReader::new)
-        .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))
-}
-
 /// Reuse one line buffer instead of retaining the entire file. Scan even past
 /// the requested output window to validate UTF-8/binary data and count lines.
 fn scan_text(
     path: &Path,
     reader: impl BufRead,
-    cancel: &AtomicBool,
+    cancel: &CancellationToken,
     mut visit: impl FnMut(usize, &str),
-) -> Result<usize, ToolError> {
+) -> Result<usize, OperationError> {
     let mut reader = reader;
     let mut line = String::new();
     let mut carry = Vec::new();
@@ -178,7 +174,7 @@ fn scan_text(
     let mut has_bytes = false;
     let mut total = 0;
     loop {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(failure("File scan cancelled"));
         }
         let buffer = reader
@@ -267,7 +263,7 @@ pub(crate) fn media_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-pub(super) fn text_file(path: &Path) -> Result<String, ToolError> {
+pub(super) fn text_file(path: &Path) -> Result<String, OperationError> {
     let metadata = std::fs::metadata(path)
         .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
     if !metadata.is_file() {
@@ -287,22 +283,12 @@ pub(super) fn text_file(path: &Path) -> Result<String, ToolError> {
     String::from_utf8(bytes).map_err(|_| failure(format!("{} is not UTF-8 text", path.display())))
 }
 
-fn nonnegative(input: &Value, key: &str, default: u64) -> Result<u64, ToolError> {
-    match input.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| failure(format!("{key} must be a nonnegative integer"))),
-    }
-}
-
 pub(super) fn prepare_edit(
-    directory: &str,
-    input: &Value,
-) -> Result<(std::path::PathBuf, String, String, usize), ToolError> {
-    let path = resolve_path(directory, super::required(input, "filePath")?);
-    let old = super::required(input, "oldString")?;
-    let new = super::required(input, "newString")?;
+    path: &Path,
+    input: &super::changes::EditInput,
+) -> Result<(String, String, usize), OperationError> {
+    let old = &input.old_string;
+    let new = &input.new_string;
     if old == new {
         return Err(failure("oldString and newString are identical"));
     }
@@ -311,7 +297,7 @@ pub(super) fn prepare_edit(
             "oldString must not be empty; use write to create or replace a file",
         ));
     }
-    let original = text_file(&path)?;
+    let original = text_file(path)?;
     let crlf = original.contains("\r\n") && !original.replace("\r\n", "").contains('\n');
     let content = original.replace("\r\n", "\n");
     let old = old.replace("\r\n", "\n");
@@ -320,12 +306,7 @@ pub(super) fn prepare_edit(
     if count == 0 {
         return Err(failure("oldString was not found in the file"));
     }
-    let all = match input.get("replaceAll") {
-        None => false,
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| failure("replaceAll must be boolean"))?,
-    };
+    let all = input.replace_all;
     if count > 1 && !all {
         return Err(failure(format!(
             "oldString matches {count} locations; supply more context or set replaceAll"
@@ -341,23 +322,7 @@ pub(super) fn prepare_edit(
     } else {
         changed
     };
-    Ok((path, original, changed, count))
-}
-
-fn edit(directory: &str, input: &Value) -> Result<ToolOutput, ToolError> {
-    let (path, _original, changed, count) = prepare_edit(directory, input)?;
-    let all = input["replaceAll"].as_bool().unwrap_or(false);
-    atomic_write(&path, changed.as_bytes()).map_err(failure)?;
-    output(
-        format!(
-            "Edited {} ({} replacement{})",
-            path.display(),
-            if all { count } else { 1 },
-            if all && count > 1 { "s" } else { "" }
-        ),
-        &path,
-        json!({"filepath":path,"replacements":if all {count} else {1}}),
-    )
+    Ok((original, changed, count))
 }
 
 pub(super) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
@@ -401,7 +366,7 @@ pub(super) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn output(text: String, path: &Path, metadata: Value) -> Result<ToolOutput, ToolError> {
+fn output(text: String, path: &Path, metadata: Value) -> Result<ToolOutput, OperationError> {
     Ok(ToolOutput {
         output: text,
         title: path.display().to_string(),
@@ -437,7 +402,7 @@ mod tests {
             directory.dir(),
             "read",
             &json!({"filePath":"large.txt","offset":2,"limit":1}),
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(result.output, "2: LAST_LINE\n");
@@ -453,7 +418,7 @@ mod tests {
             directory.dir(),
             "read",
             &json!({"filePath":"entries","limit":20_001}),
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(!result.metadata["truncated"].is_null());
@@ -470,7 +435,7 @@ mod tests {
             directory.dir(),
             "read",
             &json!({"filePath":"page.txt","limit":50000}),
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(result.output.contains("continue with offset 18"));
@@ -479,7 +444,7 @@ mod tests {
             directory.dir(),
             "read",
             &json!({"filePath":"page.txt","offset":18,"limit":1}),
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(next.output.starts_with("18: "));
@@ -487,7 +452,7 @@ mod tests {
             directory.dir(),
             "read",
             &json!({"filePath":"page.txt","offset":0,"limit":0}),
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(empty.output.contains("continue with offset 1"));
@@ -506,7 +471,7 @@ mod tests {
         scan_text(
             Path::new("fixture"),
             reader,
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
             |_, line| lines.push(line.to_string()),
         )
         .unwrap();
@@ -520,7 +485,7 @@ mod tests {
     #[test]
     fn files_are_relative_to_session_and_edit_preserves_crlf() {
         let directory = Directory::new();
-        let flag = AtomicBool::new(false);
+        let flag = CancellationToken::new();
         run(
             directory.dir(),
             "write",
@@ -561,9 +526,11 @@ mod tests {
         let directory = Directory::new();
         let path = directory.0.path().join("file");
         std::fs::write(&path, "same same").unwrap();
-        assert!(edit(
+        assert!(run(
             directory.dir(),
-            &json!({"filePath":"file","oldString":"same","newString":"new"})
+            "edit",
+            &json!({"filePath":"file","oldString":"same","newString":"new"}),
+            &CancellationToken::new()
         )
         .is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "same same");
@@ -573,7 +540,7 @@ mod tests {
     fn streamed_reads_preserve_line_endings_unicode_offsets_and_counts() {
         let directory = Directory::new();
         let path = directory.0.path().join("lines.txt");
-        let flag = AtomicBool::new(false);
+        let flag = CancellationToken::new();
         let content = "first\r\n\n中文 café ☕\nlast\r";
         std::fs::write(&path, content).unwrap();
         for offset in 1..=4 {
@@ -615,7 +582,7 @@ mod tests {
     #[test]
     fn scans_validate_data_beyond_the_requested_output() {
         let directory = Directory::new();
-        let flag = AtomicBool::new(false);
+        let flag = CancellationToken::new();
         let prefix = "needle\n".repeat(110);
         for (name, tail) in [("binary.txt", &b"\0"[..]), ("invalid.txt", &b"\xff"[..])] {
             let mut data = prefix.as_bytes().to_vec();
@@ -634,7 +601,7 @@ mod tests {
     #[test]
     fn long_read_lines_follow_the_2000_character_limit() {
         let directory = Directory::new();
-        let flag = AtomicBool::new(false);
+        let flag = CancellationToken::new();
         let line = format!("START{}END", "é".repeat(20_000));
         std::fs::write(directory.0.path().join("long.txt"), &line).unwrap();
         let result = run(
@@ -653,12 +620,12 @@ mod tests {
 
     #[test]
     fn large_scans_can_be_cancelled_between_lines() {
-        let flag = AtomicBool::new(false);
+        let flag = CancellationToken::new();
         let result = scan_text(
             Path::new("fixture"),
             std::io::Cursor::new(b"first\nsecond\n"),
             &flag,
-            |_, _| flag.store(true, Ordering::Release),
+            |_, _| flag.cancel(),
         );
         assert!(result.unwrap_err().message.contains("cancelled"));
     }
@@ -672,7 +639,7 @@ mod tests {
             directory.dir(),
             "read",
             &json!({"filePath":"image.png"}),
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(result.metadata["attachments"][0]["mimeType"], "image/png");

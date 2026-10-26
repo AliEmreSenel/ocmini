@@ -69,6 +69,19 @@ async fn streaming_admission_attachments_and_usage_reach_t3() {
                 .as_i64()
                 .unwrap_or(0)
                 > 0));
+    for event in first.iter().chain(&final_events) {
+        let properties = &event["properties"];
+        match event["type"].as_str() {
+            Some("message.updated") => {
+                assert_eq!(properties["messageID"], properties["info"]["id"])
+            }
+            Some("message.part.updated") => {
+                assert_eq!(properties["messageID"], properties["part"]["messageID"]);
+                assert_eq!(properties["partID"], properties["part"]["id"]);
+            }
+            _ => {}
+        }
+    }
     let messages = server.messages(&id).await;
     assert_eq!(messages[0]["info"]["id"], "msg_t3_admission_1");
     let assistant = messages

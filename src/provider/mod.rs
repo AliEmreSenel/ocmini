@@ -1,14 +1,22 @@
+use crate::types::{FailureKind, OperationError};
 pub mod anthropic;
 mod catalog;
-mod hooks;
+mod completion;
+mod content;
+pub use completion::{request as request_completion, request_text};
+pub(crate) mod hooks;
 pub mod openai_compat;
+mod options;
+mod replay;
 pub mod responses;
 pub mod sse;
+mod stream;
 pub use catalog::discover_models;
 pub(crate) use catalog::normalize_provider;
-pub use hooks::{complete_text, prepare_hooks, reconcile_text, TEXT_TRANSFORMED};
+pub use hooks::{complete_text, prepare_hooks, TEXT_TRANSFORMED};
+pub use replay::reconcile_text;
 
-use crate::auth::{configured_token, AuthEntry, AuthStore};
+use crate::auth::{configured_credential, AuthEntry, AuthStore};
 use crate::config::{deep_merge, ProviderCfg};
 use crate::types::{ProviderEvent, Tokens};
 use async_trait::async_trait;
@@ -16,7 +24,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ChatRequest {
     pub model: String,
     pub system: String,
@@ -37,6 +45,7 @@ pub type EventStream = Box<dyn futures::Stream<Item = ProviderEvent> + Send + Un
 /// the provider's own Retry-After hint where available.
 #[derive(Debug, Clone)]
 pub struct ProviderError {
+    pub kind: FailureKind,
     pub message: String,
     pub retryable: bool,
     pub retry_after: Option<Duration>,
@@ -49,10 +58,26 @@ pub struct ProviderError {
 impl ProviderError {
     pub fn fatal(message: impl Into<String>) -> Self {
         Self {
+            kind: FailureKind::Error,
             message: message.into(),
             retryable: false,
             retry_after: None,
             overflow: false,
+        }
+    }
+}
+
+impl From<ProviderError> for OperationError {
+    fn from(error: ProviderError) -> Self {
+        Self::new(error.kind, error.message)
+    }
+}
+
+impl From<OperationError> for ProviderError {
+    fn from(error: OperationError) -> Self {
+        Self {
+            kind: error.kind,
+            ..Self::fatal(error.message)
         }
     }
 }
@@ -165,7 +190,7 @@ pub trait ProviderAdapter: Send + Sync {
     async fn stream(&self, req: &ChatRequest) -> Result<EventStream, ProviderError>;
     /// Protocol `prepare` will select for this request, without building
     /// settings. Context assembly needs it before the request exists.
-    async fn protocol_of(&self, req: &ChatRequest) -> Result<Protocol, String>;
+    fn protocol_of(&self, req: &ChatRequest) -> Result<Protocol, OperationError>;
 }
 
 struct Adapter {
@@ -216,7 +241,7 @@ pub(super) struct Settings {
 #[async_trait]
 impl ProviderAdapter for Adapter {
     async fn stream(&self, req: &ChatRequest) -> Result<EventStream, ProviderError> {
-        let (protocol, settings) = self.prepare(req).await.map_err(ProviderError::fatal)?;
+        let (protocol, settings) = self.prepare(req).await.map_err(ProviderError::from)?;
         match protocol {
             Protocol::Chat => openai_compat::stream(settings, req).await,
             Protocol::Responses => responses::stream(settings, req).await,
@@ -226,133 +251,40 @@ impl ProviderAdapter for Adapter {
 
     /// Protocol `prepare` will select for this request, without building
     /// settings. Context assembly needs it before the request exists.
-    async fn protocol_of(&self, req: &ChatRequest) -> Result<Protocol, String> {
-        self.prepare(req).await.map(|(protocol, _)| protocol)
+    fn protocol_of(&self, req: &ChatRequest) -> Result<Protocol, OperationError> {
+        let options = resolve_options(&self.cfg, req).map_err(OperationError::invalid)?;
+        let (token, _) = configured_credential(&self.provider_id, Some(&self.cfg), &options);
+        let codex = token.is_empty()
+            && self.auth.is_oauth(&self.provider_id)
+            && ["openai", "openai-codex"].contains(&self.provider_id.as_str());
+        self.select_protocol(req, &options, codex)
+            .map_err(OperationError::invalid)
     }
 }
 
 impl Adapter {
-    async fn prepare(&self, req: &ChatRequest) -> Result<(Protocol, Settings), String> {
+    fn select_protocol(
+        &self,
+        req: &ChatRequest,
+        options: &Value,
+        codex: bool,
+    ) -> Result<Protocol, String> {
         let model = self.cfg.models.get(&req.model);
-        let mut options = serde_json::to_value(&self.cfg.options).map_err(|e| e.to_string())?;
-        if let Some(api) = self.cfg.extra.get("api").and_then(Value::as_str) {
-            options["baseURL"] = json!(api);
-        }
-        if let Some(model) = model {
-            for key in ["options", "settings", "request"] {
-                if let Some(value) = model.extra.get(key) {
-                    if !value.is_object() {
-                        return Err(format!("model {} {key} must be an object", req.model));
-                    }
-                    deep_merge(&mut options, value.clone());
-                }
-            }
-            if let Some(headers) = model.extra.get("headers") {
-                deep_merge(&mut options["headers"], headers.clone());
-            }
-            if let Some(body) = model.extra.get("body") {
-                deep_merge(&mut options["body"], body.clone());
-            }
-            if let Some(api) = model
-                .extra
-                .get("provider")
-                .and_then(|v| v.get("api"))
-                .and_then(Value::as_str)
-            {
-                options["baseURL"] = json!(api);
-            }
-            if let Some(variant) = &req.variant {
-                if let Some(value) = model.extra.get("variants").and_then(|v| v.get(variant)) {
-                    if !value.is_object() {
-                        return Err(format!(
-                            "variant {variant} for {} must be an object",
-                            req.model
-                        ));
-                    }
-                    if value["disabled"] == true {
-                        return Err(format!(
-                            "variant {variant} is disabled for model {}",
-                            req.model
-                        ));
-                    }
-                    deep_merge(&mut options, value.clone());
-                } else if ![
-                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-                ]
-                .contains(&variant.as_str())
-                {
-                    return Err(format!("unknown model variant {variant} for {}", req.model));
-                }
-            }
-            if model.extra.get("disabled").and_then(Value::as_bool) == Some(true) {
-                return Err(format!("model {} is disabled", req.model));
-            }
-        }
-        if model.is_none()
-            && req.variant.as_deref().is_some_and(|variant| {
-                ![
-                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-                ]
-                .contains(&variant)
-            })
-        {
-            return Err(format!(
-                "unknown model variant {} for {}",
-                req.variant.as_deref().unwrap(),
-                req.model
-            ));
-        }
-        hooks::validate_options(&req.options)?;
-        if let Some(request_options) = req.options.as_object() {
-            if request_options.contains_key("maxOutputTokens") {
-                options.as_object_mut().unwrap().remove("maxTokens");
-            }
-            if request_options.contains_key("maxTokens") {
-                options.as_object_mut().unwrap().remove("maxOutputTokens");
-            }
-            for (key, value) in request_options {
-                options[key] = value.clone();
-            }
-        }
-        for key in ["headers", "body", "extraBody"] {
-            if options
-                .get(key)
-                .is_some_and(|value| !value.is_object() && !value.is_null())
-            {
-                return Err(format!("provider option {key} must be an object"));
-            }
-        }
-        if let Some(transport) = options["transport"].as_str() {
-            if !["http", "sse", "auto"].contains(&transport) {
-                return Err(format!("provider transport {transport} is not supported; configure transport as http or sse"));
-            }
-        }
-        let mut token = options["apiKey"].as_str().unwrap_or_default().to_string();
-        let mut bearer = options["apiKey"].as_str().unwrap_or_default().is_empty()
-            && ["authToken", "accessToken"].iter().any(|key| {
-                options[*key]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
-            });
-        if token.is_empty() {
-            token = options["authToken"]
-                .as_str()
-                .or_else(|| options["accessToken"].as_str())
-                .unwrap_or_default()
-                .into();
-        }
-        if token.is_empty() {
-            token = configured_token(&self.provider_id, Some(&self.cfg));
-            if self.provider_id == "anthropic"
-                && std::env::var("ANTHROPIC_API_KEY")
-                    .unwrap_or_default()
-                    .is_empty()
-                && std::env::var("ANTHROPIC_AUTH_TOKEN").ok().as_deref() == Some(token.as_str())
-                && !token.is_empty()
-            {
-                bearer = true;
-            }
-        }
+        model_protocol(
+            &self.provider_id,
+            &self.cfg.npm,
+            options,
+            model,
+            &req.model,
+            codex,
+        )
+    }
+
+    async fn prepare(&self, req: &ChatRequest) -> Result<(Protocol, Settings), OperationError> {
+        let model = self.cfg.models.get(&req.model);
+        let options = resolve_options(&self.cfg, req).map_err(OperationError::invalid)?;
+        let (mut token, mut bearer) =
+            configured_credential(&self.provider_id, Some(&self.cfg), &options);
         let credential = if token.is_empty() {
             self.auth.credential(&self.provider_id).await?
         } else {
@@ -369,7 +301,9 @@ impl Adapter {
                 if let Some(value) = value.as_str() {
                     headers.insert(key.to_lowercase(), value.to_string());
                 } else {
-                    return Err(format!("provider header {key} must be a string"));
+                    return Err(OperationError::invalid(format!(
+                        "provider header {key} must be a string"
+                    )));
                 }
             }
         }
@@ -421,49 +355,29 @@ impl Adapter {
                     });
                 }
             }
-            Some(AuthEntry::WellKnown { .. }) => return Err(format!("provider {} uses well-known discovery credentials; configure an explicit provider baseURL and API key instead of treating discovery data as an API token", self.provider_id)),
+            Some(AuthEntry::WellKnown { .. }) => return Err(OperationError::invalid(format!("provider {} uses well-known discovery credentials; configure an explicit provider baseURL and API key instead of treating discovery data as an API token", self.provider_id))),
             None => {}
         }
-        let npm = model
-            .and_then(|m| m.extra.get("provider"))
-            .and_then(|v| v.get("npm"))
-            .and_then(Value::as_str)
-            .unwrap_or(&self.cfg.npm);
-        let explicit = options["endpoint"]
-            .as_str()
-            .or_else(|| options["api"].as_str());
-        let protocol = protocol(&self.provider_id, npm, explicit, &req.model, codex)?;
-        hooks::validate_protocol_options(&req.options, protocol, codex)?;
+        let protocol = self
+            .select_protocol(req, &options, codex)
+            .map_err(OperationError::invalid)?;
+        options::validate_protocol_options(&req.options, protocol, codex)
+            .map_err(OperationError::invalid)?;
         if base_url.is_empty() {
             base_url = default_base_url(&self.provider_id).ok_or_else(|| format!("provider {} has no supported default endpoint; configure provider.{}.options.baseURL", self.provider_id, self.provider_id))?.into();
         }
-        if !self.configured
-            && ![
-                "openai",
-                "openai-codex",
-                "anthropic",
-                "github-copilot",
-                "openrouter",
-                "groq",
-                "xai",
-                "deepseek",
-                "mistral",
-                "togetherai",
-                "ollama",
-                "vllm",
-                "lmstudio",
-            ]
-            .contains(&self.provider_id.as_str())
-        {
-            return Err(format!(
+        if !self.configured && default_base_url(&self.provider_id).is_none() {
+            return Err(OperationError::invalid(format!(
                 "unknown provider {}; define it in OpenCode configuration",
                 self.provider_id
-            ));
+            )));
         }
         let parsed =
             reqwest::Url::parse(&base_url).map_err(|e| format!("invalid provider baseURL: {e}"))?;
         if !["http", "https"].contains(&parsed.scheme()) {
-            return Err("provider baseURL must use http or https".into());
+            return Err(OperationError::invalid(
+                "provider baseURL must use http or https",
+            ));
         }
         if token.is_empty()
             && !headers.contains_key("authorization")
@@ -481,7 +395,7 @@ impl Adapter {
                 })
                 .unwrap_or(false)
         {
-            return Err(format!("missing credentials for {}; set its API key environment variable, options.apiKey, or connect it with OpenCode", self.provider_id));
+            return Err(OperationError::invalid(format!("missing credentials for {}; set its API key environment variable, options.apiKey, or connect it with OpenCode", self.provider_id)));
         }
         if self.provider_id == "github-copilot" {
             headers
@@ -549,8 +463,9 @@ impl Adapter {
         let max_output = model
             .and_then(|m| m.limit.as_ref())
             .and_then(|v| v["output"].as_u64());
-        hooks::validate_limits(&req.options, &options, protocol, max_output)?;
-        for (name, value) in hooks::safe_headers(&req.headers)? {
+        options::validate_limits(&req.options, &options, protocol, max_output)
+            .map_err(OperationError::invalid)?;
+        for (name, value) in options::safe_headers(&req.headers).map_err(OperationError::invalid)? {
             headers.insert(name, value);
         }
         let header_timeout = if options["headerTimeout"] == false {
@@ -605,6 +520,162 @@ impl Adapter {
             },
         ))
     }
+}
+
+fn resolve_options(cfg: &ProviderCfg, req: &ChatRequest) -> Result<Value, String> {
+    let model = cfg.models.get(&req.model);
+    let mut options = serde_json::to_value(&cfg.options).map_err(|e| e.to_string())?;
+    if let Some(api) = cfg.extra.get("api").and_then(Value::as_str) {
+        options["baseURL"] = json!(api);
+    }
+    let mut options = merge_model_options(options, model)?;
+    if let Some(variant) = &req.variant {
+        match model.and_then(|model| model.extra.get("variants")?.get(variant)) {
+            Some(value) => {
+                if !value.is_object() {
+                    return Err(format!(
+                        "variant {variant} for {} must be an object",
+                        req.model
+                    ));
+                }
+                if value["disabled"] == true {
+                    return Err(format!(
+                        "variant {variant} is disabled for model {}",
+                        req.model
+                    ));
+                }
+                deep_merge(&mut options, value.clone());
+            }
+            None if ![
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ]
+            .contains(&variant.as_str()) =>
+            {
+                return Err(format!("unknown model variant {variant} for {}", req.model));
+            }
+            None => {}
+        }
+    }
+    options::validate_options(&req.options)?;
+    if let Some(request_options) = req.options.as_object() {
+        if request_options.contains_key("maxOutputTokens") {
+            options.as_object_mut().unwrap().remove("maxTokens");
+        }
+        if request_options.contains_key("maxTokens") {
+            options.as_object_mut().unwrap().remove("maxOutputTokens");
+        }
+        for (key, value) in request_options {
+            options[key] = value.clone();
+        }
+    }
+    for key in ["headers", "body", "extraBody"] {
+        if options
+            .get(key)
+            .is_some_and(|value| !value.is_object() && !value.is_null())
+        {
+            return Err(format!("provider option {key} must be an object"));
+        }
+    }
+    if let Some(transport) = options["transport"].as_str() {
+        if !["http", "sse", "auto"].contains(&transport) {
+            return Err(format!("provider transport {transport} is not supported; configure transport as http or sse"));
+        }
+    }
+    Ok(options)
+}
+
+/// Inventory and execution resolve the same model-level credentials and endpoints.
+pub fn is_configured(id: &str, provider: Option<&ProviderCfg>) -> bool {
+    let empty = ProviderCfg::default();
+    let provider = provider.unwrap_or(&empty);
+    std::iter::once("")
+        .chain(provider.models.keys().map(String::as_str))
+        .any(|model| {
+            let request = ChatRequest {
+                model: model.into(),
+                ..Default::default()
+            };
+            resolve_options(provider, &request).is_ok_and(|options| {
+                let (token, _) = configured_credential(id, Some(provider), &options);
+                !token.is_empty()
+                    || options["baseURL"]
+                        .as_str()
+                        .is_some_and(|url| !url.is_empty())
+                    || provider
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .chain(
+                            options["headers"]
+                                .as_object()
+                                .into_iter()
+                                .flat_map(|headers| {
+                                    headers
+                                        .iter()
+                                        .filter_map(|(k, v)| v.as_str().map(|v| (k.as_str(), v)))
+                                }),
+                        )
+                        .any(|(name, value)| {
+                            !value.is_empty()
+                                && ["authorization", "x-api-key"]
+                                    .contains(&name.to_ascii_lowercase().as_str())
+                        })
+                    || ["ollama", "vllm", "lmstudio"].contains(&id)
+            })
+        })
+}
+
+fn merge_model_options(
+    mut options: Value,
+    model: Option<&crate::config::ModelInfo>,
+) -> Result<Value, String> {
+    if let Some(model) = model {
+        for key in ["options", "settings", "request"] {
+            if let Some(value) = model.extra.get(key) {
+                if !value.is_object() {
+                    return Err(format!("model {} {key} must be an object", model.id));
+                }
+                deep_merge(&mut options, value.clone());
+            }
+        }
+        if let Some(headers) = model.extra.get("headers") {
+            deep_merge(&mut options["headers"], headers.clone());
+        }
+        if let Some(body) = model.extra.get("body") {
+            deep_merge(&mut options["body"], body.clone());
+        }
+        if let Some(api) = model
+            .extra
+            .get("provider")
+            .and_then(|v| v.get("api"))
+            .and_then(Value::as_str)
+        {
+            options["baseURL"] = json!(api);
+        }
+        if model.extra.get("disabled").and_then(Value::as_bool) == Some(true) {
+            return Err(format!("model {} is disabled", model.id));
+        }
+    }
+    Ok(options)
+}
+
+fn model_protocol(
+    provider: &str,
+    npm_default: &str,
+    options: &Value,
+    model: Option<&crate::config::ModelInfo>,
+    model_id: &str,
+    codex: bool,
+) -> Result<Protocol, String> {
+    let npm = model
+        .and_then(|m| m.extra.get("provider"))
+        .and_then(|v| v.get("npm"))
+        .and_then(Value::as_str)
+        .unwrap_or(npm_default);
+    let explicit = options["endpoint"]
+        .as_str()
+        .or_else(|| options["api"].as_str());
+    protocol(provider, npm, explicit, model_id, codex)
 }
 
 fn protocol(
@@ -697,82 +768,85 @@ fn default_base_url(provider: &str) -> Option<&'static str> {
 }
 
 impl Settings {
+    pub(super) fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        protocol: Protocol,
+    ) -> reqwest::RequestBuilder {
+        let mut request = client()
+            .request(method, url)
+            .header("accept", "text/event-stream, application/json")
+            .header("user-agent", "ocmini");
+        if !self.token.is_empty() {
+            request = if protocol == Protocol::Anthropic && !self.bearer {
+                request.header("x-api-key", &self.token)
+            } else {
+                request.bearer_auth(&self.token)
+            };
+        }
+        if protocol == Protocol::Anthropic {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+        for (name, value) in &self.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if let Some(timeout) = self.total_timeout {
+            request = request.timeout(timeout);
+        }
+        request
+    }
+
     pub async fn send(
         &self,
         endpoint: &str,
+        protocol: Protocol,
         body: &Value,
     ) -> Result<reqwest::Response, ProviderError> {
-        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "accept",
-            HeaderValue::from_static("text/event-stream, application/json"),
-        );
-        headers.insert("user-agent", HeaderValue::from_static("ocmini"));
-        if !self.token.is_empty() {
-            let (name, value) = if endpoint == "messages" && !self.bearer {
-                ("x-api-key", self.token.clone())
-            } else {
-                ("authorization", format!("Bearer {}", self.token))
-            };
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes())
-                    .map_err(|e| ProviderError::fatal(e.to_string()))?,
-                HeaderValue::from_str(&value).map_err(|_| {
-                    ProviderError::fatal("provider credential contains invalid header characters")
-                })?,
-            );
-        }
-        if endpoint == "messages" {
-            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        }
-        for (name, value) in &self.headers {
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                    ProviderError::fatal(format!("invalid provider header {name}: {e}"))
-                })?,
-                HeaderValue::from_str(value).map_err(|_| {
-                    ProviderError::fatal(format!("invalid value for provider header {name}"))
-                })?,
-            );
-        }
         let suffix = format!("/{endpoint}");
         let url = if self.base_url.ends_with(&suffix) {
             self.base_url.clone()
         } else {
             format!("{}{suffix}", self.base_url.trim_end_matches('/'))
         };
-        let mut request = client().post(url).headers(headers).json(body);
-        if let Some(timeout) = self.total_timeout {
-            request = request.timeout(timeout);
+        self.send_request(
+            self.request(reqwest::Method::POST, &url, protocol)
+                .json(body),
+        )
+        .await
+    }
+
+    pub(super) async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let request = request
+            .build()
+            .map_err(|error| ProviderError::fatal(error.without_url().to_string()))?;
+        let send = client().execute(request);
+        let response = match self.header_timeout {
+            Some(timeout) => {
+                tokio::time::timeout(timeout, send)
+                    .await
+                    .map_err(|_| ProviderError {
+                        retryable: true,
+                        ..ProviderError::fatal(format!(
+                            "{} did not return response headers within {} seconds",
+                            self.provider_id,
+                            timeout.as_secs()
+                        ))
+                    })?
+            }
+            None => send.await,
         }
-        let response = if let Some(timeout) = self.header_timeout {
-            tokio::time::timeout(timeout, request.send())
-                .await
-                .map_err(|_| ProviderError {
-                    message: format!(
-                        "{} did not return response headers within {} seconds",
-                        self.provider_id,
-                        timeout.as_secs()
-                    ),
-                    retryable: true,
-                    retry_after: None,
-                    overflow: false,
-                })?
-                .map_err(|e| ProviderError {
-                    message: format!("{} request failed: {}", self.provider_id, e.without_url()),
-                    retryable: true,
-                    retry_after: None,
-                    overflow: false,
-                })?
-        } else {
-            request.send().await.map_err(|e| ProviderError {
-                message: format!("{} request failed: {}", self.provider_id, e.without_url()),
-                retryable: true,
-                retry_after: None,
-                overflow: false,
-            })?
-        };
+        .map_err(|error| ProviderError {
+            retryable: true,
+            ..ProviderError::fatal(format!(
+                "{} request failed: {}",
+                self.provider_id,
+                error.without_url()
+            ))
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let retry_after = response
@@ -781,7 +855,7 @@ impl Settings {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<u64>().ok())
                 .map(|seconds| Duration::from_secs(seconds.min(120)));
-            let value = read_response(response, self.chunk_timeout, 64 * 1024)
+            let value = crate::http::read_body(response, Some(self.chunk_timeout), 64 * 1024)
                 .await
                 .unwrap_or_default();
             let message = serde_json::from_slice::<Value>(&value)
@@ -796,6 +870,7 @@ impl Settings {
             let retryable = status_retryable(status);
             let overflow = matches!(status.as_u16(), 400 | 413 | 422) && context_overflow(&message);
             return Err(ProviderError {
+                kind: FailureKind::Error,
                 message: format!("{} HTTP {status}: {message}", self.provider_id),
                 retryable,
                 retry_after: if retryable { retry_after } else { None },
@@ -811,6 +886,13 @@ impl Settings {
                 deep_merge(body, overlay.clone());
             }
         }
+    }
+}
+
+pub(super) fn append_text(value: &mut Value, delta: &str) {
+    match value {
+        Value::String(text) => text.push_str(delta),
+        _ => *value = Value::String(delta.into()),
     }
 }
 
@@ -839,27 +921,6 @@ pub(super) fn reasoning_effort<'a>(
     })
 }
 
-pub(super) async fn read_response(
-    mut response: reqwest::Response,
-    timeout: Duration,
-    limit: usize,
-) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    loop {
-        let chunk = tokio::time::timeout(timeout, response.chunk())
-            .await
-            .map_err(|_| "provider response body timed out")?
-            .map_err(|e| e.to_string())?;
-        let Some(chunk) = chunk else {
-            return Ok(bytes);
-        };
-        if bytes.len() + chunk.len() > limit {
-            return Err(format!("provider response exceeds {limit} bytes"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-}
-
 pub(super) fn json_response(response: &reqwest::Response) -> bool {
     response
         .headers()
@@ -870,40 +931,26 @@ pub(super) fn json_response(response: &reqwest::Response) -> bool {
 }
 
 pub(super) fn usage_openai(value: &Value, responses: bool) -> Tokens {
-    let input = value[if responses {
-        "input_tokens"
+    let (input_key, output_key, input_details, output_details) = if responses {
+        (
+            "input_tokens",
+            "output_tokens",
+            "input_tokens_details",
+            "output_tokens_details",
+        )
     } else {
-        "prompt_tokens"
-    }]
-    .as_i64()
-    .unwrap_or(0)
-    .max(0);
-    let output = value[if responses {
-        "output_tokens"
-    } else {
-        "completion_tokens"
-    }]
-    .as_i64()
-    .unwrap_or(0)
-    .max(0);
-    let cache = value[if responses {
-        "input_tokens_details"
-    } else {
-        "prompt_tokens_details"
-    }]["cached_tokens"]
-        .as_i64()
-        .unwrap_or(0)
-        .max(0)
-        .min(input);
-    let reasoning = value[if responses {
-        "output_tokens_details"
-    } else {
-        "completion_tokens_details"
-    }]["reasoning_tokens"]
-        .as_i64()
-        .unwrap_or(0)
-        .max(0)
-        .min(output);
+        (
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+            "completion_tokens_details",
+        )
+    };
+    let count = |value: &Value| value.as_i64().unwrap_or(0).max(0);
+    let input = count(&value[input_key]);
+    let output = count(&value[output_key]);
+    let cache = count(&value[input_details]["cached_tokens"]).min(input);
+    let reasoning = count(&value[output_details]["reasoning_tokens"]).min(output);
     Tokens {
         input: input - cache,
         output: output - reasoning,

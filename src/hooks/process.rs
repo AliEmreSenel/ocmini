@@ -4,63 +4,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, Write};
+use std::io;
 use std::ops::Deref;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static SHUTDOWN_NOTIFY: Notify = Notify::const_new();
-static ACTIVE_PROCESSES: AtomicUsize = AtomicUsize::new(0);
-
-pub async fn wait_for_shutdown() {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while ACTIVE_PROCESSES.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-struct ProcessCount;
-impl ProcessCount {
-    fn new() -> Self {
-        ACTIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
-        Self
-    }
-}
+struct ProcessCount(Arc<Runtime>);
 impl Drop for ProcessCount {
     fn drop(&mut self) {
-        ACTIVE_PROCESSES.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-pub fn shutdown() {
-    SHUTDOWN.store(true, Ordering::Release);
-    SHUTDOWN_NOTIFY.notify_waiters();
-}
-pub fn is_shutdown() -> bool {
-    SHUTDOWN.load(Ordering::Acquire)
-}
-
-pub async fn cancelled(cancel: Option<&Arc<AtomicBool>>) {
-    let stopping = SHUTDOWN_NOTIFY.notified();
-    tokio::pin!(stopping);
-    stopping.as_mut().enable();
-    loop {
-        if is_shutdown() || cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-            return;
-        }
-        if cancel.is_none() {
-            stopping.await;
-            return;
-        }
-        tokio::select! {
-            _ = &mut stopping => return,
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+        let mut active = self.0.active.lock().unwrap();
+        *active -= 1;
+        if *active == 0 {
+            self.0.idle.notify_waiters();
         }
     }
 }
@@ -90,66 +50,32 @@ pub struct ProcessError {
 }
 
 impl ProcessError {
+    fn new(kind: FailureKind, summary: impl Into<String>) -> Self {
+        Self {
+            kind,
+            summary: summary.into(),
+            stderr_tail: Vec::new(),
+            stderr_bytes: 0,
+            queue_ms: 0,
+            execution_ms: 0,
+            exit_code: None,
+        }
+    }
     pub fn cancelled() -> Self {
-        Self {
-            kind: FailureKind::Cancelled,
-            summary: "hook cancelled".into(),
-            stderr_tail: Vec::new(),
-            stderr_bytes: 0,
-            queue_ms: 0,
-            execution_ms: 0,
-            exit_code: None,
-        }
+        Self::new(FailureKind::Cancelled, "hook cancelled")
     }
-
     pub fn queue_timeout(msg: impl Into<String>, queue_ms: u64) -> Self {
-        Self {
-            kind: FailureKind::QueueTimeout,
-            summary: msg.into(),
-            stderr_tail: Vec::new(),
-            stderr_bytes: 0,
-            queue_ms,
-            execution_ms: 0,
-            exit_code: None,
-        }
+        Self::new(FailureKind::QueueTimeout, msg).with_timings(queue_ms, 0)
     }
-
     pub fn deadline(msg: impl Into<String>, queue_ms: u64, execution_ms: u64) -> Self {
-        Self {
-            kind: FailureKind::Deadline,
-            summary: msg.into(),
-            stderr_tail: Vec::new(),
-            stderr_bytes: 0,
-            queue_ms,
-            execution_ms,
-            exit_code: None,
-        }
+        Self::new(FailureKind::Deadline, msg).with_timings(queue_ms, execution_ms)
     }
-
     pub fn spawn(msg: impl Into<String>, queue_ms: u64) -> Self {
-        Self {
-            kind: FailureKind::Spawn,
-            summary: msg.into(),
-            stderr_tail: Vec::new(),
-            stderr_bytes: 0,
-            queue_ms,
-            execution_ms: 0,
-            exit_code: None,
-        }
+        Self::new(FailureKind::Spawn, msg).with_timings(queue_ms, 0)
     }
-
     pub fn io(msg: impl Into<String>) -> Self {
-        Self {
-            kind: FailureKind::Io,
-            summary: msg.into(),
-            stderr_tail: Vec::new(),
-            stderr_bytes: 0,
-            queue_ms: 0,
-            execution_ms: 0,
-            exit_code: None,
-        }
+        Self::new(FailureKind::Io, msg)
     }
-
     pub fn exit(
         code_or_signal: &str,
         exit_code: Option<i32>,
@@ -170,27 +96,10 @@ impl ProcessError {
     }
 
     pub fn output_limit(msg: impl Into<String>, queue_ms: u64, execution_ms: u64) -> Self {
-        Self {
-            kind: FailureKind::OutputLimit,
-            summary: msg.into(),
-            stderr_tail: Vec::new(),
-            stderr_bytes: 0,
-            queue_ms,
-            execution_ms,
-            exit_code: None,
-        }
+        Self::new(FailureKind::OutputLimit, msg).with_timings(queue_ms, execution_ms)
     }
-
     pub fn payload(msg: impl Into<String>) -> Self {
-        Self {
-            kind: FailureKind::Payload,
-            summary: msg.into(),
-            stderr_tail: Vec::new(),
-            stderr_bytes: 0,
-            queue_ms: 0,
-            execution_ms: 0,
-            exit_code: None,
-        }
+        Self::new(FailureKind::Payload, msg)
     }
 
     pub fn with_timings(mut self, queue_ms: u64, execution_ms: u64) -> Self {
@@ -403,10 +312,12 @@ impl ResizablePool {
         }
     }
 
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.balance.lock().unwrap().capacity
     }
 
+    #[cfg(test)]
     pub fn available(&self) -> usize {
         self.semaphore.available_permits()
     }
@@ -475,81 +386,81 @@ impl Drop for PoolPermit {
     }
 }
 
-struct GlobalPools {
+pub struct Runtime {
+    shutdown: tokio_util::sync::CancellationToken,
+    active: Mutex<usize>,
+    idle: Notify,
     processes: ResizablePool,
     observers: ResizablePool,
     pending: ResizablePool,
     pending_observers: ResizablePool,
-    max_payload_bytes: AtomicUsize,
-    default_queue_timeout_ms: AtomicU64,
 }
 
-fn global_pools() -> &'static GlobalPools {
-    static POOLS: OnceLock<GlobalPools> = OnceLock::new();
-    POOLS.get_or_init(|| GlobalPools {
-        processes: ResizablePool::new(16),
-        observers: ResizablePool::new(4),
-        pending: ResizablePool::new(128),
-        pending_observers: ResizablePool::new(128),
-        max_payload_bytes: AtomicUsize::new(64 * 1024 * 1024),
-        default_queue_timeout_ms: AtomicU64::new(30_000),
-    })
-}
-
-pub fn configure_limits(settings: &Settings) {
-    let pools = global_pools();
-    pools.processes.resize(settings.max_global_processes);
-    pools.observers.resize(settings.max_global_observers);
-    pools.pending.resize(settings.max_pending_hooks);
-    pools.pending_observers.resize(settings.max_pending_hooks);
-    pools
-        .max_payload_bytes
-        .store(settings.max_payload_bytes, Ordering::Release);
-    pools
-        .default_queue_timeout_ms
-        .store(settings.queue_timeout_ms, Ordering::Release);
-}
-
-pub fn limits_debug() -> Value {
-    let pools = global_pools();
-    serde_json::json!({
-        "maxGlobalProcesses": pools.processes.capacity(),
-        "availableProcesses": pools.processes.available(),
-        "maxGlobalObservers": pools.observers.capacity(),
-        "availableObservers": pools.observers.available(),
-        "maxPendingHooks": pools.pending.capacity(),
-        "availablePending": pools.pending.available(),
-        "availablePendingObservers": pools.pending_observers.available(),
-        "defaultQueueTimeoutMs": pools.default_queue_timeout_ms.load(Ordering::Acquire),
-        "maxPayloadBytes": pools.max_payload_bytes.load(Ordering::Acquire),
-    })
-}
-
-struct BoundedWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-impl Write for BoundedWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-            return Err(io::Error::other("hook stdin exceeds byte budget"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+impl Runtime {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            active: Mutex::new(0),
+            idle: Notify::new(),
+            processes: ResizablePool::new(16),
+            observers: ResizablePool::new(4),
+            pending: ResizablePool::new(128),
+            pending_observers: ResizablePool::new(128),
+        })
     }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    pub fn configure(&self, settings: &Settings) {
+        self.processes.resize(settings.max_global_processes);
+        self.observers.resize(settings.max_global_observers);
+        self.pending.resize(settings.max_pending_hooks);
+        self.pending_observers.resize(settings.max_pending_hooks);
+    }
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
+    pub async fn shutdown(&self) {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let idle = self.idle.notified();
+                {
+                    let active = self.active.lock().unwrap();
+                    self.shutdown.cancel();
+                    if *active == 0 {
+                        return;
+                    }
+                }
+                idle.await;
+            }
+        })
+        .await;
+    }
+    fn register(self: &Arc<Self>) -> Result<ProcessCount, ProcessError> {
+        let mut active = self.active.lock().unwrap();
+        if self.is_shutdown() {
+            return Err(ProcessError::cancelled());
+        }
+        *active += 1;
+        Ok(ProcessCount(self.clone()))
+    }
+    pub async fn cancelled(&self, cancel: Option<&CancellationToken>) {
+        match cancel {
+            Some(cancel) => tokio::select! {
+                _ = self.shutdown.cancelled() => {},
+                _ = cancel.cancelled() => {},
+            },
+            None => self.shutdown.cancelled().await,
+        }
     }
 }
 
 pub fn encode<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, String> {
-    let mut writer = BoundedWriter {
-        bytes: Vec::new(),
+    let mut writer = payload::BoundedWriter {
+        writer: Vec::new(),
+        bytes: 0,
         limit,
     };
     serde_json::to_writer(&mut writer, value)
         .map_err(|e| format!("cannot encode hook input: {e}"))?;
-    Ok(writer.bytes)
+    Ok(writer.writer)
 }
 
 async fn capture_stdout(
@@ -618,23 +529,13 @@ async fn capture_stderr_tail(
 /// Owns the child even if the caller drops or aborts the invocation future.
 struct ChildGuard {
     child: Option<tokio::process::Child>,
-    id: u32,
+    group: crate::process::Group,
     count: Option<ProcessCount>,
-    reaped: Arc<AtomicBool>,
 }
 
 impl ChildGuard {
-    fn kill_group(&self) {
-        #[cfg(unix)]
-        if self.id > 1 && self.id <= i32::MAX as u32 && !self.reaped.load(Ordering::Acquire) {
-            unsafe {
-                libc::kill(-(self.id as i32), libc::SIGKILL);
-            }
-        }
-    }
-
     async fn stop(&mut self) {
-        self.kill_group();
+        self.group.kill();
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -644,68 +545,9 @@ impl ChildGuard {
     }
 }
 
-async fn wait_child_status(
-    child: &mut tokio::process::Child,
-    id: u32,
-    reaped: &AtomicBool,
-) -> Result<std::process::ExitStatus, ProcessError> {
-    #[cfg(unix)]
-    {
-        let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
-            .map_err(|e| ProcessError::io(format!("cannot watch hook exit: {e}")))?;
-        loop {
-            let exited = {
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                // WNOWAIT keeps the leader's PID reserved until descendants have
-                // been stopped; never signal a process-group ID after reaping it.
-                let result = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        id,
-                        &mut info,
-                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                    )
-                };
-                if result < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    if error.raw_os_error() == Some(libc::ECHILD) {
-                        reaped.store(true, Ordering::Release);
-                    }
-                    return Err(ProcessError::io(format!(
-                        "cannot inspect hook exit: {error}"
-                    )));
-                }
-                unsafe { info.si_pid() == id as i32 }
-            };
-            if exited {
-                if id > 1 && id <= i32::MAX as u32 {
-                    unsafe {
-                        libc::kill(-(id as i32), libc::SIGKILL);
-                    }
-                }
-                break;
-            }
-            if exits.recv().await.is_none() {
-                return Err(ProcessError::io("hook exit watcher closed"));
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = id;
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| ProcessError::io(format!("cannot reap hook child: {e}")))?;
-    reaped.store(true, Ordering::Release);
-    Ok(status)
-}
-
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        self.kill_group();
+        self.group.kill();
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -720,242 +562,251 @@ impl Drop for ChildGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run<T: Serialize>(
-    registration: &ResolvedRegistration,
-    settings: &Settings,
-    directory: &str,
-    envelope: &T,
-    cancel: Option<&Arc<AtomicBool>>,
-    deadline: Option<Instant>,
-    capacity: Arc<Semaphore>,
-    boundary: &str,
-    invocation: &str,
-    session: &str,
-) -> Result<ProcessOutcome, ProcessError> {
-    let observer = boundary == "event";
-    if is_shutdown() || cancel.is_some_and(|v| v.load(Ordering::Acquire)) {
-        return Err(ProcessError::cancelled());
-    }
+impl Runtime {
+    pub async fn run<T: Serialize>(
+        self: &Arc<Self>,
+        registration: &ResolvedRegistration,
+        settings: &Settings,
+        directory: &str,
+        envelope: &T,
+        cancel: Option<&CancellationToken>,
+        deadline: Option<Instant>,
+        capacity: Arc<Semaphore>,
+        kind: super::InvocationKind,
+        invocation: &str,
+        session: &str,
+    ) -> Result<ProcessOutcome, ProcessError> {
+        let observer = kind == super::InvocationKind::Observer;
+        if self.is_shutdown() || cancel.is_some_and(|v| v.is_cancelled()) {
+            return Err(ProcessError::cancelled());
+        }
 
-    if deadline.is_some_and(|d| Instant::now() >= d) {
-        return Err(ProcessError::deadline("hook deadline exceeded", 0, 0));
-    }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(ProcessError::deadline("hook deadline exceeded", 0, 0));
+        }
 
-    let r = &registration.registration;
-    let queue_start = Instant::now();
-    let queue_timeout_ms = r.queue_timeout_ms.unwrap_or(settings.queue_timeout_ms);
-    let queue_timeout_duration = Duration::from_millis(queue_timeout_ms);
-    let queue_deadline = queue_start + queue_timeout_duration;
-    let effective_queue_deadline = match deadline {
-        Some(d) => queue_deadline.min(d),
-        None => queue_deadline,
-    };
+        let r = &registration.registration;
+        let queue_start = Instant::now();
+        let queue_timeout_ms = r.queue_timeout_ms.unwrap_or(settings.queue_timeout_ms);
+        let queue_timeout_duration = Duration::from_millis(queue_timeout_ms);
+        let queue_deadline = queue_start + queue_timeout_duration;
+        let effective_queue_deadline = match deadline {
+            Some(d) => queue_deadline.min(d),
+            None => queue_deadline,
+        };
 
-    let pending_pool = if observer {
-        &global_pools().pending_observers
-    } else {
-        &global_pools().pending
-    };
-    let pending_permit = pending_pool.try_acquire_permit()?;
-    let acquire_capacity = async {
-        let local = capacity
-            .acquire_owned()
-            .await
-            .map_err(|_| ProcessError::io("scope capacity closed"))?;
-        let global = if observer {
-            global_pools().observers.acquire_permit().await?
+        let pending_pool = if observer {
+            &self.pending_observers
         } else {
-            global_pools().processes.acquire_permit().await?
+            &self.pending
         };
-        Ok::<_, ProcessError>((global, local))
-    };
-
-    let (_global_permit, _local_permit) = tokio::select! {
-        biased;
-        _ = cancelled(cancel) => return Err(ProcessError::cancelled().with_timings(queue_start.elapsed().as_millis() as u64, 0)),
-        _ = tokio::time::sleep_until(effective_queue_deadline) => {
-            let elapsed_queue = queue_start.elapsed().as_millis() as u64;
-            if deadline.is_some_and(|d| d <= queue_deadline && Instant::now() >= d) {
-                return Err(ProcessError::deadline("hook deadline exceeded while waiting for capacity", elapsed_queue, 0));
+        let pending_permit = pending_pool.try_acquire_permit()?;
+        let acquire_capacity = async {
+            let local = capacity
+                .acquire_owned()
+                .await
+                .map_err(|_| ProcessError::io("scope capacity closed"))?;
+            let global = if observer {
+                self.observers.acquire_permit().await?
             } else {
-                return Err(ProcessError::queue_timeout("hook queue timeout exceeded while waiting for capacity", elapsed_queue));
-            }
-        }
-        res = acquire_capacity => res?,
-    };
-
-    drop(pending_permit);
-    let queue_ms = queue_start.elapsed().as_millis() as u64;
-
-    let exec_start = Instant::now();
-    let exec_duration = Duration::from_millis(registration.hook_timeout_ms(boundary));
-    let exec_deadline = exec_start + exec_duration;
-    let effective_exec_deadline = match deadline {
-        Some(d) => exec_deadline.min(d),
-        None => exec_deadline,
-    };
-
-    let payload_mode = r.payload_mode;
-    let (stdin_bytes, files) = crate::blocking::run(|| match payload_mode {
-        PayloadMode::Inline => {
-            let limit = r.max_input_bytes.unwrap_or(settings.max_input_bytes);
-            let bytes = encode(envelope, limit).map_err(ProcessError::payload)?;
-            Ok::<_, ProcessError>((bytes, None))
-        }
-        PayloadMode::File => {
-            let max_payload_bytes = settings.max_payload_bytes;
-            let files = payload::spool(envelope, max_payload_bytes, invocation)?;
-            let stdin_bytes = files.v2_stdin_bytes()?;
-            Ok((stdin_bytes, Some(files)))
-        }
-    })?;
-    if is_shutdown() || cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-        return Err(ProcessError::cancelled()
-            .with_timings(queue_ms, exec_start.elapsed().as_millis() as u64));
-    }
-    if Instant::now() >= effective_exec_deadline {
-        return Err(ProcessError::deadline(
-            "hook deadline exceeded during payload preparation",
-            queue_ms,
-            exec_start.elapsed().as_millis() as u64,
-        ));
-    }
-
-    let mut command = tokio::process::Command::new(
-        r.command
-            .first()
-            .ok_or_else(|| ProcessError::spawn("empty hook command", queue_ms))?,
-    );
-    command
-        .args(&r.command[1..])
-        .current_dir(directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .env("OCMINI_HOOK_INVOCATION_ID", invocation)
-        .env("OCMINI_HOOK_SESSION_ID", session);
-
-    if let Some(f) = &files {
-        command.env("OCMINI_HOOK_PAYLOAD_PATH", f.payload_path());
-        command.env("OCMINI_HOOK_RESPONSE_PATH", f.response_path());
-        command.env("OCMINI_HOOK_PAYLOAD_DIR", f.dir_path());
-    }
-
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let child = command.spawn().map_err(|e| {
-        ProcessError::spawn(
-            format!("cannot start hook executable {}: {e}", r.command[0]),
-            queue_ms,
-        )
-    })?;
-    let id = child
-        .id()
-        .ok_or_else(|| ProcessError::spawn("hook child has no process id", queue_ms))?;
-    let mut guard = ChildGuard {
-        child: Some(child),
-        id,
-        count: Some(ProcessCount::new()),
-        reaped: Arc::new(AtomicBool::new(false)),
-    };
-    let reaped = guard.reaped.clone();
-    let child = guard.child.as_mut().unwrap();
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ProcessError::io("hook stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ProcessError::io("hook stdout unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ProcessError::io("hook stderr unavailable"))?;
-
-    let max_output = r.max_output_bytes.unwrap_or(settings.max_output_bytes);
-    let max_stderr = r.max_stderr_bytes.unwrap_or(settings.max_stderr_bytes);
-    let stderr_capture = Mutex::new(StderrTail::default());
-
-    let io = async {
-        let write_stdin = async {
-            match stdin.write_all(&stdin_bytes).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-                Err(e) => return Err(ProcessError::io(format!("cannot write hook stdin: {e}"))),
-            }
-            drop(stdin);
-            Ok::<_, ProcessError>(())
+                self.processes.acquire_permit().await?
+            };
+            Ok::<_, ProcessError>((global, local))
         };
 
-        let wait_child = async { wait_child_status(child, id, &reaped).await };
+        let (_global_permit, _local_permit) = tokio::select! {
+            biased;
+            _ = self.cancelled(cancel) => return Err(ProcessError::cancelled().with_timings(queue_start.elapsed().as_millis() as u64, 0)),
+            _ = tokio::time::sleep_until(effective_queue_deadline) => {
+                let elapsed_queue = queue_start.elapsed().as_millis() as u64;
+                if deadline.is_some_and(|d| d <= queue_deadline && Instant::now() >= d) {
+                    return Err(ProcessError::deadline("hook deadline exceeded while waiting for capacity", elapsed_queue, 0));
+                } else {
+                    return Err(ProcessError::queue_timeout("hook queue timeout exceeded while waiting for capacity", elapsed_queue));
+                }
+            }
+            res = acquire_capacity => res?,
+        };
 
-        let ((), stdout, (), status) = tokio::try_join!(
-            write_stdin,
-            capture_stdout(stdout, max_output),
-            capture_stderr_tail(stderr, max_stderr, &stderr_capture),
-            wait_child,
-        )?;
+        drop(pending_permit);
+        let queue_ms = queue_start.elapsed().as_millis() as u64;
 
-        let execution_ms = exec_start.elapsed().as_millis() as u64;
+        let exec_start = Instant::now();
+        let exec_duration = Duration::from_millis(registration.timeout_ms(kind));
+        let exec_deadline = exec_start + exec_duration;
+        let effective_exec_deadline = match deadline {
+            Some(d) => exec_deadline.min(d),
+            None => exec_deadline,
+        };
 
-        if !status.success() {
-            let code_str = status
-                .code()
-                .map_or_else(|| "signal".into(), |n| n.to_string());
-            return Err(ProcessError::exit(
-                &code_str,
-                status.code(),
-                Vec::new(),
-                0,
+        let payload_mode = r.payload_mode;
+        let (stdin_bytes, files) = crate::blocking::run(|| match payload_mode {
+            PayloadMode::Inline => {
+                let limit = r.max_input_bytes.unwrap_or(settings.max_input_bytes);
+                let bytes = encode(envelope, limit).map_err(ProcessError::payload)?;
+                Ok::<_, ProcessError>((bytes, None))
+            }
+            PayloadMode::File => {
+                let max_payload_bytes = settings.max_payload_bytes;
+                let files = payload::spool(envelope, max_payload_bytes, invocation)?;
+                let stdin_bytes = files.v2_stdin_bytes()?;
+                Ok((stdin_bytes, Some(files)))
+            }
+        })?;
+        if self.is_shutdown() || cancel.is_some_and(|c| c.is_cancelled()) {
+            return Err(ProcessError::cancelled()
+                .with_timings(queue_ms, exec_start.elapsed().as_millis() as u64));
+        }
+        if Instant::now() >= effective_exec_deadline {
+            return Err(ProcessError::deadline(
+                "hook deadline exceeded during payload preparation",
                 queue_ms,
-                execution_ms,
+                exec_start.elapsed().as_millis() as u64,
             ));
         }
 
-        Ok::<_, ProcessError>(stdout)
-    };
+        let mut command = tokio::process::Command::new(
+            r.command
+                .first()
+                .ok_or_else(|| ProcessError::spawn("empty hook command", queue_ms))?,
+        );
+        command
+            .args(&r.command[1..])
+            .current_dir(directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .env("OCMINI_HOOK_INVOCATION_ID", invocation)
+            .env("OCMINI_HOOK_SESSION_ID", session);
 
-    let result = tokio::select! {
-        biased;
-        _ = cancelled(cancel) => {
+        if let Some(f) = &files {
+            command.env("OCMINI_HOOK_PAYLOAD_PATH", f.payload_path());
+            command.env("OCMINI_HOOK_RESPONSE_PATH", f.response_path());
+            command.env("OCMINI_HOOK_PAYLOAD_DIR", f.dir_path());
+        }
+
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let count = self.register()?;
+        let child = command.spawn().map_err(|e| {
+            ProcessError::spawn(
+                format!("cannot start hook executable {}: {e}", r.command[0]),
+                queue_ms,
+            )
+        })?;
+        let id = child
+            .id()
+            .ok_or_else(|| ProcessError::spawn("hook child has no process id", queue_ms))?;
+        let mut guard = ChildGuard {
+            child: Some(child),
+            group: crate::process::Group::new(id),
+            count: Some(count),
+        };
+        let group = guard.group.clone();
+        let child = guard.child.as_mut().unwrap();
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProcessError::io("hook stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProcessError::io("hook stdout unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ProcessError::io("hook stderr unavailable"))?;
+
+        let max_output = r.max_output_bytes.unwrap_or(settings.max_output_bytes);
+        let max_stderr = r.max_stderr_bytes.unwrap_or(settings.max_stderr_bytes);
+        let stderr_capture = Mutex::new(StderrTail::default());
+
+        let io = async {
+            let write_stdin = async {
+                match stdin.write_all(&stdin_bytes).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+                    Err(e) => {
+                        return Err(ProcessError::io(format!("cannot write hook stdin: {e}")))
+                    }
+                }
+                drop(stdin);
+                Ok::<_, ProcessError>(())
+            };
+
+            let wait_child = async {
+                group.wait(child).await.map_err(|error| {
+                    ProcessError::io(format!("cannot wait for hook child: {error}"))
+                })
+            };
+
+            let ((), stdout, (), status) = tokio::try_join!(
+                write_stdin,
+                capture_stdout(stdout, max_output),
+                capture_stderr_tail(stderr, max_stderr, &stderr_capture),
+                wait_child,
+            )?;
+
             let execution_ms = exec_start.elapsed().as_millis() as u64;
-            Err(ProcessError::cancelled().with_timings(queue_ms, execution_ms))
-        }
-        _ = tokio::time::sleep_until(effective_exec_deadline) => {
-            let execution_ms = exec_start.elapsed().as_millis() as u64;
-            Err(ProcessError::deadline("hook deadline exceeded", queue_ms, execution_ms))
-        }
-        res = io => res,
-    };
 
-    guard.stop().await;
+            if !status.success() {
+                let code_str = status
+                    .code()
+                    .map_or_else(|| "signal".into(), |n| n.to_string());
+                return Err(ProcessError::exit(
+                    &code_str,
+                    status.code(),
+                    Vec::new(),
+                    0,
+                    queue_ms,
+                    execution_ms,
+                ));
+            }
 
-    let captured = stderr_capture.into_inner().unwrap();
-    let stderr_tail: Vec<u8> = captured.bytes.into_iter().collect();
-    let stderr_bytes = captured.total;
-    let execution_ms = exec_start.elapsed().as_millis() as u64;
-    let stdout = match result {
-        Ok(stdout) => stdout,
-        Err(error) => {
-            return Err(error
-                .with_timings(queue_ms, execution_ms)
-                .with_stderr(stderr_tail, stderr_bytes))
-        }
-    };
+            Ok::<_, ProcessError>(stdout)
+        };
 
-    Ok(ProcessOutcome {
-        stdout,
-        stderr_tail,
-        stderr_bytes,
-        queue_ms,
-        execution_ms,
-        payload: files,
-        _permits: Some((_global_permit, _local_permit)),
-        deadline: effective_exec_deadline,
-    })
+        let result = tokio::select! {
+            biased;
+            _ = self.cancelled(cancel) => {
+                let execution_ms = exec_start.elapsed().as_millis() as u64;
+                Err(ProcessError::cancelled().with_timings(queue_ms, execution_ms))
+            }
+            _ = tokio::time::sleep_until(effective_exec_deadline) => {
+                let execution_ms = exec_start.elapsed().as_millis() as u64;
+                Err(ProcessError::deadline("hook deadline exceeded", queue_ms, execution_ms))
+            }
+            res = io => res,
+        };
+
+        guard.stop().await;
+
+        let captured = stderr_capture.into_inner().unwrap();
+        let stderr_tail: Vec<u8> = captured.bytes.into_iter().collect();
+        let stderr_bytes = captured.total;
+        let execution_ms = exec_start.elapsed().as_millis() as u64;
+        let stdout = match result {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                return Err(error
+                    .with_timings(queue_ms, execution_ms)
+                    .with_stderr(stderr_tail, stderr_bytes))
+            }
+        };
+
+        Ok(ProcessOutcome {
+            stdout,
+            stderr_tail,
+            stderr_bytes,
+            queue_ms,
+            execution_ms,
+            payload: files,
+            _permits: Some((_global_permit, _local_permit)),
+            deadline: effective_exec_deadline,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -964,6 +815,7 @@ mod tests {
     use crate::hooks::config::Registration;
     use serde_json::json;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_settings() -> Settings {
         Settings {
@@ -996,20 +848,21 @@ mod tests {
         let resolved = test_resolved(vec!["sh", "-c", script], PayloadMode::Inline);
         let sem = Arc::new(Semaphore::new(4));
 
-        let outcome = run(
-            &resolved,
-            &settings,
-            ".",
-            &json!({"test": 123}),
-            None,
-            None,
-            sem,
-            "turn.start.before",
-            "inv_1",
-            "ses_1",
-        )
-        .await
-        .expect("should succeed despite massive stderr");
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                ".",
+                &json!({"test": 123}),
+                None,
+                None,
+                sem,
+                super::super::InvocationKind::Handler,
+                "inv_1",
+                "ses_1",
+            )
+            .await
+            .expect("should succeed despite massive stderr");
 
         assert_eq!(outcome.stdout, b"{\"action\":\"allow\"}\n");
         assert!(outcome.stderr_bytes >= 3 * 1024 * 1024);
@@ -1026,20 +879,21 @@ mod tests {
         let sem = Arc::new(Semaphore::new(4));
 
         let start = Instant::now();
-        let err = run(
-            &resolved,
-            &settings,
-            ".",
-            &json!({"test": 123}),
-            None,
-            None,
-            sem,
-            "turn.start.before",
-            "inv_2",
-            "ses_1",
-        )
-        .await
-        .unwrap_err();
+        let err = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                ".",
+                &json!({"test": 123}),
+                None,
+                None,
+                sem,
+                super::super::InvocationKind::Handler,
+                "inv_2",
+                "ses_1",
+            )
+            .await
+            .unwrap_err();
 
         assert_eq!(err.kind, FailureKind::OutputLimit);
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -1060,19 +914,20 @@ mod tests {
 
         let sem_clone = sem.clone();
         let handle = tokio::spawn(async move {
-            run(
-                &resolved,
-                &settings,
-                ".",
-                &json!({}),
-                None,
-                None,
-                sem_clone,
-                "turn.start.before",
-                "inv_q",
-                "ses_1",
-            )
-            .await
+            Runtime::new()
+                .run(
+                    &resolved,
+                    &settings,
+                    ".",
+                    &json!({}),
+                    None,
+                    None,
+                    sem_clone,
+                    super::super::InvocationKind::Handler,
+                    "inv_q",
+                    "ses_1",
+                )
+                .await
         });
 
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1091,7 +946,7 @@ mod tests {
     async fn cancellation_during_queue_and_execution() {
         let settings = test_settings();
         let sem = Arc::new(Semaphore::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
 
         let mut resolved = test_resolved(vec!["echo", "ok"], PayloadMode::Inline);
         resolved.registration.queue_timeout_ms = Some(2000);
@@ -1099,23 +954,24 @@ mod tests {
         let cancel_clone = cancel.clone();
         let sem_clone = sem.clone();
         let handle = tokio::spawn(async move {
-            run(
-                &resolved,
-                &settings,
-                ".",
-                &json!({}),
-                Some(&cancel_clone),
-                None,
-                sem_clone,
-                "turn.start.before",
-                "inv_c1",
-                "ses_1",
-            )
-            .await
+            Runtime::new()
+                .run(
+                    &resolved,
+                    &settings,
+                    ".",
+                    &json!({}),
+                    Some(&cancel_clone),
+                    None,
+                    sem_clone,
+                    super::super::InvocationKind::Handler,
+                    "inv_c1",
+                    "ses_1",
+                )
+                .await
         });
 
         tokio::time::sleep(Duration::from_millis(30)).await;
-        cancel.store(true, Ordering::Release);
+        cancel.cancel();
 
         let err = handle.await.unwrap().unwrap_err();
         assert_eq!(err.kind, FailureKind::Cancelled);
@@ -1152,20 +1008,21 @@ mod tests {
             "input": {"hello": "world"}
         });
 
-        let outcome = run(
-            &resolved,
-            &settings,
-            dir.path().to_str().unwrap(),
-            &envelope,
-            None,
-            None,
-            sem,
-            "turn.start.before",
-            "inv_file_1",
-            "ses_file",
-        )
-        .await
-        .expect("file mode hook should succeed");
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                dir.path().to_str().unwrap(),
+                &envelope,
+                None,
+                None,
+                sem,
+                super::super::InvocationKind::Handler,
+                "inv_file_1",
+                "ses_file",
+            )
+            .await
+            .expect("file mode hook should succeed");
 
         assert!(outcome.payload.is_some());
         let payload_files = outcome.payload.as_ref().unwrap();
@@ -1209,20 +1066,21 @@ mod tests {
             PayloadMode::File,
         );
         let sem = Arc::new(Semaphore::new(4));
-        let outcome = run(
-            &resolved,
-            &settings,
-            dir.path().to_str().unwrap(),
-            &json!({}),
-            None,
-            None,
-            sem.clone(),
-            "turn.start.before",
-            "inv_bad1",
-            "s",
-        )
-        .await
-        .unwrap();
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                dir.path().to_str().unwrap(),
+                &json!({}),
+                None,
+                None,
+                sem.clone(),
+                super::super::InvocationKind::Handler,
+                "inv_bad1",
+                "s",
+            )
+            .await
+            .unwrap();
 
         let err = outcome.response_value(1024 * 1024).unwrap_err();
         assert_eq!(err.kind, FailureKind::Payload);
@@ -1234,20 +1092,21 @@ mod tests {
             echo "{\"version\":2,\"responseFile\":\"$OCMINI_HOOK_RESPONSE_PATH\"}"
         "#;
         let resolved = test_resolved(vec!["sh", "-c", script], PayloadMode::File);
-        let outcome = run(
-            &resolved,
-            &settings,
-            dir.path().to_str().unwrap(),
-            &json!({}),
-            None,
-            None,
-            sem.clone(),
-            "turn.start.before",
-            "inv_bad2",
-            "s",
-        )
-        .await
-        .unwrap();
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                dir.path().to_str().unwrap(),
+                &json!({}),
+                None,
+                None,
+                sem.clone(),
+                super::super::InvocationKind::Handler,
+                "inv_bad2",
+                "s",
+            )
+            .await
+            .unwrap();
 
         let err = outcome.response_value(1024 * 1024).unwrap_err();
         assert_eq!(err.kind, FailureKind::Payload);
@@ -1258,20 +1117,21 @@ mod tests {
             echo "{\"version\":2,\"responseFile\":\"$OCMINI_HOOK_RESPONSE_PATH\"}"
         "#;
         let resolved = test_resolved(vec!["sh", "-c", script], PayloadMode::File);
-        let outcome = run(
-            &resolved,
-            &settings,
-            dir.path().to_str().unwrap(),
-            &json!({}),
-            None,
-            None,
-            sem.clone(),
-            "turn.start.before",
-            "inv_bad3",
-            "s",
-        )
-        .await
-        .unwrap();
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                dir.path().to_str().unwrap(),
+                &json!({}),
+                None,
+                None,
+                sem.clone(),
+                super::super::InvocationKind::Handler,
+                "inv_bad3",
+                "s",
+            )
+            .await
+            .unwrap();
 
         let err = outcome.response_value(512).unwrap_err();
         assert_eq!(err.kind, FailureKind::Payload);
@@ -1282,20 +1142,21 @@ mod tests {
             echo "{\"version\":2,\"responseFile\":\"$OCMINI_HOOK_RESPONSE_PATH\"}"
         "#;
         let resolved = test_resolved(vec!["sh", "-c", script], PayloadMode::File);
-        let outcome = run(
-            &resolved,
-            &settings,
-            dir.path().to_str().unwrap(),
-            &json!({}),
-            None,
-            None,
-            sem,
-            "turn.start.before",
-            "inv_bad4",
-            "s",
-        )
-        .await
-        .unwrap();
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                dir.path().to_str().unwrap(),
+                &json!({}),
+                None,
+                None,
+                sem,
+                super::super::InvocationKind::Handler,
+                "inv_bad4",
+                "s",
+            )
+            .await
+            .unwrap();
 
         let err = outcome.response_value(1024 * 1024).unwrap_err();
         assert_eq!(err.kind, FailureKind::Payload);
@@ -1314,20 +1175,21 @@ mod tests {
         let resolved = test_resolved(vec!["sh", "-c", script], PayloadMode::File);
         let sem = Arc::new(Semaphore::new(4));
 
-        let outcome = run(
-            &resolved,
-            &settings,
-            dir.path().to_str().unwrap(),
-            &json!({}),
-            None,
-            None,
-            sem,
-            "turn.start.before",
-            "inv_clean",
-            "s",
-        )
-        .await
-        .unwrap();
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                dir.path().to_str().unwrap(),
+                &json!({}),
+                None,
+                None,
+                sem,
+                super::super::InvocationKind::Handler,
+                "inv_clean",
+                "s",
+            )
+            .await
+            .unwrap();
 
         let temp_dir_path = fs::read_to_string(dir.path().join("dir.txt")).unwrap();
         let temp_dir_path = Path::new(temp_dir_path.trim());
@@ -1376,20 +1238,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let local = Arc::new(Semaphore::new(1));
         let resolved = test_resolved(vec!["true"], PayloadMode::Inline);
-        let outcome = run(
-            &resolved,
-            &settings,
-            dir.path().to_str().unwrap(),
-            &json!({}),
-            None,
-            None,
-            local.clone(),
-            "turn.start.before",
-            "inv_capacity",
-            "s",
-        )
-        .await
-        .unwrap();
+        let outcome = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                dir.path().to_str().unwrap(),
+                &json!({}),
+                None,
+                None,
+                local.clone(),
+                super::super::InvocationKind::Handler,
+                "inv_capacity",
+                "s",
+            )
+            .await
+            .unwrap();
         assert_eq!(local.available_permits(), 0);
         drop(outcome);
         assert_eq!(local.available_permits(), 1);
@@ -1407,20 +1270,21 @@ mod tests {
         let mut resolved = test_resolved(vec!["true"], PayloadMode::Inline);
         resolved.registration.queue_timeout_ms = Some(25);
         let encodes = Arc::new(AtomicUsize::new(0));
-        let error = run(
-            &resolved,
-            &settings,
-            ".",
-            &Input(encodes.clone()),
-            None,
-            None,
-            Arc::new(Semaphore::new(0)),
-            "turn.start.before",
-            "inv_queue",
-            "s",
-        )
-        .await
-        .unwrap_err();
+        let error = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                ".",
+                &Input(encodes.clone()),
+                None,
+                None,
+                Arc::new(Semaphore::new(0)),
+                super::super::InvocationKind::Handler,
+                "inv_queue",
+                "s",
+            )
+            .await
+            .unwrap_err();
         assert_eq!(error.kind, FailureKind::QueueTimeout);
         assert_eq!(encodes.load(Ordering::Relaxed), 0);
     }
@@ -1432,21 +1296,58 @@ mod tests {
             PayloadMode::Inline,
         );
         let start = Instant::now();
-        let out = run(
-            &resolved,
-            &settings,
-            ".",
-            &json!({}),
-            None,
-            None,
-            Arc::new(Semaphore::new(1)),
-            "turn.start.before",
-            "inv_children",
-            "s",
-        )
-        .await
-        .unwrap();
+        let out = Runtime::new()
+            .run(
+                &resolved,
+                &settings,
+                ".",
+                &json!({}),
+                None,
+                None,
+                Arc::new(Semaphore::new(1)),
+                super::super::InvocationKind::Handler,
+                "inv_children",
+                "s",
+            )
+            .await
+            .unwrap();
         assert_eq!(out.stdout, b"{}\n");
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+    #[tokio::test]
+    async fn application_pools_and_shutdown_do_not_change_another_runtime() {
+        let first = Runtime::new();
+        let second = Runtime::new();
+        first.configure(&Settings {
+            max_global_processes: 1,
+            ..Settings::default()
+        });
+        assert_eq!(first.processes.capacity(), 1);
+        assert_eq!(second.processes.capacity(), 16);
+        first.shutdown().await;
+        assert!(first.is_shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), second.cancelled(None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_registered_processes_and_refuses_new_ones() {
+        let runtime = Runtime::new();
+        let process = runtime.register().unwrap();
+        let mut shutdown = Box::pin(runtime.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(runtime.register().is_err());
+        drop(process);
+        tokio::time::timeout(Duration::from_millis(100), shutdown)
+            .await
+            .unwrap();
+        assert_eq!(*runtime.active.lock().unwrap(), 0);
     }
 }

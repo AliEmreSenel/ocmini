@@ -265,6 +265,29 @@ async fn run_command_prints_the_answer_and_continues_the_session() {
 }
 
 #[tokio::test]
+async fn run_reports_fatal_provider_errors_in_both_formats() {
+    let provider = Provider::start(vec![
+        Script::http_status_body(400, "invalid request from CLI test"),
+        Script::http_status_body(400, "invalid request from CLI test"),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    for format in ["text", "json"] {
+        let output = configured_command(server.root.path(), &server.directory)
+            .args(["run", "--format", format, "failure test"])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success(), "{format}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid request from CLI test"),
+            "{output:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn run_json_format_emits_event_lines() {
     let provider = Provider::start(vec![Script::ok(vec![
         json!({"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "deep thought"}, "finish_reason": null}]}),

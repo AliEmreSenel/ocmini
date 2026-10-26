@@ -30,6 +30,7 @@ tempfile = "3.27.0"
 yaml_serde = "0.10.7"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+schemars = { version = "1", features = ["derive"] }
 
 [[bin]]
 name = "ocmini"

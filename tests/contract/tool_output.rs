@@ -369,3 +369,44 @@ async fn aborting_a_session_stops_the_background_jobs_it_started() {
     }
     panic!("background job {pid} survived the session abort");
 }
+
+#[tokio::test]
+async fn malformed_optional_shell_fields_fail_without_effects_and_remain_visible() {
+    let input = json!({"command":"printf SHOULD_NOT_RUN > malformed-effect", "background":"false"});
+    let mut provider = Provider::start(vec![
+        tool_script("bash", input.clone(), "malformed-shell"),
+        text_script("Correct the tool input", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{sid}/message"),
+            &prompt("msg_malformed_shell", "Run command"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(!server.directory.join("malformed-effect").exists());
+    let messages = server.messages(&sid).await;
+    let tool = messages
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .find(|part| part["callID"] == "malformed-shell")
+        .unwrap();
+    assert_eq!(tool["state"]["status"], "error");
+    assert_eq!(tool["state"]["input"], input);
+    provider.request().await;
+    let continued = provider.request().await;
+    assert!(continued["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("boolean"))));
+}

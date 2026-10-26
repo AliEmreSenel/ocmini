@@ -1102,3 +1102,66 @@ async fn a_failed_text_hook_records_measured_usage_and_never_executes_tools() {
         .filter(|p| p["type"] == "tool")
         .all(|p| p["state"]["status"] == "error"));
 }
+
+#[tokio::test]
+async fn cancelling_a_result_hook_preserves_completed_effects_and_accounting() {
+    let mut provider = Provider::start(vec![tool_script(
+        "write",
+        json!({"filePath":"completed.txt","content":"written once"}),
+        "call_after_cancel",
+    )])
+    .await;
+    let code = "import json,sys,pathlib,time; json.load(sys.stdin); pathlib.Path('after-entered').touch(); time.sleep(30)";
+    let server = TestServer::start(
+        &provider,
+        hook_config(vec![registration("tool.execute.after", code)]),
+    )
+    .await;
+    let sid = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{sid}/prompt_async"),
+            &prompt("msg_after_cancel", "Write a file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    wait_file(&server.directory.join("after-entered")).await;
+    assert_eq!(
+        std::fs::read_to_string(server.directory.join("completed.txt")).unwrap(),
+        "written once"
+    );
+    server
+        .post(&format!("/session/{sid}/abort"), &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
+    let messages = server.messages(&sid).await;
+    let tool = messages
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .find(|part| part["callID"] == "call_after_cancel")
+        .unwrap();
+    assert_eq!(tool["state"]["status"], "error");
+    assert_eq!(tool["state"]["metadata"]["executionOccurred"], true);
+    assert!(tool["state"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("effects already completed"));
+    assert_eq!(
+        messages
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .filter(|part| part["type"] == "step-finish")
+            .count(),
+        1
+    );
+    provider.request().await;
+    assert!(provider.requests.try_recv().is_err());
+}

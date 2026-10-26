@@ -234,7 +234,7 @@ Full tool outputs saved separately from transcript previews are retained by defa
 
 ## ocmini hook extension
 
-The command-based `ocmini.hooks` interface has awaited operation hooks and event subscriptions. [HOOKS.md](HOOKS.md) is the user guide; [HOOKS-REFERENCE.md](HOOKS-REFERENCE.md) specifies the schemas, complete catalog, and advanced settings; [HOOKS-PLAN.md](HOOKS-PLAN.md) describes architecture. Conversation, tool, model, and resource families organize the existing names without adding configuration keys or execution modes.
+The command-based `ocmini.hooks` interface has awaited operation hooks and event subscriptions. [hooks guide](hooks.md) is the user guide; [hook reference](hooks-reference.md) specifies the schemas, complete catalog, and advanced settings. Conversation, tool, model, and resource families organize the existing names without adding configuration keys or execution modes.
 
 Hooks are ordered and schema-validated. Final arguments are authorized after all preparation. A per-prompt completion gate can request continuation; the read-only finalizer finishes before its waiter or queue-idle transition. Steering and cancellation preempt a natural-completion gate. Required failures block by default; optional handlers can continue on failure, preserving prior valid input and native permissions. Explicit denials and cancellation remain authoritative. Hook installation is explicit, and project registrations require trusted user/launch policy. Existing scripts retain inline v1; file payload mode uses v2 references to exact invocation snapshots. Stderr volume does not fail an operation.
 

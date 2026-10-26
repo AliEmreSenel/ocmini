@@ -1,6 +1,8 @@
+use crate::events as event;
+pub(crate) mod hooks;
 use crate::engine::App;
 use crate::store::Store;
-use crate::types::{now_ms, PermissionRule, Session, Time, Tokens};
+use crate::types::{OperationError, PermissionRule, Session};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -11,12 +13,15 @@ const PLACEHOLDER_TITLES: [&str; 3] = ["tui session", "run", "New session"];
 /// Longest auto-title in characters; the picker truncates further to fit.
 const TITLE_MAX: usize = 80;
 
-pub fn directory(path: &str) -> Result<String, String> {
-    let path = Path::new(path)
-        .canonicalize()
-        .map_err(|error| format!("Cannot open directory {path}: {error}"))?;
+pub fn directory(path: &str) -> Result<String, OperationError> {
+    let path = Path::new(path).canonicalize().map_err(|error| {
+        OperationError::invalid(format!("Cannot open directory {path}: {error}"))
+    })?;
     if !path.is_dir() {
-        return Err(format!("Not a directory: {}", path.display()));
+        return Err(OperationError::invalid(format!(
+            "Not a directory: {}",
+            path.display()
+        )));
     }
     Ok(path.to_string_lossy().into_owned())
 }
@@ -26,15 +31,18 @@ pub fn open(
     path: Option<&str>,
     id: Option<&str>,
     continue_last: bool,
-) -> Result<Session, String> {
+) -> Result<Session, OperationError> {
     let path = path.map(directory).transpose()?;
     let session = if let Some(id) = id {
         let session = store
             .get_session(id)?
-            .ok_or_else(|| format!("Session not found: {id}"))?;
+            .ok_or_else(|| OperationError::not_found(format!("Session not found: {id}")))?;
         if let Some(path) = &path {
             if *path != directory(&session.directory)? {
-                return Err(format!("Session {id} belongs to {}", session.directory));
+                return Err(OperationError::not_found(format!(
+                    "Session {id} belongs to {}",
+                    session.directory
+                )));
             }
         }
         session
@@ -45,13 +53,16 @@ pub fn open(
                 .list_sessions(Some(&path))?
                 .into_iter()
                 .find(|session| session.parent_id.is_none())
-                .ok_or_else(|| format!("No saved sessions in {path}"))?
+                .ok_or_else(|| OperationError::not_found(format!("No saved sessions in {path}")))?
         } else {
-            store.try_create_session_owned("tui session", &path)?
+            return Err("Fresh sessions must be created through the application lifecycle".into());
         }
     };
     if store.is_busy(&session.id)? {
-        return Err(format!("Session {} is already busy", session.id));
+        return Err(OperationError::busy(format!(
+            "Session {} is already busy",
+            session.id
+        )));
     }
     // Verify the saved project still exists before entering terminal raw mode.
     directory(&session.directory)?;
@@ -59,13 +70,16 @@ pub fn open(
 }
 
 /// CLI subprocesses inherit explicit hook correlation from the command runner.
-pub fn reject_correlated_reentry(session_id: &str) -> Result<(), String> {
+pub fn reject_correlated_reentry(session_id: &str) -> Result<(), OperationError> {
     let invocation = std::env::var("OCMINI_HOOK_INVOCATION_ID").ok();
     let origin_session = std::env::var("OCMINI_HOOK_SESSION_ID").ok();
     if invocation.as_ref().is_some_and(|value| !value.is_empty())
         && origin_session.as_deref() == Some(session_id)
     {
-        return Err("A hook cannot synchronously wait for a prompt in its own session".into());
+        return Err(OperationError::new(
+            crate::types::FailureKind::HookReentry,
+            "A hook cannot synchronously wait for a prompt in its own session",
+        ));
     }
     Ok(())
 }
@@ -76,60 +90,43 @@ pub async fn open_for_app(
     path: Option<&str>,
     id: Option<&str>,
     continue_last: bool,
-) -> Result<Session, String> {
+) -> Result<Session, OperationError> {
     if id.is_some() || continue_last {
         return open(&app.store, path, id, continue_last);
     }
     let path = directory(path.unwrap_or("."))?;
-    create_owned(app, "tui session", &path, None, None).await
-}
-
-pub async fn create_owned(
-    app: &App,
-    title: &str,
-    directory: &str,
-    parent_id: Option<String>,
-    permission: Option<Vec<PermissionRule>>,
-) -> Result<Session, String> {
-    create_owned_with_metadata(app, title, directory, parent_id, permission, None).await
-}
-
-pub async fn create_owned_with_metadata(
-    app: &App,
-    title: &str,
-    directory: &str,
-    parent_id: Option<String>,
-    permission: Option<Vec<PermissionRule>>,
-    metadata: Option<&Value>,
-) -> Result<Session, String> {
-    let now = now_ms();
-    let mut session = Session {
-        id: crate::types::hex_id("ses_"),
-        slug: crate::types::slug(),
-        project_id: "global".into(),
-        directory: directory.into(),
-        path: directory.into(),
-        cost: 0.0,
-        tokens: Tokens::default(),
-        title: title.into(),
-        version: crate::OPENCODE_COMPAT_VERSION.into(),
-        time: Time {
-            created: now,
-            updated: Some(now),
-            ..Default::default()
-        },
-        parent_id,
-        permission,
-        extra: Default::default(),
-    };
-    if let Some(metadata) = metadata {
-        apply_public_fields(&mut session, &json!({"metadata":metadata}), false)?;
-    }
-    create(app, session).await
+    create(app, Session::new("tui session", &path), None).await
 }
 
 /// User/resource creation; automatic accounting and title updates use Store directly.
-pub async fn create(app: &App, mut session: Session) -> Result<Session, String> {
+pub fn set_status(app: &App, sid: &str, status: event::SessionStatus) {
+    let mut statuses = app.statuses.lock().unwrap();
+    match status {
+        event::SessionStatus::Idle => {
+            statuses.remove(sid);
+        }
+        _ => {
+            statuses.insert(sid.to_owned(), status.clone());
+        }
+    }
+    drop(statuses);
+    app.hooks.emit(
+        event::Session::Status {
+            session_id: sid,
+            status: &status,
+        },
+        &app.session_context(sid, json!({})),
+    );
+}
+
+pub async fn create(
+    app: &App,
+    mut session: Session,
+    metadata: Option<&Value>,
+) -> Result<Session, OperationError> {
+    if let Some(metadata) = metadata {
+        apply_public_fields(&mut session, &json!({"metadata":metadata}), false)?;
+    }
     let app = app.for_directory(&session.directory)?;
     validate_parent(&app, &session)?;
     let context =
@@ -137,7 +134,7 @@ pub async fn create(app: &App, mut session: Session) -> Result<Session, String> 
     let input = app
         .hooks
         .run(
-            "session.create.before",
+            crate::sessions::hooks::SESSION_CREATE_BEFORE,
             &context,
             json!({"title":session.title,"metadata":session.extra,"permission":session.permission}),
             None,
@@ -148,18 +145,20 @@ pub async fn create(app: &App, mut session: Session) -> Result<Session, String> 
     validate_parent(&app, &session)?;
     app.store.create_session(&session)?;
     app.hooks
-        .emit("session.created", &context, json!({"info":session}));
+        .emit(event::Session::Created { info: &session }, &context);
     Ok(session)
 }
 
-fn validate_parent(app: &App, session: &Session) -> Result<(), String> {
+fn validate_parent(app: &App, session: &Session) -> Result<(), OperationError> {
     if let Some(parent) = &session.parent_id {
         let parent = app
             .store
             .get_session(parent)?
-            .ok_or("Parent session not found")?;
+            .ok_or_else(|| OperationError::not_found("Parent session not found"))?;
         if directory(&parent.directory)? != directory(&session.directory)? {
-            return Err("Parent session not found in this directory".into());
+            return Err(OperationError::not_found(
+                "Parent session not found in this directory",
+            ));
         }
     }
     Ok(())
@@ -169,14 +168,19 @@ fn apply_public_fields(
     session: &mut Session,
     input: &Value,
     title_allowed: bool,
-) -> Result<(), String> {
+) -> Result<(), OperationError> {
     if title_allowed {
         if let Some(title) = input.get("title") {
-            session.title = title.as_str().ok_or("title must be a string")?.into();
+            session.title = title
+                .as_str()
+                .ok_or_else(|| OperationError::invalid("title must be a string"))?
+                .into();
         }
     }
     if let Some(metadata) = input.get("metadata") {
-        let metadata = metadata.as_object().ok_or("metadata must be an object")?;
+        let metadata = metadata
+            .as_object()
+            .ok_or_else(|| OperationError::invalid("metadata must be an object"))?;
         // These flattened keys are authority or persisted runtime state, never public metadata.
         const RESERVED: &[&str] = &[
             "id",
@@ -194,9 +198,12 @@ fn apply_public_fields(
             "revert",
             "share",
             "summary",
+            "ocminiTitleSource",
         ];
         if metadata.keys().any(|key| RESERVED.contains(&key.as_str())) {
-            return Err("metadata contains a reserved session field".into());
+            return Err(OperationError::invalid(
+                "metadata contains a reserved session field",
+            ));
         }
         let mut fields: serde_json::Map<String, Value> = session
             .extra
@@ -214,74 +221,87 @@ fn apply_public_fields(
     Ok(())
 }
 
-pub async fn update(app: &App, source: &Session, requested: Value) -> Result<Session, String> {
+pub async fn update(
+    app: &App,
+    source: &Session,
+    requested: Value,
+) -> Result<Session, OperationError> {
     let app = app.for_directory(&source.directory)?;
     if !requested.is_object() {
-        return Err("Session body must be an object".into());
+        return Err(OperationError::invalid("Session body must be an object"));
     }
     // Validate before a handler runs. Permission authority is visible but immutable to hooks.
     let mut validated = source.clone();
     apply_public_fields(&mut validated, &requested, true)?;
     let permission: Option<Vec<PermissionRule>> = requested
         .get("permission")
-        .map(|value| {
-            serde_json::from_value(value.clone())
-                .map_err(|e| format!("Invalid permission rules: {e}"))
-        })
-        .transpose()?;
+        .map(crate::permission::parse_rules)
+        .transpose()
+        .map_err(OperationError::invalid)?;
     let title_requested = requested.get("title").is_some();
     let metadata_requested = requested.get("metadata").is_some();
     let context =
         json!({"directory":source.directory,"sessionID":source.id,"parentID":source.parent_id});
     let input = app
         .hooks
-        .run("session.update.before", &context, requested, None)
+        .run(
+            crate::sessions::hooks::SESSION_UPDATE_BEFORE,
+            &context,
+            requested,
+            None,
+        )
         .await?
         .input;
-    let mut session = app
-        .store
-        .get_session(&source.id)?
-        .ok_or("Session not found")?;
     if (!title_requested && input.get("title").is_some())
         || (!metadata_requested && input.get("metadata").is_some())
     {
-        return Err("Session hooks may only change explicitly requested fields".into());
+        return Err(OperationError::invalid(
+            "Session hooks may only change explicitly requested fields",
+        ));
     }
-    apply_public_fields(&mut session, &input, title_requested)?;
-    if let Some(permission) = permission {
-        session.permission = Some(permission);
-    }
-    session.time.updated = Some(now_ms());
-    app.store.update_session(&session)?;
+    let session = app
+        .store
+        .mutate_session(&source.id, |session| {
+            apply_public_fields(session, &input, title_requested)?;
+            if title_requested {
+                session.title_source = Some(crate::types::TitleSource::Explicit);
+            }
+            if let Some(permission) = permission {
+                session.permission = Some(permission);
+            }
+            Ok(true)
+        })?
+        .ok_or_else(|| OperationError::not_found("Session not found"))?;
     app.hooks
-        .emit("session.updated", &context, json!({"info":session}));
+        .emit(event::Session::Updated { info: &session }, &context);
     Ok(session)
 }
 
-pub async fn fork(app: &App, source: &Session, boundary: Option<&str>) -> Result<Session, String> {
+pub async fn fork(
+    app: &App,
+    source: &Session,
+    boundary: Option<&str>,
+) -> Result<Session, OperationError> {
     let app = app.for_directory(&source.directory)?;
     if app.store.is_busy(&source.id)? {
-        return Err("Session is busy".into());
+        return Err(OperationError::busy("Session is busy"));
     }
     if let Some(boundary) = boundary {
-        if !app
-            .store
-            .messages(&source.id)?
-            .iter()
-            .any(|message| message.info.id == boundary)
-        {
-            return Err("Fork boundary message not found".into());
+        if app.store.message_owner(boundary)?.as_deref() != Some(&source.id) {
+            return Err(OperationError::not_found("Fork boundary message not found"));
         }
     }
     let context =
         json!({"directory":source.directory,"sessionID":source.id,"parentID":source.parent_id});
-    let input = app.hooks.run("session.fork.before", &context,
+    let input = app.hooks.run(crate::sessions::hooks::SESSION_FORK_BEFORE, &context,
         json!({"title":format!("{} (fork)",source.title),"sourceID":source.id,"messageID":boundary}), None).await?.input;
-    let title = input["title"].as_str().ok_or("title must be a string")?;
+    let title = input["title"]
+        .as_str()
+        .ok_or_else(|| OperationError::invalid("title must be a string"))?;
     let input = app
         .hooks
         .run(
-            "session.create.before",
+            crate::sessions::hooks::SESSION_CREATE_BEFORE,
             &context,
             json!({"title":title,"metadata":{},"permission":source.permission}),
             None,
@@ -292,25 +312,33 @@ pub async fn fork(app: &App, source: &Session, boundary: Option<&str>) -> Result
     fields.extra.clear();
     apply_public_fields(&mut fields, &input, true)?;
     if app.store.is_busy(&source.id)? {
-        return Err("Session is busy".into());
+        return Err(OperationError::busy("Session is busy"));
     }
-    let mut session = app.store.try_fork(source, boundary)?;
-    session.title = fields.title;
-    session.extra.extend(fields.extra);
-    app.store.update_session(&session)?;
+    let forked = app.store.try_fork(source, boundary)?;
+    let session = app
+        .store
+        .mutate_session(&forked.id, |session| {
+            session.title = fields.title;
+            session.extra.extend(fields.extra);
+            Ok(true)
+        })?
+        .ok_or_else(|| OperationError::not_found("Session not found"))?;
     let created_context =
         json!({"directory":session.directory,"sessionID":session.id,"parentID":session.parent_id});
     app.hooks
-        .emit("session.created", &created_context, json!({"info":session}));
+        .emit(event::Session::Created { info: &session }, &created_context);
     app.hooks.emit(
-        "ocmini.session.forked",
+        event::Session::Forked {
+            source_id: &source.id,
+            session_id: &session.id,
+            message_id: boundary,
+        },
         &created_context,
-        json!({"sourceID":source.id,"sessionID":session.id,"messageID":boundary}),
     );
     Ok(session)
 }
 
-pub async fn delete(app: &App, session: &Session) -> Result<(), String> {
+pub async fn delete(app: &App, session: &Session) -> Result<(), OperationError> {
     let mut sessions = vec![session.clone()];
     let mut ids = std::collections::HashSet::from([session.id.clone()]);
     let mut index = 0;
@@ -326,7 +354,7 @@ pub async fn delete(app: &App, session: &Session) -> Result<(), String> {
     // Cascade vetoes all run before the transaction or process cleanup begins.
     for session in &sessions {
         if app.store.is_busy(&session.id)? {
-            return Err("Session or a child session is busy".into());
+            return Err(OperationError::busy("Session or a child session is busy"));
         }
     }
     let scopes = sessions
@@ -338,7 +366,7 @@ pub async fn delete(app: &App, session: &Session) -> Result<(), String> {
         scoped
             .hooks
             .run(
-                "session.delete.before",
+                crate::sessions::hooks::SESSION_DELETE_BEFORE,
                 &context,
                 json!({"info":session}),
                 None,
@@ -349,14 +377,14 @@ pub async fn delete(app: &App, session: &Session) -> Result<(), String> {
         &session.id,
         &sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
     )? {
-        return Err("Session not found".into());
+        return Err(OperationError::not_found("Session not found"));
     }
     for (session, scoped) in sessions.iter().zip(&scopes) {
         crate::tools::cancel_background_jobs(&session.id);
         let context = json!({"directory":session.directory,"sessionID":session.id,"parentID":session.parent_id});
         scoped
             .hooks
-            .emit("session.deleted", &context, json!({"info":session}));
+            .emit(event::Session::Deleted { info: session }, &context);
     }
     Ok(())
 }
@@ -369,12 +397,15 @@ pub(crate) fn is_placeholder(title: &str) -> bool {
     title.trim().is_empty() || PLACEHOLDER_TITLES.contains(&title)
 }
 
+pub(crate) fn can_auto_title(session: &Session) -> bool {
+    session.title_source.is_none()
+        && session.extra.get("ocminiTitleExplicit") != Some(&json!(true))
+        && is_placeholder(&session.title)
+}
+
 /// The text of a prompt's text parts, in order.
 pub fn prompt_text(parts: &[Value]) -> String {
-    parts
-        .iter()
-        .filter(|part| part["type"] == "text")
-        .filter_map(|part| part["text"].as_str())
+    crate::types::text_parts(parts)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -410,22 +441,24 @@ pub fn title_from_reply(reply: &str) -> Option<String> {
 
 /// Name a session, keeping a title the user chose (`--title`,
 /// `PATCH /session`). Returns the updated session when renamed.
-pub fn set_title(store: &Store, id: &str, title: &str) -> Result<Option<Session>, String> {
-    let Some(mut session) = store.get_session(id)? else {
-        return Ok(None);
-    };
-    if !is_placeholder(&session.title) {
-        return Ok(None);
-    }
-    session.title = title.to_string();
-    session.time.updated = Some(now_ms());
-    store.update_session(&session)?;
-    Ok(Some(session))
+pub fn set_title(store: &Store, id: &str, title: &str) -> Result<Option<Session>, OperationError> {
+    store.mutate_session(id, |session| {
+        if !can_auto_title(session) {
+            return Ok(false);
+        }
+        session.title = title.to_owned();
+        session.title_source = Some(crate::types::TitleSource::Automatic);
+        Ok(true)
+    })
 }
 
 /// Name a freshly launched session after its prompt, so the resume list shows
 /// the topic instead of `tui session`.
-pub fn auto_title(store: &Store, id: &str, parts: &[Value]) -> Result<Option<Session>, String> {
+pub fn auto_title(
+    store: &Store,
+    id: &str,
+    parts: &[Value],
+) -> Result<Option<Session>, OperationError> {
     match title_from_prompt(parts) {
         Some(title) => set_title(store, id, &title),
         None => Ok(None),
@@ -489,7 +522,7 @@ mod tests {
         store.create_session_owned("another project", "/elsewhere");
         assert_eq!(open(&store, Some(&path), None, true).unwrap().id, latest.id);
         assert_ne!(
-            open(&store, Some(&path), None, false).unwrap().id,
+            store.create_session_owned("tui session", &path).id,
             latest.id
         );
     }
@@ -500,7 +533,7 @@ mod tests {
         let path = directory(project.path().to_str().unwrap()).unwrap();
         let database = project.path().join("sessions.db");
         let store = Store::open(&database, "first").unwrap();
-        let session = open(&store, Some(&path), None, false).unwrap();
+        let session = store.create_session_owned("tui session", &path);
         store.add_message(&MessageWithParts {
             info: MessageInfo {
                 id: "previous".into(), session_id: session.id.clone(), role: "user".into(),
@@ -531,7 +564,7 @@ mod tests {
         assert!(open(&store, None, Some("missing"), false)
             .unwrap_err()
             .contains("Session not found"));
-        let session = open(&store, Some(&path), None, false).unwrap();
+        let session = store.create_session_owned("tui session", &path);
         assert!(
             open(&store, other.path().to_str(), Some(&session.id), false)
                 .unwrap_err()
@@ -562,7 +595,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let path = directory(project.path().to_str().unwrap()).unwrap();
         let store = Store::open(Path::new(":memory:"), "test").unwrap();
-        let session = open(&store, Some(&path), None, false).unwrap();
+        let session = store.create_session_owned("tui session", &path);
         assert_eq!(session.title, "tui session");
         let prompt =
             [serde_json::json!({"type":"text","text":"  \nFix the resume picker\nkeep scrolling"})];

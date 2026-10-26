@@ -645,6 +645,45 @@ async fn usage_near_the_context_limit_compacts_proactively() {
         Some(()),
         "compaction ends the turn's requests"
     );
+    let saved = server.messages(&id).await;
+    let summary = saved
+        .iter()
+        .find(|message| message["info"]["summary"] == true)
+        .unwrap();
+    assert_eq!(summary["info"]["tokens"]["output"], 7);
+    assert_eq!(
+        summary["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part["type"] == "step-finish")
+            .count(),
+        1
+    );
+    let session: Value = server
+        .get(&format!("/session/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["tokens"]["output"], 107);
+    let sidecar = rusqlite::Connection::open(
+        server
+            .root
+            .path()
+            .join(".local/share/opencode/opencode-ocmini.db"),
+    )
+    .unwrap();
+    let count: i64 = sidecar
+        .query_row(
+            "SELECT COUNT(*) FROM message WHERE session_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
     let response = server
         .post(
             &format!("/session/{id}/message"),
@@ -673,6 +712,89 @@ async fn usage_near_the_context_limit_compacts_proactively() {
                 .is_some_and(|c| c.contains("Continuation summary") && c.contains("Summary text"))),
         "next turn starts from the summary"
     );
+}
+
+#[tokio::test]
+async fn manual_summaries_use_the_same_tool_bound_and_measured_accounting() {
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "bash",
+            json!({"command":"printf 'BEGIN_%09000d_END' 0"}),
+            "call_manual_summary",
+        ),
+        text_script("Before summary", ""),
+        text_script("Summary", ""),
+    ])
+    .await;
+    let server = TestServer::start(
+        &provider,
+        json!({"compaction":{"auto":false,"tail_turns":0}}),
+    )
+    .await;
+    let sid = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{sid}/message"),
+            &prompt("msg_manual_bound", "Produce output"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let original = provider.request().await;
+    let full = original["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(full.len() > 9000);
+    server
+        .post(
+            &format!("/session/{sid}/summarize"),
+            &json!({"providerID":"mock","modelID":"test-model"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let request = provider.request().await;
+    let shortened = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(shortened.chars().count() < 2050);
+    assert!(shortened.contains("[truncated]"));
+    let saved = server.messages(&sid).await;
+    let summary = saved
+        .iter()
+        .find(|message| message["info"]["summary"] == true)
+        .unwrap();
+    assert_eq!(summary["info"]["tokens"]["output"], 7);
+    let tool = saved
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .find(|part| part["callID"] == "call_manual_summary")
+        .unwrap();
+    assert_eq!(tool["state"]["output"], full);
+    let session: Value = server
+        .get(&format!("/session/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["tokens"]["output"], 21);
 }
 
 #[tokio::test]

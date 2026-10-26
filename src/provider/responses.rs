@@ -1,73 +1,8 @@
-use super::{
-    error_message, json_response, read_response, usage_openai, ChatRequest, EventStream,
-    ProviderError, Settings,
-};
+use super::stream::Decoder;
+use super::{error_message, usage_openai, ChatRequest, EventStream, ProviderError, Settings};
 use crate::types::{ProviderEvent, Tokens};
-use async_stream::stream;
-use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-
-fn content_parts(value: &Value, assistant: bool) -> Result<Vec<Value>, String> {
-    let text_type = if assistant {
-        "output_text"
-    } else {
-        "input_text"
-    };
-    if let Some(text) = value.as_str() {
-        return Ok(if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![json!({"type":text_type,"text":text})]
-        });
-    }
-    if value.is_null() {
-        return Ok(Vec::new());
-    }
-    let parts = value
-        .as_array()
-        .ok_or("Responses message content must be text or an array")?;
-    let mut output = Vec::new();
-    for part in parts {
-        match part["type"].as_str().unwrap_or_default() {
-            "text" | "input_text" | "output_text" => {
-                output.push(json!({"type":text_type,"text":part["text"]}))
-            }
-            "image_url" => {
-                let mut image = json!({"type":"input_image","image_url":part["image_url"]["url"]});
-                if let Some(detail) = part["image_url"].get("detail") {
-                    image["detail"] = detail.clone();
-                }
-                output.push(image);
-            }
-            "input_image" | "input_file" => output.push(part.clone()),
-            "file" => {
-                let file = part
-                    .get("file")
-                    .ok_or("file attachment is missing its file object")?;
-                if !file.is_object() {
-                    return Err("file attachment must be an object".into());
-                }
-                let mut file = file.clone();
-                if file["file_data"]
-                    .as_str()
-                    .is_some_and(|url| url.starts_with("https://") || url.starts_with("http://"))
-                {
-                    let url = file.as_object_mut().unwrap().remove("file_data").unwrap();
-                    file["file_url"] = url;
-                }
-                file["type"] = json!("input_file");
-                output.push(file);
-            }
-            other => {
-                return Err(format!(
-                    "OpenAI Responses does not support message part type {other}"
-                ))
-            }
-        }
-    }
-    Ok(output)
-}
 
 fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String> {
     let mut input = Vec::new();
@@ -77,13 +12,17 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
             let output = if let Some(text) = message["content"].as_str() {
                 json!(text)
             } else {
-                json!(content_parts(&message["content"], false)?)
+                json!(crate::provider::content::blocks(
+                    &message["content"],
+                    crate::provider::Protocol::Responses,
+                    false
+                )?)
             };
             input.push(json!({"type":"function_call_output","call_id":message["tool_call_id"],"output":output}));
             continue;
         }
         if role == "assistant" && message["providerMetadata"]["provider"] == "openai-responses" {
-            let metadata = super::hooks::replay_metadata(message)?;
+            let metadata = super::replay::replay_metadata(message)?;
             if let Some(items) = metadata["output"]
                 .as_array()
                 .filter(|items| !items.is_empty())
@@ -92,7 +31,11 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
                 continue;
             }
         }
-        let content = content_parts(&message["content"], role == "assistant")?;
+        let content = crate::provider::content::blocks(
+            &message["content"],
+            crate::provider::Protocol::Responses,
+            role == "assistant",
+        )?;
         if !content.is_empty() {
             input.push(json!({"role":role,"content":content}));
         }
@@ -107,65 +50,12 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
     if settings.tools_supported && !req.tools.is_empty() {
         body["tools"] = json!(req.tools.iter().map(|tool| json!({"type":"function","name":tool["function"]["name"],"description":tool["function"]["description"],"parameters":tool["function"]["parameters"],"strict":false})).collect::<Vec<_>>());
     }
-    for (key, wire) in [
-        ("temperature", "temperature"),
-        ("topP", "top_p"),
-        ("parallelToolCalls", "parallel_tool_calls"),
-        ("store", "store"),
-        ("include", "include"),
-        ("serviceTier", "service_tier"),
-        ("user", "user"),
-        ("reasoning", "reasoning"),
-        ("text", "text"),
-        ("tool_choice", "tool_choice"),
-        ("metadata", "metadata"),
-    ] {
-        if let Some(value) = settings.options.get(key) {
-            body[wire] = value.clone();
-        }
-    }
-    for key in ["reasoning", "text"] {
-        if body
-            .get(key)
-            .is_some_and(|value| !value.is_object() && !value.is_null())
-        {
-            return Err(format!("Responses option {key} must be an object"));
-        }
-    }
-    if let Some(effort) = super::reasoning_effort(settings, req) {
-        body["reasoning"]["effort"] = json!(effort);
-    }
-    if let Some(summary) = settings.options["reasoningSummary"].as_str() {
-        body["reasoning"]["summary"] = json!(summary);
-    } else if body.get("reasoning").is_some() && body["reasoning"].get("summary").is_none() {
-        body["reasoning"]["summary"] = json!("auto");
-    }
-    if let Some(verbosity) = settings.options["textVerbosity"].as_str() {
-        body["text"]["verbosity"] = json!(verbosity);
-    }
-    if let Some(limit) = settings.options["maxTokens"]
-        .as_u64()
-        .or_else(|| settings.options["maxOutputTokens"].as_u64())
-    {
-        body["max_output_tokens"] = json!(limit);
-    }
-    settings.overlay_body(&mut body);
-    super::hooks::apply_request_options(settings, req, super::Protocol::Responses, &mut body)?;
-    body["model"] = json!(settings.api_model);
-    body["stream"] = json!(true);
-    if !settings.tools_supported {
-        body.as_object_mut().unwrap().remove("tools");
-        body.as_object_mut().unwrap().remove("tool_choice");
-    }
-    if settings.codex {
-        body["store"] = json!(false);
-        body.as_object_mut().unwrap().remove("max_output_tokens");
-        let mut include = body["include"].as_array().cloned().unwrap_or_default();
-        if !include.iter().any(|v| v == "reasoning.encrypted_content") {
-            include.push(json!("reasoning.encrypted_content"));
-        }
-        body["include"] = json!(include);
-    }
+    super::options::configure_body(
+        settings,
+        req,
+        crate::provider::Protocol::Responses,
+        &mut body,
+    )?;
     Ok(body)
 }
 
@@ -173,51 +63,7 @@ pub(super) async fn stream(
     settings: Settings,
     req: &ChatRequest,
 ) -> Result<EventStream, ProviderError> {
-    let response = settings
-        .send(
-            "responses",
-            &request_body(&settings, req).map_err(ProviderError::fatal)?,
-        )
-        .await?;
-    let json = json_response(&response);
-    let stream = stream! {
-        let mut state = ResponseState::default();
-        if json {
-            let value = match read_response(response, settings.chunk_timeout, 16 * 1024 * 1024).await.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("invalid Responses JSON: {e}"))) {
-                Ok(value) => value,
-                Err(error) => { yield ProviderEvent::Error(error); return; }
-            };
-            let event = if value["status"] == "failed" || value.get("error").filter(|v| !v.is_null()).is_some() { "response.failed" } else if value["status"] == "incomplete" { "response.incomplete" } else if value["status"] == "completed" { "response.completed" } else {
-                yield ProviderEvent::Error("Responses JSON response has no terminal status".into()); return;
-            };
-            match state.consume(&json!({"type":event,"response":value})) {
-                Ok(events) => { for event in events { yield event; } }
-                Err(error) => { yield ProviderEvent::Error(error); return; }
-            }
-        } else {
-            let mut frames = super::sse::frames(response, settings.chunk_timeout);
-            while let Some(frame) = frames.next().await {
-                let frame = match frame { Ok(frame) => frame, Err(error) => { yield ProviderEvent::Error(error); return; } };
-                if frame.data.trim().is_empty() { continue; }
-                if frame.data.trim() == "[DONE]" { break; }
-                let mut value: Value = match serde_json::from_str(&frame.data) {
-                    Ok(value) => value,
-                    Err(error) => { yield ProviderEvent::Error(format!("invalid Responses SSE JSON: {error}")); return; }
-                };
-                if value.get("type").is_none() { value["type"] = json!(frame.event); }
-                match state.consume(&value) {
-                    Ok(events) => { for event in events { yield event; } }
-                    Err(error) => { yield ProviderEvent::Error(error); return; }
-                }
-                if state.terminal { break; }
-            }
-        }
-        match state.finish(&settings.api_model) {
-            Ok(events) => { for event in events { yield event; } }
-            Err(error) => yield ProviderEvent::Error(error),
-        }
-    };
-    Ok(Box::new(Box::pin(stream)))
+    super::stream::request::<ResponseState>(settings, req, "responses", request_body).await
 }
 
 #[derive(Default)]
@@ -277,7 +123,26 @@ impl ResponseState {
         self.output.insert(index, item);
         events
     }
+}
 
+impl Decoder for ResponseState {
+    const PROTOCOL: super::Protocol = super::Protocol::Responses;
+    fn json(&mut self, value: Value) -> Result<Vec<ProviderEvent>, String> {
+        let event =
+            if value["status"] == "failed" || value.get("error").is_some_and(|v| !v.is_null()) {
+                "response.failed"
+            } else {
+                match value["status"].as_str() {
+                    Some("incomplete") => "response.incomplete",
+                    Some("completed") => "response.completed",
+                    _ => return Err("Responses JSON response has no terminal status".into()),
+                }
+            };
+        self.consume(&json!({"type":event,"response":value}))
+    }
+    fn terminal(&self) -> bool {
+        self.terminal
+    }
     fn consume(&mut self, value: &Value) -> Result<Vec<ProviderEvent>, String> {
         let kind = value["type"].as_str().unwrap_or_default();
         if kind == "error" {
@@ -345,24 +210,26 @@ impl ResponseState {
                     .output
                     .entry(index)
                     .or_insert_with(|| json!({"type":"function_call","arguments":""}));
-                let arguments = if kind.ends_with(".done") {
-                    value["arguments"]
+                if kind.ends_with(".done") {
+                    item["arguments"] = json!(value["arguments"]
                         .as_str()
-                        .ok_or("Responses arguments.done is missing arguments")?
-                        .to_string()
+                        .ok_or("Responses arguments.done is missing arguments")?);
                 } else {
-                    let mut arguments = item["arguments"].as_str().unwrap_or_default().to_string();
-                    arguments.push_str(value["delta"].as_str().unwrap_or_default());
-                    arguments
-                };
-                if arguments.len() > 16 * 1024 * 1024 {
+                    super::append_text(
+                        &mut item["arguments"],
+                        value["delta"].as_str().unwrap_or_default(),
+                    );
+                }
+                if item["arguments"].as_str().unwrap_or_default().len() > 16 * 1024 * 1024 {
                     return Err("Responses tool arguments exceed 16 MiB".into());
                 }
-                item["arguments"] = json!(arguments);
                 Ok(Vec::new())
             }
             "response.completed" | "response.incomplete" => {
                 let response = &value["response"];
+                if !response["output"].is_array() {
+                    return Err("Responses terminal event has no response output".into());
+                }
                 if response
                     .get("error")
                     .filter(|value| !value.is_null())
@@ -544,11 +411,12 @@ mod tests {
     }
     #[test]
     fn remote_files_use_file_url_and_unsupported_parts_fail() {
-        let parts = content_parts(&json!([{"type":"file","file":{"file_data":"https://example.test/spec.pdf","filename":"spec.pdf"}}]), false).unwrap();
+        let parts = crate::provider::content::blocks(&json!([{"type":"file","file":{"file_data":"https://example.test/spec.pdf","filename":"spec.pdf"}}]), crate::provider::Protocol::Responses, false).unwrap();
         assert_eq!(parts[0]["file_url"], "https://example.test/spec.pdf");
         assert!(parts[0].get("file_data").is_none());
-        assert!(content_parts(
+        assert!(crate::provider::content::blocks(
             &json!([{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]),
+            crate::provider::Protocol::Responses,
             false
         )
         .is_err());

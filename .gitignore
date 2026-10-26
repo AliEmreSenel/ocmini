@@ -1,1 +1,8 @@
 /target
+
+# Local AI development reports, research, and working notes.
+/.local/
+/validation/
+/VALIDATION.md
+/HOOKS-PLAN.md
+/HOOKS-RESEARCH.md

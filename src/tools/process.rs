@@ -1,28 +1,90 @@
-use super::{cancelled, failure, output};
-use crate::types::{ToolError, ToolOutput};
-use serde_json::json;
+use super::{failure, hook_context, output, resolve_path, ToolCtx};
+use crate::types::{OperationError, ToolOutput};
+use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct Input {
+    pub command: String,
+    pub workdir: Option<String>,
+    #[serde(rename = "description")]
+    _description: Option<String>,
+    #[schemars(range(min = 1))]
+    timeout: Option<u64>,
+    #[serde(default)]
+    background: bool,
+}
+
+/// Shell preparation owns its environment hook and foreground/background policy.
+pub(super) async fn run(ctx: &ToolCtx, input: &Input) -> Result<ToolOutput, OperationError> {
+    let directory = resolve_path(&ctx.dir, input.workdir.as_deref().unwrap_or("."));
+    let env = shell_environment(ctx, input, &directory).await?;
+    if ctx.cancel.is_cancelled() {
+        return Err(failure("Tool cancelled"));
+    }
+    // The environment hook can wait while another process takes ownership.
+    ctx.app.store.check_ownership(&ctx.session_id)?;
+    if input.background {
+        return shell_background_with_env(
+            &input.command,
+            &directory,
+            &ctx.session_id,
+            &output::directory(),
+            &env,
+        )
+        .await;
+    }
+    let timeout = input.timeout.unwrap_or(120_000);
+    if timeout == 0 {
+        return Err(failure(
+            "timeout must be a positive integer in milliseconds",
+        ));
+    }
+    shell_with_env(
+        &input.command,
+        &directory,
+        Duration::from_millis(timeout),
+        ctx.cancel.clone(),
+        &output::directory(),
+        &env,
+    )
+    .await
+}
+
+async fn shell_environment(
+    ctx: &ToolCtx,
+    input: &Input,
+    directory: &Path,
+) -> Result<serde_json::Map<String, Value>, OperationError> {
+    if !ctx.app.hooks.has(crate::tools::hooks::SHELL_ENV) {
+        return Ok(Default::default());
+    }
+    let mut context = hook_context(ctx, "bash");
+    context["workdir"] = json!(directory);
+    let effective = ctx
+        .app
+        .hooks
+        .run(
+            crate::tools::hooks::SHELL_ENV,
+            &context,
+            json!({"env":{},"command":input.command,"background":input.background}),
+            Some(&ctx.cancel),
+        )
+        .await?
+        .input;
+    let env = effective["env"]
+        .as_object()
+        .ok_or_else(|| failure("shell.env env must be an object"))?;
+    Ok(env.clone())
+}
 
 const MAX_CAPTURE: usize = 64 * 1024;
-
-pub(super) struct ProcessGroup {
-    pub(super) id: u32,
-}
-
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.id as i32), libc::SIGKILL);
-        }
-    }
-}
 
 fn preview(file: &mut File) -> std::io::Result<(Vec<u8>, u64)> {
     let total = file.metadata()?.len();
@@ -111,7 +173,7 @@ fn shell_command(command: &str, directory: &Path) -> tokio::process::Command {
     process
 }
 
-fn spawn_failure(directory: &Path, error: std::io::Error) -> ToolError {
+fn spawn_failure(directory: &Path, error: std::io::Error) -> OperationError {
     failure(format!(
         "Could not start shell in {}: {error}",
         directory.display()
@@ -134,9 +196,9 @@ pub async fn shell(
     command: &str,
     directory: &Path,
     timeout: Duration,
-    cancel: Arc<AtomicBool>,
+    cancel: CancellationToken,
     output_directory: &Path,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<ToolOutput, OperationError> {
     shell_with_env(
         command,
         directory,
@@ -152,10 +214,10 @@ pub async fn shell_with_env(
     command: &str,
     directory: &Path,
     timeout: Duration,
-    cancel: Arc<AtomicBool>,
+    cancel: CancellationToken,
     output_directory: &Path,
     env: &serde_json::Map<String, serde_json::Value>,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<ToolOutput, OperationError> {
     // Let the OS capture output directly; only bounded previews enter memory.
     std::fs::create_dir_all(output_directory)
         .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
@@ -183,15 +245,15 @@ pub async fn shell_with_env(
     #[cfg(unix)]
     process.process_group(0);
     let mut child = process.spawn().map_err(|e| spawn_failure(directory, e))?;
-    let group = ProcessGroup {
-        id: child
+    let group = crate::process::Group::new(
+        child
             .id()
             .ok_or_else(|| failure("Shell has no process id"))?,
-    };
+    );
     let outcome = tokio::select! {
-        result = child.wait() => result.map(Outcome::Exited).map_err(|e| failure(format!("Shell wait failed: {e}")))?,
+        result = group.wait(&mut child) => result.map(Outcome::Exited).map_err(|e| failure(format!("Shell wait failed: {e}")))?,
         _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
-        _ = cancelled(cancel) => Outcome::Cancelled,
+        _ = cancel.cancelled() => Outcome::Cancelled,
     };
     // Stop descendants before reading files they inherited from the shell.
     drop(group);
@@ -244,11 +306,7 @@ pub async fn shell_with_env(
 static BACKGROUND: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
 
 #[cfg(unix)]
-fn kill_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-}
+use crate::process::kill_group;
 
 #[cfg(unix)]
 fn take_jobs(keep: impl Fn(&(String, u32)) -> bool) -> Vec<u32> {
@@ -286,7 +344,7 @@ pub async fn shell_background(
     directory: &Path,
     session_id: &str,
     output_directory: &Path,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<ToolOutput, OperationError> {
     shell_background_with_env(
         command,
         directory,
@@ -303,7 +361,7 @@ pub async fn shell_background_with_env(
     session_id: &str,
     output_directory: &Path,
     env: &serde_json::Map<String, serde_json::Value>,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<ToolOutput, OperationError> {
     std::fs::create_dir_all(output_directory)
         .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
     // The log lives with the other tool-output files so existing retention
@@ -382,7 +440,7 @@ mod tests {
             "cat input.txt; cat input.txt >&2; exit 7",
             root.path(),
             Duration::from_secs(5),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
             &root.path().join("output"),
         )
         .await
@@ -403,7 +461,7 @@ mod tests {
             root.path().to_str().unwrap(),
             "read",
             &json!({"filePath":path,"offset":10002,"limit":1}),
-            &AtomicBool::new(false),
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(read.output.contains("MIDDLE_MARKER"));
@@ -427,7 +485,7 @@ mod tests {
                 "cat input",
                 root.path(),
                 Duration::from_secs(5),
-                Arc::new(AtomicBool::new(false)),
+                CancellationToken::new(),
                 &directory,
             )
             .await
@@ -446,14 +504,14 @@ mod tests {
     async fn cancelled_large_capture_leaves_no_saved_output() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("output");
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
         let flag = cancel.clone();
         let ready = root.path().join("ready");
         tokio::spawn(async move {
             while !ready.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            flag.store(true, std::sync::atomic::Ordering::Release);
+            flag.cancel();
         });
         let result = shell(
             "head -c 1048576 /dev/zero; touch ready; sleep 30",
@@ -483,7 +541,7 @@ mod tests {
             "pwd; printf 'problem' >&2; exit 7",
             &directory,
             Duration::from_secs(2),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
             &directory,
         )
         .await
@@ -503,7 +561,7 @@ mod tests {
             &command,
             &directory,
             Duration::from_secs(1),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
             &directory,
         )
         .await;
@@ -524,11 +582,11 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn cancellation_is_prompt() {
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
         let flag = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
-            flag.store(true, std::sync::atomic::Ordering::Release);
+            flag.cancel();
         });
         let result = shell(
             "sleep 30",
@@ -551,7 +609,7 @@ mod tests {
                 &command,
                 &std::env::temp_dir(),
                 Duration::from_secs(30),
-                Arc::new(AtomicBool::new(false)),
+                CancellationToken::new(),
                 &std::env::temp_dir(),
             )
             .await
@@ -581,7 +639,7 @@ mod tests {
             "echo BEFORE_LIMIT; echo BEFORE_STDERR >&2; sleep 30",
             root.path(),
             Duration::from_millis(500),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
             &root.path().join("output"),
         )
         .await
@@ -606,7 +664,7 @@ mod tests {
             "sleep 30",
             root.path(),
             Duration::from_millis(300),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
             &root.path().join("output"),
         )
         .await
@@ -683,7 +741,7 @@ mod tests {
             r#"printf '%s' "$OCMINI_TEST_PROCESS_LOCAL_ENV""#,
             root.path(),
             Duration::from_secs(5),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
             root.path(),
             env.as_object().unwrap(),
         );
@@ -691,7 +749,7 @@ mod tests {
             r#"printf '%s' "${OCMINI_TEST_PROCESS_LOCAL_ENV-unset}""#,
             root.path(),
             Duration::from_secs(5),
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
             root.path(),
         );
         let (first, second) = tokio::join!(first, second);

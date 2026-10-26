@@ -1,5 +1,5 @@
 use super::{cap_out, failure};
-use crate::types::{ToolError, ToolOutput};
+use crate::types::{OperationError, ToolOutput};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -34,7 +34,7 @@ pub(super) fn with_file(mut output: ToolOutput, path: &Path) -> ToolOutput {
 pub(super) async fn limit(
     mut output: ToolOutput,
     directory: PathBuf,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<ToolOutput, OperationError> {
     if output.metadata.get("truncated").is_none() {
         output.metadata["truncated"] = false.into();
     }
@@ -57,7 +57,7 @@ pub(super) async fn limit(
 pub(super) async fn relimit(
     mut out: ToolOutput,
     directory: PathBuf,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<ToolOutput, OperationError> {
     if !out.metadata.is_object() {
         out.metadata = serde_json::json!({});
     }

@@ -1,9 +1,9 @@
 use super::{failure, files, resolve_path};
-use crate::types::{ToolError, ToolOutput};
+use crate::types::{OperationError, ToolOutput};
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 enum Operation {
@@ -31,61 +31,29 @@ struct Hunk {
     deletions: usize,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Change {
     pub(super) path: PathBuf,
+    #[serde(with = "wire_text")]
     pub(super) before: Option<Vec<u8>>,
+    #[serde(with = "wire_text")]
     pub(super) after: Option<Vec<u8>>,
+    #[serde(skip)]
     pub(super) permissions: Option<std::fs::Permissions>,
 }
 
-pub fn affected_paths(directory: &str, patch: &str) -> Result<Vec<PathBuf>, String> {
-    let operations = parse(patch)?;
-    let mut paths = Vec::new();
-    for operation in operations {
-        match operation {
-            Operation::Add { path, .. } | Operation::Delete { path } => {
-                paths.push(resolve_path(directory, &path))
-            }
-            Operation::Update {
-                path, destination, ..
-            } => {
-                paths.push(resolve_path(directory, &path));
-                if let Some(destination) = destination {
-                    paths.push(resolve_path(directory, &destination));
-                }
-            }
-        }
-    }
-    Ok(paths)
-}
-
+#[cfg(test)]
 pub(super) fn apply(
     directory: &str,
-    patch: &str,
-    cancel: &AtomicBool,
-) -> Result<ToolOutput, ToolError> {
-    let (changes, summaries) = prepare(directory, patch, cancel)?;
-    if cancel.load(Ordering::Acquire) {
-        return Err(failure("Patch cancelled before writing"));
-    }
-    for (index, change) in changes.iter().enumerate() {
-        if let Err(error) = commit(change, false) {
-            let mut rollback_errors = Vec::new();
-            for change in changes[..=index].iter().rev() {
-                if let Err(error) = commit(change, true) {
-                    rollback_errors.push(error);
-                }
-            }
-            return Err(failure(if rollback_errors.is_empty() {
-                format!("Patch write failed and was rolled back: {error}")
-            } else {
-                format!(
-                    "Patch write failed: {error}; rollback errors: {}",
-                    rollback_errors.join("; ")
-                )
-            }));
-        }
-    }
+    text: &str,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, OperationError> {
+    super::changes::prepare_sync(directory, "apply_patch", &json!({"patchText":text}), cancel)?
+        .commit(cancel)
+}
+
+pub(super) fn output(summaries: &[serde_json::Value]) -> ToolOutput {
     let output = summaries
         .iter()
         .map(|item| {
@@ -106,24 +74,24 @@ pub(super) fn apply(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(ToolOutput {
+    ToolOutput {
         title: format!("Patched {} file(s)", summaries.len()),
         output: format!("Success. Updated files:\n{output}"),
         metadata: json!({"files":summaries}),
-    })
+    }
 }
 
 pub(super) fn prepare(
     directory: &str,
     patch: &str,
-    cancel: &AtomicBool,
-) -> Result<(Vec<Change>, Vec<serde_json::Value>), ToolError> {
-    let operations = parse(patch).map_err(failure)?;
+    cancel: &CancellationToken,
+) -> Result<(Vec<Change>, Vec<serde_json::Value>), OperationError> {
+    let operations = parse(patch)?;
     let mut changes = Vec::new();
     let mut touched = HashSet::new();
     let mut summaries = Vec::new();
     for operation in operations {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(failure("Patch cancelled before writing"));
         }
         match operation {
@@ -249,7 +217,7 @@ pub(super) fn commit(change: &Change, rollback: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn unique(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<(), ToolError> {
+fn unique(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<(), OperationError> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
     if !touched.insert(canonical) {
         return Err(failure(format!(
@@ -479,7 +447,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path();
         std::fs::write(directory.join("a"), "original\n").unwrap();
-        let result = apply(directory.to_str().unwrap(), "*** Begin Patch\n*** Add File: added\n+new\n*** Update File: a\n@@\n-does-not-exist\n+changed\n*** End Patch", &AtomicBool::new(false));
+        let result = apply(directory.to_str().unwrap(), "*** Begin Patch\n*** Add File: added\n+new\n*** Update File: a\n@@\n-does-not-exist\n+changed\n*** End Patch", &CancellationToken::new());
         assert!(result.is_err());
         assert!(!directory.join("added").exists());
         assert_eq!(
@@ -494,7 +462,7 @@ mod tests {
         let directory = temporary.path();
         std::fs::write(directory.join("old"), "old\n").unwrap();
         std::fs::write(directory.join("remove"), "remove\n").unwrap();
-        let result = apply(directory.to_str().unwrap(), "*** Begin Patch\n*** Add File: nested/new\n+hello\n*** Update File: old\n*** Move to: moved\n@@\n-old\n+updated\n*** Delete File: remove\n*** End Patch", &AtomicBool::new(false)).unwrap();
+        let result = apply(directory.to_str().unwrap(), "*** Begin Patch\n*** Add File: nested/new\n+hello\n*** Update File: old\n*** Move to: moved\n@@\n-old\n+updated\n*** Delete File: remove\n*** End Patch", &CancellationToken::new()).unwrap();
         assert_eq!(result.metadata["files"].as_array().unwrap().len(), 3);
         assert_eq!(
             std::fs::read_to_string(directory.join("moved")).unwrap(),
@@ -506,5 +474,26 @@ mod tests {
         );
         assert!(!directory.join("old").exists());
         assert!(!directory.join("remove").exists());
+    }
+}
+
+// Only the hook projection is textual. Normal file transactions retain exact bytes.
+mod wire_text {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let text = value
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_some(&text)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        Ok(Option::<String>::deserialize(deserializer)?.map(String::into_bytes))
     }
 }

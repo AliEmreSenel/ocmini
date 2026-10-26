@@ -86,6 +86,8 @@ pub(super) fn tool_script(name: &str, arguments: Value, id: &str) -> Script {
 #[derive(Clone)]
 pub(super) struct ProviderState {
     pub(super) scripts: Arc<Mutex<VecDeque<Script>>>,
+    pub(super) title_scripts: Arc<Mutex<VecDeque<Script>>>,
+    pub(super) route_titles: bool,
     pub(super) requests: mpsc::UnboundedSender<Value>,
 }
 
@@ -93,8 +95,17 @@ pub(super) async fn provider_reply(
     State(state): State<ProviderState>,
     Json(request): Json<Value>,
 ) -> Response {
+    let queue = if state.route_titles
+        && request["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Name this conversation"))
+    {
+        &state.title_scripts
+    } else {
+        &state.scripts
+    };
     state.requests.send(request).unwrap();
-    let Some(script) = state.scripts.lock().await.pop_front() else {
+    let Some(script) = queue.lock().await.pop_front() else {
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": {"message": "Unexpected extra model request"}})),
@@ -134,9 +145,14 @@ pub(super) struct Provider {
 
 impl Provider {
     pub(super) async fn start(scripts: Vec<Script>) -> Self {
+        Self::start_with_titles(scripts, Vec::new()).await
+    }
+    pub(super) async fn start_with_titles(scripts: Vec<Script>, titles: Vec<Script>) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
         let state = ProviderState {
             scripts: Arc::new(Mutex::new(scripts.into())),
+            route_titles: !titles.is_empty(),
+            title_scripts: Arc::new(Mutex::new(titles.into())),
             requests,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -144,6 +160,7 @@ impl Provider {
         let router = Router::new()
             .route("/v1/chat/completions", post(provider_reply))
             .route("/v1/messages", post(provider_reply))
+            .route("/v1/responses", post(provider_reply))
             .with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
