@@ -139,3 +139,52 @@ async fn final_answer_at_the_explicit_step_limit_completes_normally() {
         .iter()
         .any(|event| event["type"] == "session.error"));
 }
+
+#[tokio::test]
+async fn tool_calls_in_one_step_execute_concurrently() {
+    // Two shell calls gate on each other's marker file. Sequential execution
+    // times the first call out; only concurrent execution opens both gates.
+    let provider = Provider::start(vec![
+        Script::ok(vec![
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_gate_a", "type": "function", "function": {"name": "bash", "arguments": json!({"command": "touch gate-a; for i in $(seq 1 200); do [ -f gate-b ] && { echo GATE_A_OPEN; exit 0; }; sleep 0.05; done; echo GATE_A_TIMEOUT", "timeout": 30000}).to_string()}},
+                {"index": 1, "id": "call_gate_b", "type": "function", "function": {"name": "bash", "arguments": json!({"command": "touch gate-b; for i in $(seq 1 200); do [ -f gate-a ] && { echo GATE_B_OPEN; exit 0; }; sleep 0.05; done; echo GATE_B_TIMEOUT", "timeout": 30000}).to_string()}}
+            ]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": usage()}),
+        ]),
+        text_script("Both gates opened", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_parallel_tools", "Open both gates"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
+    let messages = server.messages(&id).await;
+    let outputs: Vec<String> = ["call_gate_a", "call_gate_b"]
+        .iter()
+        .map(|call| {
+            messages
+                .iter()
+                .flat_map(|message| message["parts"].as_array().unwrap())
+                .find(|part| part["callID"] == *call)
+                .unwrap()["state"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        outputs[0].contains("GATE_A_OPEN") && outputs[1].contains("GATE_B_OPEN"),
+        "tool calls from one model step must run concurrently, got {outputs:?}"
+    );
+}
