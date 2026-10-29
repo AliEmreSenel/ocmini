@@ -2,6 +2,10 @@ use super::*;
 use crate::events as event;
 use tokio_util::sync::CancellationToken;
 
+/// Tool calls admitted in one model step are independent. Preparation runs in
+/// part order so persisted part state and the doom-loop window stay
+/// deterministic, then every call executes concurrently. Results are written
+/// back at their original indices, so history keeps the provider's call order.
 pub(super) async fn run_tools(
     base: &ToolCtx,
     cfg: &Config,
@@ -10,12 +14,9 @@ pub(super) async fn run_tools(
     tool_parts: &mut [Value],
     recent_calls: &mut VecDeque<String>,
 ) -> Result<(), String> {
-    let app = &base.app;
-    let sid = base.session_id.as_str();
-    let amid = base.message_id.as_str();
-    let cancel = &base.cancel;
     let agent = request.agent.as_deref().unwrap_or("build");
-    for part in tool_parts {
+    let mut running = Vec::new();
+    for (index, part) in tool_parts.iter_mut().enumerate() {
         if part["state"]["status"] == "error" {
             continue;
         }
@@ -27,69 +28,117 @@ pub(super) async fn run_tools(
         ctx.part_id = part["id"].as_str().unwrap_or_default().into();
         let prepared =
             prepare_effective_input(&ctx, &name, original_input.clone(), cfg, request).await;
-        let visible_input = prepared
-            .as_ref()
-            .map_or(&original_input, |input| input.args());
-        if visible_input != &part["state"]["input"] {
+        let visible_input = match &prepared {
+            Ok(input) => input.args().clone(),
+            Err(_) => original_input.clone(),
+        };
+        if visible_input != part["state"]["input"] {
             part["ocminiOriginalInput"] = part["state"]["input"].take();
         }
-        part["state"] = json!({"status":"running","input":visible_input,"time":{"start":start}});
-        crate::messages::update_part(app, part)?;
-        let signature = format!("{name}:{}", visible_input);
+        part["state"] = json!({"status":"running","input":&visible_input,"time":{"start":start}});
+        crate::messages::update_part(&base.app, part)?;
+        let signature = format!("{name}:{visible_input}");
         recent_calls.push_back(signature.clone());
         if recent_calls.len() > 3 {
             recent_calls.pop_front();
         }
         let repeated = recent_calls.len() == 3 && recent_calls.iter().all(|s| s == &signature);
-        let output = match &prepared {
-            Err(error) => Err(error.clone()),
-            Ok(_) if !allowed.contains(&name) => Err(OperationError::from(format!(
-                "Tool '{name}' is not enabled for agent '{agent}'"
-            ))),
-            Ok(input) => execute_tool(&ctx, &name, input, cfg, request, repeated).await,
-        };
-        // Task/question tools may publish metadata while blocked. Preserve it.
-        let existing = app
-            .store
-            .message(sid, amid)
-            .ok()
-            .flatten()
-            .and_then(|m| m.parts.into_iter().find(|p| p["id"] == part["id"]));
-        let running_metadata = existing
-            .as_ref()
-            .map(|p| p["state"]["metadata"].clone())
-            .unwrap_or_else(|| json!({}));
-        part["state"] = match output {
-            Ok(out) => {
-                json!({"status":"completed","input":visible_input,"output":out.output,"title":out.title,"metadata":out.metadata,"time":{"start":start,"end":now_ms()}})
-            }
-            Err(error) => {
-                json!({"status":"error","input":visible_input,"error":error.message,"metadata":running_metadata,"time":{"start":start,"end":now_ms()}})
-            }
-        };
-        crate::messages::update_part(app, part)?;
-        let event = if part["state"]["status"] == "completed" {
-            event::Tool::Completed {
-                call_id: &ctx.call_id,
-                message_id: amid,
-                part_id: &ctx.part_id,
-                error: &part["state"]["error"],
-            }
-        } else {
-            event::Tool::Failed {
-                call_id: &ctx.call_id,
-                message_id: amid,
-                part_id: &ctx.part_id,
-                error: &part["state"]["error"],
-            }
-        };
-        app.hooks.emit(event, &tools::hook_context(&ctx, &name));
-
-        if cancel.is_cancelled() {
-            break;
+        running.push(execute_part(
+            ctx,
+            index,
+            name,
+            prepared,
+            visible_input,
+            part.clone(),
+            start,
+            repeated,
+            agent,
+            cfg,
+            request,
+            allowed,
+        ));
+    }
+    let mut first_error = None;
+    for (index, part, error) in futures::future::join_all(running).await {
+        tool_parts[index] = part;
+        if let Some(error) = error.filter(|_| first_error.is_none()) {
+            first_error = Some(error);
         }
     }
-    Ok(())
+    match first_error {
+        None => Ok(()),
+        Some(error) => Err(error),
+    }
+}
+
+/// Run one prepared tool call to its terminal part state. The part is owned
+/// while it runs, so concurrent calls never share a mutable part slot.
+#[allow(clippy::too_many_arguments)]
+async fn execute_part(
+    ctx: ToolCtx,
+    index: usize,
+    name: String,
+    prepared: Result<PreparedTool, OperationError>,
+    visible_input: Value,
+    mut part: Value,
+    start: i64,
+    repeated: bool,
+    agent: &str,
+    cfg: &Config,
+    request: &PromptRequest,
+    allowed: &HashSet<String>,
+) -> (usize, Value, Option<String>) {
+    let output = match &prepared {
+        Err(error) => Err(error.clone()),
+        Ok(_) if !allowed.contains(&name) => Err(OperationError::from(format!(
+            "Tool '{name}' is not enabled for agent '{agent}'"
+        ))),
+        Ok(input) => execute_tool(&ctx, &name, input, cfg, request, repeated).await,
+    };
+    // Task/question tools may publish metadata while blocked. Preserve it.
+    let existing = ctx
+        .app
+        .store
+        .message(&ctx.session_id, &ctx.message_id)
+        .ok()
+        .flatten()
+        .and_then(|m| m.parts.into_iter().find(|p| p["id"] == part["id"]));
+    let running_metadata = existing
+        .as_ref()
+        .map(|p| p["state"]["metadata"].clone())
+        .unwrap_or_else(|| json!({}));
+    part["state"] = match output {
+        Ok(out) => {
+            json!({"status":"completed","input":visible_input,"output":out.output,"title":out.title,"metadata":out.metadata,"time":{"start":start,"end":now_ms()}})
+        }
+        Err(error) => {
+            json!({"status":"error","input":visible_input,"error":error.message,"metadata":running_metadata,"time":{"start":start,"end":now_ms()}})
+        }
+    };
+    let update = crate::messages::update_part(&ctx.app, &part);
+    let completed = part["state"]["status"] == "completed";
+    let error_value = part["state"]["error"].clone();
+    let event = if completed {
+        event::Tool::Completed {
+            call_id: &ctx.call_id,
+            message_id: &ctx.message_id,
+            part_id: &ctx.part_id,
+            error: &error_value,
+        }
+    } else {
+        event::Tool::Failed {
+            call_id: &ctx.call_id,
+            message_id: &ctx.message_id,
+            part_id: &ctx.part_id,
+            error: &error_value,
+        }
+    };
+    ctx.app.hooks.emit(event, &tools::hook_context(&ctx, &name));
+    let failure = match update {
+        Ok(()) => None,
+        Err(error) => Some(error.message),
+    };
+    (index, part, failure)
 }
 
 pub(super) fn execution_tool(name: &str) -> bool {

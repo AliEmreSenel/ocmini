@@ -139,3 +139,268 @@ async fn final_answer_at_the_explicit_step_limit_completes_normally() {
         .iter()
         .any(|event| event["type"] == "session.error"));
 }
+
+#[tokio::test]
+async fn tool_calls_in_one_step_execute_concurrently() {
+    // Two shell calls gate on each other's marker file. Sequential execution
+    // times the first call out; only concurrent execution opens both gates.
+    let provider = Provider::start(vec![
+        Script::ok(vec![
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_gate_a", "type": "function", "function": {"name": "bash", "arguments": json!({"command": "touch gate-a; for i in $(seq 1 200); do [ -f gate-b ] && { echo GATE_A_OPEN; exit 0; }; sleep 0.05; done; echo GATE_A_TIMEOUT", "timeout": 30000}).to_string()}},
+                {"index": 1, "id": "call_gate_b", "type": "function", "function": {"name": "bash", "arguments": json!({"command": "touch gate-b; for i in $(seq 1 200); do [ -f gate-a ] && { echo GATE_B_OPEN; exit 0; }; sleep 0.05; done; echo GATE_B_TIMEOUT", "timeout": 30000}).to_string()}}
+            ]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": usage()}),
+        ]),
+        text_script("Both gates opened", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_parallel_tools", "Open both gates"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
+    let messages = server.messages(&id).await;
+    let outputs: Vec<String> = ["call_gate_a", "call_gate_b"]
+        .iter()
+        .map(|call| {
+            messages
+                .iter()
+                .flat_map(|message| message["parts"].as_array().unwrap())
+                .find(|part| part["callID"] == *call)
+                .unwrap()["state"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        outputs[0].contains("GATE_A_OPEN") && outputs[1].contains("GATE_B_OPEN"),
+        "tool calls from one model step must run concurrently, got {outputs:?}"
+    );
+}
+
+async fn poll_messages(
+    server: &TestServer,
+    id: &str,
+    ready: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    for _ in 0..200 {
+        let messages = server.messages(id).await;
+        if ready(&messages) {
+            return messages;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    server.messages(id).await
+}
+
+#[tokio::test]
+async fn background_task_returns_immediately_and_delivers_its_result_to_the_parent() {
+    // The parent consumes: launch, continuation, delivery turn. The child
+    // consumes one completion turn. All answer scripts share one text, so the
+    // test is deterministic under any interleaving: the delivery is answered
+    // either by a fresh turn (idle parent) or by the steered live turn.
+    let mut provider = Provider::start(vec![
+        tool_script("task", json!({"description":"Background work","prompt":"Do the work","subagent_type":"general","background":true}), "call_bg"),
+        text_script("OK", ""),
+        text_script("OK", ""),
+        text_script("OK", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_bg", "Launch a background task"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let ended = events.through("ocmini.task.ended").await;
+    assert!(
+        ended
+            .iter()
+            .any(|event| event["properties"]["status"] == "completed"
+                && event["properties"]["parentSessionID"] == id),
+        "the parent must see its background task complete"
+    );
+    let messages = poll_messages(&server, &id, |messages| {
+        messages
+            .iter()
+            .position(|message| {
+                message["info"]["role"] == "user"
+                    && message["parts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|part| part["synthetic"] == true)
+            })
+            .is_some_and(|index| {
+                messages.get(index + 1).is_some_and(|answer| {
+                    answer["info"]["role"] == "assistant"
+                        && answer["info"]["time"]["completed"].is_number()
+                        && answer["parts"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|part| part["text"] == "OK")
+                })
+            })
+    })
+    .await;
+    let tool = messages
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap().clone())
+        .find(|part| part["callID"] == "call_bg")
+        .expect("task tool part");
+    assert_eq!(tool["state"]["status"], "completed");
+    assert_eq!(tool["state"]["metadata"]["background"], true);
+    let output = tool["state"]["output"].as_str().unwrap();
+    assert!(
+        output.starts_with("Task session: ") && output.contains("DO NOT sleep"),
+        "{output}"
+    );
+    let child_id = tool["state"]["metadata"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let delivery = messages
+        .iter()
+        .find(|message| {
+            message["info"]["role"] == "user"
+                && message["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| part["synthetic"] == true)
+        })
+        .expect("synthetic delivery message in parent history");
+    let text = delivery["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|part| part["synthetic"] == true)
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.starts_with(&format!("<task id=\"{child_id}\" state=\"completed\">")),
+        "{text}"
+    );
+    assert!(
+        text.contains("<summary>Background task completed: Background work</summary>"),
+        "{text}"
+    );
+    assert!(text.contains("<task_result>\nOK\n</task_result>"), "{text}");
+    let requests: Vec<_> = std::iter::from_fn(|| provider.requests.try_recv().ok()).collect();
+    assert!(
+        (3..=4).contains(&requests.len()),
+        "parent launch/continuation, child answer and (when the parent was idle) a delivery turn, got {}",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_the_child_silences_its_background_delivery() {
+    let (release, gate) = oneshot::channel();
+    let mut stalled = text_script("Too late", "");
+    stalled.gate = Some(gate);
+    let provider = Provider::start(vec![
+        tool_script("task", json!({"description":"Slow work","prompt":"Take your time","subagent_type":"general","background":true}), "call_bg2"),
+        text_script("Launched", ""),
+        stalled,
+        text_script("Noted", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_bg2", "Launch a slow background task"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    // The parent's first turn settles while the child's response sits on its gate.
+    // If the child claimed the parent's continuation script instead, releasing
+    // the gate lets the parent's steered delivery turn finish.
+    let mut release = Some(release);
+    let mut released = false;
+    loop {
+        let batch = events.through("session.idle").await;
+        let parent_idle = batch.last().is_some_and(|event| {
+            event["type"] == "session.idle" && event["properties"]["sessionID"] == id
+        });
+        if parent_idle {
+            break;
+        }
+        if !released {
+            drop(release.take());
+            released = true;
+        }
+    }
+    let mut child_id = None;
+    for _ in 0..200 {
+        let messages = server.messages(&id).await;
+        child_id = messages
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap().clone())
+            .find(|part| part["callID"] == "call_bg2")
+            .and_then(|part| {
+                part["state"]["metadata"]["sessionId"]
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        if child_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let child_id = child_id.expect("background child session");
+    let users_before = server
+        .messages(&id)
+        .await
+        .iter()
+        .filter(|message| message["info"]["role"] == "user")
+        .count();
+    server
+        .post(&format!("/session/{child_id}/abort"), &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    if !released {
+        drop(release.take());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    let users_after = server
+        .messages(&id)
+        .await
+        .iter()
+        .filter(|message| message["info"]["role"] == "user")
+        .count();
+    assert_eq!(
+        users_after, users_before,
+        "a cancelled child must not wake the parent with a delivery"
+    );
+}
