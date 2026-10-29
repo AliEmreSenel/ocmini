@@ -1,10 +1,17 @@
 //! Child-session preparation and execution, including cancellation ownership.
 use super::{decode, failure, hook_context, ToolCtx};
-use crate::engine::EngineApi;
+use crate::engine::{App, EngineApi};
 use crate::events as event;
-use crate::types::{ModelRef, OperationError, PromptRequest, ToolOutput};
+use crate::types::{ModelRef, OperationError, PromptRequest, ToolOutput, TurnResult};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::sync::oneshot;
+
+const BACKGROUND_STARTED: &str = concat!(
+    "The task is working in the background. You will be notified automatically when it finishes.\n",
+    "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.\n",
+    "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
+);
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct Input {
@@ -12,6 +19,11 @@ pub(super) struct Input {
     prompt: String,
     pub subagent_type: String,
     task_id: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress"
+    )]
+    background: bool,
 }
 
 pub(super) struct Plan {
@@ -237,6 +249,24 @@ pub(super) async fn run(ctx: &ToolCtx, plan: &Plan) -> Result<ToolOutput, Operat
         },
         &context,
     );
+    if input.background {
+        guard.armed = false;
+        tokio::spawn(deliver(Delivery {
+            app: ctx.app.clone(),
+            engine: ctx.engine.clone(),
+            parent_id: ctx.session_id.clone(),
+            child_id: child.id.clone(),
+            description: description.to_owned(),
+            parent_message_id: ctx.message_id.clone(),
+            done,
+            context,
+        }));
+        return Ok(ToolOutput {
+            output: format!("Task session: {}\n\n{BACKGROUND_STARTED}", child.id),
+            title: description.into(),
+            metadata: json!({"sessionId":child.id,"model":model,"agent":agent,"background":true}),
+        });
+    }
     let result = tokio::select! {
         result = done => result.map_err(|_| "Subagent ended without a result".to_owned()).and_then(|result| result.map_err(String::from)),
         _ = ctx.cancel.cancelled() => Err("Subagent cancelled".into()),
@@ -265,4 +295,96 @@ pub(super) async fn run(ctx: &ToolCtx, plan: &Plan) -> Result<ToolOutput, Operat
         title: description.into(),
         metadata: json!({"sessionId":child.id,"model":model,"agent":agent}),
     })
+}
+
+/// Everything a detached background delivery needs to run on its own.
+struct Delivery {
+    app: App,
+    engine: Arc<dyn EngineApi>,
+    parent_id: String,
+    child_id: String,
+    description: String,
+    parent_message_id: String,
+    done: oneshot::Receiver<TurnResult>,
+    context: Value,
+}
+
+/// Delivers a background child's terminal result to the parent session, once.
+async fn deliver(job: Delivery) {
+    let Delivery {
+        app,
+        engine,
+        parent_id,
+        child_id,
+        description,
+        parent_message_id,
+        done,
+        context,
+    } = job;
+    let (state, body, message_id) = match done.await {
+        Ok(Ok(message)) => (
+            "completed",
+            crate::types::text_parts(&message.parts)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Some(message.info.id),
+        ),
+        Ok(Err(error)) if error.message == "Aborted" => {
+            app.hooks.emit(
+                event::Task::Ended {
+                    parent_session_id: &parent_id,
+                    child_session_id: &child_id,
+                    status: event::TaskStatus::Cancelled,
+                    message_id: None,
+                },
+                &context,
+            );
+            return;
+        }
+        Ok(Err(error)) => ("error", error.message, None),
+        Err(_) => return,
+    };
+    app.hooks.emit(
+        event::Task::Ended {
+            parent_session_id: &parent_id,
+            child_session_id: &child_id,
+            status: if state == "completed" {
+                event::TaskStatus::Completed
+            } else {
+                event::TaskStatus::Failed
+            },
+            message_id: message_id.as_deref(),
+        },
+        &context,
+    );
+    let (summary, tag) = if state == "completed" {
+        (
+            format!("Background task completed: {description}"),
+            "task_result",
+        )
+    } else {
+        (
+            format!("Background task failed: {description}"),
+            "task_error",
+        )
+    };
+    let text = format!(
+        "<task id=\"{child_id}\" state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
+    );
+    let agent = app
+        .store
+        .message(&parent_id, &parent_message_id)
+        .ok()
+        .flatten()
+        .and_then(|message| message.info.agent);
+    let model = app.store.last_model(&parent_id).ok().flatten();
+    let request = PromptRequest {
+        model,
+        parts: vec![json!({"type": "text", "text": text, "synthetic": true})],
+        agent,
+        ..Default::default()
+    };
+    if let Ok(receiver) = engine.admit(app, parent_id, request).await {
+        drop(receiver);
+    }
 }
