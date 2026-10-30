@@ -3,8 +3,9 @@ use super::{decode, failure, files, patch, resolve_path, ToolCtx};
 use crate::types::{OperationError, ToolOutput};
 use patch::Change;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -332,6 +333,38 @@ fn transformed_changes(
     Ok(changes)
 }
 
+/// A commit validates its baselines and then writes, so an unprotected commit
+/// is a check-then-write window. Tool calls from one model step run
+/// concurrently, and two batches prepared from the same file would both pass
+/// validation, letting the later write silently discard the earlier change.
+/// Commits take their paths in sorted order, which serializes overlapping
+/// batches (including moves, whose source and destination are separate
+/// changes) without deadlocking.
+static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn with_path_locks<T>(
+    paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+    write: impl FnOnce() -> Result<T, OperationError>,
+) -> Result<T, OperationError> {
+    let mut keys: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let locks = {
+        let mut registry = PATH_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        keys.into_iter()
+            .map(|key| Arc::clone(registry.entry(key).or_default()))
+            .collect::<Vec<_>>()
+    };
+    let _guards = locks
+        .iter()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+        .collect::<Vec<_>>();
+    write()
+}
+
 fn validate_changes(changes: &[Change], cancel: &CancellationToken) -> Result<(), OperationError> {
     if changes.is_empty() {
         return Err(failure("File change batch must not be empty"));
@@ -365,25 +398,27 @@ impl Plan {
         self.changes.iter().map(|change| change.path.as_path())
     }
     pub fn commit(&self, cancel: &CancellationToken) -> Result<ToolOutput, OperationError> {
-        validate_changes(&self.changes, cancel)?;
-        for (index, change) in self.changes.iter().enumerate() {
-            if let Err(error) = patch::commit(change, false) {
-                let rollback = self.changes[..=index]
-                    .iter()
-                    .rev()
-                    .filter_map(|c| patch::commit(c, true).err())
-                    .collect::<Vec<_>>();
-                return Err(failure(format!(
-                    "File change failed: {error}; rollback {}",
-                    if rollback.is_empty() {
-                        "completed".into()
-                    } else {
-                        rollback.join("; ")
-                    }
-                )));
+        with_path_locks(self.changes.iter().map(|change| &change.path), || {
+            validate_changes(&self.changes, cancel)?;
+            for (index, change) in self.changes.iter().enumerate() {
+                if let Err(error) = patch::commit(change, false) {
+                    let rollback = self.changes[..=index]
+                        .iter()
+                        .rev()
+                        .filter_map(|c| patch::commit(c, true).err())
+                        .collect::<Vec<_>>();
+                    return Err(failure(format!(
+                        "File change failed: {error}; rollback {}",
+                        if rollback.is_empty() {
+                            "completed".into()
+                        } else {
+                            rollback.join("; ")
+                        }
+                    )));
+                }
             }
-        }
-        Ok(self.output.clone())
+            Ok(self.output.clone())
+        })
     }
 }
 
@@ -428,6 +463,57 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "no final newline");
         assert!(plan(json!([{"path":path,"before":"no final newline","after":"one"},{"path":path,"before":"no final newline","after":null}])).commit(&CancellationToken::new()).is_err());
+    }
+    #[test]
+    fn concurrent_commits_to_one_path_never_lose_a_change() {
+        // Tool calls admitted in one model step commit on separate blocking
+        // threads. Overlapping batches must serialize so exactly one plan
+        // commits and the file keeps the winning plan's content.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        for round in 0..32 {
+            std::fs::write(&path, "base").unwrap();
+            let commit = |after: &'static str| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let plan = plan(json!([{"path":path,"before":"base","after":after}]));
+                    plan.commit(&CancellationToken::new()).is_ok()
+                })
+            };
+            let (a, b) = (commit("A").join().unwrap(), commit("B").join().unwrap());
+            assert_ne!(a, b, "exactly one commit may win round {round}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                if a { "A" } else { "B" },
+                "round {round} must keep the winning content"
+            );
+        }
+    }
+    #[test]
+    fn commit_validates_after_a_concurrent_writer_releases_the_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "base").unwrap();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                with_path_locks([path.clone()], || {
+                    acquired_tx.send(()).unwrap();
+                    // A racing writer lands its change while holding the path.
+                    std::fs::write(&path, "theirs").unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    Ok(())
+                })
+            })
+        };
+        acquired_rx.recv().unwrap();
+        let error = plan(json!([{"path":path,"before":"base","after":"mine"}]))
+            .commit(&CancellationToken::new())
+            .expect_err("a committed change must force a fresh baseline check");
+        assert!(error.message.contains("changed since preparation"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+        holder.join().unwrap().unwrap();
     }
     fn hooks(directory: &str, script: &str) -> std::sync::Arc<crate::hooks::Hooks> {
         let cfg:crate::config::Config=serde_json::from_value(json!({"ocmini":{"hooks":{"handlers":[{"id":"file-hook","on":"file.change.before","command":["/bin/sh","-c",script]}]}}})).unwrap();
