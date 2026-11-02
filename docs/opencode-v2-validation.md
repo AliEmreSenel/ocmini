@@ -1,6 +1,6 @@
 # OpenCode v2 validation
 
-The v2 implementation is checked against local provider/MCP fixtures and the official OpenCode v2.2.5 and T3-pinned v2.0.28 clients/schemas. It has not been exercised through the installed T3 graphical application or on a physical single-core/500 MB/SD-card device. Native compaction retains the accepted older-T3 schema exception.
+The v2 implementation is checked against local provider/MCP fixtures and the official OpenCode v2.2.5 and T3-pinned v2.0.28 clients/schemas. The installed T3-managed OCMini server has also completed real model/tool turns through those clients, as recorded below. The graphical T3 interaction flow and physical single-core/500 MB/SD-card devices have not been tested. Native compaction retains the accepted older-T3 schema exception.
 
 ## Correctness
 
@@ -11,6 +11,29 @@ The v2 implementation is checked against local provider/MCP fixtures and the off
 - Event filters accept repeated query parameters and inspect the shared encoded frame's type without parsing JSON for every subscriber.
 - Resource regressions have focused tests: saved session IDs are not loaded into an event cache at startup; idle execution indexes are released; an unobserved execution does not advance event counters; cached sequence IDs do not write SQLite; sibling reservations and restart invalidate old ranges; range exhaustion obtains more IDs; a blocked session event lock does not block another session's event processing.
 - Official-client conformance includes catalog/history/event decoding, tools, forms, permissions, archive/list operations and the version-2 deletion event. T3's pinned Effect client also creates root/child sessions, updates a title and completes a prompt with omitted optional fields encoded as null.
+- T3's percent-encoded run-attempt message IDs and IDs longer than 256 bytes survive admission, retries and restart unchanged. Both official clients submit these opaque IDs. Provider metadata avoids remote discovery; remote lookups finish and cache their results even after caller cancellation. Failed lookups reuse the existing cache, and changed credentials invalidate cached failures.
+
+## Expanded verification, 2026-11-02
+
+Ran these checks on x86_64 Linux after the T3 startup and discovery fixes. No runtime changes were needed during this verification.
+
+| Check | Result |
+| --- | --- |
+| `cargo test --all-targets --all-features --locked -- --include-ignored` | 325 unit tests and 122 contract tests passed; zero failures or skips. Includes the 121-second hook test and official-client conformance. |
+| `cargo test --release --locked --test contract -- --include-ignored` | All 122 contracts passed against the optimized binary, including both official clients. |
+| `cargo fmt --all -- --check` | Passed. |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Passed with the default nightly compiler and stable Rust 1.99.1. |
+| `cargo +1.85.0 check --all-targets --all-features --locked` | Passed on the declared minimum Rust version. |
+| `cargo build --release --locked` and `git diff --check` | Passed. |
+| Installed binary, release artifact and running T3-managed process | All three SHA-256 hashes matched: `305e2dc2bb97bace16bf26494180d682704b4e9ed92ff24ba8c81a331e7b3626`. |
+
+The live test used the existing T3-managed server and configured `pllm5/todiadiyatmo/Swift-1.5-Qwen3.8-Flash-Next-W4A16-Attn8-FP8PLE` model, with an independent temporary workspace and session. Both official clients decoded the configured model. T3's pinned Effect client admitted a message ID containing percent-encoded run-attempt components and exceeding 256 bytes. The model requested a shell command to read a freshly generated random value; the test answered the permission request through T3's client, observed successful tool execution and streaming, and decoded the resulting events/history with both versions' schemas.
+
+A duplicate submission left the transcript unchanged. A second real turn recovered the random value from prior context without another tool call. Exactly two execution-start events were observed. The session reported a successful outcome, idle timestamp and nonzero measured input/output tokens. The fixture file was unchanged, and the temporary session and workspace were removed. Existing user sessions were not interrupted.
+
+Missing and incorrect credentials returned tagged HTTP 401 responses for `/api/info`, `/api/model`, `/api/provider`, `/api/event` and `/api/session` on the installed server.
+
+These results exercise the clients and real backend directly; they do not constitute an automated test of T3's graphical UI or its complete orchestration adapter. Cross-platform release builds and physical ARM/500 MB/SD-card behavior were not exercised in this pass. The accepted older-T3 compaction-schema limitation and deferred endpoint scope remain unchanged.
 
 ## Event persistence and memory
 

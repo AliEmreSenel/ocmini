@@ -57,7 +57,7 @@ impl EngineApi for Engine {
             .message_id
             .get_or_insert_with(|| hex_id("msg_"))
             .clone();
-        validate_message_id(&mid)?;
+        validate_message_id(&mid, request.v2.is_some() || app.v2.enabled(&sid))?;
         if !app.hooks.is_empty() {
             request.hook_snapshot = Some(app.hooks.snapshot());
         }
@@ -213,7 +213,7 @@ impl EngineApi for Engine {
                 .ok_or_else(|| OperationError::not_found("Session not found"))?;
             let mut guard = self.running.lock().unwrap();
             let mid = request.message_id.clone().unwrap_or_else(|| hex_id("msg_"));
-            validate_message_id(&mid)?;
+            validate_message_id(&mid, request.v2.is_some() || app.v2.enabled(&sid))?;
             let (tx, rx) = oneshot::channel();
             if let Some(owner) = app.store.message_owner(&mid)? {
                 if owner != sid {

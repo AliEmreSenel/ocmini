@@ -14,6 +14,8 @@ GET /api/info returns version, pid, urls and paths.tmp. OPENCODE_PASSWORD takes 
 
 GET /api/model, /api/provider, /api/agent, /api/skill and /api/command return location-scoped catalogs. The query key is location[directory], with a canonical absolute directory. Catalogs use {location, data}; model/agent/skill IDs and variants follow v2 shapes. Only connected providers contribute selectable models. Existing provider discovery and supported Chat Completions, Responses and Anthropic transports remain shared with CLI use.
 
+Provider metadata reads use local configuration and connected provider identities without waiting for remote model enumeration. Model discovery caches successful and failed remote lookups for the existing five-minute lifetime, keyed by endpoint, credentials and headers; changed credentials trigger a fresh lookup. An already-started lookup finishes even if its HTTP caller disconnects. A cold model lookup can still wait for a remote provider, but subsequent reads reuse its result while retaining every available model from other providers.
+
 ## Sessions and prompts
 
 POST /api/session creates a session with optional id, parentID, title, model, agent, location, permissions and metadata. Model references use {providerID, id, variant?}. Permissions use ordered {action, resource, effect} records; shell/subagent actions map to the runtime's existing shell/task policy checks.

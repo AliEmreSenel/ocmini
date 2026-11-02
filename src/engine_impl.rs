@@ -414,7 +414,16 @@ async fn wait_for_finalization(
     }
 }
 
-fn validate_message_id(mid: &str) -> Result<(), OperationError> {
+fn validate_message_id(mid: &str, native: bool) -> Result<(), OperationError> {
+    if native {
+        // V2 IDs are opaque strings with a msg_ prefix. T3 includes encoded
+        // run-attempt IDs, which can contain percent signs and exceed 256 bytes.
+        return if mid.starts_with("msg_") {
+            Ok(())
+        } else {
+            Err(OperationError::invalid("messageID must start with msg_"))
+        };
+    }
     if mid.is_empty()
         || mid.len() > 256
         || !mid

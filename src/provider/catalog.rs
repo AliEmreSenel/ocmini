@@ -7,7 +7,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-type Cache = HashMap<u64, (Instant, HashMap<String, ModelInfo>)>;
+type Discovery = Result<HashMap<String, ModelInfo>, String>;
+type Cache = HashMap<u64, (Instant, Discovery)>;
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
 pub async fn discover_models(config: &Config, auth: &AuthStore) -> (Config, Vec<String>) {
@@ -208,9 +209,32 @@ async fn discover(
         .get(&key)
     {
         if created.elapsed() < Duration::from_secs(300) {
-            return Ok(models.clone());
+            return models.clone();
         }
     }
+    // A failed optional provider must not stall every catalog read. Use the
+    // same credential-keyed cache and lifetime as successful discovery.
+    // T3 cancels a cold catalog read after five seconds. Finish an admitted
+    // lookup even if its HTTP caller disconnects, so the next read can use it.
+    let id = id.to_owned();
+    tokio::spawn(async move {
+        let models = fetch_models(&id, &settings, protocol).await;
+        let mut cache = CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        cache.retain(|_, (created, _)| created.elapsed() < Duration::from_secs(300));
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, (Instant::now(), models.clone()));
+        models
+    })
+    .await
+    .map_err(|error| format!("model discovery task failed: {error}"))?
+}
+
+async fn fetch_models(id: &str, settings: &super::Settings, protocol: Protocol) -> Discovery {
     let mut base = settings.base_url.as_str();
     for suffix in ["/chat/completions", "/responses", "/messages"] {
         if let Some(stripped) = base.strip_suffix(suffix) {
@@ -255,15 +279,6 @@ async fn discover(
     if models.is_empty() {
         return Err("provider returned no supported language models".into());
     }
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    cache.retain(|_, (created, _)| created.elapsed() < Duration::from_secs(300));
-    if cache.len() >= 64 {
-        cache.clear();
-    }
-    cache.insert(key, (Instant::now(), models.clone()));
     Ok(models)
 }
 
@@ -525,6 +540,125 @@ mod tests {
         // high variant is the midpoint floor clamped up to the configured min.
         assert_eq!(variants["high"]["thinking"]["budgetTokens"], 6000);
         assert_eq!(variants["max"]["thinking"]["budgetTokens"], 11999);
+    }
+
+    #[tokio::test]
+    async fn discovery_finishes_and_caches_after_its_caller_is_cancelled() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let model = format!("after-cancel-{}", listener.local_addr().unwrap().port());
+        let router = Router::new().route(
+            "/models",
+            get({
+                let (calls, entered, release, model) = (
+                    calls.clone(),
+                    entered.clone(),
+                    release.clone(),
+                    model.clone(),
+                );
+                move || {
+                    let (calls, entered, release, model) = (
+                        calls.clone(),
+                        entered.clone(),
+                        release.clone(),
+                        model.clone(),
+                    );
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        entered.notify_one();
+                        release.notified().await;
+                        Json(json!({"data":[{"id":model}]}))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let cfg = config(
+            json!({"provider":{"fixture":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":url}}}}),
+        );
+        let auth = AuthStore::from_json("{}").unwrap();
+        let caller = tokio::spawn({
+            let (cfg, auth) = (cfg.clone(), auth.clone());
+            async move { discover("fixture", &cfg, &auth).await }
+        });
+        entered.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cached = CACHE
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|(_, result)| {
+                        result
+                            .as_ref()
+                            .is_ok_and(|models| models.contains_key(&model))
+                    });
+                if cached {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled caller must not cancel remote discovery");
+        assert!(discover("fixture", &cfg, &auth)
+            .await
+            .unwrap()
+            .contains_key(&model));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_cache_is_invalidated_by_new_credentials() {
+        use axum::{extract::State, routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route(
+                "/models",
+                get(|State(calls): State<Arc<AtomicUsize>>| async move {
+                    if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        Json(json!({"error":"Invalid credentials"}))
+                    } else {
+                        Json(json!({"data":[{"id":"reconnected"}]}))
+                    }
+                }),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let auth = AuthStore::from_json("{}").unwrap();
+        let mut cfg = config(
+            json!({"provider":{"fixture":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":url,"apiKey":"old"}}}}),
+        );
+        assert!(discover("fixture", &cfg, &auth).await.is_err());
+        assert!(discover("fixture", &cfg, &auth).await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        cfg.provider.get_mut("fixture").unwrap().options.api_key = "new".into();
+        assert!(discover("fixture", &cfg, &auth)
+            .await
+            .unwrap()
+            .contains_key("reconnected"));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.abort();
     }
 
     #[tokio::test]
