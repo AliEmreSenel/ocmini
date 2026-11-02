@@ -46,11 +46,9 @@ pub(super) fn expand(text: &str) -> String {
     format!("{shown}{note}").replace('\n', "\n  ")
 }
 
-/// A tool call's opening row in the two forms `Ctrl+O` switches between:
-/// `(collapsed, expanded)` — the input summary truncated to one line, and the
-/// whole command. Shared by the live event stream and the resumed history, so a
-/// session reads the same after `--continue` as it did while running, and a
-/// saved call expands just like a live one.
+/// A call's brief and full command rows. The grouped view derives its count
+/// and tool names from retained calls instead of printing these rows. Live
+/// events and saved history use the same formatting.
 pub(super) fn tool_line(part: &Value) -> (String, String) {
     let mark = format!("{CYAN}● {}{RESET}", part["tool"].as_str().unwrap_or("tool"));
     let input = input_summary(&part["state"]["input"]);
@@ -226,14 +224,40 @@ fn render_interaction(ui: &mut Ui, event: &crate::types::BusEvent) -> String {
 pub(super) enum Row {
     /// Committed transcript text, tagged with the toggle that can hide it.
     Text(RowKind, String),
-    /// A running tool call's live row: painted above the prompt, replaced by
-    /// the next running call, and never committed. Its header and result are
-    /// committed together when the call finishes, so a parallel batch lists
-    /// every result under its own call, in completion order.
-    Live(RowKind, String),
-    /// The running call finished: drop its live row so the committed pair
-    /// starts on a fresh row.
-    LiveEnd,
+    /// Replace this call's state in its retained chain, including pending calls.
+    Tool(ToolCall),
+    /// A turn ended, or the next user prompt begins a new chain.
+    EndTools,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub brief: String,
+    pub full: String,
+}
+
+impl ToolCall {
+    fn from_part(part: &Value) -> Self {
+        let (mut brief, mut full) = tool_line(part);
+        if let Some((result, full_result)) = tool_result(part) {
+            brief.push_str(&format!("\n{result}"));
+            full.push_str(&format!("\n{full_result}"));
+        }
+        Self {
+            id: format!(
+                "{}:{}",
+                part["sessionID"].as_str().unwrap_or_default(),
+                part["id"].as_str().unwrap_or_default()
+            ),
+            name: part["tool"].as_str().unwrap_or("tool").into(),
+            status: part["state"]["status"].as_str().unwrap_or("pending").into(),
+            brief,
+            full,
+        }
+    }
 }
 
 fn render_text(update: TextUpdate) -> Vec<Row> {
@@ -264,35 +288,18 @@ pub(super) fn render_part(ui: &mut Ui, part: &Value) -> Vec<Row> {
     let mut rows = Vec::new();
     if part["type"] == "tool" {
         let id = part["id"].as_str().unwrap_or_default();
-        if ui.headered.insert(format!("{id}:start")) {
-            // The call runs as a live row, with its status suffix; nothing
-            // commits yet, so it costs no blank rows and no stray pending
-            // lines in the scrollback.
-            let (line, full) = tool_line(part);
-            rows.push(Row::Live(RowKind::ToolBrief, line));
-            rows.push(Row::Live(RowKind::ToolFull, full));
-        }
-        if let Some((result, full)) = tool_result(part) {
-            if ui.tool_done.insert(id.into()) {
-                // Header and result commit as one pair, each in both forms,
-                // so Ctrl+O swaps whole calls and a result never lands
-                // under the wrong call.
-                let (line, full_line) = tool_line(part);
-                rows.push(Row::LiveEnd);
-                rows.push(Row::Text(RowKind::ToolBrief, format!("{line}\n{result}\n")));
-                rows.push(Row::Text(
-                    RowKind::ToolFull,
-                    format!("{full_line}\n{full}\n"),
-                ));
+        let key = format!("{}:{id}", part["sessionID"].as_str().unwrap_or_default());
+        if !ui.tool_done.contains(&key) {
+            if tool_result(part).is_some() {
+                ui.tool_done.insert(key);
             }
+            rows.push(Row::Tool(ToolCall::from_part(part)));
         }
     }
     rows
 }
 
-/// Transcript text split by the kind that hides it, so the renderer filters per
-/// row instead of per call: one event can emit a visible tool line and a
-/// hideable result line.
+/// Transcript updates shared by the event stream and saved history.
 pub(super) fn render_event(
     ui: &mut Ui,
     event: &crate::types::BusEvent,
@@ -308,6 +315,11 @@ pub(super) fn render_event(
     }
     if event.kind == event::EventKind::Part(event::PartKind::Updated) {
         return render_part(ui, &properties["part"]);
+    }
+    if event.kind == event::EventKind::Message(event::MessageKind::Updated)
+        && properties["info"]["role"] == "user"
+    {
+        rows.push(Row::EndTools);
     }
     if let Some(update) = ui.text.apply(event) {
         rows.extend(render_text(update));
@@ -326,6 +338,7 @@ pub(super) fn render_event(
             Some(format!("\n{RED}error:{RESET} {message}\n"))
         }
         event::EventKind::Session(event::SessionKind::Idle) => {
+            rows.push(Row::EndTools);
             Some(format!("\n{DIM}└ idle{RESET}\n"))
         }
         event::EventKind::Session(event::SessionKind::Title) => {
@@ -351,6 +364,7 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
     for message in history {
         ui.text.remember_role(&message.info.id, &message.info.role);
         if message.info.role != "assistant" {
+            display.end_tools();
             display.output(&format!("\n{BOLD}{}{RESET}\n", message.info.role), width);
         }
         for part in &message.parts {
@@ -367,13 +381,7 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
                     width,
                 ),
                 _ => {
-                    for row in render_part(ui, part) {
-                        match row {
-                            Row::Text(kind, text) => display.output_as(&text, width, kind),
-                            Row::Live(kind, text) => display.live_row(&text, kind),
-                            Row::LiveEnd => display.clear_live(),
-                        }
-                    }
+                    display.apply(render_part(ui, part), width);
                 }
             }
         }
@@ -387,6 +395,7 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
             );
         }
     }
+    display.end_tools();
 }
 
 /// The session's user prompts in order, for Up/Down recall.

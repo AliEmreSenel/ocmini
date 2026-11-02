@@ -25,11 +25,11 @@ use input::{
     clean_input, input_prefix, page_move, terminal_width, Display, Draft, History, KillRing,
 };
 use render::{
-    answer_line, option_labels, render_event, render_history, render_question, session_prompts, Row,
+    answer_line, option_labels, render_event, render_history, render_question, session_prompts,
 };
 pub(crate) use render::{display_model, summarize_input};
 #[cfg(test)]
-use render::{expand, tool_line, tool_result, MAX_EXPANDED};
+use render::{expand, tool_line, tool_result, Row, MAX_EXPANDED};
 use std::io::IsTerminal;
 use std::task::Poll;
 
@@ -93,33 +93,54 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
     out.replace('\n', " ")
 }
 
-/// Which runtime toggle hides a transcript row. Everything else is always
-/// painted, so a toggle can never swallow a prompt, an error or a tool's name.
+/// Transcript rows and retained tool chains. Plain text always stays visible.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RowKind {
     Plain,
     /// Chain of thought: the `◦ thinking` header and every reasoning delta.
     Thinking,
-    /// A tool call's collapsed form: the `● tool` line and a truncated result.
-    ToolBrief,
-    /// The same call with its full command and its full result. Exactly one of
-    /// the two forms is painted, so Ctrl+O swaps views instead of hiding work.
-    ToolFull,
+    /// A retained tool chain, rendered in the selected tool view.
+    Tools(usize),
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum ToolView {
+    #[default]
+    Grouped,
+    Brief,
+    Full,
+}
+
+impl ToolView {
+    fn next(self) -> Self {
+        match self {
+            Self::Grouped => Self::Brief,
+            Self::Brief => Self::Full,
+            Self::Full => Self::Grouped,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Brief => "brief",
+            Self::Full => "full",
+        }
+    }
 }
 
 /// Transcript noise the reader can hide while chatting, with Ctrl+T and Ctrl+O.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Visibility {
     pub thinking: bool,
-    /// Tool calls: collapsed one-liners, or the full command and full result.
-    pub tools_expanded: bool,
+    pub tools: ToolView,
 }
 
 impl Default for Visibility {
     fn default() -> Self {
         Self {
             thinking: true,
-            tools_expanded: false,
+            tools: ToolView::Grouped,
         }
     }
 }
@@ -129,8 +150,7 @@ impl Visibility {
         match kind {
             RowKind::Plain => true,
             RowKind::Thinking => self.thinking,
-            RowKind::ToolBrief => !self.tools_expanded,
-            RowKind::ToolFull => self.tools_expanded,
+            RowKind::Tools(_) => true,
         }
     }
 
@@ -139,11 +159,7 @@ impl Visibility {
         format!(
             " · thinking {} · tools {}",
             if self.thinking { "on" } else { "off" },
-            if self.tools_expanded {
-                "expanded"
-            } else {
-                "collapsed"
-            }
+            self.tools.label()
         )
     }
 }
@@ -152,7 +168,6 @@ impl Visibility {
 struct Ui {
     interactions: crate::client::Interactions,
     text: TextState,
-    headered: std::collections::HashSet<String>, // part ids that printed their header
     tool_done: std::collections::HashSet<String>,
     // Prompt interaction routed from the terminal: lines when idle, keys while a request is pending.
     prompt: Option<PendingPrompt>,
@@ -191,6 +206,11 @@ fn prompt_header(model: &str, visibility: Visibility) -> String {
 
 /// Local help is shown only on request, never sent to the model.
 fn help_text(fullscreen: bool) -> String {
+    let tools = if fullscreen {
+        "Cycle tools: grouped / brief / full"
+    } else {
+        "Brief/full tools (new output)"
+    };
     let scroll = if fullscreen {
         "  PgUp/PgDn              Scroll transcript\n  Ctrl+Home/End          Jump to top/bottom\n  Mouse wheel            Scroll transcript\n"
     } else {
@@ -219,7 +239,7 @@ fn help_text(fullscreen: bool) -> String {
   Ctrl+L                 Clear screen\n\
   Ctrl+R                 Switch session\n\
   Ctrl+T                 Toggle thinking\n\
-  Ctrl+O                 Expand/collapse tools\n\
+  Ctrl+O                 {tools}\n\
 {scroll}\
   Questions: Tab/Shift+Tab switch; Enter answers/confirms; Esc dismisses\n"
     )
@@ -630,6 +650,10 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
     prompt_history.load(session_prompts(&history));
     let mut display = Display::new(fullscreen);
     let mut ui = Ui::default();
+    if !fullscreen {
+        ui.visibility.tools = ToolView::Brief;
+        display.set_visibility(ui.visibility);
+    }
     let width = terminal_width();
     display.output(
         &format!(
@@ -677,13 +701,17 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                         display.scroll_bottom();
                     }
                     key @ (Key::ToggleThinking | Key::ToggleTools) => {
-                        // Runtime transcript toggles. Full-screen mode repaints
-                        // from the rows it kept, so hidden text comes back;
-                        // native mode cannot rewrite the terminal's scrollback,
-                        // so the change applies to output from here on.
+                        // Fullscreen cycles all retained chains through three
+                        // views. Native mode keeps brief/full for new output.
                         match key {
                             Key::ToggleThinking => ui.visibility.thinking = !ui.visibility.thinking,
-                            _ => ui.visibility.tools_expanded = !ui.visibility.tools_expanded,
+                            _ => ui.visibility.tools = if fullscreen {
+                                ui.visibility.tools.next()
+                            } else if ui.visibility.tools == ToolView::Full {
+                                ToolView::Brief
+                            } else {
+                                ToolView::Full
+                            },
                         }
                         display.set_visibility(ui.visibility);
                     }
@@ -725,7 +753,6 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                                         session = resumed;
                                         ui.interactions.clear();
                                         ui.text = TextState::default();
-                                        ui.headered.clear();
                                         ui.tool_done.clear();
                                         ui.prompt = None;
                                         model_display = display_model(selected.model.as_ref(), &app.config.model);
@@ -887,15 +914,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     Ok(event) => {
                         if !crate::client::accepts(&app.store, &session.id, &event) { continue; }
                         let event_session = crate::client::event_session(&event).unwrap_or(&session.id);
-                        for row in render_event(&mut ui, &event, event_session) {
-                            match row {
-                                Row::Text(kind, text) => {
-                                    display.output_as(&text, terminal_width(), kind)
-                                }
-                                Row::Live(kind, text) => display.live_row(&text, kind),
-                                Row::LiveEnd => display.clear_live(),
-                            }
-                        }
+                        display.apply(render_event(&mut ui, &event, event_session), terminal_width());
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let history = app.store.messages(&session.id)?;
@@ -904,15 +923,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                         display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), terminal_width());
                         render_history(&mut display, &mut ui, &history);
                         for pending in crate::client::pending_events(&app, &session.id) {
-                            for row in render_event(&mut ui, &pending, &session.id) {
-                                match row {
-                                    Row::Text(kind, text) => {
-                                        display.output_as(&text, terminal_width(), kind)
-                                    }
-                                    Row::Live(kind, text) => display.live_row(&text, kind),
-                                    Row::LiveEnd => display.clear_live(),
-                                }
-                            }
+                            display.apply(render_event(&mut ui, &pending, &session.id), terminal_width());
                         }
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -934,7 +945,7 @@ mod tests {
         answer_line, decode_event, expand, file_attachment, help_text, image_attachment,
         parse_answer, pasted_image_path, prompt_header, render_confirmation, render_event,
         render_question, switch_question, tool_line, tool_result, Draft, Key, Motion,
-        PendingPrompt, Row, RowKind, Ui, Visibility, MAX_EXPANDED, WHEEL,
+        PendingPrompt, Row, RowKind, ToolView, Ui, Visibility, MAX_EXPANDED, WHEEL,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -1300,8 +1311,8 @@ mod tests {
     fn tool_block(part: &serde_json::Value) -> (String, String) {
         let rows = super::render::render_part(&mut Ui::default(), part);
         (
-            painted(&rows, RowKind::ToolBrief),
-            painted(&rows, RowKind::ToolFull),
+            tool_text(&rows, ToolView::Brief),
+            tool_text(&rows, ToolView::Full),
         )
     }
 
@@ -1355,26 +1366,20 @@ mod tests {
         }
     }
 
-    /// The transcript text one toggle paints. Live rows are transient (they
-    /// paint above the prompt, never commit), so only committed text counts.
-    fn painted(rows: &[Row], kind: RowKind) -> String {
+    fn tool_text(rows: &[Row], view: ToolView) -> String {
         rows.iter()
             .filter_map(|row| match row {
-                Row::Text(row_kind, text) if *row_kind == kind => Some(text.as_str()),
+                Row::Tool(call) => Some(format!(
+                    "{}\n",
+                    if view == ToolView::Full {
+                        &call.full
+                    } else {
+                        &call.brief
+                    }
+                )),
                 _ => None,
             })
             .collect()
-    }
-
-    /// The live row one toggle paints, newest last.
-    fn live(rows: &[Row], kind: RowKind) -> String {
-        rows.iter()
-            .rev()
-            .find_map(|row| match row {
-                Row::Live(row_kind, text) if *row_kind == kind => Some(plain(text)),
-                _ => None,
-            })
-            .unwrap_or_default()
     }
 
     fn completed_tool() -> serde_json::Value {
@@ -1420,20 +1425,20 @@ mod tests {
             let part = serde_json::json!({"type":"tool","tool":"bash","state":{
                 "status":status,"input":{"command":"sleep 30"},"time":{"start":1}}});
             let rows = super::render::render_part(&mut Ui::default(), &part);
-            // A running call is a live row: the status shows in both forms,
-            // and nothing commits until the call finishes.
-            for kind in [RowKind::ToolBrief, RowKind::ToolFull] {
-                let text = live(&rows, kind);
+            // Pending and running updates carry both detail views. Neither
+            // appends transcript text while the batch is being generated.
+            for view in [ToolView::Brief, ToolView::Full] {
+                let text = plain(&tool_text(&rows, view));
                 assert!(text.contains("● bash sleep 30"), "{text}");
-                assert!(text.ends_with(&format!("· {status}")), "{text}");
+                assert!(text.ends_with(&format!("· {status}\n")), "{text}");
             }
-            assert!(painted(&rows, RowKind::ToolBrief).is_empty());
+            assert!(rows.iter().all(|row| matches!(row, Row::Tool(_))));
             assert!(tool_result(&part).is_none(), "{status} has no result line");
         }
     }
 
     #[test]
-    fn a_running_tool_stays_live_and_its_result_commits_under_its_call() {
+    fn a_tool_update_keeps_its_result_under_its_call() {
         let mut ui = new_ui();
         let part = |state: serde_json::Value| serde_json::json!({"id":"t1","sessionID":"s","type":"tool","tool":"bash","state":state});
         let running = render_event(
@@ -1445,9 +1450,8 @@ mod tests {
             ),
             "s",
         );
-        // A running call is a live row, not a committed one: parallel calls
-        // never stack pending rows, and none costs a blank row.
-        assert!(matches!(running[0], Row::Live(RowKind::ToolBrief, _)));
+        // State updates replace the retained call instead of appending rows.
+        assert!(matches!(running[0], Row::Tool(_)));
         assert!(running.iter().all(|row| !matches!(row, Row::Text(..))));
         let done = render_event(
             &mut ui,
@@ -1459,13 +1463,28 @@ mod tests {
             ),
             "s",
         );
-        // The live row ends, then the call and its result commit as one pair,
-        // so every result sits under its own call, in completion order.
-        assert_eq!(done[0], Row::LiveEnd);
-        let Row::Text(RowKind::ToolBrief, pair) = &done[1] else {
-            panic!("the finished call commits as header + result")
+        let [Row::Tool(call)] = done.as_slice() else {
+            panic!("the finished call updates one retained block")
         };
-        assert_eq!(plain(pair), "● bash ls\n  ✓ file1 file2\n");
+        assert_eq!(plain(&call.brief), "● bash ls\n  ✓ file1 file2");
+        assert_eq!(call.status, "completed");
+    }
+
+    #[test]
+    fn pending_calls_refresh_their_input_and_status_until_they_finish() {
+        let mut ui = new_ui();
+        let mut part = completed_tool();
+        for status in ["pending", "running", "completed"] {
+            part["state"]["status"] = serde_json::json!(status);
+            part["state"]["input"]["command"] = serde_json::json!(format!("echo {status}"));
+            let rows = super::render::render_part(&mut ui, &part);
+            let [Row::Tool(call)] = rows.as_slice() else {
+                panic!("expected one call update")
+            };
+            assert_eq!(call.status, status);
+            assert!(plain(&call.brief).contains(&format!("echo {status}")));
+        }
+        assert!(super::render::render_part(&mut ui, &part).is_empty());
     }
 
     #[test]
@@ -1482,8 +1501,8 @@ mod tests {
         );
         // One renderer formats a call for both paths, in both forms.
         let (collapsed, expanded) = tool_block(&part);
-        assert_eq!(painted(&segments, RowKind::ToolBrief), collapsed);
-        assert_eq!(painted(&segments, RowKind::ToolFull), expanded);
+        assert_eq!(tool_text(&segments, ToolView::Brief), collapsed);
+        assert_eq!(tool_text(&segments, ToolView::Full), expanded);
 
         // The header and result each print once, however many updates follow.
         for status in ["running", "completed"] {
@@ -1540,19 +1559,22 @@ mod tests {
         }
         // The status reports visibility; shortcuts are available in help.
         let starts = Visibility::default();
-        assert!(starts.thinking && !starts.tools_expanded);
+        assert!(starts.thinking && starts.tools == ToolView::Grouped);
+        assert_eq!(starts.tools.next(), ToolView::Brief);
+        assert_eq!(starts.tools.next().next(), ToolView::Full);
+        assert_eq!(starts.tools.next().next().next(), ToolView::Grouped);
         let header = plain(&prompt_header("mock/m", starts));
         assert!(header.contains("thinking on"));
-        assert!(header.contains("tools collapsed"));
+        assert!(header.contains("tools grouped"));
         let header = plain(&prompt_header(
             "mock/m",
             Visibility {
                 thinking: false,
-                tools_expanded: true,
+                tools: ToolView::Full,
             },
         ));
         assert!(header.contains("thinking off"));
-        assert!(header.contains("tools expanded"));
+        assert!(header.contains("tools full"));
     }
 
     #[test]
@@ -1585,9 +1607,8 @@ mod tests {
             panic!("a reasoning delta follows its part's kind")
         };
         assert_eq!(plain(text), "pondering");
-        // A finished tool emits a collapsed form and an expanded form, so
-        // Ctrl+O swaps views instead of hiding work, and shows calls that
-        // already ran. The long command and result are kept whole when expanded.
+        // The retained call carries brief and full detail views. The full
+        // view preserves the long command and every line of the result.
         let command = format!("ls {}", "dir/".repeat(60));
         let output = "notes.txt\nplan.md\nlong ".repeat(40);
         let segments = render_event(
@@ -1600,8 +1621,8 @@ mod tests {
             ),
             "s",
         );
-        let collapsed = plain(&painted(&segments, RowKind::ToolBrief));
-        let expanded_form = plain(&painted(&segments, RowKind::ToolFull));
+        let collapsed = plain(&tool_text(&segments, ToolView::Brief));
+        let expanded_form = plain(&tool_text(&segments, ToolView::Full));
         assert!(collapsed.contains("● bash") && collapsed.contains("ls dir/"));
         // Collapsed keeps the one-liners it always had.
         assert!(collapsed.contains('…') && !collapsed.contains(&output));
@@ -1642,9 +1663,9 @@ mod tests {
 
     #[test]
     fn a_failed_tool_call_shows_in_both_forms() {
-        for tools_expanded in [false, true] {
+        for tools in [ToolView::Brief, ToolView::Full] {
             let mut ui = new_ui();
-            ui.visibility.tools_expanded = tools_expanded;
+            ui.visibility.tools = tools;
             let segments = render_event(
                 &mut ui,
                 &bus_event(
@@ -1657,12 +1678,7 @@ mod tests {
             );
             // Hiding tool output must never hide a failure: a collapsed call
             // that failed has to look like it failed.
-            assert!(segments.iter().any(|row| match row {
-                Row::Text(kind, text) => {
-                    ui.visibility.visible(*kind) && plain(text).contains("✗ permission denied")
-                }
-                _ => false,
-            }));
+            assert!(plain(&tool_text(&segments, tools)).contains("✗ permission denied"));
         }
     }
 
@@ -1695,7 +1711,7 @@ mod tests {
         );
         // One expanded call paints its command plus its result, each capped,
         // and the result says how much of it was left out.
-        let shown = painted(&segments, RowKind::ToolFull);
+        let shown = tool_text(&segments, ToolView::Full);
         let text = plain(&shown);
         assert!(text.contains("● bash grep -r . ."), "{text}");
         assert!(text.contains("more characters not shown"), "{text}");
