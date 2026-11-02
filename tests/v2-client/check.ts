@@ -7,7 +7,7 @@ import { SessionMessage } from "@opencode/schema/session-message";
 import { Model } from "@opencode/schema/model";
 import { Provider } from "@opencode/schema/provider";
 import { Agent } from "@opencode/schema/agent";
-import { Schema, Effect } from "effect";
+import { Schema, Effect, Queue, Stream } from "effect";
 import { OpenCodeEvent as T3Event } from "opencode-protocol-t3/groups/event";
 import { SessionMessage as T3Message } from "opencode-schema-t3/session-message";
 import { OpenCode as T3OpenCode } from "opencode-client-t3/effect";
@@ -81,7 +81,29 @@ await Effect.runPromise(Effect.gen(function* () {
   yield* t3.agent.list({ location });
   yield* t3.session.get({ sessionID });
   yield* t3.message.list({ sessionID });
-}).pipe(Effect.provide(FetchHttpClient.layer)));
+  // Exercise T3's Effect client writes too: it serializes omitted fields as null.
+  const created = yield* t3.session.create({ location, model: { id: "test-model", providerID: "mock" } });
+  assert.equal(created.parentID, undefined);
+  assert.equal(created.agent, "build");
+  yield* t3.session.update({ sessionID: created.id, title: "T3 Effect client" });
+  const child = yield* t3.session.create({ parentID: created.id });
+  assert.equal(child.parentID, created.id);
+  assert.equal(child.location.directory, directory);
+  // Subscribe before submitting so even a quick local provider cannot race us.
+  const events = yield* t3.event.subscribe().pipe(Stream.toQueue({ capacity: "unbounded" }));
+  assert.equal((yield* Queue.take(events)).type, "server.connected");
+  const receipt = yield* t3.session.prompt({ sessionID: created.id, text: "T3 prompt" });
+  assert.ok(receipt.id.startsWith("msg_"));
+  yield* Stream.fromQueue(events).pipe(
+    Stream.filter((event) => event.type === "session.execution.succeeded" && event.data.sessionID === created.id),
+    Stream.take(1),
+    Stream.runDrain,
+    Effect.timeout("10 seconds"),
+  );
+  const messages = yield* t3.message.list({ sessionID: created.id });
+  assert.ok(messages.data.some((message) => message.type === "assistant"));
+  yield* t3.session.remove({ sessionID: created.id });
+}).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)));
 // Validate archive state and paged session discovery through the real client.
 await client.session.update({ sessionID, archived: true });
 assert.ok((await client.session.get({ sessionID })).time.archived);
