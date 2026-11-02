@@ -227,6 +227,8 @@ pub(super) enum Row {
     /// One blank row before a block-level element. The display owns the
     /// transcript's rhythm, so headers carry no leading newline of their own.
     Blank,
+    /// The text stream restarted: drop the markdown renderer's line and fence.
+    Rewrite,
     /// A label row: the separator, the label, and leave the transcript ready to
     /// swallow the blank row a model's leading newline produces, so a label
     /// sits on top of the text it marks instead of floating above it.
@@ -307,12 +309,14 @@ fn render_text(ui: &mut Ui, update: TextUpdate, source: &Value) -> Vec<Row> {
     if label {
         ui.answer_labelled = true;
     }
+    let mut rows = Vec::new();
     let mut text = String::new();
     if update.reset {
+        // The whole text is coming again, so the renderer starts over.
+        rows.push(Row::Rewrite);
         text.push_str(&format!("\n{DIM}[response updated]{RESET}\n"));
     }
     text.push_str(&update.text);
-    let mut rows = Vec::new();
     if label {
         rows.push(Row::Header(
             RowKind::Plain,
