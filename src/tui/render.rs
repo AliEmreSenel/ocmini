@@ -227,6 +227,10 @@ pub(super) enum Row {
     /// One blank row before a block-level element. The display owns the
     /// transcript's rhythm, so headers carry no leading newline of their own.
     Blank,
+    /// A label row: the separator, the label, and leave the transcript ready to
+    /// swallow the blank row a model's leading newline produces, so a label
+    /// sits on top of the text it marks instead of floating above it.
+    Header(RowKind, String),
     /// Replace this call's state in its retained chain, including pending calls.
     Tool(ToolCall),
     Thought(ThoughtUpdate),
@@ -295,15 +299,13 @@ fn render_text(ui: &mut Ui, update: TextUpdate, source: &Value) -> Vec<Row> {
             end: source["time"]["end"].as_i64(),
         })];
     }
-    // One label per assistant message. A turn streams a new text part after
-    // every tool batch, and labeling each part printed `assistant` again in the
-    // middle of the same answer. Without a message id there is nothing to
-    // group by, so the first run of a part is all the label the stream offers.
-    let message_id = source["messageID"].as_str().unwrap_or_default();
-    let label = update.new
-        && (message_id.is_empty() || ui.last_assistant_msg.as_deref() != Some(message_id));
-    if label && !message_id.is_empty() {
-        ui.last_assistant_msg = Some(message_id.to_string());
+    // One label per answer. A turn runs one model step per tool batch, each
+    // step in its own assistant message with its own text parts, so labeling a
+    // new part - or a new message - printed `assistant` again in the middle of
+    // the same answer. The label is spent until the next user prompt.
+    let label = update.new && !ui.answer_labelled;
+    if label {
+        ui.answer_labelled = true;
     }
     let mut text = String::new();
     if update.reset {
@@ -312,8 +314,7 @@ fn render_text(ui: &mut Ui, update: TextUpdate, source: &Value) -> Vec<Row> {
     text.push_str(&update.text);
     let mut rows = Vec::new();
     if label {
-        rows.push(Row::Blank);
-        rows.push(Row::Text(
+        rows.push(Row::Header(
             RowKind::Plain,
             format!("{BOLD}assistant{RESET}\n"),
         ));
@@ -371,6 +372,8 @@ pub(super) fn render_event(
     if event.kind == event::EventKind::Message(event::MessageKind::Updated)
         && properties["info"]["role"] == "user"
     {
+        // A new prompt starts an answer, so the label is available again.
+        ui.answer_labelled = false;
         rows.push(Row::EndTools);
     }
     if let Some(update) = ui.text.apply(event) {
@@ -421,6 +424,8 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
         if message.info.role != "assistant" {
             display.end_tools();
             if message.info.role == "user" {
+                // A prompt starts an answer, so its label is available again.
+                ui.answer_labelled = false;
                 display.user_prompt(
                     message
                         .parts

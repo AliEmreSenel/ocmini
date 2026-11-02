@@ -1102,6 +1102,14 @@ impl Display {
             match row {
                 Row::Text(kind, text) => self.output_as(&text, width, kind),
                 Row::Blank => self.ensure_blank(),
+                Row::Header(kind, text) => {
+                    self.ensure_blank();
+                    self.output_as(&text, width, kind);
+                    // The label's own row ends it. A blank row that follows
+                    // comes from the model's leading newline, not from the
+                    // transcript's rhythm, so it collapses into the label.
+                    self.spacing.blank = true;
+                }
                 Row::Tool(call) => self.update_tool(call),
                 Row::Thought(update) => self.update_thought(update, width),
                 Row::ThoughtTokens { message_id, tokens } => {
