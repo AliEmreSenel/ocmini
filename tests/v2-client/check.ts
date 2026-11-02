@@ -61,7 +61,8 @@ const reading = (async () => {
     }
   }
 })();
-await client.session.prompt({ sessionID, id: "msg_t3_turn_conformance:1", text: "Answer" });
+const attemptId = "run-attempt:run:run%3Athread%3Aconformance%3Aordinal%3A1:attempt:1";
+await client.session.prompt({ sessionID, id: `msg_t3_turn_${sessionID}:${attemptId}`, text: "Answer" });
 await Promise.race([ended, reading, new Promise((_, reject) => setTimeout(() => reject(new Error("No terminal event")), 10000))]);
 const history = await client.message.list({ sessionID, order: "asc" });
 for (const message of history.data) { Schema.decodeUnknownSync(SessionMessage.Info)(message); Schema.decodeUnknownSync(T3Message.Info)(message); }
@@ -92,8 +93,9 @@ await Effect.runPromise(Effect.gen(function* () {
   // Subscribe before submitting so even a quick local provider cannot race us.
   const events = yield* t3.event.subscribe().pipe(Stream.toQueue({ capacity: "unbounded" }));
   assert.equal((yield* Queue.take(events)).type, "server.connected");
-  const receipt = yield* t3.session.prompt({ sessionID: created.id, text: "T3 prompt" });
-  assert.ok(receipt.id.startsWith("msg_"));
+  const promptId = `msg_t3_turn_${created.id}:${attemptId}:${"encoded%3A".repeat(30)}`;
+  const receipt = yield* t3.session.prompt({ sessionID: created.id, id: promptId, text: "T3 prompt" });
+  assert.equal(receipt.id, promptId);
   yield* Stream.fromQueue(events).pipe(
     Stream.filter((event) => event.type === "session.execution.succeeded" && event.data.sessionID === created.id),
     Stream.take(1),

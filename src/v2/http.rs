@@ -190,7 +190,16 @@ async fn providers(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
     let dir = directory(&query)?;
-    let cfg = catalog(&st, &dir).await?;
+    // Provider metadata does not depend on remote model enumeration.
+    let mut cfg = Config::load_for(&dir).map_err(OperationError::invalid)?;
+    for id in st.app.auth.connected_for(&cfg) {
+        cfg.provider
+            .entry(id.clone())
+            .or_insert_with(|| crate::config::ProviderCfg {
+                name: id,
+                ..Default::default()
+            });
+    }
     let list:Vec<_>=cfg.provider.iter().filter(|(id,_)|cfg.provider_enabled(id)).map(|(id,p)|json!({"id":id,"name":p.name,"package":p.npm,"env":p.env,"models":{},"enabled":true,"activation":"auto","settings":{},"headers":{},"body":{}})).collect();
     Ok(located(&dir, json!(list)))
 }

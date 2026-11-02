@@ -28,6 +28,119 @@ async fn get(server: &TestServer, path: &str) -> Value {
 }
 
 #[tokio::test]
+async fn v2_preserves_opaque_t3_message_ids_across_retries_and_restart() {
+    let mut provider = Provider::start(vec![
+        text_script("T3 reply", ""),
+        text_script("Long ID reply", ""),
+    ])
+    .await;
+    let mut server = TestServer::start(&provider, json!({})).await;
+    let sid = session(&server).await;
+    let attempt =
+        "run-attempt:run:run%3Athread%3Aef6198cd-b243-4f2b-8002-14372d94b3c1%3Aordinal%3A1:attempt:1";
+    let ids = [
+        format!("msg_t3_turn_{sid}:{attempt}"),
+        format!("msg_t3_steer_{sid}:{}", "part%3A".repeat(50)),
+    ];
+    assert!(ids[1].len() > 256);
+    for id in &ids {
+        let mut events = server.events_at("/api/event").await;
+        let receipt = post(
+            &server,
+            &format!("/api/session/{sid}/prompt"),
+            json!({"id":id,"text":"Hello T3"}),
+        )
+        .await;
+        assert_eq!(receipt["data"]["id"], *id);
+        events.through("session.execution.succeeded").await;
+        provider.request().await;
+    }
+    server.restart().await;
+    for id in &ids {
+        let receipt = post(
+            &server,
+            &format!("/api/session/{sid}/prompt"),
+            json!({"id":id,"text":"Retry"}),
+        )
+        .await;
+        assert_eq!(receipt["data"]["id"], *id);
+    }
+    let history = get(&server, &format!("/api/session/{sid}/message")).await;
+    for id in &ids {
+        assert_eq!(
+            history["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["id"] == *id)
+                .count(),
+            1
+        );
+    }
+    let invalid = server
+        .post(
+            &format!("/api/session/{sid}/prompt"),
+            &json!({"id":"wrong_prefix","text":"Invalid"}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    assert_eq!(
+        invalid.json::<Value>().await.unwrap()["message"],
+        "messageID must start with msg_"
+    );
+}
+
+#[tokio::test]
+async fn v2_provider_metadata_avoids_discovery_and_model_reads_reuse_failed_discovery() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let remote = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/models",
+                axum::routing::get(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error":{"message":"Catalog offline"}})),
+                        )
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({"providers":{"offline":{"package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":url}}}})).await;
+    let providers = get(&server, "/api/provider").await;
+    assert!(providers["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "offline"));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    for _ in 0..2 {
+        let models = get(&server, "/api/model").await;
+        assert!(models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "test-model"));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    remote.abort();
+}
+
+#[tokio::test]
 async fn v2_accepts_null_optional_fields_from_t3_session_requests() {
     let mut provider = Provider::start(vec![text_script("Hello T3", "")]).await;
     let mut server = TestServer::start(&provider, json!({})).await;
