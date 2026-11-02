@@ -36,13 +36,13 @@ Set it in `opencode.json` before starting; a running TUI keeps the mode it start
 
 Two transcript toggles work while you chat, and the status row shows the current state when space allows:
 
-- `Ctrl+T` hides chain of thought - the `◦ thinking` block and everything streamed into it - for a transcript of just answers and tool calls.
+- In `fullscreen` mode, `Ctrl+T` collapses each thinking block to one row, such as `◦ Thought for 2.5s (42 tokens)`. Press it again to restore the text. Durations use the block’s timestamps; token counts use reported reasoning usage when available, or an estimate marked `~`. Native mode keeps its existing thinking visibility toggle.
 - In `fullscreen` mode, `Ctrl+O` cycles through three views for every tool chain, including saved and running calls:
   1. **Grouped** (default): one summary, such as `▸ 100 tool calls · bash × 80, read × 20`, with pending/running counts and a visible failure count.
   2. **Brief**: every call with its command and a short result immediately underneath.
   3. **Full**: complete commands and results, with multiline output indented under each call. Each command or result is capped at 50 KiB and says how much was omitted.
 
-A chain includes the tool calls made during a turn, across model steps. Calls remain in their original order, and their states update in place while the model generates the batch and the tools run. A new user prompt or an idle event closes the chain. Assistant text stays visible alongside the chain.
+A tool group contains only consecutive tool calls between messages. An intervening assistant message or thinking block ends the group, including when thinking is collapsed to its summary row. Calls stay in chronological order and update in place while the model generates the batch and the tools run. Streamed narrative newline runs render as a single blank separator; fenced code blocks and tool output keep their original blank lines.
 
 In `fullscreen` mode these controls re-render the retained transcript at any scroll position. In `native` mode, `Ctrl+O` keeps the two brief/full views and affects new output; the terminal owns previously printed scrollback. Running calls use a bounded live area, with wrapped and multiline rows counted correctly, so generating a large batch does not accumulate blank rows. Each completed native call prints its header and result together.
 

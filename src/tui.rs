@@ -101,6 +101,8 @@ pub(crate) enum RowKind {
     Thinking,
     /// A retained tool chain, rendered in the selected tool view.
     Tools(usize),
+    /// A reasoning block: full text or its duration/token summary.
+    Thought(usize),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -150,7 +152,7 @@ impl Visibility {
         match kind {
             RowKind::Plain => true,
             RowKind::Thinking => self.thinking,
-            RowKind::Tools(_) => true,
+            RowKind::Tools(_) | RowKind::Thought(_) => true,
         }
     }
 
@@ -1590,10 +1592,10 @@ mod tests {
             "s",
         );
         assert_eq!(segments.len(), 1);
-        let Row::Text(RowKind::Thinking, header) = &segments[0] else {
-            panic!("a reasoning header is a committed thinking row")
+        let Row::Thought(thought) = &segments[0] else {
+            panic!("a reasoning part opens a retained thought block")
         };
-        assert!(plain(header).contains("thinking"));
+        assert!(thought.new && thought.text.is_empty());
         // Its deltas follow the part's kind, so hiding it hides the stream.
         let segments = render_event(
             &mut ui,
@@ -1603,10 +1605,11 @@ mod tests {
             ),
             "s",
         );
-        let Row::Text(RowKind::Thinking, text) = &segments[0] else {
-            panic!("a reasoning delta follows its part's kind")
+        let Row::Thought(thought) = &segments[0] else {
+            panic!("a reasoning delta updates its retained thought block")
         };
-        assert_eq!(plain(text), "pondering");
+        assert_eq!(thought.text, "pondering");
+        assert_eq!(thought.id, "r1");
         // The retained call carries brief and full detail views. The full
         // view preserves the long command and every line of the result.
         let command = format!("ls {}", "dir/".repeat(60));

@@ -1,4 +1,4 @@
-use super::render::{Row, ToolCall};
+use super::render::{Row, ThoughtUpdate, ToolCall};
 use super::{Attachment, Key, PendingPrompt, RowKind, ToolView, Ui, Visibility, BOLD, RESET};
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -753,6 +753,53 @@ fn wrap_row(row: &str, width: usize) -> Vec<String> {
     rows
 }
 
+fn unstyled(text: &str) -> String {
+    let mut rest = text;
+    let mut plain = String::new();
+    while !rest.is_empty() {
+        if let Some(end) = escape_len(rest) {
+            rest = &rest[end..];
+        } else {
+            let ch = rest.chars().next().unwrap();
+            plain.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    plain
+}
+
+/// Streamed whitespace outside code blocks is a paragraph separator, not one
+/// transcript row per newline token. Tool results bypass this presentation rule.
+#[derive(Default)]
+struct Spacing {
+    blank: bool,
+    fence: Option<(char, usize)>,
+}
+
+impl Spacing {
+    fn accept(&mut self, row: &str) -> bool {
+        let plain = unstyled(row);
+        let text = plain.trim();
+        let blank = text.is_empty();
+        if blank && self.blank && self.fence.is_none() {
+            return false;
+        }
+        self.blank = blank;
+        if let Some((mark, count)) = self.fence {
+            let length = text.chars().take_while(|ch| *ch == mark).count();
+            if length >= count && text[length..].trim().is_empty() {
+                self.fence = None;
+            }
+        } else if let Some(mark @ ('`' | '~')) = text.chars().next() {
+            let length = text.chars().take_while(|ch| *ch == mark).count();
+            if length >= 3 {
+                self.fence = Some((mark, length));
+            }
+        }
+        true
+    }
+}
+
 // Two transcript renderers share one event pipeline. In native mode only the
 // unfinished row and the draft are redrawn: complete rows are committed to the
 // terminal's scrollback and never erased by editing, and the terminal owns
@@ -781,6 +828,9 @@ pub(super) struct Display {
     chains: Vec<ToolChain>,
     calls: HashMap<String, (usize, usize)>,
     active_chain: Option<usize>,
+    thoughts: Vec<Thought>,
+    thought_ids: HashMap<String, usize>,
+    spacing: Spacing,
     fullscreen: bool,
     /// First transcript display row painted at the viewport top. None follows
     /// the newest output.
@@ -826,6 +876,54 @@ struct WrappedRows {
 struct ToolChain {
     anchor: usize,
     calls: Vec<ToolCall>,
+}
+
+struct Thought {
+    anchor: usize,
+    message_id: String,
+    text: String,
+    start: i64,
+    end: Option<i64>,
+    tokens: Option<i64>,
+}
+
+impl Thought {
+    fn rows(&self, expanded: bool) -> Vec<String> {
+        if self.text.trim().is_empty() {
+            return Vec::new();
+        }
+        if expanded {
+            let mut spacing = Spacing::default();
+            return std::iter::once(format!("{}◦ thinking{RESET}", super::DIM))
+                .chain(
+                    self.text
+                        .trim_end()
+                        .lines()
+                        .filter(|line| spacing.accept(line))
+                        .map(|line| format!("{line}{RESET}")),
+                )
+                .collect();
+        }
+        let seconds = self
+            .end
+            .unwrap_or_else(crate::types::now_ms)
+            .saturating_sub(self.start)
+            .max(0) as f64
+            / 1000.0;
+        let tokens = self
+            .tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| format!("~{}", self.text.chars().count().div_ceil(4)));
+        let label = if self.end.is_some() {
+            "Thought"
+        } else {
+            "Thinking"
+        };
+        vec![format!(
+            "{}◦ {label} for {seconds:.1}s ({tokens} tokens){RESET}",
+            super::DIM
+        )]
+    }
 }
 
 impl ToolChain {
@@ -901,6 +999,9 @@ impl Display {
             chains: Vec::new(),
             calls: HashMap::new(),
             active_chain: None,
+            thoughts: Vec::new(),
+            thought_ids: HashMap::new(),
+            spacing: Spacing::default(),
             fullscreen,
             scroll: None,
             page: 24,
@@ -962,8 +1063,88 @@ impl Display {
             match row {
                 Row::Text(kind, text) => self.output_as(&text, width, kind),
                 Row::Tool(call) => self.update_tool(call),
+                Row::Thought(update) => self.update_thought(update, width),
+                Row::ThoughtTokens { message_id, tokens } => {
+                    let matching: Vec<_> = self
+                        .thoughts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, thought)| thought.message_id == message_id)
+                        .map(|(index, _)| index)
+                        .collect();
+                    // A message's aggregate usage is exact for a single block;
+                    // do not assign that total to every block in older history.
+                    if let [index] = matching.as_slice() {
+                        self.thoughts[*index].tokens = Some(tokens);
+                        self.invalidate_from(self.thoughts[*index].anchor);
+                    }
+                }
                 Row::EndTools => self.end_tools(),
             }
+        }
+    }
+
+    fn update_thought(&mut self, update: ThoughtUpdate, width: usize) {
+        if !self.fullscreen {
+            let mut text = if update.new {
+                format!("\n{}◦ thinking{RESET}\n", super::DIM)
+            } else {
+                String::new()
+            };
+            if update.reset {
+                text.push_str(&format!("\n{}[response updated]{RESET}\n", super::DIM));
+            }
+            text.push_str(&update.text);
+            self.output_as(&text, width, RowKind::Thinking);
+            return;
+        }
+        let index = if let Some(&index) = self.thought_ids.get(&update.id) {
+            index
+        } else {
+            self.active_chain = None;
+            self.finish_line();
+            self.spacing = Spacing::default();
+            let index = self.thoughts.len();
+            self.thoughts.push(Thought {
+                anchor: self.lines.len(),
+                message_id: update.message_id.clone(),
+                text: String::new(),
+                start: update.start.unwrap_or_else(crate::types::now_ms),
+                end: None,
+                tokens: None,
+            });
+            self.thought_ids.insert(update.id, index);
+            self.lines.push((RowKind::Thought(index), String::new()));
+            index
+        };
+        let thought = &mut self.thoughts[index];
+        if update.reset {
+            thought.text.clear();
+        }
+        thought.text.push_str(&update.text);
+        if !update.message_id.is_empty() {
+            thought.message_id = update.message_id;
+        }
+        if let Some(start) = update.start {
+            thought.start = start;
+        }
+        if let Some(end) = update.end {
+            thought.end = Some(end);
+        }
+        let anchor = thought.anchor;
+        self.invalidate_from(anchor);
+    }
+
+    fn invalidate_from(&mut self, anchor: usize) {
+        let cache = self.wrapped.get_mut();
+        if anchor < cache.through {
+            cache.through = anchor;
+            cache.rows.truncate(if anchor == 0 {
+                0
+            } else {
+                cache.ends[anchor - 1]
+            });
+            cache.ends.truncate(anchor);
         }
     }
 
@@ -987,6 +1168,7 @@ impl Display {
                 Some(chain) => chain,
                 None => {
                     self.finish_line();
+                    self.spacing = Spacing::default();
                     let chain = self.chains.len();
                     self.chains.push(ToolChain {
                         anchor: self.lines.len(),
@@ -1008,17 +1190,8 @@ impl Display {
                 crate::println!("{row}{RESET}");
             }
         }
-        let cache = self.wrapped.get_mut();
         let anchor = self.chains[chain].anchor;
-        if anchor < cache.through {
-            cache.through = anchor;
-            cache.rows.truncate(if anchor == 0 {
-                0
-            } else {
-                cache.ends[anchor - 1]
-            });
-            cache.ends.truncate(anchor);
-        }
+        self.invalidate_from(anchor);
     }
 
     pub fn end_tools(&mut self) {
@@ -1041,6 +1214,11 @@ impl Display {
     /// brings it back, and dropped in native mode, where the terminal's
     /// scrollback cannot be rewritten.
     pub fn output_as(&mut self, text: &str, width: usize, kind: RowKind) {
+        if !unstyled(text).trim().is_empty() {
+            // Only consecutive tool calls belong to a group. Even when
+            // thinking is collapsed, intervening messages keep their place.
+            self.active_chain = None;
+        }
         let mut text = text;
         if kind != self.tail_kind {
             let committed = self.columns > 0;
@@ -1104,6 +1282,9 @@ impl Display {
     /// toggle is off is never printed, and never stored in native mode, where
     /// it could not be taken back.
     fn push_row(&mut self, row: String) {
+        if !self.spacing.accept(&row) {
+            return;
+        }
         if self.fullscreen {
             self.lines.push((self.tail_kind, format!("{row}{RESET}")));
         } else if self.visibility.visible(self.tail_kind) {
@@ -1117,6 +1298,9 @@ impl Display {
         self.chains.clear();
         self.calls.clear();
         self.active_chain = None;
+        self.thoughts.clear();
+        self.thought_ids.clear();
+        self.spacing = Spacing::default();
         *self.wrapped.get_mut() = WrappedRows::default();
         if self.fullscreen {
             self.scroll = None;
@@ -1147,6 +1331,9 @@ impl Display {
         self.chains.clear();
         self.calls.clear();
         self.active_chain = None;
+        self.thoughts.clear();
+        self.thought_ids.clear();
+        self.spacing = Spacing::default();
         *self.wrapped.get_mut() = WrappedRows::default();
         self.scroll = None;
     }
@@ -1186,6 +1373,7 @@ impl Display {
     fn export_rows(&self) -> impl Iterator<Item = String> + '_ {
         self.lines.iter().flat_map(|(kind, line)| match *kind {
             RowKind::Tools(chain) => self.chains[chain].rows(self.visibility.tools),
+            RowKind::Thought(index) => self.thoughts[index].rows(self.visibility.thinking),
             _ if self.visibility.visible(*kind) => vec![line.clone()],
             _ => Vec::new(),
         })
@@ -1204,6 +1392,10 @@ impl Display {
         for (kind, line) in &self.lines[cache.through..] {
             if let RowKind::Tools(chain) = *kind {
                 for line in self.chains[chain].rows(self.visibility.tools) {
+                    cache.rows.extend(wrap_row(&line, width));
+                }
+            } else if let RowKind::Thought(index) = *kind {
+                for line in self.thoughts[index].rows(self.visibility.thinking) {
                     cache.rows.extend(wrap_row(&line, width));
                 }
             } else if self.visibility.visible(*kind) {
@@ -1312,20 +1504,19 @@ impl Display {
         if self.columns > 0 && self.visibility.visible(self.tail_kind) {
             rows.extend(wrap_row(&format!("{}{RESET}", self.tail), width));
         }
-        if let Some(chain) = self.active_chain {
-            if let Some(call) = self.chains[chain]
-                .calls
-                .iter()
-                .rev()
-                .find(|call| !matches!(call.status.as_str(), "completed" | "error"))
-            {
-                let text = if self.visibility.tools == ToolView::Full {
-                    &call.full
-                } else {
-                    &call.brief
-                };
-                rows.extend(wrap_row(text, width));
-            }
+        if let Some(call) = self
+            .chains
+            .iter()
+            .rev()
+            .flat_map(|chain| chain.calls.iter().rev())
+            .find(|call| !matches!(call.status.as_str(), "completed" | "error"))
+        {
+            let text = if self.visibility.tools == ToolView::Full {
+                &call.full
+            } else {
+                &call.brief
+            };
+            rows.extend(wrap_row(text, width));
         }
         let cut = rows.len().saturating_sub(available);
         rows.drain(..cut);
@@ -1627,14 +1818,7 @@ mod tests {
     }
 
     fn plain(rows: &[String]) -> Vec<String> {
-        rows.iter()
-            .map(|row| {
-                row.replace(BOLD, "")
-                    .replace(RESET, "")
-                    .replace("\x1b[7m", "")
-                    .replace("\x1b[27m", "")
-            })
-            .collect()
+        rows.iter().map(|row| unstyled(row)).collect()
     }
 
     #[test]
@@ -2269,6 +2453,293 @@ mod tests {
             display.update_tool(sample_tool(id, "pending"));
             display.viewport(80);
             assert_eq!(display.wrapped.borrow().work, work);
+        }
+    }
+
+    #[test]
+    fn streaming_narrative_newlines_do_not_reserve_rows_for_tool_calls() {
+        let mut display = Display::new(true);
+        display.output("I will run fifty calls.\n", 80);
+        for _ in 0..150 {
+            display.output("\n", 80);
+        }
+        for id in 0..10 {
+            display.update_tool(sample_tool(id, "pending"));
+        }
+        let rows = plain(&display.wrapped(80));
+        assert_eq!(
+            rows.len(),
+            3,
+            "narrative newline tokens must not create a huge gap: {rows:?}"
+        );
+        assert_eq!(rows[0], "I will run fifty calls.");
+        assert!(rows[2].contains("10 tool calls"));
+        display.output("Batch one done.\n", 80);
+        for _ in 0..150 {
+            display.output("\n", 80);
+        }
+        for id in 10..20 {
+            display.update_tool(sample_tool(id, "pending"));
+        }
+        let rows = plain(&display.wrapped(80));
+        assert_eq!(display.chains.len(), 2);
+        assert_eq!(rows.len(), 6);
+        assert!(rows[5].contains("10 tool calls"));
+    }
+
+    #[test]
+    fn code_blocks_and_full_tool_output_preserve_their_blank_lines() {
+        let mut display = Display::new(true);
+        display.output("```rust\nfirst\n\n\nsecond\n```\n", 80);
+        let rows = plain(&display.wrapped(80));
+        assert_eq!(rows, ["```rust", "first", "", "", "second", "```"]);
+        let mut call = sample_tool(0, "completed");
+        call.full = "● bash command\n  ✓ first\n\n\n  second".into();
+        display.update_tool(call);
+        display.set_visibility(Visibility {
+            thinking: true,
+            tools: ToolView::Full,
+        });
+        let rows = plain(&display.wrapped(80));
+        assert!(rows
+            .windows(4)
+            .any(|rows| rows == ["  ✓ first", "", "", "  second"]));
+    }
+
+    #[test]
+    fn tool_groups_stop_at_thinking_and_assistant_messages_in_every_view() {
+        let mut display = Display::new(true);
+        display.output("Running batch one.\n", 80);
+        for id in 0..10 {
+            display.update_tool(sample_tool(id, "completed"));
+        }
+        display.apply(
+            vec![
+                Row::Thought(ThoughtUpdate {
+                    id: "r1".into(),
+                    message_id: "m1".into(),
+                    text: "Need the next batch.".into(),
+                    new: true,
+                    reset: false,
+                    start: Some(1000),
+                    end: Some(3500),
+                }),
+                Row::ThoughtTokens {
+                    message_id: "m1".into(),
+                    tokens: 42,
+                },
+            ],
+            80,
+        );
+        for id in 10..20 {
+            display.update_tool(sample_tool(id, "completed"));
+        }
+        display.output("Batch two done; running batch three.\n", 80);
+        for id in 20..30 {
+            display.update_tool(sample_tool(id, "completed"));
+        }
+        display.output("Finished.\n", 80);
+        assert_eq!(display.chains.len(), 3);
+        for thinking in [true, false] {
+            display.set_visibility(Visibility {
+                thinking,
+                tools: ToolView::Grouped,
+            });
+            let rows = plain(&display.wrapped(120));
+            let groups: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.contains("10 tool calls"))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(groups.len(), 3, "{rows:?}");
+            let thought = rows
+                .iter()
+                .position(|row| {
+                    row.contains(if thinking {
+                        "Need the next batch."
+                    } else {
+                        "Thought for 2.5s (42 tokens)"
+                    })
+                })
+                .unwrap();
+            let message = rows
+                .iter()
+                .position(|row| row.contains("Batch two done"))
+                .unwrap();
+            assert!(groups[0] < thought && thought < groups[1]);
+            assert!(groups[1] < message && message < groups[2]);
+            assert!(!rows.iter().any(|row| row.contains("30 tool calls")));
+            if !thinking {
+                assert!(!rows.iter().any(|row| row.contains("Need the next batch.")));
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_updates_one_summary_then_uses_reported_tokens() {
+        let mut display = Display::new(true);
+        display.set_visibility(Visibility {
+            thinking: false,
+            tools: ToolView::Grouped,
+        });
+        for (text, new, end) in [
+            ("Planning", true, None),
+            (" the work", false, None),
+            ("", false, Some(2400)),
+        ] {
+            display.apply(
+                vec![Row::Thought(ThoughtUpdate {
+                    id: "r".into(),
+                    message_id: "m".into(),
+                    text: text.into(),
+                    new,
+                    reset: false,
+                    start: Some(1000),
+                    end,
+                })],
+                80,
+            );
+        }
+        let rows = plain(&display.wrapped(80));
+        assert_eq!(rows, ["◦ Thought for 1.4s (~5 tokens)"]);
+        display.apply(
+            vec![Row::ThoughtTokens {
+                message_id: "m".into(),
+                tokens: 17,
+            }],
+            80,
+        );
+        assert_eq!(
+            plain(&display.wrapped(80)),
+            ["◦ Thought for 1.4s (17 tokens)"]
+        );
+        display.set_visibility(Visibility::default());
+        assert_eq!(
+            plain(&display.wrapped(80)),
+            ["◦ thinking", "Planning the work"]
+        );
+        assert_eq!(display.lines.len(), 1);
+    }
+
+    #[test]
+    fn mixed_batch_events_and_saved_history_have_the_same_compact_chronology() {
+        use crate::types::{BusEvent, MessageInfo, MessageWithParts, Tokens};
+        let mut live = Display::new(true);
+        let mut ui = Ui::default();
+        let mut history = Vec::new();
+        let event = |kind: &str, properties| BusEvent {
+            id: "event".into(),
+            kind: serde_json::from_value(serde_json::json!(kind)).unwrap(),
+            properties,
+        };
+        for batch in 0..5 {
+            let message_id = format!("message_{batch}");
+            let reasoning_id = format!("reasoning_{batch}");
+            let text_id = format!("text_{batch}");
+            let mut parts = Vec::new();
+            let mut reasoning = serde_json::json!({"id":reasoning_id,"messageID":message_id,"sessionID":"s",
+                "type":"reasoning","text":"","time":{"start":1000,"end":3000}});
+            live.apply(
+                crate::tui::render::render_event(
+                    &mut ui,
+                    &event(
+                        "message.part.updated",
+                        serde_json::json!({"part":reasoning}),
+                    ),
+                    "s",
+                ),
+                120,
+            );
+            let reasoning_text = format!("Thinking about batch {batch}.{}", "\n".repeat(100));
+            live.apply(crate::tui::render::render_event(&mut ui,&event("message.part.delta",serde_json::json!({"sessionID":"s","messageID":message_id,"partID":reasoning_id,"delta":reasoning_text})),"s"),120);
+            reasoning["text"] = serde_json::json!(reasoning_text);
+            parts.push(reasoning);
+            let mut text = serde_json::json!({"id":text_id,"messageID":message_id,"sessionID":"s","type":"text","text":""});
+            live.apply(
+                crate::tui::render::render_event(
+                    &mut ui,
+                    &event("message.part.updated", serde_json::json!({"part":text})),
+                    "s",
+                ),
+                120,
+            );
+            let text_body = format!("Running batch {batch}.{}", "\n".repeat(100));
+            for delta in [format!("Running batch {batch}."), "\n".repeat(100)] {
+                live.apply(crate::tui::render::render_event(&mut ui,&event("message.part.delta",serde_json::json!({"sessionID":"s","messageID":message_id,"partID":text_id,"delta":delta})),"s"),120);
+            }
+            text["text"] = serde_json::json!(text_body);
+            parts.push(text);
+            for call in 0..10 {
+                let part = serde_json::json!({"id":format!("tool_{batch}_{call}"),"messageID":message_id,"sessionID":"s","type":"tool","tool":"bash",
+                    "state":{"status":"completed","input":{"command":format!("echo {batch}_{call}")},"output":format!("result {batch}_{call}")}});
+                live.apply(
+                    crate::tui::render::render_event(
+                        &mut ui,
+                        &event("message.part.updated", serde_json::json!({"part":part})),
+                        "s",
+                    ),
+                    120,
+                );
+                parts.push(part);
+            }
+            let finish = serde_json::json!({"id":format!("finish_{batch}"),"messageID":message_id,"sessionID":"s","type":"step-finish","tokens":{"reasoning":42}});
+            live.apply(
+                crate::tui::render::render_event(
+                    &mut ui,
+                    &event("message.part.updated", serde_json::json!({"part":finish})),
+                    "s",
+                ),
+                120,
+            );
+            parts.push(finish);
+            history.push(MessageWithParts {
+                info: MessageInfo {
+                    id: message_id,
+                    session_id: "s".into(),
+                    role: "assistant".into(),
+                    tokens: Some(Tokens {
+                        reasoning: 42,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                parts,
+            });
+        }
+        let mut replay = Display::new(true);
+        crate::tui::render::render_history(&mut replay, &mut Ui::default(), &history);
+        for thinking in [true, false] {
+            for tools in [ToolView::Grouped, ToolView::Brief, ToolView::Full] {
+                let visibility = Visibility { thinking, tools };
+                live.set_visibility(visibility);
+                replay.set_visibility(visibility);
+                let rows = plain(&live.wrapped(120));
+                assert_eq!(
+                    rows,
+                    plain(&replay.wrapped(120)),
+                    "history drift: {visibility:?}"
+                );
+                assert!(!rows
+                    .windows(2)
+                    .any(|pair| pair[0].trim().is_empty() && pair[1].trim().is_empty()));
+                if tools == ToolView::Grouped {
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| row.contains("10 tool calls"))
+                            .count(),
+                        5
+                    );
+                }
+                if !thinking {
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| row.contains("Thought for 2.0s (42 tokens)"))
+                            .count(),
+                        5
+                    );
+                }
+            }
         }
     }
 
