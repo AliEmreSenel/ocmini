@@ -226,8 +226,24 @@ pub(super) enum Row {
     Text(RowKind, String),
     /// Replace this call's state in its retained chain, including pending calls.
     Tool(ToolCall),
+    Thought(ThoughtUpdate),
+    ThoughtTokens {
+        message_id: String,
+        tokens: i64,
+    },
     /// A turn ended, or the next user prompt begins a new chain.
     EndTools,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ThoughtUpdate {
+    pub id: String,
+    pub message_id: String,
+    pub text: String,
+    pub new: bool,
+    pub reset: bool,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -260,17 +276,24 @@ impl ToolCall {
     }
 }
 
-fn render_text(update: TextUpdate) -> Vec<Row> {
-    let row = if update.kind == TextKind::Text {
-        RowKind::Plain
-    } else {
-        RowKind::Thinking
-    };
+fn render_text(update: TextUpdate, source: &Value) -> Vec<Row> {
+    if update.kind == TextKind::Reasoning {
+        return vec![Row::Thought(ThoughtUpdate {
+            id: source["id"]
+                .as_str()
+                .or_else(|| source["partID"].as_str())
+                .unwrap_or_default()
+                .into(),
+            message_id: source["messageID"].as_str().unwrap_or_default().into(),
+            text: update.text,
+            new: update.new,
+            reset: update.reset,
+            start: source["time"]["start"].as_i64(),
+            end: source["time"]["end"].as_i64(),
+        })];
+    }
     let mut text = if update.new {
-        match update.kind {
-            TextKind::Text => format!("\n{BOLD}assistant{RESET}\n"),
-            TextKind::Reasoning => format!("\n{DIM}◦ thinking{RESET}\n"),
-        }
+        format!("\n{BOLD}assistant{RESET}\n")
     } else {
         String::new()
     };
@@ -278,14 +301,25 @@ fn render_text(update: TextUpdate) -> Vec<Row> {
         text.push_str(&format!("\n{DIM}[response updated]{RESET}\n"));
     }
     text.push_str(&update.text);
-    vec![Row::Text(row, text)]
+    vec![Row::Text(RowKind::Plain, text)]
 }
 
 pub(super) fn render_part(ui: &mut Ui, part: &Value) -> Vec<Row> {
     if let Some(update) = ui.text.part(part) {
-        return render_text(update);
+        return render_text(update, part);
     }
     let mut rows = Vec::new();
+    if part["type"] == "step-finish" {
+        if let Some(tokens) = part["tokens"]["reasoning"]
+            .as_i64()
+            .filter(|tokens| *tokens > 0)
+        {
+            rows.push(Row::ThoughtTokens {
+                message_id: part["messageID"].as_str().unwrap_or_default().into(),
+                tokens,
+            });
+        }
+    }
     if part["type"] == "tool" {
         let id = part["id"].as_str().unwrap_or_default();
         let key = format!("{}:{id}", part["sessionID"].as_str().unwrap_or_default());
@@ -322,7 +356,7 @@ pub(super) fn render_event(
         rows.push(Row::EndTools);
     }
     if let Some(update) = ui.text.apply(event) {
-        rows.extend(render_text(update));
+        rows.extend(render_text(update, properties));
     }
     if ui.interactions.apply(event) {
         ui.prompt = None;
@@ -391,6 +425,21 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
                     "{RED}error: {}{RESET}\n",
                     error["data"]["message"].as_str().unwrap_or("interrupted")
                 ),
+                width,
+            );
+        }
+        if let Some(tokens) = message
+            .info
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.reasoning)
+            .filter(|tokens| *tokens > 0)
+        {
+            display.apply(
+                vec![Row::ThoughtTokens {
+                    message_id: message.info.id.clone(),
+                    tokens,
+                }],
                 width,
             );
         }
