@@ -116,6 +116,14 @@ fn apply(app: &App, result: Result<Option<Session>, crate::types::OperationError
             },
             &app.session_context(sid, json!({})),
         );
+        if app.v2.enabled(sid) {
+            app.v2.emit(
+                sid,
+                "session.renamed",
+                json!({"sessionID":sid,"title":session.title}),
+                true,
+            );
+        }
         app.hooks.emit(
             event::Session::Updated { info: &session },
             &app.session_context(sid, json!({})),

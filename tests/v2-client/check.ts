@@ -82,7 +82,38 @@ await Effect.runPromise(Effect.gen(function* () {
   yield* t3.session.get({ sessionID });
   yield* t3.message.list({ sessionID });
 }).pipe(Effect.provide(FetchHttpClient.layer)));
+// Validate archive state and paged session discovery through the real client.
+await client.session.update({ sessionID, archived: true });
+assert.ok((await client.session.get({ sessionID })).time.archived);
+const archivedPage = await client.session.list({ archived: true, limit: 1 });
+assert.equal(archivedPage.data[0]?.id, sessionID);
+await client.session.update({ sessionID, archived: false });
+
+// Keep decoding through deletion: its durable schema is version 2 in both clients.
+const deletionResponse = await fetch(`${baseUrl}/api/event?types=session.deleted`, { headers: { Authorization: authorization } });
+const deletionReader = deletionResponse.body!.getReader();
+const deleted = (async () => {
+  let pending = "";
+  const decoder = new TextDecoder();
+  while (true) {
+    const { value, done } = await deletionReader.read();
+    assert.ok(!done, "Event stream closed before deletion");
+    pending += decoder.decode(value, { stream: true });
+    let at: number;
+    while ((at = pending.indexOf("\n\n")) !== -1) {
+      const frame = pending.slice(0, at); pending = pending.slice(at + 2);
+      const raw = frame.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+      if (!raw) continue;
+      const event = JSON.parse(raw);
+      Schema.decodeUnknownSync(OpenCodeEvent)(event);
+      Schema.decodeUnknownSync(T3Event)(event);
+      if (event.type === "session.deleted" && event.data.sessionID === sessionID) return;
+    }
+  }
+})();
 await client.session.remove({ sessionID });
+await Promise.race([deleted, new Promise((_, reject) => setTimeout(() => reject(new Error("No deletion event")), 10000))]);
+await deletionReader.cancel();
 await reader.cancel();
 console.log("Official OpenCode v2.2.5 and T3-pinned v2.0.28 clients and schemas passed.");
 process.exit(0);

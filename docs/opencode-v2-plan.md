@@ -349,3 +349,5 @@ Each group needs meaningful side effects/read models and focused failure/restart
 - Full snapshot/file-revert, provider packages beyond our three protocols, and deferred product features are additional projects. They are explicitly outside the P0 claim.
 
 The original audit preceded implementation. The P0 implementation now advertises v2.2.5, adds state to the existing database and preserves legacy routes during the transition. Verification uses local provider fixtures and official SDK/schema packages; the user's live sessions and installed T3 application are not modified.
+
+Implementation follow-up: session paging/archive behavior, event filtering and resource fixes are recorded in [the v2 contract](api-v2.md) and [validation notes](opencode-v2-validation.md). The original audit above remains the historical starting point, not a claim of complete upstream product parity.

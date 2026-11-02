@@ -129,12 +129,14 @@ async fn info() -> Json<Value> {
 }
 async fn events(
     State(st): State<AppState>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
+    Query(query): Query<Vec<(String, String)>>,
+) -> Result<Response> {
     let mut rx = st.app.v2.subscribe();
-    let types: Option<Vec<_>> = query
-        .get("types")
-        .map(|v| v.split(',').map(str::to_owned).collect());
+    let types: Vec<String> = query
+        .into_iter()
+        .filter(|(key, _)| key == "types")
+        .flat_map(|(_, value)| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .collect();
     let stream = async_stream::stream! {
         yield Ok::<Event,std::io::Error>(Event::default().data(json!({"id":hex_id("evt_"),"created":now_ms(),"type":"server.connected","data":{}}).to_string()));
         loop {
@@ -142,8 +144,8 @@ async fn events(
                 _=st.shutdown.cancelled()=>break,
                 value=rx.recv()=>match value {
                     Ok(Ok(frame))=>{
-                        let selected=types.as_ref().is_none_or(|types|serde_json::from_str::<Value>(&frame).ok().is_some_and(|v|types.iter().any(|t|v["type"]==t.as_str())));
-                        if selected {yield Ok(Event::default().data(frame.as_ref()));}
+                        let selected=types.is_empty() || types.iter().any(|t| t == &frame.kind);
+                        if selected {yield Ok(Event::default().data(frame.json.as_str()));}
                     },
                     Ok(Err(error))=>{yield Err(std::io::Error::other(error.to_string()));break;},
                     Err(error)=>{yield Err(std::io::Error::other(error.to_string()));break;}
@@ -151,9 +153,9 @@ async fn events(
             }
         }
     };
-    Sse::new(stream)
+    Ok(Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
-        .into_response()
+        .into_response())
 }
 async fn catalog(st: &AppState, dir: &str) -> Result<Config> {
     let config = Config::load_for(dir).map_err(OperationError::invalid)?;
@@ -222,13 +224,64 @@ async fn list(
     State(st): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
-    let dir = query.get("directory").map(String::as_str);
-    let sessions = st.app.store.list_sessions(dir)?;
-    let list = sessions
+    let cursor = query
+        .get("cursor")
+        .map(|v| {
+            super::list::Cursor::decode(v).map_err(|e| Error {
+                status: StatusCode::BAD_REQUEST,
+                value: json!({"_tag":"InvalidCursorError","message":e.message}),
+            })
+        })
+        .transpose()?;
+    let filter = match &cursor {
+        Some(cursor) => cursor.filter.clone(),
+        None => super::list::filter(&query)?,
+    };
+    let limit = query
+        .get("limit")
+        .map(|v| {
+            v.parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0 && *n <= i64::MAX as usize)
+                .ok_or_else(|| invalid("limit must be a positive integer"))
+        })
+        .transpose()?
+        .unwrap_or(50);
+    let mut rows = st
+        .app
+        .store
+        .v2_sessions_page(&filter, cursor.as_ref(), limit)?;
+    let more = rows.len() > limit;
+    if more {
+        rows.pop();
+    }
+    if cursor.as_ref().is_some_and(|c| c.previous) {
+        rows.reverse();
+    }
+    let mut cursors = json!({});
+    let make = |row: &(Session, Value), previous| {
+        super::list::Cursor {
+            filter: filter.clone(),
+            time: row.0.time.updated.unwrap_or(row.0.time.created),
+            id: row.0.id.clone(),
+            previous,
+        }
+        .encode()
+    };
+    if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+        let backwards = cursor.as_ref().is_some_and(|c| c.previous);
+        if (backwards && more) || (!backwards && cursor.is_some()) {
+            cursors["previous"] = json!(make(first, true));
+        }
+        if (!backwards && more) || (backwards && cursor.is_some()) {
+            cursors["next"] = json!(make(last, false));
+        }
+    }
+    let data: Vec<_> = rows
         .into_iter()
-        .map(|s| Ok(wire::session(&s, &st.app.store.v2_state(&s.id)?)))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Json(json!({"data":list,"cursor":{}})))
+        .map(|(s, state)| wire::session(&s, &state))
+        .collect();
+    Ok(Json(json!({"data":data,"cursor":cursors})))
 }
 async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<Json<Value>> {
     if !body.is_object() {
@@ -307,8 +360,16 @@ async fn update(
         return Err(invalid("Session patch must be an object"));
     }
     let s = required(&st, &sid)?;
+    if body.as_object().is_some_and(|b| b.len() == 1)
+        && body
+            .get("archived")
+            .and_then(Value::as_bool)
+            .is_some_and(|archived| archived == s.time.extra.contains_key("archived"))
+    {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let mut patch = json!({});
-    for key in ["title", "metadata"] {
+    for key in ["title", "metadata", "archived"] {
         if let Some(v) = body.get(key) {
             patch[key] = v.clone();
         }
@@ -317,14 +378,6 @@ async fn update(
         patch["permission"] = json!(wire::rules(rules)?);
     }
     crate::sessions::update(&st.app, &s, patch).await?;
-    if let Some(rules) = body.get("permissions") {
-        st.app.v2.emit(
-            &sid,
-            "session.permissions",
-            json!({"sessionID":sid,"permissions":rules}),
-            true,
-        );
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn remove(State(st): State<AppState>, Path(sid): Path<String>) -> Result<StatusCode> {
@@ -357,12 +410,11 @@ async fn select_model(
 ) -> Result<StatusCode> {
     required(&st, &sid)?;
     wire::model_in(&body["model"])?;
-    st.app
-        .store
-        .v2_update(&sid, &json!({"model":body["model"]}))?;
-    st.app
-        .store
-        .v2_control(&sid, json!({"type":"model-switched","model":body["model"]}))?;
+    st.app.store.v2_transition(
+        &sid,
+        &json!({"model":body["model"]}),
+        json!({"type":"model-switched","model":body["model"]}),
+    )?;
     st.app.v2.emit(
         &sid,
         "session.model.selected",
@@ -382,10 +434,11 @@ async fn select_agent(
     if !["build", "plan", "general", "explore"].contains(&agent) && !cfg.agent.contains_key(agent) {
         return Err(invalid("Unknown agent"));
     }
-    st.app.store.v2_update(&sid, &json!({"agent":agent}))?;
-    st.app
-        .store
-        .v2_control(&sid, json!({"type":"agent-switched","agent":agent}))?;
+    st.app.store.v2_transition(
+        &sid,
+        &json!({"agent":agent}),
+        json!({"type":"agent-switched","agent":agent}),
+    )?;
     st.app.v2.emit(
         &sid,
         "session.agent.selected",

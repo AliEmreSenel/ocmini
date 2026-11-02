@@ -177,6 +177,20 @@ fn apply_public_fields(
                 .into();
         }
     }
+    if let Some(archived) = input.get("archived") {
+        let archived = archived
+            .as_bool()
+            .ok_or_else(|| OperationError::invalid("archived must be boolean"))?;
+        if archived {
+            session
+                .time
+                .extra
+                .entry("archived")
+                .or_insert_with(|| json!(crate::types::now_ms()));
+        } else {
+            session.time.extra.remove("archived");
+        }
+    }
     if let Some(metadata) = input.get("metadata") {
         let metadata = metadata
             .as_object()
@@ -274,6 +288,41 @@ pub async fn update(
         .ok_or_else(|| OperationError::not_found("Session not found"))?;
     app.hooks
         .emit(event::Session::Updated { info: &session }, &context);
+    if app.v2.enabled(&session.id) {
+        if source.title != session.title {
+            app.v2.emit(
+                &session.id,
+                "session.renamed",
+                json!({"sessionID":session.id,"title":session.title}),
+                true,
+            );
+        }
+        if source.extra != session.extra {
+            app.v2.emit(
+                &session.id,
+                "session.metadata.updated",
+                json!({"sessionID":session.id,"metadata":session.extra}),
+                true,
+            );
+        }
+        if source.permission.as_ref().map(|p| json!(p))
+            != session.permission.as_ref().map(|p| json!(p))
+        {
+            app.v2.emit(&session.id,"session.permissions",json!({"sessionID":session.id,"permissions":crate::v2::wire::rules_out(session.permission.as_deref().unwrap_or_default())}),true);
+        }
+        if source.time.extra.get("archived") != session.time.extra.get("archived") {
+            app.v2.emit(
+                &session.id,
+                if session.time.extra.contains_key("archived") {
+                    "session.archived"
+                } else {
+                    "session.unarchived"
+                },
+                json!({"sessionID":session.id}),
+                true,
+            );
+        }
+    }
     Ok(session)
 }
 

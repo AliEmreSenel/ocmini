@@ -2,6 +2,7 @@
 pub(crate) mod config;
 mod events;
 pub(crate) mod http;
+pub(crate) mod list;
 pub(crate) mod wire;
 pub use events::Events;
 use serde::{Deserialize, Serialize};

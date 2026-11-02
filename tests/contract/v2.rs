@@ -734,3 +734,163 @@ async fn v2_adopts_legacy_history_and_revert_clear_wakes_real_pending_work() {
         .iter()
         .any(|m| m["role"] == "assistant" && m["content"] == "Legacy answer"));
 }
+
+#[tokio::test]
+async fn v2_session_pages_keep_filters_and_can_page_backwards_with_tied_timestamps() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let mut ids = Vec::new();
+    for _ in 0..7 {
+        ids.push(session(&server).await);
+    }
+    let path = server.root.path().join(".local/share/ocmini/ocmini.db");
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute(
+        "UPDATE session SET time_updated=100,json=json_set(json,'$.time.updated',100)",
+        [],
+    )
+    .unwrap();
+    ids.sort();
+    let first = get(
+        &server,
+        "/api/session?limit=2&order=asc&parentID=null&search=V2",
+    )
+    .await;
+    assert_eq!(first["data"][0]["id"], ids[0]);
+    assert_eq!(first["data"][1]["id"], ids[1]);
+    assert!(first["cursor"].get("previous").is_none());
+    let next = first["cursor"]["next"].as_str().unwrap();
+    let second = get(&server, &format!("/api/session?limit=2&cursor={next}")).await;
+    assert_eq!(second["data"][0]["id"], ids[2]);
+    let previous = second["cursor"]["previous"].as_str().unwrap();
+    let back = get(&server, &format!("/api/session?limit=2&cursor={previous}")).await;
+    assert_eq!(back["data"], first["data"]);
+    let mut collected = first["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let mut page = first;
+    while let Some(next) = page["cursor"]["next"].as_str() {
+        page = get(&server, &format!("/api/session?limit=2&cursor={next}")).await;
+        collected.extend(
+            page["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_str().unwrap().to_owned()),
+        );
+    }
+    assert_eq!(collected, ids);
+    assert!(
+        get(&server, "/api/session?search=no-such-title").await["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for query in [
+        "limit=0",
+        "order=wrong",
+        "archived=maybe",
+        "cursor=invalid",
+        "project=global&subpath=child",
+    ] {
+        assert_eq!(
+            server
+                .get(&format!("/api/session?{query}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+}
+
+#[tokio::test]
+async fn v2_archive_filters_and_native_update_events_survive_restart() {
+    let provider = Provider::start(vec![]).await;
+    let mut server = TestServer::start(&provider, json!({})).await;
+    let sid = session(&server).await;
+    let mut events=server.events_at("/api/event?types=session.archived&types=session.unarchived&types=session.metadata.updated&types=session.renamed").await;
+    let patch = |body: Value| {
+        server
+            .client
+            .patch(format!("{}/api/session/{sid}", server.url))
+            .json(&body)
+            .send()
+    };
+    patch(json!({"archived":true,"metadata":{"source":"archive-test"}}))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let observed = events.through("session.archived").await;
+    assert!(observed
+        .iter()
+        .any(|e| e["type"] == "session.metadata.updated"));
+    assert!(!observed.iter().any(|e| e["type"] == "session.renamed"));
+    let archived =
+        get(&server, &format!("/api/session/{sid}")).await["data"]["time"]["archived"].clone();
+    assert!(archived.is_number());
+    let before_time =
+        get(&server, &format!("/api/session/{sid}")).await["data"]["time"]["updated"].clone();
+    patch(json!({"archived":true}))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        get(&server, &format!("/api/session/{sid}")).await["data"]["time"]["updated"],
+        before_time,
+        "repeating archive state is a no-op"
+    );
+    assert_eq!(
+        get(&server, &format!("/api/session/{sid}")).await["data"]["time"]["archived"],
+        archived
+    );
+    assert_eq!(
+        get(&server, "/api/session?archived=true").await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(get(&server, "/api/session?archived=false").await["data"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        patch(json!({"archived":"yes"})).await.unwrap().status(),
+        400
+    );
+    drop(events);
+    server.restart().await;
+    assert_eq!(
+        get(&server, &format!("/api/session/{sid}")).await["data"]["time"]["archived"],
+        archived
+    );
+    let mut events = server
+        .events_at("/api/event?types=session.archived&types=session.unarchived")
+        .await;
+    server
+        .client
+        .patch(format!("{}/api/session/{sid}", server.url))
+        .json(&json!({"archived":false}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(events.next().await["type"], "session.unarchived");
+    assert!(
+        get(&server, &format!("/api/session/{sid}")).await["data"]["time"]
+            .get("archived")
+            .is_none()
+    );
+    assert!(get(&server, "/api/session?archived=true").await["data"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}

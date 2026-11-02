@@ -59,7 +59,10 @@ pub fn session(s: &Session, state: &Value) -> Value {
             value[key] = v.clone();
         }
     }
-    for key in ["busy", "idle", "archived"] {
+    if let Some(archived) = s.time.extra.get("archived") {
+        value["time"]["archived"] = archived.clone();
+    }
+    for key in ["busy", "idle"] {
         if let Some(v) = state.get(key).filter(|v| !v.is_null()) {
             value["time"][key] = v.clone();
         }

@@ -20,7 +20,9 @@ POST /api/session creates a session with optional id, parentID, title, model, ag
 
 GET/PATCH/DELETE /api/session/{sessionID} read, update and remove sessions. GET /api/session/active returns {data: {sessionID: {type: "running"}}} for this process's active executions. Session responses use {data: session}; selection, update, move and removal return 204. Removing a session stops its work and removes descendants.
 
-Agent and model selections persist through POST /api/session/{sessionID}/agent and /model. POST /move admits a directory move at a step boundary. Session reads expose saved location, model/agent selection, usage, busy/idle timestamps and the latest outcome.
+Agent and model selections persist through POST /api/session/{sessionID}/agent and /model. POST /move admits a directory move at a step boundary. Session reads expose saved location, model/agent selection, usage, busy/idle timestamps and the latest outcome. PATCH accepts archived:true/false; an archive-only request repeating the current state is a no-op. Archive state persists in the existing session record.
+
+GET /api/session pages through the existing timestamp index with stable ID tie-breaking. It accepts limit (default 50), order, directory, project, search, parentID (including null for roots) and archived. Returned cursor.previous/cursor.next retain the filters and requested order. No extra maximum page size is imposed. Project-relative subpath filtering is explicitly unsupported; use directory.
 
 POST /api/session/{sessionID}/prompt accepts:
 
@@ -58,7 +60,7 @@ GET /api/session/{sessionID}/permission lists pending requests. POST /permission
 
 Questions appear through GET /api/session/{sessionID}/form and form.created events. String and multiselect fields use stable string keys. POST /form/{formID}/reply accepts {answer: {key: string | string[]}}. DELETE /form/{formID} cancels the question. Session ownership and answer validity are checked before settlement.
 
-PUT /api/experimental/session/{sessionID}/instructions/entries/{key} stores a keyed JSON value. Entries affect subsequent model steps and survive restart, compaction, history rewind and fork. GET the entries collection to inspect them or DELETE an entry to remove it. Updating instructions does not start a model turn.
+PUT /api/experimental/session/{sessionID}/instructions/entries/{key} stores a keyed JSON value. Entries affect subsequent model steps and survive restart, compaction, history rewind and fork. Upstream instruction hash/epoch and instructions.updated notification machinery is not implemented. GET the entries collection to inspect them or DELETE an entry to remove it. Updating instructions does not start a model turn.
 
 PUT /api/experimental/mcp/{server}?location[directory]=... accepts {config} and performs the real MCP handshake. An unchanged registration reuses its connection; a failed handshake returns an error. DELETE stops and removes the runtime registration. T3's unique per-thread server names and ordered permission rules retain workspace/thread isolation.
 
@@ -66,9 +68,11 @@ V2 model-facing tool catalogs use shell and subagent, retaining bash/task input 
 
 ## Event stream
 
-GET /api/event is global across server locations. It emits an initial server.connected event, 15-second SSE keep-alives and JSON events with id, created, type, data and optional location. Session facts have monotonically persisted per-session durable sequence metadata. Text/reasoning deltas remain live-only and use existing batched transcript persistence; frames are encoded once and shared between subscribers. The feed is allocated on first subscription.
+GET /api/event is global across server locations. It emits an initial server.connected event, 15-second SSE keep-alives and JSON events with id, created, type, data and optional location. Observed session facts have per-session durable sequence metadata allocated against a persisted high-water mark. IDs can have gaps after restart, idle cleanup or another writer; they are not an event count. Text/reasoning deltas remain live-only and use existing batched transcript persistence; frames are encoded once and shared between subscribers. The feed is allocated on first subscription. Repeated types query parameters select multiple event types without reparsing each shared JSON frame.
 
 Lifecycle events cover input enqueue/delivery/cancellation, execution start/success/failure/interruption, step start/streamed/end/failure, text/reasoning start/delta/end, tool input/call/progress/outcome, retries, compaction, permissions, forms, selections, movement and revert. Text ordinals and assistant/tool IDs retain their native attribution. A slow subscriber fails visibly using the existing event-lag policy; the live stream does not advertise replay. History, active state and session outcomes support reconnection.
+
+Streaming indexes are retained only for active executions; startup does not load every saved v2 session ID. Session event locks are independent, and database work does not hold the shared session-map lock. Active observed executions reserve sequence IDs in batches; no event/output/queue/concurrency limit is imposed. Without listeners, live frames and counter reservations are skipped while required session/transcript state still persists.
 
 A full replay log endpoint is not implemented. Existing hook events and command-hook payload protocols remain unchanged; their versions are independent of the OpenCode HTTP generation.
 
@@ -92,3 +96,5 @@ cargo test --locked --test contract official_v2_client_and_schema_conformance --
 ~~~
 
 The optional last test exercises both the current official client and T3's pinned client against a live local fixture server, plus their event/history/catalog schemas, tool outcomes, permission replies and forms. The development fixture shares Effect 4.0.6 between the two client versions. Normal Rust integration tests cover state, streaming, cancellation, compaction, background children, forms, permissions, configuration and history controls without a JavaScript runtime or paid model credentials.
+
+See [validation and measured resource costs](opencode-v2-validation.md) for the local evidence and its limits.

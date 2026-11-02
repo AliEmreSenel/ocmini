@@ -361,11 +361,10 @@ impl Engine {
     }
 }
 
-fn finish_running(app: &App, sid: &str, running: Option<Running>, error: Option<&str>) {
+fn finish_running(app: &App, sid: &str, mut running: Option<Running>, error: Option<&str>) {
     app.perms.reject_all(sid);
     app.questions.reject_all(sid);
-    app.store.release(sid);
-    if let Some(mut running) = running {
+    if let Some(running) = &mut running {
         let value = Err(error.unwrap_or("Prompt is no longer pending").into());
         for waiters in std::mem::take(&mut running.waiters).into_values() {
             for waiter in waiters {
@@ -378,6 +377,7 @@ fn finish_running(app: &App, sid: &str, running: Option<Running>, error: Option<
         event::Session::Idle { session_id: sid },
         &app.session_context(sid, json!({})),
     );
+    app.store.release(sid);
 }
 
 async fn wait_for_finalization(
