@@ -167,6 +167,7 @@ impl McpScope {
 #[derive(Clone)]
 pub struct App {
     pub store: Arc<Store>,
+    pub v2: Arc<crate::v2::Events>,
     pub config: Arc<Config>,
     pub auth: Arc<AuthStore>,
     pub perms: PermissionState,
@@ -198,8 +199,11 @@ impl App {
             directory,
             mcp_scope.clone(),
         )])));
+        let v2 = crate::v2::Events::new(&store)?;
+        bus().register_v2(&v2);
         Ok(Self {
             store,
+            v2,
             config: Arc::new(config),
             auth: Arc::new(AuthStore::load()),
             perms: PermissionState::default(),
@@ -295,6 +299,9 @@ pub trait EngineApi: Send + Sync + 'static {
         request: PromptRequest,
     ) -> Result<oneshot::Receiver<TurnResult>, OperationError>;
     fn abort(&self, session_id: &str);
+    fn interrupt(&self, session_id: &str) -> bool;
+    fn resume(&self, app: App, session_id: String) -> Result<(), OperationError>;
+    async fn wait_idle(&self, session_id: &str);
     async fn run_sync(
         &self,
         app: App,

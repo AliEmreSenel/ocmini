@@ -246,6 +246,15 @@ impl EngineApi for Engine {
                     let _ = tx.send(value);
                     return Ok(rx);
                 }
+                if existing
+                    .info
+                    .extra
+                    .get("ocminiV2Input")
+                    .is_some_and(|v| v["resume"] == false)
+                {
+                    let _ = tx.send(Ok(existing));
+                    return Ok(rx);
+                }
                 if app.store.is_pending_message(&mid)? {
                     if let Some(state) = guard.get_mut(&sid) {
                         state.waiters.entry(mid).or_default().push(tx);
@@ -278,6 +287,14 @@ impl EngineApi for Engine {
             }
             let cfg = app.config.as_ref().clone();
             request.message_id = Some(mid.clone());
+            if app.v2.enabled(&sid) && request.v2.is_none() {
+                let synthetic = request.parts.iter().any(|p| p["synthetic"] == true);
+                request.v2 = Some(crate::v2::Input {
+                    kind: if synthetic { "synthetic" } else { "user" }.into(),
+                    payload: json!({"text":text_parts(&request.parts).collect::<Vec<_>>().join("\n")}),
+                    ..Default::default()
+                });
+            }
             let agent = normalize_request(&cfg, &app, &sid, &mut request)?;
             let mut seen_parts = HashSet::new();
             for part in &mut request.parts {
@@ -312,6 +329,9 @@ impl EngineApi for Engine {
                 variant: request.variant.clone(),
                 ..Default::default()
             };
+            if let Some(input) = &request.v2 {
+                info.extra.insert("ocminiV2Input".into(), json!(input));
+            }
             if let Some(tools) = &request.tools {
                 info.extra.insert("tools".into(), json!(tools));
             }
@@ -325,7 +345,8 @@ impl EngineApi for Engine {
             // Reserve an idle session before persisting acknowledged work.
             // Otherwise another process could claim it between admission and
             // starting the drain, leaving work queued after a rejected request.
-            let claimed = !request.no_reply && !guard.contains_key(&sid);
+            let deferred = request.v2.as_ref().is_some_and(|input| !input.resume);
+            let claimed = !request.no_reply && !deferred && !guard.contains_key(&sid);
             if claimed {
                 app.store.claim(&sid)?;
             }
@@ -356,7 +377,7 @@ impl EngineApi for Engine {
             // A launcher title ("tui session", "run") says nothing about the chat.
             // Name the session after its first prompt, with the model writing the
             // title in the background when `title_model` is configured.
-            if request.no_reply {
+            if request.no_reply || deferred {
                 let _ = tx.send(Ok(message));
                 return Ok(rx);
             }
@@ -364,7 +385,12 @@ impl EngineApi for Engine {
                 title::launch(app.clone(), sid.clone(), &message.parts, model);
             }
             if let Some(state) = guard.get_mut(&sid) {
-                if let Some(gate) = &state.end_gate {
+                if let Some(gate) = state.end_gate.as_ref().filter(|_| {
+                    request
+                        .v2
+                        .as_ref()
+                        .is_none_or(|input| input.delivery == "steer")
+                }) {
                     gate.cancel();
                 }
                 state.waiters.entry(mid).or_default().push(tx);
@@ -378,6 +404,30 @@ impl EngineApi for Engine {
             });
             Ok(rx)
         })
+    }
+
+    async fn wait_idle(&self, sid: &str) {
+        self.wait_for_idle(sid).await;
+    }
+
+    fn resume(&self, app: App, sid: String) -> Result<(), OperationError> {
+        self.wake(app, sid)
+    }
+
+    fn interrupt(&self, sid: &str) -> bool {
+        let mut running = self.running.lock().unwrap();
+        let Some(state) = running.get_mut(sid) else {
+            return false;
+        };
+        state.preserve_pending = true;
+        state.cancel.cancel();
+        if let Some(gate) = &state.end_gate {
+            gate.cancel();
+        }
+        state.app.perms.reject_all(sid);
+        state.app.questions.reject_all(sid);
+        crate::tools::cancel_background_jobs(sid);
+        true
     }
 
     fn abort(&self, sid: &str) {
@@ -497,6 +547,21 @@ fn normalize_request(
     sid: &str,
     request: &mut PromptRequest,
 ) -> Result<String, OperationError> {
+    if app.v2.enabled(sid) {
+        let state = app.store.v2_state(sid)?;
+        if request.model.is_none() {
+            request.model = state
+                .get("model")
+                .map(crate::v2::wire::model_in)
+                .transpose()?;
+        }
+        if request.agent.is_none() {
+            request.agent = state["agent"].as_str().map(str::to_owned);
+        }
+        if request.variant.is_none() {
+            request.variant = state["model"]["variant"].as_str().map(str::to_owned);
+        }
+    }
     let agent = request
         .agent
         .get_or_insert_with(|| {
@@ -516,6 +581,14 @@ fn normalize_request(
         return Err(OperationError::invalid(format!(
             "Agent '{agent}' is disabled"
         )));
+    }
+    if request.variant.is_none() && request.model.is_none() {
+        request.variant = cfg
+            .agent
+            .get(&agent)
+            .and_then(|a| a["variant"].as_str())
+            .or_else(|| cfg.extra.get("variant").and_then(Value::as_str))
+            .map(str::to_owned);
     }
     let model = resolve_model(cfg, app, sid, request.model.as_ref(), Some(&agent))?;
     if !cfg.model_available(&model.provider_id, &model.model_id) {

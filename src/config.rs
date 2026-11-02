@@ -61,6 +61,10 @@ pub struct McpLocal {
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct CompactionCfg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer: Option<CompactionBuffer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<CompactionKeep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prune: Option<bool>,
@@ -72,6 +76,34 @@ pub struct CompactionCfg {
     pub tail_turns: Option<u64>,
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+pub struct CompactionKeep {
+    pub tokens: Option<u64>,
+}
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(try_from = "Value", into = "Value")]
+pub struct CompactionBuffer(Value);
+impl TryFrom<Value> for CompactionBuffer {
+    type Error = String;
+    fn try_from(value: Value) -> Result<Self, String> {
+        let valid = value.as_u64().is_some()
+            || value
+                .as_str()
+                .and_then(|s| s.strip_suffix('%'))
+                .and_then(|s| s.parse::<f64>().ok())
+                .is_some_and(|v| (1.0..100.0).contains(&v));
+        if !valid {
+            return Err("compaction.buffer must be a nonnegative token count or percentage from 1% to below 100%".into());
+        }
+        Ok(Self(value))
+    }
+}
+impl From<CompactionBuffer> for Value {
+    fn from(buffer: CompactionBuffer) -> Self {
+        buffer.0
+    }
+}
+
 impl CompactionCfg {
     pub fn automatic(&self) -> bool {
         self.auto.unwrap_or(true)
@@ -79,8 +111,27 @@ impl CompactionCfg {
 
     pub fn usable(&self, context: Option<u64>, input: Option<u64>, output: u64) -> Option<u64> {
         context.filter(|context| *context > 0).map(|context| {
+            let window = input.filter(|i| *i > 0).map_or(context, |i| i.min(context));
+            if let Some(buffer) = &self.buffer {
+                let reserve = buffer.0.as_u64().unwrap_or_else(|| {
+                    (window as f64
+                        * buffer
+                            .0
+                            .as_str()
+                            .and_then(|s| s.strip_suffix('%'))
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0)
+                        / 100.0)
+                        .round() as u64
+                });
+                if reserve < window {
+                    return window - reserve;
+                }
+            }
             if let Some(input) = input.filter(|input| *input > 0) {
-                input.saturating_sub(self.reserved.unwrap_or(output.min(20_000)))
+                input
+                    .min(context)
+                    .saturating_sub(self.reserved.unwrap_or(output.min(20_000)))
             } else {
                 context.saturating_sub(output)
             }
@@ -88,11 +139,16 @@ impl CompactionCfg {
     }
 
     pub fn recent_bytes(&self, usable: Option<u64>) -> usize {
-        let tokens = self.preserve_recent_tokens.unwrap_or_else(|| {
-            usable
-                .map(|usable| (usable / 4).clamp(2_000, 15_000))
-                .unwrap_or(15_000)
-        });
+        let tokens = self
+            .keep
+            .as_ref()
+            .and_then(|keep| keep.tokens)
+            .or(self.preserve_recent_tokens)
+            .unwrap_or_else(|| {
+                usable
+                    .map(|usable| (usable / 4).clamp(2_000, 15_000))
+                    .unwrap_or(15_000)
+            });
         usize::try_from(tokens.saturating_mul(4)).unwrap_or(usize::MAX)
     }
 }
@@ -507,6 +563,7 @@ fn parse_config(text: &str, source: &str, base: &Path) -> Result<Value, String> 
     if !value.is_object() {
         return Err(format!("config {source} must be a JSON object"));
     }
+    crate::v2::config::normalize(&mut value)?;
     interpolate(&mut value, base).map_err(|e| format!("config {source}: {e}"))?;
     if let Some(paths) = value.get_mut("instructions").and_then(Value::as_array_mut) {
         for path in paths {

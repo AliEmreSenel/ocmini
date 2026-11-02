@@ -90,9 +90,13 @@ async fn execute_part(
 ) -> (usize, Value, Option<String>) {
     let output = match &prepared {
         Err(error) => Err(error.clone()),
-        Ok(_) if !allowed.contains(&name) => Err(OperationError::from(format!(
-            "Tool '{name}' is not enabled for agent '{agent}'"
-        ))),
+        Ok(_)
+            if !allowed.contains(&name) && !allowed.contains(crate::v2::wire::tool_name(&name)) =>
+        {
+            Err(OperationError::from(format!(
+                "Tool '{name}' is not enabled for agent '{agent}'"
+            )))
+        }
         Ok(input) => execute_tool(&ctx, &name, input, cfg, request, repeated).await,
     };
     // Task/question tools may publish metadata while blocked. Preserve it.
@@ -146,14 +150,22 @@ pub(super) fn execution_tool(name: &str) -> bool {
         || name.starts_with("mcp_")
 }
 pub(super) fn tool_enabled(name: &str, agent: &str, cfg: &Config, request: &PromptRequest) -> bool {
-    if request.tools.as_ref().and_then(|t| t.get(name)) == Some(&false) {
-        return false;
-    }
-    cfg.agent
-        .get(agent)
-        .and_then(|a| a["tools"].get(name))
-        .and_then(Value::as_bool)
-        != Some(false)
+    let legacy = match name {
+        "shell" => "bash",
+        "subagent" => "task",
+        other => other,
+    };
+    [name, legacy, crate::v2::wire::tool_name(name)]
+        .into_iter()
+        .all(|alias| {
+            request.tools.as_ref().and_then(|t| t.get(alias)) != Some(&false)
+                && cfg
+                    .agent
+                    .get(agent)
+                    .and_then(|a| a["tools"].get(alias))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+        })
 }
 
 fn permission_rules(
@@ -373,12 +385,19 @@ async fn check_permission(
         event::Permission::Asked { request: &req },
         &ctx.app.session_context(&ctx.session_id, json!({})),
     );
-    let reply = tokio::select! { reply=rx=>reply.unwrap_or_else(|_|"reject".into()), _=ctx.cancel.cancelled()=>"reject".into() };
-    if reply == "reject" {
+    let rejected = || crate::permission::Response {
+        decision: "reject".into(),
+        message: None,
+    };
+    let reply = tokio::select! { reply=rx=>reply.unwrap_or_else(|_|rejected()), _=ctx.cancel.cancelled()=>rejected() };
+    if reply.decision == "reject" {
         ctx.app.perms.reply(&req.id, "reject");
-        return Err(denied());
+        return Err(reply
+            .message
+            .map(|message| OperationError::from(format!("{}: {message}", denied().message)))
+            .unwrap_or_else(denied));
     }
-    if reply == "always" {
+    if reply.decision == "always" {
         let rule = PermissionRule {
             permission: permission.into(),
             pattern: pattern.into(),

@@ -373,11 +373,20 @@ pub async fn delete(app: &App, session: &Session) -> Result<(), OperationError> 
             )
             .await?;
     }
+    let v2_events = sessions
+        .iter()
+        .map(|s| app.v2.prepare_delete(s))
+        .collect::<Result<Vec<_>, _>>()?;
     if !app.store.delete_session_checked(
         &session.id,
         &sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
     )? {
         return Err(OperationError::not_found("Session not found"));
+    }
+    for (session, frame) in sessions.iter().zip(v2_events) {
+        if let Some(frame) = frame {
+            app.v2.deleted(&session.id, frame);
+        }
     }
     for (session, scoped) in sessions.iter().zip(&scopes) {
         crate::tools::cancel_background_jobs(&session.id);

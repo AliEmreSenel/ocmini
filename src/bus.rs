@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 #[derive(Clone)]
 pub struct Bus {
     tx: broadcast::Sender<Arc<BusEvent>>,
+    v2: Arc<Mutex<Vec<Weak<crate::v2::Events>>>>,
     observers: Arc<Mutex<Vec<Weak<crate::hooks::ObserverRegistry>>>>,
 }
 
@@ -14,6 +15,7 @@ impl Bus {
         let (tx, _) = broadcast::channel(16384);
         Self {
             tx,
+            v2: Arc::new(Mutex::new(Vec::new())),
             observers: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -22,7 +24,19 @@ impl Bus {
         self.publish(Arc::new(BusEvent::new(event, context)));
     }
 
+    pub fn register_v2(&self, events: &Arc<crate::v2::Events>) {
+        self.v2.lock().unwrap().push(Arc::downgrade(events));
+    }
+
     pub fn publish(&self, ev: Arc<BusEvent>) {
+        let bridges = {
+            let mut bridges = self.v2.lock().unwrap();
+            bridges.retain(|bridge| bridge.strong_count() > 0);
+            bridges.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+        for bridge in bridges {
+            bridge.observe(&ev);
+        }
         let observers = {
             let mut observers = self.observers.lock().unwrap();
             observers.retain(|registry| registry.strong_count() > 0);

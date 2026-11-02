@@ -17,9 +17,9 @@ async fn startup_auth_and_cli_inventory_match_t3() {
     assert_eq!(health["healthy"], true);
     assert_eq!(
         health["version"],
-        concat!("1.19.4-ocmini.", env!("CARGO_PKG_VERSION"))
+        concat!("2.2.5-ocmini.", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(server.get("/api/info").send().await.unwrap().status(), 404);
+    assert_eq!(server.get("/api/info").send().await.unwrap().status(), 200);
     for path in ["/global/health", "/api/info", "/event", "/session"] {
         assert_eq!(
             reqwest::get(format!("{}{path}", server.url))
@@ -107,7 +107,7 @@ async fn cli_help_version_and_invalid_arguments_do_not_start_the_runtime() {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
-            concat!("1.19.4-ocmini.", env!("CARGO_PKG_VERSION"))
+            concat!("2.2.5-ocmini.", env!("CARGO_PKG_VERSION"))
         );
     }
     for arguments in [

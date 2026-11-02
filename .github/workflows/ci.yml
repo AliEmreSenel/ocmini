@@ -47,6 +47,13 @@ jobs:
         run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
       - name: Unit and contract tests
         run: cargo +stable test --all-targets --locked
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install development-only OpenCode clients
+        run: bun install --cwd tests/v2-client --frozen-lockfile --ignore-scripts
+      - name: Check official OpenCode and T3 client contracts
+        run: cargo +stable test --locked --test contract official_v2_client_and_schema_conformance -- --ignored
 
   msrv:
     # Stable covers PRs; check compiler compatibility once after merging.

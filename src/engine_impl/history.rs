@@ -96,6 +96,9 @@ pub(super) fn build_messages(
         0
     };
     for message in history.into_iter().skip(start) {
+        if message.info.extra.get("ocminiV2Cancelled") == Some(&Value::Bool(true)) {
+            continue;
+        }
         if message.info.role == "user" {
             flush_chat_run(&mut out, run.take());
             let mut content = Vec::new();

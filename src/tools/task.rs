@@ -17,8 +17,11 @@ const BACKGROUND_STARTED: &str = concat!(
 pub(super) struct Input {
     description: String,
     prompt: String,
+    #[serde(alias = "agent")]
     pub subagent_type: String,
+    #[serde(alias = "sessionID")]
     task_id: Option<String>,
+    model: Option<String>,
     #[serde(default)]
     #[schemars(
         description = "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress"
@@ -101,6 +104,11 @@ fn options(
         .and_then(|value| value["model"].as_str())
     {
         model = Some(ModelRef::parse(selected)?);
+    }
+    if let Some(selected) = &input.model {
+        model = Some(ModelRef::parse(
+            selected.split('#').next().unwrap_or(selected),
+        )?);
     }
     if let Some(selected) = selected_model {
         model = Some(selected.clone());
@@ -227,6 +235,11 @@ pub(super) async fn run(ctx: &ToolCtx, plan: &Plan) -> Result<ToolOutput, Operat
         model: model.clone(),
         parts: vec![json!({"type":"text","text":prompt})],
         agent: Some(agent.into()),
+        variant: input
+            .model
+            .as_deref()
+            .and_then(|m| m.split_once('#'))
+            .map(|(_, v)| v.to_owned()),
         ..Default::default()
     };
     let mut guard = ChildGuard {
@@ -378,8 +391,10 @@ async fn deliver(job: Delivery) {
         .flatten()
         .and_then(|message| message.info.agent);
     let model = app.store.last_model(&parent_id).ok().flatten();
+    let v2 = app.v2.enabled(&parent_id).then(||crate::v2::Input{kind:"synthetic".into(),payload:json!({"text":text,"metadata":{"source":"subagent","childID":child_id,"state":state,"description":description}}),..Default::default()});
     let request = PromptRequest {
         model,
+        v2,
         parts: vec![json!({"type": "text", "text": text, "synthetic": true})],
         agent,
         ..Default::default()

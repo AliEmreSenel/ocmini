@@ -1,6 +1,8 @@
 # ocmini
 
-A minimal OpenCode replica in Rust. One binary for terminal chat, coding tools, saved sessions and an OpenCode 1.x HTTP/SSE server.
+A minimal OpenCode replica in Rust. One binary for terminal chat, coding tools, saved sessions and an OpenCode v2 HTTP/SSE server. Legacy v1 routes remain available during the transition.
+
+The lightweight runtime supports use on single-core machines with roughly 500 MB of total system RAM, including embedded Linux devices using SD cards. V2 work should preserve the current approach and performance, using the same behavior across machines.
 
 ## Quick start
 
@@ -92,7 +94,7 @@ ocmini run --auto -m provider/model "…"      # allow tools without asking
 - **Providers:** OpenAI Chat Completions, OpenAI Responses and Anthropic Messages, including compatible endpoints.
 - **Project setup:** OpenCode JSON/JSONC configuration, agents, commands, skills and `AGENTS.md` instructions.
 - **MCP:** stdio and Streamable HTTP servers.
-- **API:** OpenCode 1.x HTTP/SSE, model inventory and usage reporting.
+- **API:** OpenCode v2 HTTP/SSE (plus transitional v1 routes), model inventory and usage reporting.
 
 Tool text over 50 KiB is saved under `$XDG_DATA_HOME/ocmini/tool-output` (default `~/.local/share/ocmini/tool-output`). The conversation keeps a preview of the beginning and end plus the saved path, so omitted content can be read or searched later. Large shell output is captured to disk with bounded memory. Existing file-read/search paging and media limits still apply. Full output files are retained by default so resumed sessions can still read them. Set `OCMINI_TOOL_OUTPUT_RETENTION_DAYS` to a positive integer to remove expired output files at startup; unset or `0` retains them. These files use disk space separately from session history.
 
@@ -106,7 +108,7 @@ Compaction can be requested manually, runs automatically with room reserved for 
 
 ## What gets cut
 
-Desktop/web apps, hosted accounts and billing, plugin marketplaces and installers, auto-updates, telemetry, LSP management and the OpenCode 2.x service layer.
+Desktop/web apps, hosted accounts and billing, plugin marketplaces and installers, auto-updates, telemetry, LSP management and upstream managed-service infrastructure.
 
 Provider support is limited to the three HTTP protocols above. Native Gemini, Vertex, Bedrock, Azure-specific authentication, arbitrary npm provider SDKs and WebSocket transports are excluded. Compatible HTTP endpoints can still be configured. MCP browser OAuth and legacy HTTP+SSE transport are also excluded.
 
@@ -157,7 +159,7 @@ Sessions are saved in `$XDG_DATA_HOME/ocmini/ocmini.db`; refreshed credentials u
 
 History is kept unless `OCMINI_RETENTION_DAYS` enables pruning. Recovery marks interrupted work and preserves queued prompts without replaying potentially completed tool calls.
 
-Set `OPENCODE_SERVER_PASSWORD` to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `1.19.4-ocmini.<package version>`, identifies API compatibility.
+Set `OPENCODE_PASSWORD` (or `OPENCODE_SERVER_PASSWORD`) to require Basic authentication with username `opencode`. The server defaults to `127.0.0.1:4096`; `--port 0` chooses a free port. `ocmini --help` lists commands. The reported version, `2.2.5-ocmini.<package version>`, identifies API compatibility.
 
 Async I/O uses one Tokio worker by default. Synchronous database operations hand the scheduler to another worker while they run, so database lock waits do not stall the async event loop. File operations and history loading also use the blocking pool. Set `TOKIO_WORKER_THREADS` to a positive integer to choose a different async worker count. SQLite checkpoints allow oversized journal files to shrink to 1 MiB on reuse; active transactions can temporarily exceed this size.
 
@@ -172,7 +174,9 @@ cargo build --release --locked
 
 Tests use temporary state and local provider/MCP fixtures; no paid credentials are needed. Unit tests stay inline beside the code they cover. Integration tests are grouped by behavior under `tests/contract/`.
 
-See the [API contract](docs/api-contract.md) for API details.
+See the [v2 API contract](docs/api-v2.md) and [legacy API contract](docs/api-contract.md) for API details.
+
+The [OpenCode v2 migration plan](docs/opencode-v2-plan.md) compares our current implementation with upstream v2.2.5 and T3 Code, including endpoint coverage and the v1 compatibility decision.
 
 ## Hooks and event subscriptions
 

@@ -394,6 +394,8 @@ impl std::fmt::Display for ModelRef {
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct PromptRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2: Option<crate::v2::Input>,
     pub model: Option<ModelRef>,
     pub parts: Vec<Value>,
     #[serde(rename = "messageID")]
@@ -452,7 +454,7 @@ pub struct PermissionRequest {
     pub tool: Option<Value>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionRequest {
     #[serde(skip)]

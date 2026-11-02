@@ -96,6 +96,30 @@ async fn prepare_turn(
         });
     }
     let mut defs = tools::tool_defs();
+    if app.v2.enabled(sid) {
+        for def in &mut defs {
+            if let Some(name) = def["function"]["name"].as_str() {
+                def["function"]["name"] = json!(crate::v2::wire::tool_name(name));
+                if def["function"]["name"] == "subagent" {
+                    let parameters = &mut def["function"]["parameters"];
+                    if let Some(properties) = parameters["properties"].as_object_mut() {
+                        for (old, new) in [("subagent_type", "agent"), ("task_id", "sessionID")] {
+                            if let Some(v) = properties.remove(old) {
+                                properties.insert(new.into(), v);
+                            }
+                        }
+                    }
+                    if let Some(required) = parameters["required"].as_array_mut() {
+                        for v in required {
+                            if v == "subagent_type" {
+                                *v = json!("agent");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     defs.extend(tokio::select! {
         value = app.mcp().tool_defs_async() => value,
         _ = cancel.cancelled() => return Err("Aborted".into()),
@@ -183,7 +207,7 @@ async fn end_feedback(
             if gate_cancel.is_cancelled()
                 && !cancel.is_cancelled()
                 && error.kind == crate::hooks::FailureKind::Cancelled
-                && app.store.has_waiting(sid)? =>
+                && app.store.has_steering(sid)? =>
         {
             None
         }
@@ -207,6 +231,27 @@ pub(super) async fn run_turn(
         .message_id
         .as_deref()
         .ok_or("Admitted prompt has no messageID")?;
+    if let Some(input) = &request.v2 {
+        if input.kind == "move" {
+            app.v2.emit(
+                sid,
+                "session.inbox.delivered",
+                json!({"sessionID":sid,"inboxID":uid}),
+                true,
+            );
+            let directory = crate::sessions::directory(
+                input.payload["location"]["directory"]
+                    .as_str()
+                    .ok_or("Missing move directory")?,
+            )?;
+            app.store.v2_move(sid, &directory)?;
+            app.v2.emit(sid,"session.moved",json!({"sessionID":sid,"location":{"directory":directory},"projectID":session.project_id}),true);
+            return app
+                .store
+                .message(sid, uid)?
+                .ok_or_else(|| "Move receipt missing".into());
+        }
+    }
     let model = request
         .model
         .as_ref()
@@ -275,6 +320,7 @@ pub(super) async fn run_turn(
         let (messages, has_summary) =
             history::load_messages(app.store.clone(), sid, uid, chat).await?;
         let mut info = MessageInfo::assistant(sid, Some(uid.into()), model, agent);
+        info.variant = request.variant.clone();
         let amid = info.id.clone();
         hook_context["step"] = json!(step);
         hook_context["messageID"] = json!(amid);
@@ -291,6 +337,11 @@ pub(super) async fn run_turn(
         )?;
         let result = async {
             let req = ChatRequest {
+                system: if app.v2.enabled(sid) {
+                    format!("{}{}", base.system, app.store.v2_instructions(sid)?)
+                } else {
+                    base.system.clone()
+                },
                 messages,
                 ..base.clone()
             };
@@ -396,8 +447,8 @@ pub(super) async fn run_turn(
                 Err(error) => eprintln!("ocmini: proactive compaction rebuild failed: {error}"),
             }
         }
-        if tool_parts.is_empty() || app.store.has_waiting(sid)? {
-            if tool_parts.is_empty() && !app.store.has_waiting(sid)? && !cancel.is_cancelled() {
+        if tool_parts.is_empty() || app.store.has_steering(sid)? {
+            if tool_parts.is_empty() && !app.store.has_steering(sid)? && !cancel.is_cancelled() {
                 hook_context["messageID"] = json!(amid);
                 hook_context["endAttempt"] = json!(end_continuations + 1);
                 let feedback =
