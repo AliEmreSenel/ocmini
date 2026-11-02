@@ -1,6 +1,7 @@
-use super::{Attachment, Key, PendingPrompt, RowKind, Ui, Visibility, BOLD, RESET};
+use super::render::{Row, ToolCall};
+use super::{Attachment, Key, PendingPrompt, RowKind, ToolView, Ui, Visibility, BOLD, RESET};
 use std::cell::{Ref, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -732,6 +733,7 @@ fn wrap_row(row: &str, width: usize) -> Vec<String> {
         rest = &rest[grapheme.len()..];
         if grapheme.contains('\n') {
             rows.push(std::mem::take(&mut out));
+            out.push_str(&style);
             columns = 0;
             continue;
         }
@@ -773,9 +775,12 @@ pub(super) struct Display {
     /// caret's row, which is the block's last row only when the caret is at
     /// the end of the draft.
     caret_row: usize,
-    /// Full-screen mode: committed transcript rows with the kind that can hide
-    /// them, oldest first. Hidden rows stay stored so a toggle brings them back.
+    /// Logical transcript rows and anchors for chains, oldest first. Chains
+    /// replace their own state instead of appending snapshots or blank rows.
     lines: Vec<(RowKind, String)>,
+    chains: Vec<ToolChain>,
+    calls: HashMap<String, (usize, usize)>,
+    active_chain: Option<usize>,
     fullscreen: bool,
     /// First transcript display row painted at the viewport top. None follows
     /// the newest output.
@@ -812,8 +817,70 @@ struct WrappedRows {
     visibility: Visibility,
     through: usize,
     rows: Vec<String>,
+    /// Display-row count after each logical row, for invalidating a changed chain.
+    ends: Vec<usize>,
     #[cfg(test)]
     work: usize,
+}
+
+struct ToolChain {
+    anchor: usize,
+    calls: Vec<ToolCall>,
+}
+
+impl ToolChain {
+    fn rows(&self, view: ToolView) -> Vec<String> {
+        if view != ToolView::Grouped {
+            return self
+                .calls
+                .iter()
+                .map(|call| {
+                    let text = if view == ToolView::Brief {
+                        &call.brief
+                    } else {
+                        &call.full
+                    };
+                    format!("{text}{RESET}")
+                })
+                .collect();
+        }
+        let mut tools: Vec<(&str, usize)> = Vec::new();
+        let (mut pending, mut running, mut failed) = (0, 0, 0);
+        for call in &self.calls {
+            if let Some((_, count)) = tools.iter_mut().find(|(name, _)| *name == call.name) {
+                *count += 1;
+            } else {
+                tools.push((&call.name, 1));
+            }
+            match call.status.as_str() {
+                "pending" => pending += 1,
+                "running" => running += 1,
+                "error" => failed += 1,
+                _ => {}
+            }
+        }
+        let tools = tools
+            .iter()
+            .map(|(name, count)| format!("{name} × {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut status = String::new();
+        for (count, label) in [
+            (pending, "pending"),
+            (running, "running"),
+            (failed, "failed"),
+        ] {
+            if count > 0 {
+                status.push_str(&format!(" · {count} {label}"));
+            }
+        }
+        let mark = if failed > 0 { "✗" } else { "▸" };
+        let count = self.calls.len();
+        vec![format!(
+            "{mark} {count} tool call{} · {tools}{status}{RESET}",
+            if count == 1 { "" } else { "s" }
+        )]
+    }
 }
 
 impl Default for Display {
@@ -831,12 +898,22 @@ impl Display {
             drawn_rows: 0,
             caret_row: 0,
             lines: Vec::new(),
+            chains: Vec::new(),
+            calls: HashMap::new(),
+            active_chain: None,
             fullscreen,
             scroll: None,
             page: 24,
             paint_width: 80,
             tail_kind: RowKind::Plain,
-            visibility: Visibility::default(),
+            visibility: Visibility {
+                thinking: true,
+                tools: if fullscreen {
+                    ToolView::Grouped
+                } else {
+                    ToolView::Brief
+                },
+            },
             wrapped: RefCell::new(WrappedRows::default()),
             input: None,
         }
@@ -878,6 +955,81 @@ impl Display {
         self.tail.clear();
         self.style.clear();
         self.columns = 0;
+    }
+
+    pub fn apply(&mut self, rows: Vec<Row>, width: usize) {
+        for row in rows {
+            match row {
+                Row::Text(kind, text) => self.output_as(&text, width, kind),
+                Row::Tool(call) => self.update_tool(call),
+                Row::EndTools => self.end_tools(),
+            }
+        }
+    }
+
+    fn update_tool(&mut self, call: ToolCall) {
+        let completed = matches!(call.status.as_str(), "completed" | "error");
+        let native_text = (!self.fullscreen && completed).then(|| {
+            if self.visibility.tools == ToolView::Full {
+                call.full.clone()
+            } else {
+                call.brief.clone()
+            }
+        });
+        let chain = if let Some(&(chain, index)) = self.calls.get(&call.id) {
+            if self.chains[chain].calls[index] == call {
+                return;
+            }
+            self.chains[chain].calls[index] = call;
+            chain
+        } else {
+            let chain = match self.active_chain {
+                Some(chain) => chain,
+                None => {
+                    self.finish_line();
+                    let chain = self.chains.len();
+                    self.chains.push(ToolChain {
+                        anchor: self.lines.len(),
+                        calls: Vec::new(),
+                    });
+                    self.lines.push((RowKind::Tools(chain), String::new()));
+                    self.active_chain = Some(chain);
+                    chain
+                }
+            };
+            self.calls
+                .insert(call.id.clone(), (chain, self.chains[chain].calls.len()));
+            self.chains[chain].calls.push(call);
+            chain
+        };
+        if let Some(text) = native_text {
+            self.finish_line();
+            for row in wrap_row(&text, terminal_width()) {
+                crate::println!("{row}{RESET}");
+            }
+        }
+        let cache = self.wrapped.get_mut();
+        let anchor = self.chains[chain].anchor;
+        if anchor < cache.through {
+            cache.through = anchor;
+            cache.rows.truncate(if anchor == 0 {
+                0
+            } else {
+                cache.ends[anchor - 1]
+            });
+            cache.ends.truncate(anchor);
+        }
+    }
+
+    pub fn end_tools(&mut self) {
+        self.active_chain = None;
+        if !self.fullscreen {
+            // Completed native calls already live in terminal scrollback.
+            self.lines.clear();
+            self.chains.clear();
+            self.calls.clear();
+            *self.wrapped.get_mut() = WrappedRows::default();
+        }
     }
 
     pub fn output(&mut self, text: &str, width: usize) {
@@ -961,13 +1113,14 @@ impl Display {
 
     /// Ctrl+L: drop the transcript; the next draw restores the status and draft.
     pub fn clear_screen(&mut self) {
+        self.lines.clear();
+        self.chains.clear();
+        self.calls.clear();
+        self.active_chain = None;
+        *self.wrapped.get_mut() = WrappedRows::default();
         if self.fullscreen {
-            self.lines.clear();
-            self.wrapped.get_mut().rows.clear();
-            self.wrapped.get_mut().through = 0;
             self.scroll = None;
         } else {
-            self.finish_line();
             print!("\x1b[2J\x1b[H");
         }
         self.tail.clear();
@@ -991,8 +1144,10 @@ impl Display {
             crate::println!("{line}");
         }
         self.lines.clear();
-        self.wrapped.get_mut().rows.clear();
-        self.wrapped.get_mut().through = 0;
+        self.chains.clear();
+        self.calls.clear();
+        self.active_chain = None;
+        *self.wrapped.get_mut() = WrappedRows::default();
         self.scroll = None;
     }
 
@@ -1028,11 +1183,12 @@ impl Display {
     }
 
     /// Export one visible representation, respecting both transcript toggles.
-    fn export_rows(&self) -> impl Iterator<Item = &str> {
-        self.lines
-            .iter()
-            .filter(|(kind, _)| self.visibility.visible(*kind))
-            .map(|(_, line)| line.as_str())
+    fn export_rows(&self) -> impl Iterator<Item = String> + '_ {
+        self.lines.iter().flat_map(|(kind, line)| match *kind {
+            RowKind::Tools(chain) => self.chains[chain].rows(self.visibility.tools),
+            _ if self.visibility.visible(*kind) => vec![line.clone()],
+            _ => Vec::new(),
+        })
     }
 
     /// Cache visible display rows; scrolling and painting share this index.
@@ -1043,15 +1199,22 @@ impl Display {
             cache.visibility = self.visibility;
             cache.through = 0;
             cache.rows.clear();
+            cache.ends.clear();
         }
         for (kind, line) in &self.lines[cache.through..] {
-            if self.visibility.visible(*kind) {
+            if let RowKind::Tools(chain) = *kind {
+                for line in self.chains[chain].rows(self.visibility.tools) {
+                    cache.rows.extend(wrap_row(&line, width));
+                }
+            } else if self.visibility.visible(*kind) {
                 cache.rows.extend(wrap_row(line, width));
                 #[cfg(test)]
                 {
                     cache.work += 1;
                 }
             }
+            let end = cache.rows.len();
+            cache.ends.push(end);
         }
         cache.through = self.lines.len();
         drop(cache);
@@ -1114,12 +1277,14 @@ impl Display {
         }
         self.drawn_rows = 0;
         print!("\r");
-        // The streaming row follows the toggle of the text it carries, so
-        // hidden thinking never peeks out above the draft.
-        if self.columns > 0 && self.visibility.visible(self.tail_kind) {
-            crate::println!("{}{RESET}", self.tail);
-            self.drawn_rows += 1;
+        // Bound and wrap every live row before drawing. Counting a long or
+        // multiline header as one row makes erase leave a row behind on each
+        // event, even while the model is only generating pending calls.
+        let live = self.native_live_rows(width, height.saturating_sub(layout.rows.len()));
+        for row in &live {
+            crate::println!("{row}{RESET}");
         }
+        self.drawn_rows = live.len();
         // A flushed transcript row sits above the draft, so the block starts
         // one row lower and the caret moves with it.
         let first = self.drawn_rows;
@@ -1140,6 +1305,31 @@ impl Display {
             print!("\x1b[{}C", layout.cursor.1);
         }
         let _ = std::io::stdout().flush();
+    }
+
+    fn native_live_rows(&self, width: usize, available: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        if self.columns > 0 && self.visibility.visible(self.tail_kind) {
+            rows.extend(wrap_row(&format!("{}{RESET}", self.tail), width));
+        }
+        if let Some(chain) = self.active_chain {
+            if let Some(call) = self.chains[chain]
+                .calls
+                .iter()
+                .rev()
+                .find(|call| !matches!(call.status.as_str(), "completed" | "error"))
+            {
+                let text = if self.visibility.tools == ToolView::Full {
+                    &call.full
+                } else {
+                    &call.brief
+                };
+                rows.extend(wrap_row(text, width));
+            }
+        }
+        let cut = rows.len().saturating_sub(available);
+        rows.drain(..cut);
+        rows
     }
 
     /// Repaint the whole screen: the transcript window, then the draft. The
@@ -1489,7 +1679,6 @@ mod tests {
         let ui = Ui {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
-            headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: Some(PendingPrompt::Question {
                 id: "q1".into(),
@@ -1540,7 +1729,6 @@ mod tests {
         let ui = Ui {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
-            headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
             visibility: Visibility::default(),
@@ -1580,47 +1768,50 @@ mod tests {
         assert_eq!(wrap_row("abc", 10), ["abc"]);
     }
 
+    fn sample_tool(id: usize, status: &str) -> ToolCall {
+        ToolCall {
+            id: format!("tool_{id}"),
+            name: "bash".into(),
+            status: status.into(),
+            brief: if status == "completed" {
+                format!("● bash command_{id}\n  ✓ result_{id}")
+            } else {
+                format!("● bash command_{id} · {status}")
+            },
+            full: if status == "completed" {
+                format!("● bash full_command_{id}\n  ✓ full_result_{id}\n  second line")
+            } else {
+                format!("● bash full_command_{id} · {status}")
+            },
+        }
+    }
+
     #[test]
     fn the_toggles_filter_rows_at_paint_time_and_bring_hidden_ones_back() {
         let mut display = Display::new(true);
         display.output("the answer\n", 80);
         display.output_as("pondering\n", 80, RowKind::Thinking);
-        display.output_as("  collapsed result\n", 80, RowKind::ToolBrief);
-        display.output_as("  full command\n  full result\n", 80, RowKind::ToolFull);
-        let all = display.wrapped(80).join("|");
-        assert!(all.contains("the answer"));
-        assert!(all.contains("pondering"));
-        // Tool calls start collapsed: one form is painted, never both.
-        assert!(all.contains("collapsed result"));
-        assert!(!all.contains("full result"));
+        display.update_tool(sample_tool(0, "completed"));
+        let grouped = display.wrapped(80).join("|");
+        assert!(grouped.contains("the answer") && grouped.contains("pondering"));
+        assert!(grouped.contains("1 tool call · bash × 1"));
+        assert!(!grouped.contains("command_0"));
         display.set_visibility(Visibility {
             thinking: false,
-            tools_expanded: false,
+            tools: ToolView::Brief,
         });
-        let hidden = display.wrapped(80).join("|");
-        assert!(hidden.contains("the answer"));
-        // Hidden rows are filtered at paint time, never dropped, so flipping
-        // the toggle restores the transcript exactly.
-        assert!(!hidden.contains("pondering"));
-        // Collapsed rows are what a collapsed view shows.
-        assert!(hidden.contains("collapsed result"));
-        assert!(!hidden.contains("full result"));
-        // Expanding swaps in the full command and result, and keeps thinking off.
+        let brief = display.wrapped(80).join("|");
+        assert!(brief.contains("command_0") && brief.contains("result_0"));
+        assert!(!brief.contains("pondering") && !brief.contains("full_result_0"));
         display.set_visibility(Visibility {
             thinking: false,
-            tools_expanded: true,
+            tools: ToolView::Full,
         });
-        let expanded = display.wrapped(80).join("|");
-        assert!(expanded.contains("full command") && expanded.contains("full result"));
-        assert!(!expanded.contains("collapsed result"));
-        assert!(!expanded.contains("pondering"));
-        display.set_visibility(Visibility {
-            thinking: true,
-            tools_expanded: true,
-        });
-        assert!(display.wrapped(80).join("|").contains("pondering"));
+        let full = display.wrapped(80).join("|");
+        assert!(full.contains("full_command_0") && full.contains("full_result_0"));
+        assert!(!full.contains("pondering"));
         display.set_visibility(Visibility::default());
-        assert_eq!(display.wrapped(80).join("|"), all);
+        assert_eq!(display.wrapped(80).join("|"), grouped);
     }
 
     #[test]
@@ -1628,7 +1819,6 @@ mod tests {
         let ui = Ui {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
-            headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
             visibility: Visibility::default(),
@@ -1637,7 +1827,7 @@ mod tests {
         let mut display = Display::default();
         display.set_visibility(Visibility {
             thinking: false,
-            tools_expanded: false,
+            tools: ToolView::Brief,
         });
         display.output_as("pondering", 40, RowKind::Thinking);
         // The hidden tail is not painted, so no thinking text shows above the
@@ -1653,7 +1843,6 @@ mod tests {
         let ui = crate::tui::Ui {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
-            headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
             visibility: Visibility::default(),
@@ -1706,7 +1895,6 @@ mod tests {
         let mut ui = Ui {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
-            headered: std::collections::HashSet::new(),
             tool_done: std::collections::HashSet::new(),
             prompt: None,
             visibility: Visibility::default(),
@@ -1720,7 +1908,7 @@ mod tests {
             let saved = display.lines.clone();
             for _ in 0..6 {
                 ui.visibility.thinking = !ui.visibility.thinking;
-                ui.visibility.tools_expanded = !ui.visibility.tools_expanded;
+                ui.visibility.tools = ui.visibility.tools.next();
                 display.set_visibility(ui.visibility);
                 display.erase();
                 display.draw(&ui, &draft, 40, &model);
@@ -1865,31 +2053,223 @@ mod tests {
     }
 
     #[test]
-    fn kind_transitions_preserve_the_previous_tail_and_export_one_tool_form() {
+    fn pending_batches_update_one_chain_before_any_call_completes() {
+        for fullscreen in [false, true] {
+            let mut display = Display::new(fullscreen);
+            for id in 0..200 {
+                display.update_tool(sample_tool(id, "pending"));
+                assert_eq!(
+                    display.lines.len(),
+                    1,
+                    "pending calls must not append blank rows"
+                );
+                assert!(display.tail.is_empty());
+            }
+            display.set_visibility(Visibility::default());
+            assert_eq!(
+                plain(&display.wrapped(80)),
+                ["▸ 200 tool calls · bash × 200 · 200 pending"]
+            );
+            for id in 0..200 {
+                display.update_tool(sample_tool(id, "running"));
+            }
+            assert_eq!(
+                plain(&display.wrapped(80)),
+                ["▸ 200 tool calls · bash × 200 · 200 running"]
+            );
+        }
+    }
+
+    #[test]
+    fn all_three_views_survive_out_of_order_completion_and_repeated_toggles() {
         let mut display = Display::new(true);
-        display.output_as("secret thinking", 80, RowKind::Thinking);
-        display.output("\nassistant\nanswer without newline", 80);
-        display.output_as("\nbrief command\n", 80, RowKind::ToolBrief);
-        display.output_as("expanded command\nexpanded output\n", 80, RowKind::ToolFull);
-        display.set_visibility(Visibility {
-            thinking: false,
-            tools_expanded: false,
-        });
-        let rows = display.wrapped(80).join("\n");
-        assert!(!rows.contains("secret thinking"));
-        assert!(rows.contains("answer without newline"));
-        let exported = display.export_rows().collect::<Vec<_>>().join("\n");
-        assert!(exported.contains("brief command"));
-        assert!(!exported.contains("expanded command"));
-        assert!(!exported.contains("secret thinking"));
+        for id in 0..100 {
+            let mut call = sample_tool(id, "pending");
+            if id % 2 == 0 {
+                call.name = "read".into();
+            }
+            display.update_tool(call);
+        }
+        assert!(display
+            .wrapped(100)
+            .join("")
+            .contains("100 tool calls · read × 50, bash × 50"));
+        for id in (0..100).rev() {
+            let mut call = sample_tool(id, "completed");
+            if id % 2 == 0 {
+                call.name = "read".into();
+            }
+            display.update_tool(call);
+        }
+        for _ in 0..3 {
+            display.set_visibility(Visibility {
+                thinking: true,
+                tools: ToolView::Brief,
+            });
+            let rows = plain(&display.wrapped(100));
+            assert_eq!(rows.len(), 200);
+            for (id, pair) in rows.chunks(2).enumerate() {
+                assert_eq!(
+                    pair,
+                    [format!("● bash command_{id}"), format!("  ✓ result_{id}")]
+                );
+            }
+            display.set_visibility(Visibility {
+                thinking: true,
+                tools: ToolView::Full,
+            });
+            assert_eq!(display.wrapped(100).len(), 300);
+            display.set_visibility(Visibility::default());
+            assert_eq!(display.wrapped(100).len(), 1);
+        }
+    }
+
+    #[test]
+    fn native_live_rows_wrap_and_stay_inside_the_terminal_during_generation() {
+        let mut display = Display::default();
         display.set_visibility(Visibility {
             thinking: true,
-            tools_expanded: true,
+            tools: ToolView::Full,
+        });
+        let mut call = sample_tool(0, "pending");
+        call.full = "● bash echo first\n  echo second · pending".into();
+        display.update_tool(call);
+        let ui = Ui {
+            visibility: display.visibility,
+            ..Ui::default()
+        };
+        for _ in 0..200 {
+            display.draw(&ui, &Draft::default(), 80, "mock/m");
+            assert_eq!((display.drawn_rows, display.caret_row), (4, 3));
+            display.erase();
+        }
+        let mut call = sample_tool(0, "running");
+        call.full = format!("● bash {} · running", "x".repeat(5000));
+        display.update_tool(call);
+        assert_eq!(display.native_live_rows(20, 5).len(), 5);
+        assert_eq!(display.lines.len(), 1);
+        assert!(display.tail.is_empty());
+    }
+
+    #[test]
+    fn text_and_parallel_completions_preserve_other_running_calls() {
+        let mut display = Display::new(true);
+        display.output("half a sentence", 80);
+        display.update_tool(sample_tool(0, "running"));
+        display.update_tool(sample_tool(1, "running"));
+        display.output("assistant commentary\n", 80);
+        display.update_tool(sample_tool(0, "completed"));
+        display.set_visibility(Visibility {
+            thinking: true,
+            tools: ToolView::Brief,
+        });
+        let rows = display.wrapped(80).join("\n");
+        assert!(rows.contains("half a sentence") && rows.contains("assistant commentary"));
+        assert!(rows.contains("command_1 · running"));
+        assert!(!rows.contains("command_0 · running"));
+        assert!(display
+            .native_live_rows(80, 20)
+            .join("")
+            .contains("command_1 · running"));
+        display.end_tools();
+        display.update_tool(sample_tool(2, "pending"));
+        assert_eq!(display.chains.len(), 2);
+    }
+
+    #[test]
+    fn grouped_failures_stay_visible_and_closed_chains_still_expand() {
+        let mut display = Display::new(true);
+        display.output_as("secret thinking", 80, RowKind::Thinking);
+        let mut failed = sample_tool(0, "error");
+        failed.brief = "● bash command_0\n  ✗ permission denied".into();
+        failed.full = failed.brief.clone();
+        display.update_tool(failed);
+        display.end_tools();
+        display.output("answer\n", 80);
+        let grouped = display.export_rows().collect::<Vec<_>>().join("\n");
+        assert!(grouped.contains("✗ 1 tool call · bash × 1 · 1 failed"));
+        display.set_visibility(Visibility {
+            thinking: false,
+            tools: ToolView::Full,
         });
         let exported = display.export_rows().collect::<Vec<_>>().join("\n");
-        assert!(exported.contains("secret thinking"));
-        assert!(exported.contains("expanded command"));
-        assert!(!exported.contains("brief command"));
+        assert!(exported.contains("permission denied") && exported.contains("answer"));
+        assert!(!exported.contains("secret thinking"));
+    }
+
+    #[test]
+    fn history_retains_separate_turns_and_expands_every_saved_result() {
+        use crate::types::{MessageInfo, MessageWithParts};
+        let message = |id: &str, role: &str, parts| MessageWithParts {
+            info: MessageInfo {
+                id: id.into(),
+                session_id: "s".into(),
+                role: role.into(),
+                ..Default::default()
+            },
+            parts,
+        };
+        let part = |id: &str, name: &str, status: &str| {
+            serde_json::json!({
+                "id":id,"sessionID":"s","type":"tool","tool":name,
+                "state":{"status":status,"input":{"command":format!("command_{id}")},
+                    "output":format!("result_{id}\nsecond line"),"error":"permission denied"}
+            })
+        };
+        let history = [
+            message(
+                "u1",
+                "user",
+                vec![serde_json::json!({"type":"text","text":"first request"})],
+            ),
+            message("a1", "assistant", vec![part("t1", "bash", "completed")]),
+            message("a2", "assistant", vec![part("t2", "read", "error")]),
+            message(
+                "u2",
+                "user",
+                vec![serde_json::json!({"type":"text","text":"second request"})],
+            ),
+            message("a3", "assistant", vec![part("t3", "bash", "completed")]),
+        ];
+        let mut display = Display::new(true);
+        let mut ui = Ui::default();
+        crate::tui::render::render_history(&mut display, &mut ui, &history);
+        let grouped = display.wrapped(100).join("\n");
+        assert!(grouped.contains("2 tool calls · bash × 1, read × 1 · 1 failed"));
+        assert!(grouped.contains("1 tool call · bash × 1"));
+        assert_eq!(display.chains.len(), 2);
+        display.set_visibility(Visibility {
+            thinking: true,
+            tools: ToolView::Full,
+        });
+        let full = display.wrapped(100).join("\n");
+        for text in [
+            "command_t1",
+            "result_t1",
+            "command_t2",
+            "permission denied",
+            "command_t3",
+            "result_t3",
+        ] {
+            assert!(full.contains(text), "{text}");
+        }
+        let duplicate = crate::tui::render::render_part(&mut ui, &part("t1", "bash", "completed"));
+        assert!(duplicate.is_empty(), "history must seed live deduplication");
+    }
+
+    #[test]
+    fn tool_updates_reuse_the_wrapped_transcript_before_the_chain() {
+        let mut display = Display::new(true);
+        for _ in 0..1000 {
+            display.output("previous transcript row\n", 80);
+        }
+        display.viewport(80);
+        let work = display.wrapped.borrow().work;
+        for id in 0..100 {
+            display.update_tool(sample_tool(id, "pending"));
+            display.viewport(80);
+            assert_eq!(display.wrapped.borrow().work, work);
+        }
     }
 
     #[test]
@@ -1912,7 +2292,7 @@ mod tests {
         assert_eq!(resized, work + 1 + 8001);
         display.set_visibility(Visibility {
             thinking: false,
-            tools_expanded: false,
+            tools: ToolView::Brief,
         });
         display.viewport(10);
         assert_eq!(display.wrapped.borrow().work, resized + 8001);
