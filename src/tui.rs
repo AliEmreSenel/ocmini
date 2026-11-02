@@ -84,6 +84,20 @@ const RED: &str = "\x1b[31m";
 pub(crate) const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 
+/// The only escape sequences the transcript paints. Assistant text, tool
+/// output, fetched pages, MCP servers, hooks, model-written session titles and
+/// file paths all reach the transcript, so every other sequence is consumed
+/// and dropped: untrusted text cannot restyle the terminal, hide the cursor,
+/// clear the scrollback, set the window title or open a hyperlink. Styling the
+/// app wants is written from these constants, so it always passes.
+pub(crate) const STYLES: &[&str] = &[RESET, DIM, BOLD, GREEN, RED, YELLOW, CYAN];
+
+/// Whether an escape sequence is the app's own styling and may reach the
+/// terminal.
+pub(crate) fn style_ok(escape: &str) -> bool {
+    STYLES.contains(&escape)
+}
+
 pub(crate) fn truncate(text: &str, max: usize) -> String {
     let mut chars = text.chars();
     let mut out: String = chars.by_ref().take(max).collect();
@@ -175,6 +189,10 @@ struct Ui {
     prompt: Option<PendingPrompt>,
     /// Live transcript toggles, mirrored into the display on every change.
     visibility: Visibility,
+    /// The assistant message whose label is already on screen. A turn streams
+    /// a new text part after every tool batch, so labeling each part repeats
+    /// `assistant` through one answer.
+    last_assistant_msg: Option<String>,
 }
 
 enum PendingPrompt {
@@ -800,12 +818,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     Key::Enter => {
                         display.finish_line();
                         let (text, files) = draft.take();
-                        if !text.is_empty() {
-                            display.output(
-                                &format!("{BOLD}›{RESET} {text}\n"),
-                                terminal_width(),
-                            );
-                        }
+                        display.user_prompt(&text, terminal_width());
                         for file in &files {
                             display.output(
                                 &format!(

@@ -1,5 +1,7 @@
 use super::render::{Row, ThoughtUpdate, ToolCall};
-use super::{Attachment, Key, PendingPrompt, RowKind, ToolView, Ui, Visibility, BOLD, RESET};
+use super::{
+    style_ok, Attachment, Key, PendingPrompt, RowKind, ToolView, Ui, Visibility, BOLD, CYAN, RESET,
+};
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -718,7 +720,7 @@ fn wrap_row(row: &str, width: usize) -> Vec<String> {
     while !rest.is_empty() {
         if let Some(end) = escape_len(rest) {
             let escape = &rest[..end];
-            if escape.ends_with('m') {
+            if escape.ends_with('m') && style_ok(escape) {
                 out.push_str(escape);
                 if escape == RESET {
                     style.clear();
@@ -831,6 +833,9 @@ pub(super) struct Display {
     thoughts: Vec<Thought>,
     thought_ids: HashMap<String, usize>,
     spacing: Spacing,
+    /// The transcript has painted at least one row, so the next block needs a
+    /// separator. Ctrl+L and leaving full-screen start the transcript over.
+    printed: bool,
     fullscreen: bool,
     /// First transcript display row painted at the viewport top. None follows
     /// the newest output.
@@ -893,7 +898,12 @@ impl Thought {
             return Vec::new();
         }
         if expanded {
-            let mut spacing = Spacing::default();
+            // The block's rows open at the top of their own anchor, so their
+            // leading blank row belongs to them; `Spacing::default` drops it.
+            let mut spacing = Spacing {
+                blank: true,
+                fence: None,
+            };
             return std::iter::once(format!("{}◦ thinking{RESET}", super::DIM))
                 .chain(
                     self.text
@@ -1002,6 +1012,7 @@ impl Display {
             thoughts: Vec::new(),
             thought_ids: HashMap::new(),
             spacing: Spacing::default(),
+            printed: false,
             fullscreen,
             scroll: None,
             page: 24,
@@ -1058,10 +1069,39 @@ impl Display {
         self.columns = 0;
     }
 
+    /// One blank row before a block-level element, and never two. Labels,
+    /// notices, tool chains, thinking blocks and user prompts all open with
+    /// this, so the transcript has one owner for its vertical rhythm instead of
+    /// embedding a leading newline in every header string.
+    pub fn ensure_blank(&mut self) {
+        self.finish_line();
+        if self.printed && !self.spacing.blank {
+            self.push_row(String::new());
+        }
+    }
+
+    /// One user turn. It gets a label of its own with the text indented under
+    /// it: the draft's `› ` marker stays for editing, and a committed prompt
+    /// used to print the same marker, so a prompt was not findable at a glance.
+    pub fn user_prompt(&mut self, text: &str, width: usize) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.ensure_blank();
+        self.output(
+            &format!(
+                "{BOLD}{CYAN}❯ user{RESET}\n  {}\n",
+                text.replace('\n', "\n  ")
+            ),
+            width,
+        );
+    }
+
     pub fn apply(&mut self, rows: Vec<Row>, width: usize) {
         for row in rows {
             match row {
                 Row::Text(kind, text) => self.output_as(&text, width, kind),
+                Row::Blank => self.ensure_blank(),
                 Row::Tool(call) => self.update_tool(call),
                 Row::Thought(update) => self.update_thought(update, width),
                 Row::ThoughtTokens { message_id, tokens } => {
@@ -1086,15 +1126,19 @@ impl Display {
 
     fn update_thought(&mut self, update: ThoughtUpdate, width: usize) {
         if !self.fullscreen {
-            let mut text = if update.new {
-                format!("\n{}◦ thinking{RESET}\n", super::DIM)
-            } else {
-                String::new()
-            };
+            let mut text = String::new();
             if update.reset {
                 text.push_str(&format!("\n{}[response updated]{RESET}\n", super::DIM));
             }
             text.push_str(&update.text);
+            if update.new {
+                self.ensure_blank();
+                self.output_as(
+                    &format!("{}◦ thinking{RESET}\n", super::DIM),
+                    width,
+                    RowKind::Thinking,
+                );
+            }
             self.output_as(&text, width, RowKind::Thinking);
             return;
         }
@@ -1103,7 +1147,10 @@ impl Display {
         } else {
             self.active_chain = None;
             self.finish_line();
-            self.spacing = Spacing::default();
+            // The block's rows print right under this anchor, so the next
+            // block's separator has to survive the blank-row collapse.
+            self.spacing.blank = false;
+            self.spacing.fence = None;
             let index = self.thoughts.len();
             self.thoughts.push(Thought {
                 anchor: self.lines.len(),
@@ -1168,7 +1215,10 @@ impl Display {
                 Some(chain) => chain,
                 None => {
                     self.finish_line();
-                    self.spacing = Spacing::default();
+                    // The chain's anchor row prints right here, so the next
+                    // block's separator has to survive the blank-row collapse.
+                    self.spacing.blank = false;
+                    self.spacing.fence = None;
                     let chain = self.chains.len();
                     self.chains.push(ToolChain {
                         anchor: self.lines.len(),
@@ -1189,6 +1239,9 @@ impl Display {
             for row in wrap_row(&text, terminal_width()) {
                 crate::println!("{row}{RESET}");
             }
+            // The chain's rows are on screen: the next block opens with its
+            // own separator, so the collapse must not eat it.
+            self.spacing.blank = false;
         }
         let anchor = self.chains[chain].anchor;
         self.invalidate_from(anchor);
@@ -1196,6 +1249,9 @@ impl Display {
 
     pub fn end_tools(&mut self) {
         self.active_chain = None;
+        // The next block opens with a separator row, so the blank-row collapse
+        // must not swallow it on the run of blanks that just ended.
+        self.spacing.blank = false;
         if !self.fullscreen {
             // Completed native calls already live in terminal scrollback.
             self.lines.clear();
@@ -1239,7 +1295,14 @@ impl Display {
         while !rest.is_empty() {
             if let Some(end) = escape_len(rest) {
                 let escape = &rest[..end];
-                if escape.ends_with('m') {
+                // Only the app's own styling reaches the terminal. An escape
+                // from a model, a tool, a fetched page, an MCP server, a hook,
+                // a filename or a session title is consumed and dropped, so it
+                // cannot restyle the transcript, hide the cursor, clear the
+                // screen, set the window title or open a hyperlink. A sequence
+                // that is not SGR is dropped whole, which is why an injected
+                // OSC never reaches a terminal emulator.
+                if escape.ends_with('m') && style_ok(escape) {
                     self.tail.push_str(escape);
                     if escape == RESET {
                         self.style.clear();
@@ -1285,6 +1348,10 @@ impl Display {
         if !self.spacing.accept(&row) {
             return;
         }
+        // The transcript has content from here on, so `ensure_blank` may spend
+        // a separator row. Before the first row it would open the transcript
+        // with blank space.
+        self.printed = true;
         if self.fullscreen {
             self.lines.push((self.tail_kind, format!("{row}{RESET}")));
         } else if self.visibility.visible(self.tail_kind) {
@@ -1301,6 +1368,7 @@ impl Display {
         self.thoughts.clear();
         self.thought_ids.clear();
         self.spacing = Spacing::default();
+        self.printed = false;
         *self.wrapped.get_mut() = WrappedRows::default();
         if self.fullscreen {
             self.scroll = None;
@@ -1324,8 +1392,14 @@ impl Display {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         print!("\x1b[2J\x1b[H");
         // Export the view the user selected, with one form of each tool call.
+        // Rows go through `wrap_row`, so they carry the same escape allowlist
+        // and width as live output: a tool result, a fetched page or a hook
+        // cannot restyle the terminal the transcript is printed on.
+        let width = terminal_width();
         for line in self.export_rows() {
-            crate::println!("{line}");
+            for row in wrap_row(&line, width) {
+                crate::println!("{row}{RESET}");
+            }
         }
         self.lines.clear();
         self.chains.clear();
@@ -1334,6 +1408,7 @@ impl Display {
         self.thoughts.clear();
         self.thought_ids.clear();
         self.spacing = Spacing::default();
+        self.printed = false;
         *self.wrapped.get_mut() = WrappedRows::default();
         self.scroll = None;
     }
@@ -1864,6 +1939,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
+            last_assistant_msg: None,
             prompt: Some(PendingPrompt::Question {
                 id: "q1".into(),
                 questions: vec![serde_json::json!({"question": "Pick", "options": []})],
@@ -1914,6 +1990,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
+            last_assistant_msg: None,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2004,6 +2081,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
+            last_assistant_msg: None,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2028,6 +2106,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
+            last_assistant_msg: None,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2080,6 +2159,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
+            last_assistant_msg: None,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2769,5 +2849,91 @@ mod tests {
         assert_eq!(display.wrapped.borrow().work, resized + 8001);
         display.clear_screen();
         assert!(display.viewport(10).is_empty());
+    }
+    #[test]
+    fn transcript_text_carries_only_the_apps_own_styling() {
+        let mut display = Display::new(true);
+        // A model, a tool, a fetched page, an MCP server, a hook, a session
+        // title or a path cannot restyle the transcript: SGR outside the app's
+        // list is dropped, and a sequence that is not SGR dies at its
+        // introducer instead of reaching a terminal emulator.
+        display.output("\x1b[8mconcealed\x1b[2Jtail\x1b[0m\n", 80);
+        assert_eq!(plain(&display.wrapped(80)), ["concealedtail"]);
+        // Nothing is left to replay: a dropped sequence must not leave the
+        // transcript styled from here to the end of the turn, because each
+        // wrapped row re-seeds itself from the style of the row before it.
+        assert!(display.style.is_empty());
+        display.output("\x1b[1mapp styling survives\x1b[0m\n", 80);
+        assert!(display.wrapped(80)[1].contains(BOLD));
+    }
+
+    #[test]
+    fn blocks_separate_by_one_blank_row_and_the_transcript_opens_without_one() {
+        let mut display = Display::new(true);
+        display.set_visibility(Visibility {
+            tools: ToolView::Brief,
+            ..Default::default()
+        });
+        // A separator at the top of the transcript is wasted space, and two in
+        // a row is the spacing the transcript used to drift into.
+        display.ensure_blank();
+        display.user_prompt("read src/main.rs", 80);
+        display.apply(vec![Row::Blank, Row::Blank], 80);
+        display.apply(vec![Row::Text(RowKind::Plain, "assistant\n".into())], 80);
+        display.apply(vec![Row::Text(RowKind::Plain, "I read it.\n".into())], 80);
+        display.apply(vec![Row::Tool(sample_tool(0, "completed"))], 80);
+        display.apply(vec![Row::EndTools, Row::Blank], 80);
+        display.apply(vec![Row::Text(RowKind::Plain, "next\n".into())], 80);
+        assert_eq!(
+            plain(&display.wrapped(80)),
+            [
+                "❯ user",
+                "  read src/main.rs",
+                "",
+                "assistant",
+                "I read it.",
+                "● bash command_0",
+                "  ✓ result_0",
+                "",
+                "next",
+            ]
+        );
+    }
+
+    #[test]
+    fn one_assistant_label_marks_a_whole_message() {
+        use crate::events::EventKind;
+        use crate::types::BusEvent;
+        let mut display = Display::new(true);
+        let mut ui = Ui::default();
+        let say = |ui: &mut Ui, display: &mut Display, message: &str, id: &str| {
+            let event = BusEvent {
+                id: "event".into(),
+                kind: serde_json::from_value::<EventKind>(serde_json::json!(
+                    "message.part.updated"
+                ))
+                .unwrap(),
+                properties: serde_json::json!({"part": {
+                    "id": id, "messageID": message, "sessionID": "s",
+                    "type": "text", "text": "part text\n",
+                }}),
+            };
+            let rows = crate::tui::render::render_event(ui, &event, "s");
+            display.apply(rows, 80);
+        };
+        // A turn streams a new text part after every tool batch. Each part is
+        // the start of a part, not the start of an answer.
+        let labels = |display: &Display| {
+            plain(&display.wrapped(80))
+                .iter()
+                .filter(|row| row.as_str() == "assistant")
+                .count()
+        };
+        say(&mut ui, &mut display, "m1", "text_1");
+        say(&mut ui, &mut display, "m1", "text_2");
+        say(&mut ui, &mut display, "m1", "text_3");
+        assert_eq!(labels(&display), 1, "one label marks one whole answer");
+        say(&mut ui, &mut display, "m2", "text_4");
+        assert_eq!(labels(&display), 2, "the next answer gets its own label");
     }
 }
