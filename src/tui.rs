@@ -189,10 +189,11 @@ struct Ui {
     prompt: Option<PendingPrompt>,
     /// Live transcript toggles, mirrored into the display on every change.
     visibility: Visibility,
-    /// The assistant message whose label is already on screen. A turn streams
-    /// a new text part after every tool batch, so labeling each part repeats
-    /// `assistant` through one answer.
-    last_assistant_msg: Option<String>,
+    /// The answer's `assistant` label is already on screen. A turn runs one
+    /// model step per tool batch, each step in its own assistant message, so a
+    /// label per message printed one in the middle of the same answer. The next
+    /// user prompt spends it.
+    answer_labelled: bool,
 }
 
 enum PendingPrompt {

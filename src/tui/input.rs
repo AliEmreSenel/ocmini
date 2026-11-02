@@ -1102,6 +1102,14 @@ impl Display {
             match row {
                 Row::Text(kind, text) => self.output_as(&text, width, kind),
                 Row::Blank => self.ensure_blank(),
+                Row::Header(kind, text) => {
+                    self.ensure_blank();
+                    self.output_as(&text, width, kind);
+                    // The label's own row ends it. A blank row that follows
+                    // comes from the model's leading newline, not from the
+                    // transcript's rhythm, so it collapses into the label.
+                    self.spacing.blank = true;
+                }
                 Row::Tool(call) => self.update_tool(call),
                 Row::Thought(update) => self.update_thought(update, width),
                 Row::ThoughtTokens { message_id, tokens } => {
@@ -1939,7 +1947,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
-            last_assistant_msg: None,
+            answer_labelled: false,
             prompt: Some(PendingPrompt::Question {
                 id: "q1".into(),
                 questions: vec![serde_json::json!({"question": "Pick", "options": []})],
@@ -1990,7 +1998,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
-            last_assistant_msg: None,
+            answer_labelled: false,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2081,7 +2089,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
-            last_assistant_msg: None,
+            answer_labelled: false,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2106,7 +2114,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
-            last_assistant_msg: None,
+            answer_labelled: false,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2159,7 +2167,7 @@ mod tests {
             interactions: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
-            last_assistant_msg: None,
+            answer_labelled: false,
             prompt: None,
             visibility: Visibility::default(),
         };
@@ -2901,39 +2909,71 @@ mod tests {
     }
 
     #[test]
-    fn one_assistant_label_marks_a_whole_message() {
+    fn one_label_marks_one_answer_not_one_per_step() {
         use crate::events::EventKind;
         use crate::types::BusEvent;
         let mut display = Display::new(true);
         let mut ui = Ui::default();
+        let event = |kind: &str, properties: serde_json::Value| BusEvent {
+            id: "event".into(),
+            kind: serde_json::from_value::<EventKind>(serde_json::json!(kind)).unwrap(),
+            properties,
+        };
         let say = |ui: &mut Ui, display: &mut Display, message: &str, id: &str| {
-            let event = BusEvent {
-                id: "event".into(),
-                kind: serde_json::from_value::<EventKind>(serde_json::json!(
-                    "message.part.updated"
-                ))
-                .unwrap(),
-                properties: serde_json::json!({"part": {
-                    "id": id, "messageID": message, "sessionID": "s",
-                    "type": "text", "text": "part text\n",
-                }}),
-            };
-            let rows = crate::tui::render::render_event(ui, &event, "s");
+            let rows = crate::tui::render::render_event(
+                ui,
+                &event(
+                    "message.part.updated",
+                    serde_json::json!({"part": {
+                        "id": id, "messageID": message, "sessionID": "s",
+                        "type": "text", "text": "part text\n",
+                    }}),
+                ),
+                "s",
+            );
             display.apply(rows, 80);
         };
-        // A turn streams a new text part after every tool batch. Each part is
-        // the start of a part, not the start of an answer.
         let labels = |display: &Display| {
             plain(&display.wrapped(80))
                 .iter()
                 .filter(|row| row.as_str() == "assistant")
                 .count()
         };
-        say(&mut ui, &mut display, "m1", "text_1");
-        say(&mut ui, &mut display, "m1", "text_2");
-        say(&mut ui, &mut display, "m1", "text_3");
+        // A turn runs one model step per tool batch, every step is its own
+        // assistant message, and each part is the start of a part, not of an
+        // answer. Three steps of one turn get one label.
+        say(&mut ui, &mut display, "step_1", "text_1");
+        say(&mut ui, &mut display, "step_1", "text_2");
+        say(&mut ui, &mut display, "step_2", "text_3");
+        say(&mut ui, &mut display, "step_3", "text_4");
         assert_eq!(labels(&display), 1, "one label marks one whole answer");
-        say(&mut ui, &mut display, "m2", "text_4");
-        assert_eq!(labels(&display), 2, "the next answer gets its own label");
+        // The label's row ends it, so the model's leading newline cannot push
+        // its text a row below the label that marks it.
+        assert_eq!(
+            plain(&display.wrapped(80)),
+            [
+                "assistant",
+                "part text",
+                "part text",
+                "part text",
+                "part text"
+            ]
+        );
+        // The next prompt starts the next answer, and its label with it.
+        display.apply(
+            crate::tui::render::render_event(
+                &mut ui,
+                &event(
+                    "message.updated",
+                    serde_json::json!({"info": {
+                        "id": "u1", "role": "user", "sessionID": "s",
+                    }}),
+                ),
+                "s",
+            ),
+            80,
+        );
+        say(&mut ui, &mut display, "step_4", "text_5");
+        assert_eq!(labels(&display), 2, "a new prompt labels a new answer");
     }
 }
