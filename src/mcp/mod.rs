@@ -817,7 +817,12 @@ pub fn render_result(result: &Value) -> String {
         }
     }
     if let Some(structured) = result.get("structuredContent") {
-        output.push(structured.to_string());
+        if !output
+            .iter()
+            .any(|text| serde_json::from_str::<Value>(text).ok().as_ref() == Some(structured))
+        {
+            output.push(structured.to_string());
+        }
     }
     if output.is_empty() {
         result.to_string()

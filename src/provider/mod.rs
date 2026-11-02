@@ -234,6 +234,7 @@ pub(super) struct Settings {
     pub options: Value,
     pub max_output: Option<u64>,
     pub tools_supported: bool,
+    pub pdf_supported: bool,
     pub header_timeout: Option<Duration>,
     pub total_timeout: Option<Duration>,
     pub chunk_timeout: Duration,
@@ -515,6 +516,10 @@ impl Adapter {
                 options,
                 max_output,
                 tools_supported,
+                pdf_supported: model
+                    .and_then(|m| m.modalities.as_ref())
+                    .and_then(|m| m["input"].as_array())
+                    .is_some_and(|input| input.iter().any(|kind| kind == "pdf")),
                 header_timeout,
                 total_timeout,
                 chunk_timeout,
@@ -976,6 +981,7 @@ pub(super) fn test_settings(options: Value) -> Settings {
         options,
         max_output: Some(32_000),
         tools_supported: true,
+        pdf_supported: false,
         header_timeout: None,
         total_timeout: None,
         chunk_timeout: Duration::from_secs(1),
