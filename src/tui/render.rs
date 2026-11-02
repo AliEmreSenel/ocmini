@@ -224,6 +224,9 @@ fn render_interaction(ui: &mut Ui, event: &crate::types::BusEvent) -> String {
 pub(super) enum Row {
     /// Committed transcript text, tagged with the toggle that can hide it.
     Text(RowKind, String),
+    /// One blank row before a block-level element. The display owns the
+    /// transcript's rhythm, so headers carry no leading newline of their own.
+    Blank,
     /// Replace this call's state in its retained chain, including pending calls.
     Tool(ToolCall),
     Thought(ThoughtUpdate),
@@ -276,7 +279,7 @@ impl ToolCall {
     }
 }
 
-fn render_text(update: TextUpdate, source: &Value) -> Vec<Row> {
+fn render_text(ui: &mut Ui, update: TextUpdate, source: &Value) -> Vec<Row> {
     if update.kind == TextKind::Reasoning {
         return vec![Row::Thought(ThoughtUpdate {
             id: source["id"]
@@ -292,21 +295,36 @@ fn render_text(update: TextUpdate, source: &Value) -> Vec<Row> {
             end: source["time"]["end"].as_i64(),
         })];
     }
-    let mut text = if update.new {
-        format!("\n{BOLD}assistant{RESET}\n")
-    } else {
-        String::new()
-    };
+    // One label per assistant message. A turn streams a new text part after
+    // every tool batch, and labeling each part printed `assistant` again in the
+    // middle of the same answer. Without a message id there is nothing to
+    // group by, so the first run of a part is all the label the stream offers.
+    let message_id = source["messageID"].as_str().unwrap_or_default();
+    let label = update.new
+        && (message_id.is_empty() || ui.last_assistant_msg.as_deref() != Some(message_id));
+    if label && !message_id.is_empty() {
+        ui.last_assistant_msg = Some(message_id.to_string());
+    }
+    let mut text = String::new();
     if update.reset {
         text.push_str(&format!("\n{DIM}[response updated]{RESET}\n"));
     }
     text.push_str(&update.text);
-    vec![Row::Text(RowKind::Plain, text)]
+    let mut rows = Vec::new();
+    if label {
+        rows.push(Row::Blank);
+        rows.push(Row::Text(
+            RowKind::Plain,
+            format!("{BOLD}assistant{RESET}\n"),
+        ));
+    }
+    rows.push(Row::Text(RowKind::Plain, text));
+    rows
 }
 
 pub(super) fn render_part(ui: &mut Ui, part: &Value) -> Vec<Row> {
     if let Some(update) = ui.text.part(part) {
-        return render_text(update, part);
+        return render_text(ui, update, part);
     }
     let mut rows = Vec::new();
     if part["type"] == "step-finish" {
@@ -356,7 +374,7 @@ pub(super) fn render_event(
         rows.push(Row::EndTools);
     }
     if let Some(update) = ui.text.apply(event) {
-        rows.extend(render_text(update, properties));
+        rows.extend(render_text(ui, update, properties));
     }
     if ui.interactions.apply(event) {
         ui.prompt = None;
@@ -369,15 +387,15 @@ pub(super) fn render_event(
             let message = properties["error"]["data"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
-            Some(format!("\n{RED}error:{RESET} {message}\n"))
+            Some(format!("{RED}error:{RESET} {message}\n"))
         }
         event::EventKind::Session(event::SessionKind::Idle) => {
             rows.push(Row::EndTools);
-            Some(format!("\n{DIM}└ idle{RESET}\n"))
+            Some(format!("{DIM}└ idle{RESET}\n"))
         }
         event::EventKind::Session(event::SessionKind::Title) => {
             match properties["state"].as_str() {
-                Some("start") => Some(format!("\n{DIM}◦ generating title…{RESET}\n")),
+                Some("start") => Some(format!("{DIM}◦ generating title…{RESET}\n")),
                 Some("done") => Some(format!(
                     "{DIM}◦ title: {}{RESET}\n",
                     truncate(properties["title"].as_str().unwrap_or_default(), 60)
@@ -388,6 +406,9 @@ pub(super) fn render_event(
         _ => None,
     };
     if let Some(notice) = notice {
+        // A notice stands at block level, so it opens with the transcript's
+        // separator instead of a newline baked into its own text.
+        rows.push(Row::Blank);
         rows.push(Row::Text(RowKind::Plain, notice));
     }
     rows
@@ -399,10 +420,25 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
         ui.text.remember_role(&message.info.id, &message.info.role);
         if message.info.role != "assistant" {
             display.end_tools();
-            display.output(&format!("\n{BOLD}{}{RESET}\n", message.info.role), width);
+            if message.info.role == "user" {
+                display.user_prompt(
+                    message
+                        .parts
+                        .iter()
+                        .find(|part| part["type"] == "text")
+                        .and_then(|part| part["text"].as_str())
+                        .unwrap_or_default(),
+                    width,
+                );
+            } else {
+                display.ensure_blank();
+                display.output(&format!("{BOLD}{}{RESET}\n", message.info.role), width);
+            }
         }
         for part in &message.parts {
             match part["type"].as_str() {
+                // A user prompt's text is on its landmark row already.
+                Some("text") if message.info.role == "user" => {}
                 Some("text") if message.info.role != "assistant" => display.output(
                     &format!("{}\n", part["text"].as_str().unwrap_or_default()),
                     width,
