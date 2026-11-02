@@ -1,6 +1,77 @@
 use super::*;
 
 #[tokio::test]
+async fn pdf_tool_results_follow_chat_capabilities_after_restart_and_replay() {
+    for supported in [false, true] {
+        let mut provider = Provider::start(vec![
+            tool_script("read", json!({"filePath":"spec.pdf"}), "read_pdf"),
+            text_script("done", ""),
+            text_script("continued", ""),
+        ])
+        .await;
+        let server_config = json!({"provider":{"mock":{
+            "npm":"@ai-sdk/openai-compatible",
+            "options":{"baseURL":provider.url},
+            "models":{"test-model":{"modalities":{"input":if supported {vec!["text","pdf"]} else {vec!["text"]}}}}
+        }}});
+        let mut server = TestServer::start(&provider, server_config).await;
+        std::fs::write(server.directory.join("spec.pdf"), b"%PDF-1.4\n%%EOF\n").unwrap();
+        let id = server.session(allow()).await;
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt("msg_pdf_read", "Read spec.pdf"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        provider.request().await;
+        let after_read = provider.request().await;
+        server.restart().await;
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt("msg_pdf_retry", "."),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let replay = provider.request().await;
+        for request in [after_read, replay] {
+            let parts: Vec<_> = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .collect();
+            assert_eq!(parts.iter().any(|part| part["type"] == "file"), supported);
+            assert_eq!(
+                parts.iter().any(|part| part["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("contents were not sent"))),
+                !supported
+            );
+        }
+        let history = server.messages(&id).await;
+        let tool = history
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .find(|part| part["type"] == "tool")
+            .unwrap();
+        assert_eq!(
+            tool["state"]["metadata"]["attachments"][0]["resource"]["mimeType"],
+            "application/pdf"
+        );
+        assert!(tool["state"]["metadata"]["attachments"][0]["resource"]["blob"].is_string());
+    }
+}
+
+#[tokio::test]
 async fn truncated_provider_streams_fail_instead_of_reporting_success() {
     let script = Script::truncated();
     let provider = Provider::start(vec![script]).await;

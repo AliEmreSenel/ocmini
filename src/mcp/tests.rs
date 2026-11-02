@@ -332,6 +332,33 @@ async fn remote_server_without_tool_capability_stays_connected() {
 }
 
 #[test]
+fn structured_results_are_only_omitted_when_json_text_already_contains_them() {
+    let structured = json!({"ok":true,"count":2});
+    assert_eq!(
+        render_result(
+            &json!({"content":[{"type":"text","text":"{ \"count\": 2, \"ok\": true }"}],"structuredContent":structured})
+        ),
+        "{ \"count\": 2, \"ok\": true }"
+    );
+    assert_eq!(
+        render_result(&json!({"structuredContent":structured})),
+        structured.to_string()
+    );
+    assert_eq!(
+        render_result(
+            &json!({"content":[{"type":"text","text":"summary"}],"structuredContent":structured})
+        ),
+        format!("summary\n{structured}")
+    );
+    assert_eq!(
+        render_result(
+            &json!({"content":[{"type":"text","text":"{\"ok\":true}"}],"structuredContent":structured})
+        ),
+        format!("{{\"ok\":true}}\n{structured}")
+    );
+}
+
+#[test]
 fn nontext_results_and_tool_failures_are_not_silently_discarded() {
     let result = render_result(
         &json!({"content":[{"type":"resource","resource":{"uri":"file:///x","text":"resource text"}},{"type":"image","data":"abc","mimeType":"image/png"}]}),

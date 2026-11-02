@@ -10,6 +10,17 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         messages.push(json!({"role":"system","content":req.system}));
     }
     for message in &req.messages {
+        let mut message = message.clone();
+        if !settings.pdf_supported {
+            if let Some(parts) = message["content"].as_array_mut() {
+                for part in parts {
+                    if part["type"] == "file" {
+                        let filename = part["file"]["filename"].as_str().unwrap_or("attachment");
+                        *part = json!({"type":"text","text":format!("Cannot read attachment {filename}: PDF/file input is not enabled for this Chat Completions model. The file contents were not sent. Select a model with PDF input support or provide the contents as text.")});
+                    }
+                }
+            }
+        }
         if message["content"].as_array().is_some_and(|parts| {
             parts.iter().any(|part| {
                 part["type"] == "file"
@@ -20,7 +31,6 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         }) {
             return Err("Chat Completions file attachments require a base64 data URL or file ID. Use a local/data attachment, or select a Responses or Anthropic endpoint for remote files.".into());
         }
-        let mut message = message.clone();
         if let Some(map) = message.as_object_mut() {
             map.remove("is_error");
             map.remove(super::TEXT_TRANSFORMED);
@@ -247,6 +257,52 @@ impl Decoder for ChatState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_files_become_notices_without_mutating_history_or_other_parts() {
+        let settings = super::super::test_settings(json!({}));
+        let req = ChatRequest {
+            messages: vec![json!({"role":"user","content":[
+                {"type":"text","text":"Read this"},
+                {"type":"file","file":{"filename":"spec.pdf","file_data":"data:application/pdf;base64,AAAA"}},
+                {"type":"file","file":{"filename":"remote.pdf","file_data":"https://example.test/spec.pdf"}},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}}
+            ]})],
+            ..Default::default()
+        };
+        let body = request_body(&settings, &req).unwrap();
+        let parts = &body["messages"][0]["content"];
+        for (index, filename) in [(1, "spec.pdf"), (2, "remote.pdf")] {
+            assert_eq!(parts[index]["type"], "text");
+            let text = parts[index]["text"].as_str().unwrap();
+            assert!(text.contains(filename));
+            assert!(text.contains("contents were not sent"));
+            assert!(!text.contains("AAAA"));
+        }
+        assert_eq!(parts[0], req.messages[0]["content"][0]);
+        assert_eq!(parts[3], req.messages[0]["content"][3]);
+        assert_eq!(req.messages[0]["content"][1]["type"], "file");
+    }
+
+    #[test]
+    fn pdf_capable_chat_keeps_native_files_and_remote_url_validation() {
+        let mut settings = super::super::test_settings(json!({}));
+        settings.pdf_supported = true;
+        let mut req = ChatRequest {
+            messages: vec![
+                json!({"role":"user","content":[{"type":"file","file":{"filename":"spec.pdf","file_data":"data:application/pdf;base64,AAAA"}}]}),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            request_body(&settings, &req).unwrap()["messages"][0],
+            req.messages[0]
+        );
+        req.messages[0]["content"][0]["file"]["file_data"] = json!("https://example.test/spec.pdf");
+        assert!(request_body(&settings, &req)
+            .unwrap_err()
+            .contains("base64 data URL or file ID"));
+    }
+
     #[test]
     fn request_options_override_presets_and_internal_markers_stay_local() {
         let settings =
