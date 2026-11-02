@@ -25,7 +25,7 @@ use input::{
     clean_input, input_prefix, page_move, terminal_width, Display, Draft, History, KillRing,
 };
 use render::{
-    answer_line, option_labels, render_event, render_history, render_question, session_prompts,
+    answer_line, option_labels, render_event, render_history, render_question, session_prompts, Row,
 };
 pub(crate) use render::{display_model, summarize_input};
 #[cfg(test)]
@@ -887,8 +887,14 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     Ok(event) => {
                         if !crate::client::accepts(&app.store, &session.id, &event) { continue; }
                         let event_session = crate::client::event_session(&event).unwrap_or(&session.id);
-                        for (kind, text) in render_event(&mut ui, &event, event_session) {
-                            display.output_as(&text, terminal_width(), kind);
+                        for row in render_event(&mut ui, &event, event_session) {
+                            match row {
+                                Row::Text(kind, text) => {
+                                    display.output_as(&text, terminal_width(), kind)
+                                }
+                                Row::Live(kind, text) => display.live_row(&text, kind),
+                                Row::LiveEnd => display.clear_live(),
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -898,7 +904,15 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                         display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), terminal_width());
                         render_history(&mut display, &mut ui, &history);
                         for pending in crate::client::pending_events(&app, &session.id) {
-                            for (kind, text) in render_event(&mut ui, &pending, &session.id) { display.output_as(&text, terminal_width(), kind); }
+                            for row in render_event(&mut ui, &pending, &session.id) {
+                                match row {
+                                    Row::Text(kind, text) => {
+                                        display.output_as(&text, terminal_width(), kind)
+                                    }
+                                    Row::Live(kind, text) => display.live_row(&text, kind),
+                                    Row::LiveEnd => display.clear_live(),
+                                }
+                            }
                         }
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -920,7 +934,7 @@ mod tests {
         answer_line, decode_event, expand, file_attachment, help_text, image_attachment,
         parse_answer, pasted_image_path, prompt_header, render_confirmation, render_event,
         render_question, switch_question, tool_line, tool_result, Draft, Key, Motion,
-        PendingPrompt, RowKind, Ui, Visibility, MAX_EXPANDED, WHEEL,
+        PendingPrompt, Row, RowKind, Ui, Visibility, MAX_EXPANDED, WHEEL,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -1341,13 +1355,26 @@ mod tests {
         }
     }
 
-    /// The transcript text one toggle paints.
-    fn painted(segments: &[(RowKind, String)], kind: RowKind) -> String {
-        segments
-            .iter()
-            .filter(|(row_kind, _)| *row_kind == kind)
-            .map(|(_, text)| text.as_str())
+    /// The transcript text one toggle paints. Live rows are transient (they
+    /// paint above the prompt, never commit), so only committed text counts.
+    fn painted(rows: &[Row], kind: RowKind) -> String {
+        rows.iter()
+            .filter_map(|row| match row {
+                Row::Text(row_kind, text) if *row_kind == kind => Some(text.as_str()),
+                _ => None,
+            })
             .collect()
+    }
+
+    /// The live row one toggle paints, newest last.
+    fn live(rows: &[Row], kind: RowKind) -> String {
+        rows.iter()
+            .rev()
+            .find_map(|row| match row {
+                Row::Live(row_kind, text) if *row_kind == kind => Some(plain(text)),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     fn completed_tool() -> serde_json::Value {
@@ -1392,14 +1419,53 @@ mod tests {
         for status in ["running", "pending"] {
             let part = serde_json::json!({"type":"tool","tool":"bash","state":{
                 "status":status,"input":{"command":"sleep 30"},"time":{"start":1}}});
-            let (collapsed, expanded) = tool_block(&part);
-            // The status is part of the call, so both forms carry it.
-            for text in [plain(&collapsed), plain(&expanded)] {
+            let rows = super::render::render_part(&mut Ui::default(), &part);
+            // A running call is a live row: the status shows in both forms,
+            // and nothing commits until the call finishes.
+            for kind in [RowKind::ToolBrief, RowKind::ToolFull] {
+                let text = live(&rows, kind);
                 assert!(text.contains("● bash sleep 30"), "{text}");
-                assert!(text.ends_with(&format!("· {status}\n")), "{text}");
+                assert!(text.ends_with(&format!("· {status}")), "{text}");
             }
+            assert!(painted(&rows, RowKind::ToolBrief).is_empty());
             assert!(tool_result(&part).is_none(), "{status} has no result line");
         }
+    }
+
+    #[test]
+    fn a_running_tool_stays_live_and_its_result_commits_under_its_call() {
+        let mut ui = new_ui();
+        let part = |state: serde_json::Value| serde_json::json!({"id":"t1","sessionID":"s","type":"tool","tool":"bash","state":state});
+        let running = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.updated",
+                serde_json::json!({"sessionID": "s", "part": part(serde_json::json!(
+                    {"status":"running","input":{"command":"ls"},"time":{"start":1}}))}),
+            ),
+            "s",
+        );
+        // A running call is a live row, not a committed one: parallel calls
+        // never stack pending rows, and none costs a blank row.
+        assert!(matches!(running[0], Row::Live(RowKind::ToolBrief, _)));
+        assert!(running.iter().all(|row| !matches!(row, Row::Text(..))));
+        let done = render_event(
+            &mut ui,
+            &bus_event(
+                "message.part.updated",
+                serde_json::json!({"sessionID": "s", "part": part(serde_json::json!(
+                    {"status":"completed","input":{"command":"ls"},"output":"file1\nfile2",
+                     "time":{"start":1,"end":2}}))}),
+            ),
+            "s",
+        );
+        // The live row ends, then the call and its result commit as one pair,
+        // so every result sits under its own call, in completion order.
+        assert_eq!(done[0], Row::LiveEnd);
+        let Row::Text(RowKind::ToolBrief, pair) = &done[1] else {
+            panic!("the finished call commits as header + result")
+        };
+        assert_eq!(plain(pair), "● bash ls\n  ✓ file1 file2\n");
     }
 
     #[test]
@@ -1502,8 +1568,10 @@ mod tests {
             "s",
         );
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].0, RowKind::Thinking);
-        assert!(plain(&segments[0].1).contains("thinking"));
+        let Row::Text(RowKind::Thinking, header) = &segments[0] else {
+            panic!("a reasoning header is a committed thinking row")
+        };
+        assert!(plain(header).contains("thinking"));
         // Its deltas follow the part's kind, so hiding it hides the stream.
         let segments = render_event(
             &mut ui,
@@ -1513,8 +1581,10 @@ mod tests {
             ),
             "s",
         );
-        assert_eq!(segments[0].0, RowKind::Thinking);
-        assert_eq!(plain(&segments[0].1), "pondering");
+        let Row::Text(RowKind::Thinking, text) = &segments[0] else {
+            panic!("a reasoning delta follows its part's kind")
+        };
+        assert_eq!(plain(text), "pondering");
         // A finished tool emits a collapsed form and an expanded form, so
         // Ctrl+O swaps views instead of hiding work, and shows calls that
         // already ran. The long command and result are kept whole when expanded.
@@ -1530,36 +1600,22 @@ mod tests {
             ),
             "s",
         );
-        let segments: Vec<_> = segments
-            .into_iter()
-            .map(|(kind, text)| (kind, plain(&text)))
-            .collect();
-        let collapsed = segments
-            .iter()
-            .filter(|(kind, _)| *kind == RowKind::ToolBrief)
-            .map(|(_, text)| text)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("");
-        let expanded_form = segments
-            .iter()
-            .filter(|(kind, _)| *kind == RowKind::ToolFull)
-            .map(|(_, text)| text)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("");
+        let collapsed = plain(&painted(&segments, RowKind::ToolBrief));
+        let expanded_form = plain(&painted(&segments, RowKind::ToolFull));
         assert!(collapsed.contains("● bash") && collapsed.contains("ls dir/"));
         // Collapsed keeps the one-liners it always had.
         assert!(collapsed.contains('…') && !collapsed.contains(&output));
-        // A leading blank row, then one row each for the call and its result.
-        assert_eq!(collapsed.lines().count(), 3);
+        // One row each for the call and its result, the result under the call.
+        assert_eq!(collapsed.lines().count(), 2);
         // Expanded shows the whole command and the whole result, the multi-line
         // result indented under its marker.
         assert!(expanded_form.contains(&command));
         assert!(expanded_form.contains("plan.md"));
         assert!(expanded_form.contains("\n  long "));
-        assert_eq!(expanded_form.lines().count(), 2 + output.lines().count());
-        assert!(segments.iter().all(|(kind, _)| *kind != RowKind::Plain));
+        assert_eq!(expanded_form.lines().count(), 1 + output.lines().count());
+        assert!(segments
+            .iter()
+            .all(|row| !matches!(row, Row::Text(RowKind::Plain, _))));
         // Answer text is never hideable.
         let mut ui = new_ui();
         render_event(
@@ -1578,7 +1634,10 @@ mod tests {
             ),
             "s",
         );
-        assert_eq!(segments, vec![(RowKind::Plain, "the answer".into())]);
+        assert_eq!(
+            segments,
+            vec![Row::Text(RowKind::Plain, "the answer".into())]
+        );
     }
 
     #[test]
@@ -1598,10 +1657,12 @@ mod tests {
             );
             // Hiding tool output must never hide a failure: a collapsed call
             // that failed has to look like it failed.
-            assert!(segments
-                .iter()
-                .any(|(kind, text)| ui.visibility.visible(*kind)
-                    && plain(text).contains("✗ permission denied")));
+            assert!(segments.iter().any(|row| match row {
+                Row::Text(kind, text) => {
+                    ui.visibility.visible(*kind) && plain(text).contains("✗ permission denied")
+                }
+                _ => false,
+            }));
         }
     }
 
@@ -1634,11 +1695,7 @@ mod tests {
         );
         // One expanded call paints its command plus its result, each capped,
         // and the result says how much of it was left out.
-        let shown: String = segments
-            .iter()
-            .filter(|(kind, _)| *kind == RowKind::ToolFull)
-            .map(|(_, text)| text.as_str())
-            .collect();
+        let shown = painted(&segments, RowKind::ToolFull);
         let text = plain(&shown);
         assert!(text.contains("● bash grep -r . ."), "{text}");
         assert!(text.contains("more characters not shown"), "{text}");

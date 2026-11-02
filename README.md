@@ -37,7 +37,7 @@ Set it in `opencode.json` before starting; a running TUI keeps the mode it start
 Two transcript toggles work while you chat, and the status row shows the current state when space allows:
 
 - `Ctrl+T` hides chain of thought - the `◦ thinking` block and everything streamed into it - for a transcript of just answers and tool calls.
-- `Ctrl+O` expands tool calls. Collapsed (default) shows one line per call: the command truncated to 120 columns and the result truncated to 160. Expanded shows the whole command and the whole result, with multi-line output indented under its `✓` / `✗` marker. One call paints at most 50 KiB, the same cap the tool layer puts on a result, and says how much it left out.
+- `Ctrl+O` expands tool calls. Collapsed (default) shows one line per call: the command truncated to 120 columns and the result truncated to 160. Expanded shows the whole command and the whole result, with multi-line output indented under its `✓` / `✗` marker. One call paints at most 50 KiB, the same cap the tool layer puts on a result, and says how much it left out. A running call shows as a live row above the prompt, and a finished call commits its header and result together, so every result sits under its own call - in completion order, and with no blank rows between calls.
 
 Press a key again to switch back. In `fullscreen` mode the transcript is re-rendered, so expanding shows calls that already ran and hiding brings text back exactly as it was, at any scroll position. In `native` mode ocmini cannot rewrite the terminal's scrollback, so the toggle applies to output from that keystroke on.
 

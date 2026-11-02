@@ -880,6 +880,42 @@ impl Display {
         self.columns = 0;
     }
 
+    /// Show a running tool call's live row: painted above the prompt, replaced
+    /// by the next running call, and never committed. A parallel batch keeps
+    /// one live row (the newest call), and its header commits together with
+    /// its result, so every result lands under its own call, in completion
+    /// order, with no blank rows between calls.
+    pub fn live_row(&mut self, text: &str, kind: RowKind) {
+        // One form of a call paints: the toggle picks it, so the live row
+        // reads like the committed pair will.
+        if !self.visibility.visible(kind) {
+            return;
+        }
+        // Running rows replace each other; a streaming text row above commits
+        // first, so the live row never overwrites unfinished output.
+        let running =
+            self.columns > 0 && matches!(self.tail_kind, RowKind::ToolBrief | RowKind::ToolFull);
+        if !running {
+            self.finish_line();
+        }
+        self.tail.clear();
+        self.tail.push_str(text);
+        self.tail_kind = kind;
+        self.columns = text.width().max(1);
+        self.style.clear();
+    }
+
+    /// A running call finished: drop its live row so the committed header and
+    /// result start on a fresh row. Only ever clears a live tool row; a
+    /// streaming text tail stays untouched.
+    pub fn clear_live(&mut self) {
+        if matches!(self.tail_kind, RowKind::ToolBrief | RowKind::ToolFull) {
+            self.tail.clear();
+            self.style.clear();
+            self.columns = 0;
+        }
+    }
+
     pub fn output(&mut self, text: &str, width: usize) {
         self.output_as(text, width, RowKind::Plain);
     }
@@ -1862,6 +1898,47 @@ mod tests {
         draft.backspace();
         draft.undo();
         assert_eq!(draft.text, "a👩‍💻z");
+    }
+
+    #[test]
+    fn a_running_tool_row_is_replaced_and_the_result_lands_under_its_call() {
+        let mut display = Display::new(true);
+        // Parallel calls replace one live row: none commits a pending line,
+        // and none costs a blank row.
+        display.live_row("● bash ls · running", RowKind::ToolBrief);
+        display.live_row("● bash pwd · running", RowKind::ToolBrief);
+        assert_eq!(display.tail, "● bash pwd · running");
+        assert!(display.lines.is_empty());
+        // A finished call clears its live row, then commits header and result
+        // as one pair, so the result sits under its own call.
+        display.clear_live();
+        display.output_as("● bash pwd\n  ✓ /tmp\n", 80, RowKind::ToolBrief);
+        let rows = display
+            .wrapped(80)
+            .iter()
+            .map(|row| row.replace(RESET, ""))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["● bash pwd", "  ✓ /tmp"]);
+    }
+
+    #[test]
+    fn a_live_tool_row_never_overwrites_streaming_text() {
+        let mut display = Display::new(true);
+        display.output("half a sentence", 80);
+        display.live_row("● bash ls · running", RowKind::ToolBrief);
+        // The streaming row commits above the live row, intact.
+        assert_eq!(display.lines.len(), 1);
+        assert!(display.lines[0].1.contains("half a sentence"));
+        assert_eq!(display.tail, "● bash ls · running");
+        // A collapsed view paints the brief live row; expanding swaps forms.
+        display.live_row("● bash\n  ls", RowKind::ToolFull);
+        assert_eq!(display.tail, "● bash ls · running");
+        display.set_visibility(Visibility {
+            thinking: true,
+            tools_expanded: true,
+        });
+        display.live_row("● bash\n  ls", RowKind::ToolFull);
+        assert_eq!(display.tail, "● bash\n  ls");
     }
 
     #[test]

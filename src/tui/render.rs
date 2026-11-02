@@ -221,7 +221,22 @@ fn render_interaction(ui: &mut Ui, event: &crate::types::BusEvent) -> String {
     }
 }
 
-fn render_text(update: TextUpdate) -> Vec<(RowKind, String)> {
+/// One transcript instruction for the display.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Row {
+    /// Committed transcript text, tagged with the toggle that can hide it.
+    Text(RowKind, String),
+    /// A running tool call's live row: painted above the prompt, replaced by
+    /// the next running call, and never committed. Its header and result are
+    /// committed together when the call finishes, so a parallel batch lists
+    /// every result under its own call, in completion order.
+    Live(RowKind, String),
+    /// The running call finished: drop its live row so the committed pair
+    /// starts on a fresh row.
+    LiveEnd,
+}
+
+fn render_text(update: TextUpdate) -> Vec<Row> {
     let row = if update.kind == TextKind::Text {
         RowKind::Plain
     } else {
@@ -239,10 +254,10 @@ fn render_text(update: TextUpdate) -> Vec<(RowKind, String)> {
         text.push_str(&format!("\n{DIM}[response updated]{RESET}\n"));
     }
     text.push_str(&update.text);
-    vec![(row, text)]
+    vec![Row::Text(row, text)]
 }
 
-pub(super) fn render_part(ui: &mut Ui, part: &Value) -> Vec<(RowKind, String)> {
+pub(super) fn render_part(ui: &mut Ui, part: &Value) -> Vec<Row> {
     if let Some(update) = ui.text.part(part) {
         return render_text(update);
     }
@@ -250,14 +265,25 @@ pub(super) fn render_part(ui: &mut Ui, part: &Value) -> Vec<(RowKind, String)> {
     if part["type"] == "tool" {
         let id = part["id"].as_str().unwrap_or_default();
         if ui.headered.insert(format!("{id}:start")) {
+            // The call runs as a live row, with its status suffix; nothing
+            // commits yet, so it costs no blank rows and no stray pending
+            // lines in the scrollback.
             let (line, full) = tool_line(part);
-            rows.push((RowKind::ToolBrief, format!("\n{line}\n")));
-            rows.push((RowKind::ToolFull, format!("\n{full}\n")));
+            rows.push(Row::Live(RowKind::ToolBrief, line));
+            rows.push(Row::Live(RowKind::ToolFull, full));
         }
         if let Some((result, full)) = tool_result(part) {
             if ui.tool_done.insert(id.into()) {
-                rows.push((RowKind::ToolBrief, format!("{result}\n")));
-                rows.push((RowKind::ToolFull, format!("{full}\n")));
+                // Header and result commit as one pair, each in both forms,
+                // so Ctrl+O swaps whole calls and a result never lands
+                // under the wrong call.
+                let (line, full_line) = tool_line(part);
+                rows.push(Row::LiveEnd);
+                rows.push(Row::Text(RowKind::ToolBrief, format!("{line}\n{result}\n")));
+                rows.push(Row::Text(
+                    RowKind::ToolFull,
+                    format!("{full_line}\n{full}\n"),
+                ));
             }
         }
     }
@@ -271,7 +297,7 @@ pub(super) fn render_event(
     ui: &mut Ui,
     event: &crate::types::BusEvent,
     session_id: &str,
-) -> Vec<(RowKind, String)> {
+) -> Vec<Row> {
     let mut rows = Vec::new();
     let properties = &event.properties;
     if crate::client::event_session(event).is_some_and(|id| id != session_id)
@@ -289,7 +315,7 @@ pub(super) fn render_event(
     if ui.interactions.apply(event) {
         ui.prompt = None;
         if let Some(request) = ui.interactions.current().cloned() {
-            rows.push((RowKind::Plain, render_interaction(ui, &request)));
+            rows.push(Row::Text(RowKind::Plain, render_interaction(ui, &request)));
         }
     }
     let notice = match event.kind {
@@ -315,7 +341,7 @@ pub(super) fn render_event(
         _ => None,
     };
     if let Some(notice) = notice {
-        rows.push((RowKind::Plain, notice));
+        rows.push(Row::Text(RowKind::Plain, notice));
     }
     rows
 }
@@ -341,8 +367,12 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
                     width,
                 ),
                 _ => {
-                    for (kind, text) in render_part(ui, part) {
-                        display.output_as(&text, width, kind);
+                    for row in render_part(ui, part) {
+                        match row {
+                            Row::Text(kind, text) => display.output_as(&text, width, kind),
+                            Row::Live(kind, text) => display.live_row(&text, kind),
+                            Row::LiveEnd => display.clear_live(),
+                        }
                     }
                 }
             }
