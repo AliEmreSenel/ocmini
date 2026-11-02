@@ -47,3 +47,6 @@ mod tool_output;
 
 #[path = "contract/hooks.rs"]
 mod hooks;
+
+#[path = "contract/v2.rs"]
+mod v2;

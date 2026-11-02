@@ -49,8 +49,24 @@ pub(super) fn read(
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, OperationError> {
     let path = resolve_path(directory, &input.file_path);
-    let metadata = std::fs::metadata(&path)
-        .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound
+            && path.parent().is_some_and(|parent| !parent.is_dir())
+        {
+            let parent = path.parent().expect("checked parent");
+            let nearest = parent.ancestors().find(|candidate| candidate.is_dir());
+            failure(format!(
+                "Cannot read {}: folder {} does not exist; nearest existing folder: {}",
+                path.display(),
+                parent.display(),
+                nearest
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".into())
+            ))
+        } else {
+            failure(format!("Cannot read {}: {error}", path.display()))
+        }
+    })?;
     let offset = input.offset.unwrap_or(1).max(1) as usize;
     let limit = input.limit.unwrap_or(2000) as usize;
     if metadata.is_dir() {
@@ -304,7 +320,27 @@ pub(super) fn prepare_edit(
     let new = new.replace("\r\n", "\n");
     let count = content.matches(old.as_str()).count();
     if count == 0 {
-        return Err(failure("oldString was not found in the file"));
+        if !new.is_empty() && content.contains(&new) {
+            return Err(failure(
+                "oldString was not found; the requested change is already present",
+            ));
+        }
+        let target = old
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(&old);
+        let words: std::collections::HashSet<_> = target.split_whitespace().collect();
+        let closest = content.lines().enumerate().max_by_key(|(_, line)| {
+            line.split_whitespace()
+                .filter(|word| words.contains(word))
+                .count()
+        });
+        let hint = closest
+            .map(|(index, line)| format!(" Closest line {}: {line}", index + 1))
+            .unwrap_or_default();
+        return Err(failure(format!(
+            "oldString was not found in the file.{hint}"
+        )));
     }
     let all = input.replace_all;
     if count > 1 && !all {

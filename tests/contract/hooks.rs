@@ -837,7 +837,8 @@ async fn observer_receives_one_terminal_event_and_sse_filter_is_exact() {
     let observer = r#"import json,sys,pathlib
 r=json.load(sys.stdin)
 with pathlib.Path('observed.jsonl').open('a') as f:
- for e in r['events']: f.write(json.dumps(e)+'\n')"#;
+ for e in r['events']: f.write(json.dumps(e)+'\n')
+pathlib.Path('observer-finished').touch()"#;
     let mut config = hook_config(vec![registration(
         "turn.start.before",
         r#"import json,sys
@@ -863,7 +864,7 @@ json.load(sys.stdin);print('{}')"#,
         .unwrap()
         .status()
         .is_success());
-    wait_file(&server.directory.join("observed.jsonl")).await;
+    wait_file(&server.directory.join("observer-finished")).await;
     let text = std::fs::read_to_string(server.directory.join("observed.jsonl")).unwrap();
     assert_eq!(
         text.lines().count(),

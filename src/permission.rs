@@ -17,7 +17,12 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-type Pending = (PermissionRequest, oneshot::Sender<String>);
+#[derive(Default)]
+pub struct Response {
+    pub decision: String,
+    pub message: Option<String>,
+}
+type Pending = (PermissionRequest, oneshot::Sender<Response>);
 
 pub fn parse_rules(value: &Value) -> Result<Vec<PermissionRule>, String> {
     let rules: Vec<PermissionRule> = serde_json::from_value(value.clone())
@@ -97,7 +102,7 @@ impl PermissionState {
         permission: &str,
         pattern: &str,
         input: &Value,
-    ) -> (PermissionRequest, oneshot::Receiver<String>) {
+    ) -> (PermissionRequest, oneshot::Receiver<Response>) {
         let (tx, rx) = oneshot::channel();
         let req = PermissionRequest {
             id: crate::types::hex_id("per_"),
@@ -132,6 +137,10 @@ impl PermissionState {
     }
 
     pub fn reply(&self, id: &str, response: &str) -> bool {
+        self.reply_with_message(id, response, None)
+    }
+
+    pub fn reply_with_message(&self, id: &str, response: &str, message: Option<&str>) -> bool {
         let Some(reply) = event::PermissionReply::parse(response) else {
             return false;
         };
@@ -149,7 +158,10 @@ impl PermissionState {
             },
             req.context,
         );
-        let _ = tx.send(reply.as_str().into());
+        let _ = tx.send(Response {
+            decision: reply.as_str().into(),
+            message: message.map(str::to_owned),
+        });
         true
     }
 
@@ -217,6 +229,6 @@ mod tests {
         assert!(!state.reply(&request.id, "yes"));
         assert_eq!(state.list().len(), 1);
         assert!(state.reply(&request.id, "once"));
-        assert_eq!(rx.await.unwrap(), "once");
+        assert_eq!(rx.await.unwrap().decision, "once");
     }
 }

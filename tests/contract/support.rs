@@ -346,8 +346,12 @@ impl TestServer {
     }
 
     pub(super) async fn events(&self) -> Events {
+        self.events_at("/event").await
+    }
+
+    pub(super) async fn events_at(&self, path: &str) -> Events {
         let response = self
-            .get("/event")
+            .get(path)
             .send()
             .await
             .unwrap()

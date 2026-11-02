@@ -29,6 +29,7 @@ use tool_execution::*;
 use turn::run_turn;
 
 struct Running {
+    preserve_pending: bool,
     app: App,
     cancel: CancellationToken,
     done: CancellationToken,
@@ -92,7 +93,11 @@ impl Engine {
             for sid in app.store.pending_sessions().unwrap_or_default() {
                 if let Some(session) = app.store.get_session(&sid).unwrap_or_default() {
                     match app.for_directory(&session.directory) {
-                        Ok(scoped) => self.wake(scoped, sid),
+                        Ok(scoped) => {
+                            if let Err(error) = self.wake(scoped, sid.clone()) {
+                                emit_error(app, &sid, &error, false);
+                            }
+                        }
                         Err(error) => emit_error(app, &sid, &error, false),
                     }
                 }
@@ -124,24 +129,19 @@ impl Engine {
         }
     }
 
-    fn wake(&self, app: App, sid: String) {
+    fn wake(&self, app: App, sid: String) -> Result<(), OperationError> {
         crate::blocking::run(|| {
             let mut running = self.running.lock().unwrap();
             if running.contains_key(&sid) {
-                return;
+                return Ok(());
             }
-            let cancel = match self.claim(&mut running, &app, &sid, None) {
-                Ok(cancel) => cancel,
-                Err(error) => {
-                    emit_error(&app, &sid, &error, false);
-                    return;
-                }
-            };
+            let cancel = self.claim(&mut running, &app, &sid, None)?;
             drop(running);
             let engine = self.clone();
             tokio::spawn(async move {
                 engine.drain(app, sid, cancel).await;
             });
+            Ok(())
         })
     }
 
@@ -157,6 +157,7 @@ impl Engine {
         running.insert(
             sid.into(),
             Running {
+                preserve_pending: false,
                 end_gate: None,
                 done: CancellationToken::new(),
                 app: app.clone(),
@@ -197,7 +198,13 @@ impl Engine {
         let app = app.clone();
         let cancel = cancel.clone();
         loop {
-            if cancel.is_cancelled() {
+            let preserve_pending = self
+                .running
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .is_some_and(|s| s.preserve_pending);
+            if cancel.is_cancelled() && !preserve_pending {
                 // Local admissions are fenced by Running.cancel under the
                 // running lock; the owner lease fences sibling instances.
                 // Keep both fences until every queued finalizer has settled.
@@ -234,7 +241,11 @@ impl Engine {
             let request = crate::blocking::run(|| {
                 let mut running = self.running.lock().unwrap();
                 if cancel.is_cancelled() {
-                    if let Err(e) = app.store.cancel_pending(&sid) {
+                    if let Err(e) = if running.get(&sid).is_some_and(|s| s.preserve_pending) {
+                        Ok(())
+                    } else {
+                        app.store.cancel_pending(&sid)
+                    } {
                         emit_error(&app, &sid, &e, false);
                     }
                     finish_running(&app, &sid, running.remove(&sid), Some("Aborted"));
@@ -350,11 +361,10 @@ impl Engine {
     }
 }
 
-fn finish_running(app: &App, sid: &str, running: Option<Running>, error: Option<&str>) {
+fn finish_running(app: &App, sid: &str, mut running: Option<Running>, error: Option<&str>) {
     app.perms.reject_all(sid);
     app.questions.reject_all(sid);
-    app.store.release(sid);
-    if let Some(mut running) = running {
+    if let Some(running) = &mut running {
         let value = Err(error.unwrap_or("Prompt is no longer pending").into());
         for waiters in std::mem::take(&mut running.waiters).into_values() {
             for waiter in waiters {
@@ -367,6 +377,7 @@ fn finish_running(app: &App, sid: &str, running: Option<Running>, error: Option<
         event::Session::Idle { session_id: sid },
         &app.session_context(sid, json!({})),
     );
+    app.store.release(sid);
 }
 
 async fn wait_for_finalization(
@@ -408,10 +419,10 @@ fn validate_message_id(mid: &str) -> Result<(), OperationError> {
         || mid.len() > 256
         || !mid
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"_-:".contains(&b))
     {
         return Err(OperationError::invalid(
-            "messageID must contain 1–256 ASCII letters, digits, underscores or hyphens",
+            "messageID must contain 1–256 ASCII letters, digits, underscores, hyphens or colons",
         ));
     }
     Ok(())

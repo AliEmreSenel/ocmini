@@ -65,6 +65,8 @@ macro_rules! builtin_tools {
                 match name {
                     $($name => Some(Self::$variant),)+
                     "patch" => Some(Self::ApplyPatch),
+                    "shell" => Some(Self::Bash),
+                    "subagent" => Some(Self::Task),
                     _ => None,
                 }
             }
@@ -218,10 +220,11 @@ impl PreparedTool {
         vec![resolve_path(directory, path.unwrap_or("."))]
     }
     pub fn permission<'a>(&self, name: &'a str, paths: &[PathBuf]) -> (&'a str, Vec<String>) {
-        let permission = if matches!(self.tool, Tool::File(_)) {
-            "edit"
-        } else {
-            name
+        let permission = match self.tool {
+            Tool::File(_) => "edit",
+            Tool::Bash(_) => "bash",
+            Tool::Task(_) => "task",
+            _ => name,
         };
         let patterns = match &self.tool {
             Tool::File(_) | Tool::Read(_) => paths

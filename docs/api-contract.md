@@ -1,6 +1,6 @@
 # ocmini compatibility contract
 
-ocmini implements the OpenCode 1.x HTTP/SSE API. Its compatibility version is `1.19.4-ocmini.<package version>`; the ocmini suffix is derived from Cargo.toml. `GET /api/info` returns 404 because the 2.x protocol is not supported. `GET /global/health` returns `healthy: true` and the compatibility version.
+This document describes the transitional OpenCode 1.x routes and the internal runtime behavior shared by terminal and HTTP clients. The primary interface is the [v2 HTTP/SSE API](api-v2.md); the compatibility version is now 2.2.5-ocmini.<package version>. GET /api/info returns native v2 discovery, while GET /global/health remains available for legacy clients.
 
 This document specifies observable behavior. Integration tests are grouped under `tests/contract/`, with unit tests beside their subsystems.
 
@@ -234,7 +234,7 @@ Several ocmini processes share the database file. Recovery scans run outside the
 
 For T3's usage widget, a separate `opencode-ocmini.db` sidecar under the OpenCode XDG data directory contains a compatible `message` table with `id`, `session_id`, `data`, and `time_created`. Do not overwrite the real `opencode.db` or duplicate billed usage when copying history during a fork.
 
-The headless runtime intentionally does not include OpenCode's desktop/web/TUI applications, hosted account/billing services, plugin marketplace, automatic plugin/package installation, updater, LSP fleet or OpenCode 2.x background-service protocol. Authentication mechanisms and provider formats that require those omitted integrations must fail honestly; the compatibility version is not a promise of support for every OpenCode distribution feature.
+The headless runtime intentionally does not include OpenCode's desktop/web/TUI applications, hosted account/billing services, plugin marketplace, automatic plugin/package installation, updater, LSP fleet or upstream managed-service infrastructure. Authentication mechanisms and provider formats that require those omitted integrations must fail honestly; the compatibility version is not a promise of support for every OpenCode distribution feature.
 
 Full tool outputs saved separately from transcript previews are retained by default. `OCMINI_TOOL_OUTPUT_RETENTION_DAYS` enables optional startup expiry; `0` disables it. Transcript pruning remains separately controlled by `OCMINI_RETENTION_DAYS`.
 

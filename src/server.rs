@@ -59,7 +59,9 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 }
 
 async fn auth_gate(req: Request, next: Next) -> Response {
-    if let Ok(password) = std::env::var("OPENCODE_SERVER_PASSWORD") {
+    if let Ok(password) =
+        std::env::var("OPENCODE_PASSWORD").or_else(|_| std::env::var("OPENCODE_SERVER_PASSWORD"))
+    {
         if !password.is_empty() {
             use base64::Engine;
             let expected = format!("opencode:{password}");
@@ -75,7 +77,7 @@ async fn auth_gate(req: Request, next: Next) -> Response {
                 return (
                     StatusCode::UNAUTHORIZED,
                     [(header::WWW_AUTHENTICATE, "Basic realm=\"opencode\", charset=\"UTF-8\"")],
-                    Json(json!({"name": "UnauthorizedError", "data": {"message": "Authentication required"}})),
+                    Json(if req.uri().path().starts_with("/api/") {json!({"_tag":"UnauthorizedError","message":"Authentication required"})} else {json!({"name": "UnauthorizedError", "data": {"message": "Authentication required"}})}),
                 ).into_response();
             }
         }
@@ -853,6 +855,7 @@ async fn not_found() -> OperationError {
 pub fn router(state: AppState) -> Router {
     let body_limit = state.max_request_bytes;
     Router::new()
+        .merge(crate::v2::http::router())
         .route("/global/health", get(health))
         .route("/session", get(list_sessions).post(session_create))
         .route("/session/status", get(session_status))

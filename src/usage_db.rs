@@ -121,6 +121,14 @@ pub fn record(
         event::Session::Updated { info: &session },
         &app.session_context(sid, json!({})),
     );
+    if app.v2.enabled(sid) {
+        app.v2.emit(
+            sid,
+            "session.usage.updated",
+            json!({"sessionID":sid,"cost":session.cost,"tokens":session.tokens}),
+            false,
+        );
+    }
     Ok(cost)
 }
 

@@ -151,6 +151,7 @@ pub fn context_overflow(message: &str) -> bool {
         "context window exceeded",
         "token limit exceeded",
         "maximum context window",
+        "contextwindowexceedederror",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -1091,6 +1092,9 @@ mod tests {
         assert!(context_overflow("pllm5 HTTP 400: This model\'s maximum context length is 262144 tokens. However, you requested 0 output tokens and your prompt contains at least 262145 input tokens"));
         assert!(context_overflow(
             "prompt is too long: 213000 tokens > 200000 maximum"
+        ));
+        assert!(context_overflow(
+            "litellm.ContextWindowExceededError: input rejected"
         ));
         assert!(!context_overflow(
             "provider stream failed: error decoding response body"

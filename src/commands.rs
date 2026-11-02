@@ -21,6 +21,9 @@ pub fn prepare(
         .or_else(|| command.as_str())
         .ok_or_else(|| format!("Command {name} has no template"))?;
     if request.model.is_none() {
+        if request.variant.is_none() {
+            request.variant = command["variant"].as_str().map(str::to_owned);
+        }
         request.model = command
             .get("model")
             .map(|value| {

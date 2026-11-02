@@ -1,0 +1,17 @@
+{
+  "name": "ocmini-v2-conformance",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@opencode/client": "2.2.5",
+    "@opencode/protocol": "2.2.5",
+    "@opencode/schema": "2.2.5",
+    "effect": "4.0.6",
+    "opencode-client-t3": "npm:@opencode/client@2.0.28",
+    "opencode-protocol-t3": "npm:@opencode/protocol@2.0.28",
+    "opencode-schema-t3": "npm:@opencode/schema@2.0.28"
+  },
+  "overrides": {
+    "effect": "4.0.6"
+  }
+}

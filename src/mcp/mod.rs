@@ -239,6 +239,21 @@ impl McpHub {
         config: Value,
     ) -> Result<Value, crate::types::OperationError> {
         validate_config(name, &config).map_err(crate::types::OperationError::invalid)?;
+        let existing = self
+            .servers
+            .lock()
+            .unwrap()
+            .get(name)
+            .filter(|server| server.config == config)
+            .cloned();
+        if let Some(server) = existing {
+            if server.config["enabled"] != false
+                && server.status.lock().unwrap().state != ConnectionState::Connected
+            {
+                connect(&server).await;
+            }
+            return Ok(named_status(name, &server));
+        }
         let server = Arc::new(Server {
             name: name.into(),
             events: self.events.clone(),
@@ -278,6 +293,18 @@ impl McpHub {
         let server = self.server(name)?;
         connect(&server).await;
         Ok(named_status(name, &server))
+    }
+
+    pub fn remove(&self, name: &str) -> Result<(), crate::types::OperationError> {
+        let server = self
+            .servers
+            .lock()
+            .unwrap()
+            .remove(name)
+            .ok_or_else(|| crate::types::OperationError::not_found("MCP server not found"))?;
+        server.generation.fetch_add(1, Ordering::AcqRel);
+        server.stop();
+        Ok(())
     }
 
     pub fn disconnect(&self, name: &str) -> Result<Value, crate::types::OperationError> {

@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 mod hook_state;
+mod v2;
 pub(crate) use hook_state::{AdmissionReservation, InterruptedTurn, RecoveredTurn};
 mod hook_events;
 pub(crate) use hook_events::{HookDeliveryBudget, OutboxIntent};
@@ -151,6 +152,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS session_updated ON session(time_updated);
              CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, request TEXT NOT NULL, started INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS inbox_session ON inbox(session_id, seq);
+             CREATE TABLE IF NOT EXISTS v2_state(session_id TEXT PRIMARY KEY, json TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS todo(session_id TEXT PRIMARY KEY, json TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS owner(session_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, lease_expires INTEGER NOT NULL,lease_token TEXT);
              CREATE TABLE IF NOT EXISTS hook_turn(message_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,state TEXT NOT NULL,snapshot TEXT,result TEXT,reason TEXT,started INTEGER NOT NULL DEFAULT 0,continuations INTEGER NOT NULL DEFAULT 0,finalizer TEXT);
@@ -165,6 +167,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS hook_delivery_dir ON hook_delivery(directory,state);
              CREATE INDEX IF NOT EXISTS hook_delivery_expiry ON hook_delivery(expires);
              CREATE TRIGGER IF NOT EXISTS session_delete_hooks AFTER DELETE ON session BEGIN
+               DELETE FROM v2_state WHERE session_id=OLD.id;
                DELETE FROM hook_turn WHERE session_id=OLD.id;
                DELETE FROM hook_admission WHERE session_id=OLD.id;
              END;
@@ -587,7 +590,6 @@ impl Store {
         })
     }
 
-    #[cfg(test)]
     pub fn update_session(&self, session: &Session) -> Result<(), OperationError> {
         self.mutate_session(&session.id, |current| {
             *current = session.clone();
@@ -646,6 +648,7 @@ impl Store {
             if active {
                 return Err(OperationError::busy("Session or a child session is busy; abort and wait for idle before deleting"));
             }
+            tx.execute("WITH RECURSIVE descendants(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id=d.id) DELETE FROM v2_state WHERE session_id IN (SELECT id FROM descendants)", params![id])?;
             tx.execute("WITH RECURSIVE descendants(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id=d.id) DELETE FROM session WHERE id IN (SELECT id FROM descendants)", params![id])?;
             Ok(true)
         })
@@ -988,7 +991,7 @@ impl Store {
 
     pub fn next_prompt(&self, session_id: &str) -> Result<Option<PromptRequest>, OperationError> {
         self.transaction(|tx| {
-            let next: Option<(i64,String)> = tx.query_row("SELECT seq,request FROM inbox WHERE session_id=?1 AND started=0 ORDER BY seq LIMIT 1", params![session_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let next: Option<(i64,String)> = tx.query_row("SELECT seq,request FROM inbox WHERE session_id=?1 AND started=0 AND seq <= coalesce((SELECT min(seq) FROM inbox WHERE session_id=?1 AND started=0 AND json_extract(request,'$.v2.kind') IN ('compaction','move')),9223372036854775807) ORDER BY CASE coalesce(json_extract(request,'$.v2.delivery'),'steer') WHEN 'steer' THEN 0 ELSE 1 END,seq LIMIT 1", params![session_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
             let Some((seq, raw)) = next else {
                 return Ok(None);
             };
@@ -1017,7 +1020,7 @@ impl Store {
     pub fn pending_sessions(&self) -> Result<Vec<String>, OperationError> {
         self.with_read(|c| {
             let mut s = c.prepare(&format!(
-                "SELECT DISTINCT session_id FROM inbox WHERE started=0 AND {AVAILABLE_SCOPE}"
+                "SELECT DISTINCT session_id FROM inbox WHERE started=0 AND coalesce(json_extract(request,'$.v2.resume'),1)<>0 AND {AVAILABLE_SCOPE}"
             ))?;
             let rows = s.query_map(params![self.instance, now_ms()], |r| r.get(0))?;
             rows.collect::<Result<_, _>>().map_err(OperationError::from)
@@ -1110,6 +1113,7 @@ impl Store {
                 let new_id = crate::types::hex_id("msg_");
                 ids.insert(m.info.id.clone(), new_id.clone());
                 m.info.id = new_id.clone();
+                if let Some(control) = m.info.extra.get_mut("ocminiV2") { control["id"] = json!(new_id); }
                 m.info.session_id = s.id.clone();
                 m.info.parent_id = m
                     .info

@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(unix)]
-fn local_mcp() -> Value {
+pub(super) fn local_mcp() -> Value {
     json!({"mcp": {"probe": {"type": "local", "timeout": 2000,
         "environment": {"MCP_TEST_VALUE": "global"},
         "command": ["/bin/sh", "-c", r#"
@@ -21,7 +21,7 @@ done
 }
 
 #[cfg(unix)]
-fn mcp_spawns(server: &TestServer) -> Vec<Vec<String>> {
+pub(super) fn mcp_spawns(server: &TestServer) -> Vec<Vec<String>> {
     std::fs::read_to_string(server.root.path().join("mcp-spawns"))
         .unwrap_or_default()
         .lines()

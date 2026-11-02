@@ -289,6 +289,16 @@ pub(super) async fn summarize_history(
         current.parent_id.clone()
     };
     let mut info = MessageInfo::assistant(sid, parent, &model, "compaction");
+    if app.v2.enabled(sid) {
+        info.extra.insert(
+            "ocminiV2CompactionReason".into(),
+            json!(if current.role == "user" {
+                "manual"
+            } else {
+                "auto"
+            }),
+        );
+    }
     let mut context = context.clone();
     context["messageID"] = json!(info.id);
     app.hooks.emit(

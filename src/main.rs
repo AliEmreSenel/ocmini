@@ -26,10 +26,11 @@ mod tools;
 mod tui;
 mod types;
 mod usage_db;
+mod v2;
 
 use clap::{Args, Parser, Subcommand};
 
-pub const OPENCODE_COMPAT_VERSION: &str = concat!("1.19.4-ocmini.", env!("CARGO_PKG_VERSION"));
+pub const OPENCODE_COMPAT_VERSION: &str = concat!("2.2.5-ocmini.", env!("CARGO_PKG_VERSION"));
 
 #[derive(Parser)]
 #[command(version = OPENCODE_COMPAT_VERSION, about = "A compact OpenCode-compatible coding runtime", args_conflicts_with_subcommands = true)]
