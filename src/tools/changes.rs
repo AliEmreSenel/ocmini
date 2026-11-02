@@ -3,8 +3,9 @@ use super::{decode, failure, files, patch, resolve_path, ToolCtx};
 use crate::types::{OperationError, ToolOutput};
 use patch::Change;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -332,6 +333,46 @@ fn transformed_changes(
     Ok(changes)
 }
 
+/// A commit validates its baselines and then writes, so an unprotected commit
+/// is a check-then-write window. Tool calls from one model step run
+/// concurrently, and two batches prepared from the same file would both pass
+/// validation, letting the later write silently discard the earlier change.
+/// Commits take their paths in sorted order, which serializes overlapping
+/// batches (including moves, whose source and destination are separate
+/// changes) without deadlocking.
+static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn with_path_locks<T>(
+    paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+    write: impl FnOnce() -> Result<T, OperationError>,
+) -> Result<T, OperationError> {
+    let mut keys: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let locks = {
+        let mut registry = PATH_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keep one identity for holders and waiters, without retaining every
+        // file ever edited by a long-running server.
+        registry.retain(|_, lock| lock.strong_count() > 0);
+        keys.into_iter()
+            .map(|key| {
+                let entry = registry.entry(key).or_default();
+                let lock = entry.upgrade().unwrap_or_default();
+                *entry = Arc::downgrade(&lock);
+                lock
+            })
+            .collect::<Vec<_>>()
+    };
+    let _guards = locks
+        .iter()
+        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+        .collect::<Vec<_>>();
+    write()
+}
+
 fn validate_changes(changes: &[Change], cancel: &CancellationToken) -> Result<(), OperationError> {
     if changes.is_empty() {
         return Err(failure("File change batch must not be empty"));
@@ -365,25 +406,27 @@ impl Plan {
         self.changes.iter().map(|change| change.path.as_path())
     }
     pub fn commit(&self, cancel: &CancellationToken) -> Result<ToolOutput, OperationError> {
-        validate_changes(&self.changes, cancel)?;
-        for (index, change) in self.changes.iter().enumerate() {
-            if let Err(error) = patch::commit(change, false) {
-                let rollback = self.changes[..=index]
-                    .iter()
-                    .rev()
-                    .filter_map(|c| patch::commit(c, true).err())
-                    .collect::<Vec<_>>();
-                return Err(failure(format!(
-                    "File change failed: {error}; rollback {}",
-                    if rollback.is_empty() {
-                        "completed".into()
-                    } else {
-                        rollback.join("; ")
-                    }
-                )));
+        with_path_locks(self.changes.iter().map(|change| &change.path), || {
+            validate_changes(&self.changes, cancel)?;
+            for (index, change) in self.changes.iter().enumerate() {
+                if let Err(error) = patch::commit(change, false) {
+                    let rollback = self.changes[..=index]
+                        .iter()
+                        .rev()
+                        .filter_map(|c| patch::commit(c, true).err())
+                        .collect::<Vec<_>>();
+                    return Err(failure(format!(
+                        "File change failed: {error}; rollback {}",
+                        if rollback.is_empty() {
+                            "completed".into()
+                        } else {
+                            rollback.join("; ")
+                        }
+                    )));
+                }
             }
-        }
-        Ok(self.output.clone())
+            Ok(self.output.clone())
+        })
     }
 }
 
@@ -428,6 +471,216 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "no final newline");
         assert!(plan(json!([{"path":path,"before":"no final newline","after":"one"},{"path":path,"before":"no final newline","after":null}])).commit(&CancellationToken::new()).is_err());
+    }
+    #[test]
+    fn concurrent_commits_to_one_path_never_lose_a_change() {
+        // Tool calls admitted in one model step commit on separate blocking
+        // threads. Overlapping batches must serialize so exactly one plan
+        // commits and the file keeps the winning plan's content.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        for round in 0..32 {
+            std::fs::write(&path, "base").unwrap();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let commit = |after: &'static str| {
+                let path = path.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let plan = plan(json!([{"path":path,"before":"base","after":after}]));
+                    start.wait();
+                    plan.commit(&CancellationToken::new())
+                })
+            };
+            let (a, b) = (commit("A"), commit("B"));
+            let (a, b) = (a.join().unwrap(), b.join().unwrap());
+            assert_ne!(
+                a.is_ok(),
+                b.is_ok(),
+                "exactly one commit may win round {round}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                if a.is_ok() { "A" } else { "B" },
+                "round {round} must keep the winning content"
+            );
+            assert!(a
+                .err()
+                .or_else(|| b.err())
+                .unwrap()
+                .message
+                .contains("changed since preparation"));
+        }
+    }
+    #[test]
+    fn commit_validates_after_a_concurrent_writer_releases_the_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "base").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let (waiter, blocked) = with_path_locks([path.clone()], || {
+            let path = path.clone();
+            let waiting_path = path.clone();
+            let waiter = std::thread::spawn(move || {
+                let plan = plan(json!([{"path":waiting_path,"before":"base","after":"mine"}]));
+                started_tx.send(()).unwrap();
+                let result = plan.commit(&CancellationToken::new());
+                completed_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv().unwrap();
+            // Keep the old baseline until the waiter has had a chance to
+            // commit: bypassing the lock would now succeed, so this test also
+            // detects validation that runs before acquiring the lock.
+            let blocked = matches!(
+                completed_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            std::fs::write(&path, "theirs").unwrap();
+            Ok((waiter, blocked))
+        })
+        .unwrap();
+        let result = waiter.join().unwrap();
+        assert!(
+            blocked,
+            "commit must wait while another writer owns the path"
+        );
+        let error = result.expect_err("a committed change must force a fresh baseline check");
+        assert!(error.message.contains("changed since preparation"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+    }
+    #[test]
+    fn overlapping_batches_in_reverse_order_keep_the_winners_whole_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        std::fs::write(&a, "base").unwrap();
+        std::fs::write(&b, "base").unwrap();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let commit = |changes| {
+            let start = start.clone();
+            std::thread::spawn(move || {
+                let plan = plan(changes);
+                start.wait();
+                plan.commit(&CancellationToken::new())
+            })
+        };
+        let first = commit(
+            json!([{"path":a,"before":"base","after":"A"},{"path":b,"before":"base","after":"A"}]),
+        );
+        let second = commit(
+            json!([{"path":b,"before":"base","after":"B"},{"path":a,"before":"base","after":"B"}]),
+        );
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        assert_ne!(first.is_ok(), second.is_ok());
+        let winner = if first.is_ok() { "A" } else { "B" };
+        assert_eq!(std::fs::read_to_string(a).unwrap(), winner);
+        assert_eq!(std::fs::read_to_string(b).unwrap(), winner);
+    }
+    #[test]
+    fn unrelated_paths_do_not_wait_and_unused_locks_are_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let held = root.path().join("held");
+        let unrelated = root.path().join("unrelated");
+        with_path_locks([held.clone()], || {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let result = plan(json!([{"path":unrelated,"before":null,"after":"new"}]))
+                    .commit(&CancellationToken::new());
+                done_tx.send(result).unwrap();
+            });
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            waiter.join().unwrap();
+            assert!(PATH_LOCKS
+                .lock()
+                .unwrap()
+                .get(&held)
+                .unwrap()
+                .upgrade()
+                .is_some());
+            Ok(())
+        })
+        .unwrap();
+        assert!(PATH_LOCKS
+            .lock()
+            .unwrap()
+            .get(&held)
+            .is_none_or(|lock| lock.upgrade().is_none()));
+        with_path_locks([root.path().join("next")], || Ok(())).unwrap();
+        assert!(!PATH_LOCKS.lock().unwrap().contains_key(&held));
+    }
+    #[test]
+    fn patch_moves_conflict_with_edits_to_either_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        let cancel = CancellationToken::new();
+        for endpoint in [&source, &destination] {
+            std::fs::write(&source, "base\n").unwrap();
+            let moved = prepare_sync(root.path().to_str().unwrap(), "apply_patch", &json!({"patchText":"*** Begin Patch\n*** Update File: source\n*** Move to: destination\n@@\n-base\n+moved\n*** End Patch"}), &cancel).unwrap();
+            let edited = prepare_sync(
+                root.path().to_str().unwrap(),
+                "write",
+                &json!({"filePath":endpoint,"content":"other\n"}),
+                &cancel,
+            )
+            .unwrap();
+            edited.commit(&cancel).unwrap();
+            assert!(moved
+                .commit(&cancel)
+                .unwrap_err()
+                .message
+                .contains("changed since preparation"));
+            assert_eq!(std::fs::read_to_string(endpoint).unwrap(), "other\n");
+            if destination.exists() {
+                assert_eq!(std::fs::read_to_string(&source).unwrap(), "base\n");
+                std::fs::remove_file(&destination).unwrap();
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliases_share_the_same_conflict_baseline_and_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let alias = root.path().join("alias");
+        std::fs::write(&real, "base").unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let cancel = CancellationToken::new();
+        let prepare = |path: &Path| {
+            prepare_sync(
+                root.path().to_str().unwrap(),
+                "edit",
+                &json!({"filePath":path,"oldString":"base","newString":"updated"}),
+                &cancel,
+            )
+            .unwrap()
+        };
+        let direct = prepare(&real);
+        let linked = prepare(&alias);
+        assert_eq!(direct.changes[0].path, linked.changes[0].path);
+        with_path_locks([direct.changes[0].path.clone()], || {
+            assert!(PATH_LOCKS
+                .lock()
+                .unwrap()
+                .get(&linked.changes[0].path)
+                .unwrap()
+                .upgrade()
+                .is_some());
+            Ok(())
+        })
+        .unwrap();
+        direct.commit(&cancel).unwrap();
+        assert!(linked
+            .commit(&cancel)
+            .unwrap_err()
+            .message
+            .contains("changed since preparation"));
+        assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(alias).unwrap(), "updated");
     }
     fn hooks(directory: &str, script: &str) -> std::sync::Arc<crate::hooks::Hooks> {
         let cfg:crate::config::Config=serde_json::from_value(json!({"ocmini":{"hooks":{"handlers":[{"id":"file-hook","on":"file.change.before","command":["/bin/sh","-c",script]}]}}})).unwrap();

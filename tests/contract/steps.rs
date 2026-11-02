@@ -189,6 +189,80 @@ async fn tool_calls_in_one_step_execute_concurrently() {
     );
 }
 
+#[tokio::test]
+async fn conflicting_file_tools_report_one_winner_and_preserve_its_content() {
+    let calls = [
+        (
+            "edit",
+            json!({"filePath":"shared.txt","oldString":"base","newString":"edited"}),
+            "edited\n",
+        ),
+        (
+            "write",
+            json!({"filePath":"shared.txt","content":"written\n"}),
+            "written\n",
+        ),
+        (
+            "apply_patch",
+            json!({"patchText":"*** Begin Patch\n*** Update File: shared.txt\n@@\n-base\n+patched\n*** End Patch"}),
+            "patched\n",
+        ),
+    ];
+    let tool_calls: Vec<_> = calls.iter().enumerate().map(|(index, (name, args, _))| {
+        json!({"index":index,"id":format!("call_file_{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
+    }).collect();
+    let provider = Provider::start(vec![
+        Script::ok(vec![
+            json!({"choices":[{"index":0,"delta":{"tool_calls":tool_calls},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()}),
+        ]),
+        text_script("Conflicts need a fresh read", ""),
+    ]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(server.directory.join("shared.txt"), "base\n").unwrap();
+    let id = server.session(allow()).await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_file_conflicts", "Change the shared file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
+    let messages = server.messages(&id).await;
+    let parts: Vec<_> = messages
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .filter(|part| part["type"] == "tool")
+        .collect();
+    assert_eq!(parts.len(), calls.len());
+    let mut winners = Vec::new();
+    for (index, (_, _, expected)) in calls.iter().enumerate() {
+        let part = parts
+            .iter()
+            .find(|part| part["callID"] == format!("call_file_{index}"))
+            .unwrap();
+        if part["state"]["status"] == "completed" {
+            winners.push(*expected);
+        } else {
+            assert_eq!(part["state"]["status"], "error");
+            assert!(part["state"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("File changed since preparation"));
+        }
+    }
+    assert_eq!(winners.len(), 1, "conflicting tool parts: {parts:?}");
+    assert_eq!(
+        std::fs::read_to_string(server.directory.join("shared.txt")).unwrap(),
+        winners[0]
+    );
+}
+
 async fn poll_messages(
     server: &TestServer,
     id: &str,
