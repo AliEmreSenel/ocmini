@@ -1,3 +1,4 @@
+use super::markdown::Markdown;
 use super::render::{Row, ThoughtUpdate, ToolCall};
 use super::{
     style_ok, Attachment, Key, PendingPrompt, RowKind, ToolView, Ui, Visibility, BOLD, CYAN, RESET,
@@ -771,33 +772,20 @@ fn unstyled(text: &str) -> String {
 }
 
 /// Streamed whitespace outside code blocks is a paragraph separator, not one
-/// transcript row per newline token. Tool results bypass this presentation rule.
+/// transcript row per newline token. A fenced code row carries a gutter, so it
+/// is never blank, and tool results bypass this presentation rule.
 #[derive(Default)]
 struct Spacing {
     blank: bool,
-    fence: Option<(char, usize)>,
 }
 
 impl Spacing {
     fn accept(&mut self, row: &str) -> bool {
-        let plain = unstyled(row);
-        let text = plain.trim();
-        let blank = text.is_empty();
-        if blank && self.blank && self.fence.is_none() {
+        let blank = unstyled(row).trim().is_empty();
+        if blank && self.blank {
             return false;
         }
         self.blank = blank;
-        if let Some((mark, count)) = self.fence {
-            let length = text.chars().take_while(|ch| *ch == mark).count();
-            if length >= count && text[length..].trim().is_empty() {
-                self.fence = None;
-            }
-        } else if let Some(mark @ ('`' | '~')) = text.chars().next() {
-            let length = text.chars().take_while(|ch| *ch == mark).count();
-            if length >= 3 {
-                self.fence = Some((mark, length));
-            }
-        }
         true
     }
 }
@@ -833,6 +821,18 @@ pub(super) struct Display {
     thoughts: Vec<Thought>,
     thought_ids: HashMap<String, usize>,
     spacing: Spacing,
+    /// Narrative markdown state: the line being built and the open fence.
+    markdown: Markdown,
+    /// Where the markdown renderer's current row starts inside `tail`, valid
+    /// only while `md_row` holds. The renderer owns that part of the row: it
+    /// re-renders the whole line for every chunk, so a marker that closes late
+    /// can restyle the text before it.
+    md_tail: usize,
+    /// The renderer's row is fully inside the tail. A row that wrapped has
+    /// part of it in the scrollback, so there is nothing left to rewrite.
+    md_row: bool,
+    /// Rows committed, so a write's commits can be counted.
+    committed: usize,
     /// The transcript has painted at least one row, so the next block needs a
     /// separator. Ctrl+L and leaving full-screen start the transcript over.
     printed: bool,
@@ -900,10 +900,7 @@ impl Thought {
         if expanded {
             // The block's rows open at the top of their own anchor, so their
             // leading blank row belongs to them; `Spacing::default` drops it.
-            let mut spacing = Spacing {
-                blank: true,
-                fence: None,
-            };
+            let mut spacing = Spacing { blank: true };
             return std::iter::once(format!("{}◦ thinking{RESET}", super::DIM))
                 .chain(
                     self.text
@@ -1012,6 +1009,10 @@ impl Display {
             thoughts: Vec::new(),
             thought_ids: HashMap::new(),
             spacing: Spacing::default(),
+            markdown: Markdown::default(),
+            md_tail: 0,
+            md_row: false,
+            committed: 0,
             printed: false,
             fullscreen,
             scroll: None,
@@ -1060,6 +1061,17 @@ impl Display {
     }
 
     pub fn finish_line(&mut self) {
+        // A narrative line the stream stopped in is not lost when a tool chain,
+        // a prompt or a block interrupts it: the renderer writes the whole line
+        // out, replacing the partial rendering it owned. A row that wrapped is
+        // committed, so its text is not rendered into the tail a second time.
+        let line = self.markdown.finish();
+        if self.md_row && !line.is_empty() {
+            self.tail.truncate(self.md_tail);
+            self.tail.push_str(&line);
+            self.columns = unstyled(&self.tail).width();
+        }
+        self.md_row = false;
         if self.columns > 0 {
             let tail = std::mem::take(&mut self.tail);
             self.push_row(tail);
@@ -1102,6 +1114,12 @@ impl Display {
             match row {
                 Row::Text(kind, text) => self.output_as(&text, width, kind),
                 Row::Blank => self.ensure_blank(),
+                Row::Rewrite => {
+                    // The answer restarted: drop the line and fence the old
+                    // text left behind, and stop owning any of the tail.
+                    self.markdown.restart();
+                    self.md_row = false;
+                }
                 Row::Header(kind, text) => {
                     self.ensure_blank();
                     self.output_as(&text, width, kind);
@@ -1158,7 +1176,6 @@ impl Display {
             // The block's rows print right under this anchor, so the next
             // block's separator has to survive the blank-row collapse.
             self.spacing.blank = false;
-            self.spacing.fence = None;
             let index = self.thoughts.len();
             self.thoughts.push(Thought {
                 anchor: self.lines.len(),
@@ -1226,7 +1243,6 @@ impl Display {
                     // The chain's anchor row prints right here, so the next
                     // block's separator has to survive the blank-row collapse.
                     self.spacing.blank = false;
-                    self.spacing.fence = None;
                     let chain = self.chains.len();
                     self.chains.push(ToolChain {
                         anchor: self.lines.len(),
@@ -1256,6 +1272,8 @@ impl Display {
     }
 
     pub fn end_tools(&mut self) {
+        // The answer is over: print the narrative line it stopped in.
+        self.finish_line();
         self.active_chain = None;
         // The next block opens with a separator row, so the blank-row collapse
         // must not swallow it on the run of blanks that just ended.
@@ -1278,6 +1296,37 @@ impl Display {
     /// brings it back, and dropped in native mode, where the terminal's
     /// scrollback cannot be rewritten.
     pub fn output_as(&mut self, text: &str, width: usize, kind: RowKind) {
+        // Narrative rows are markdown. The renderer re-renders the whole line
+        // for every chunk, so the row it is building is replaced rather than
+        // appended: that is what lets `**bold**` style text already on screen.
+        // Tool and thinking rows are the app's own formatting and print their
+        // text verbatim.
+        if kind == RowKind::Plain {
+            let rendered = self.markdown.push(text);
+            if self.md_row {
+                self.tail.truncate(self.md_tail);
+                self.columns = unstyled(&self.tail).width();
+            }
+            // Every rendered span closes itself, so the style in effect where
+            // the row starts is exactly the style the write leaves behind.
+            let commits = self.committed;
+            self.write(&rendered.text, width, kind);
+            // A write that committed one row per newline in the render ended
+            // every row it printed: the renderer owns the row left in the tail.
+            // A row that wrapped commits without a newline, so part of it is
+            // in the scrollback, past rewriting: the renderer lets the line go
+            // there, and ownership returns at the next row.
+            self.md_row = self.committed - commits == rendered.text.matches('\n').count();
+            self.md_tail = self.tail.len().saturating_sub(rendered.line);
+            if !self.md_row {
+                self.markdown.restart_line();
+            }
+            return;
+        }
+        self.write(text, width, kind);
+    }
+
+    fn write(&mut self, text: &str, width: usize, kind: RowKind) {
         if !unstyled(text).trim().is_empty() {
             // Only consecutive tool calls belong to a group. Even when
             // thinking is collapsed, intervening messages keep their place.
@@ -1346,6 +1395,9 @@ impl Display {
         self.push_row(tail);
         self.tail.clone_from(&self.style);
         self.columns = 0;
+        self.committed += 1;
+        // The renderer's row is committed, so it owns nothing in the tail.
+        self.md_row = false;
     }
 
     /// Native mode prints a finished row into the terminal's scrollback;
@@ -1376,6 +1428,9 @@ impl Display {
         self.thoughts.clear();
         self.thought_ids.clear();
         self.spacing = Spacing::default();
+        self.markdown = Markdown::default();
+        self.md_row = false;
+        self.committed = 0;
         self.printed = false;
         *self.wrapped.get_mut() = WrappedRows::default();
         if self.fullscreen {
@@ -1416,6 +1471,9 @@ impl Display {
         self.thoughts.clear();
         self.thought_ids.clear();
         self.spacing = Spacing::default();
+        self.markdown = Markdown::default();
+        self.md_row = false;
+        self.committed = 0;
         self.printed = false;
         *self.wrapped.get_mut() = WrappedRows::default();
         self.scroll = None;
@@ -2579,8 +2637,11 @@ mod tests {
     fn code_blocks_and_full_tool_output_preserve_their_blank_lines() {
         let mut display = Display::new(true);
         display.output("```rust\nfirst\n\n\nsecond\n```\n", 80);
+        // A fenced block's rows carry the gutter, so the blank lines inside it
+        // are rows with content and survive the blank-row collapse. The closing
+        // marker prints no row, so the block leaves no blank of its own.
         let rows = plain(&display.wrapped(80));
-        assert_eq!(rows, ["```rust", "first", "", "", "second", "```"]);
+        assert_eq!(rows, ["rust", "│ first", "│", "│", "│ second"]);
         let mut call = sample_tool(0, "completed");
         call.full = "● bash command\n  ✓ first\n\n\n  second".into();
         display.update_tool(call);
@@ -2592,6 +2653,66 @@ mod tests {
         assert!(rows
             .windows(4)
             .any(|rows| rows == ["  ✓ first", "", "", "  second"]));
+    }
+
+    /// Narrative rows are markdown; tool rows are the app's own formatting.
+    #[test]
+    fn narrative_markdown_renders_as_rows_and_keeps_tool_text_verbatim() {
+        let mut display = Display::new(true);
+        display.output("# Title\nUse **bold** and `code`.\n", 80);
+        assert_eq!(plain(&display.wrapped(80)), ["Title", "Use bold and code."]);
+        // A fence inside a tool result is the tool's text, not markdown: the
+        // renderer never sees it, so its markers print as typed.
+        let mut call = sample_tool(0, "completed");
+        call.full = "```rust\nfn main() {}\n```".into();
+        display.update_tool(call);
+        display.set_visibility(Visibility {
+            thinking: true,
+            tools: ToolView::Full,
+        });
+        let rows = plain(&display.wrapped(80));
+        assert!(rows.iter().any(|row| row == "```rust"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "```"), "{rows:?}");
+    }
+
+    /// Chunk boundaries must not change the transcript: the renderer rewrites
+    /// the row it owns, so text reads the same in one piece as in single bytes.
+    #[test]
+    fn markdown_renders_the_same_rows_whatever_the_stream_chunk_size() {
+        const TEXT: &str = "# Title\n\nUse **bold** and `code`.\n\n\
+            ```rust\nfn main() {}\n\n```\nthe end\n";
+        let mut whole = Display::new(true);
+        whole.output(TEXT, 80);
+        let expected = plain(&whole.wrapped(80));
+        for chunk in [1, 2, 3, 5, 8, 17, TEXT.len()] {
+            let mut display = Display::new(true);
+            for part in TEXT.as_bytes().chunks(chunk) {
+                // The corpus is ASCII, so a byte split is a character split.
+                display.output(std::str::from_utf8(part).unwrap(), 80);
+            }
+            display.finish_line();
+            assert_eq!(plain(&display.wrapped(80)), expected, "chunk size {chunk}");
+        }
+    }
+
+    /// The renderer owns the row under construction, so a line interrupted by a
+    /// tool call has to be written out whole, not dropped.
+    #[test]
+    fn narrative_stops_at_a_tool_call_and_survives_its_row_being_rewritten() {
+        let mut display = Display::new(true);
+        display.output("Running **the command** now", 80);
+        display.update_tool(sample_tool(0, "completed"));
+        let rows = plain(&display.wrapped(80));
+        assert_eq!(
+            rows[0], "Running the command now",
+            "an interrupted line keeps its text and its styling: {rows:?}"
+        );
+        // The narrative resumes after the chain: the line starts over, and the
+        // renderer carries nothing of the interrupted half into the next row.
+        display.output(" and **done**.\n", 80);
+        display.update_tool(sample_tool(1, "completed"));
+        let rows = plain(&display.wrapped(80));
+        assert!(rows.iter().any(|row| row == " and done."), "{rows:?}");
     }
 
     #[test]

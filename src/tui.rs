@@ -14,6 +14,7 @@ use futures::{poll, StreamExt};
 use serde_json::Value;
 mod clipboard;
 mod input;
+mod markdown;
 mod render;
 use crate::attachments::Attachment;
 use crate::client::{parse_answer, shutdown_signal, TextState};
