@@ -28,6 +28,86 @@ async fn get(server: &TestServer, path: &str) -> Value {
 }
 
 #[tokio::test]
+async fn v2_accepts_null_optional_fields_from_t3_session_requests() {
+    let mut provider = Provider::start(vec![text_script("Hello T3", "")]).await;
+    let mut server = TestServer::start(&provider, json!({})).await;
+    // The T3-pinned Effect client encodes omitted optional payload fields as null.
+    let created = post(
+        &server,
+        "/api/session",
+        json!({"id":null,"parentID":null,"title":null,"agent":null,"model":null,
+            "location":{"directory":server.directory},"metadata":null,"permissions":null}),
+    )
+    .await;
+    let sid = created["data"]["id"].as_str().unwrap();
+    assert!(created["data"].get("parentID").is_none());
+    assert!(created["data"].get("model").is_none());
+    assert_eq!(created["data"]["agent"], "build");
+    assert_eq!(created["data"]["title"], "New session");
+
+    let mut events = server.events_at("/api/event").await;
+    let receipt = post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"id":null,"text":"Hello","delivery":null,"resume":null,
+            "files":null,"skills":null,"metadata":null}),
+    )
+    .await;
+    assert!(receipt["data"]["id"].as_str().unwrap().starts_with("msg_"));
+    events.through("session.execution.succeeded").await;
+    provider.request().await;
+    assert_eq!(
+        get(&server, &format!("/api/session/{sid}")).await["data"]["title"],
+        "Hello",
+        "a null title must still allow automatic naming"
+    );
+
+    for body in [
+        json!({"metadata":{"keep":null},"permissions":[{"action":"shell","resource":"*","effect":"ask"}]}),
+        json!({"title":"T3 title","metadata":null,"permissions":null,"archived":null}),
+    ] {
+        server
+            .client
+            .patch(format!("{}/api/session/{sid}", server.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    drop(events);
+    server.restart().await;
+    let saved = get(&server, &format!("/api/session/{sid}")).await;
+    assert_eq!(saved["data"]["title"], "T3 title");
+    assert_eq!(saved["data"]["metadata"], json!({"keep":null}));
+    assert_eq!(
+        saved["data"]["permissions"],
+        json!([{"action":"shell","resource":"*","effect":"ask"}])
+    );
+    let child = post(
+        &server,
+        "/api/session",
+        json!({"parentID":sid,"location":null}),
+    )
+    .await;
+    assert_eq!(child["data"]["parentID"], sid);
+    assert_eq!(child["data"]["location"], saved["data"]["location"]);
+    for parent in [json!(false), json!(42), json!({}), json!([])] {
+        let response = server
+            .post("/api/session", &json!({"parentID":parent}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["message"],
+            "parentID must be a string"
+        );
+    }
+}
+
+#[tokio::test]
 async fn v2_streams_native_lifecycle_and_persists_selection_instructions_and_history() {
     let mut provider = Provider::start(vec![
         text_script("Hello ", "v2"),
@@ -287,6 +367,7 @@ async fn official_v2_client_and_schema_conformance() {
             "call_sdk_form",
         ),
         text_script("Native SDK reply", ""),
+        text_script("T3 Effect SDK reply", ""),
     ])
     .await;
     let server = TestServer::start(&provider, json!({})).await;
@@ -836,7 +917,7 @@ async fn v2_archive_filters_and_native_update_events_survive_restart() {
     assert!(archived.is_number());
     let before_time =
         get(&server, &format!("/api/session/{sid}")).await["data"]["time"]["updated"].clone();
-    patch(json!({"archived":true}))
+    patch(json!({"archived":true,"title":null,"metadata":null,"permissions":null}))
         .await
         .unwrap()
         .error_for_status()

@@ -18,6 +18,8 @@ GET /api/model, /api/provider, /api/agent, /api/skill and /api/command return lo
 
 POST /api/session creates a session with optional id, parentID, title, model, agent, location, permissions and metadata. Model references use {providerID, id, variant?}. Permissions use ordered {action, resource, effect} records; shell/subagent actions map to the runtime's existing shell/task policy checks.
 
+Optional session creation/update and input fields accept null as omitted, matching the official Effect client's encoding. Null values inside metadata are preserved.
+
 GET/PATCH/DELETE /api/session/{sessionID} read, update and remove sessions. GET /api/session/active returns {data: {sessionID: {type: "running"}}} for this process's active executions. Session responses use {data: session}; selection, update, move and removal return 204. Removing a session stops its work and removes descendants.
 
 Agent and model selections persist through POST /api/session/{sessionID}/agent and /model. POST /move admits a directory move at a step boundary. Session reads expose saved location, model/agent selection, usage, busy/idle timestamps and the latest outcome. PATCH accepts archived:true/false; an archive-only request repeating the current state is a no-op. Archive state persists in the existing session record.

@@ -70,6 +70,10 @@ fn data(value: Value) -> Json<Value> {
 fn located(directory: &str, value: Value) -> Json<Value> {
     Json(json!({"location":{"directory":directory},"data":value}))
 }
+// The official Effect client encodes omitted optional payload fields as null.
+fn optional<'a>(body: &'a Value, key: &str) -> Option<&'a Value> {
+    body.get(key).filter(|value| !value.is_null())
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -287,8 +291,7 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
     if !body.is_object() {
         return Err(invalid("Session body must be an object"));
     }
-    let parent = body
-        .get("parentID")
+    let parent = optional(&body, "parentID")
         .map(|v| {
             v.as_str()
                 .ok_or_else(|| invalid("parentID must be a string"))
@@ -301,7 +304,7 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
     };
     let mut s = Session::new(body["title"].as_str().unwrap_or("New session"), &dir);
     s.parent_id = parent.map(str::to_owned);
-    if let Some(id) = body.get("id") {
+    if let Some(id) = optional(&body, "id") {
         let id = id
             .as_str()
             .filter(|s| s.starts_with("ses_"))
@@ -312,17 +315,19 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
         }
         s.id = id.into();
     }
-    if body.get("title").is_some() {
+    if optional(&body, "title").is_some() {
         s.title_source = Some(TitleSource::Explicit);
     }
-    s.permission = body.get("permissions").map(wire::rules).transpose()?;
-    if let Some(model) = body.get("model") {
+    s.permission = optional(&body, "permissions")
+        .map(wire::rules)
+        .transpose()?;
+    if let Some(model) = optional(&body, "model") {
         wire::model_in(model)?;
     }
-    let s = crate::sessions::create(&st.app, s, body.get("metadata")).await?;
+    let s = crate::sessions::create(&st.app, s, optional(&body, "metadata")).await?;
     st.app.v2.enable(&s.id)?;
     let mut state = json!({"agent":body["agent"].as_str().unwrap_or("build")});
-    if let Some(model) = body.get("model") {
+    if let Some(model) = optional(&body, "model") {
         state["model"] = model.clone();
     }
     let state = st.app.store.v2_update(&s.id, &state)?;
@@ -360,21 +365,23 @@ async fn update(
         return Err(invalid("Session patch must be an object"));
     }
     let s = required(&st, &sid)?;
-    if body.as_object().is_some_and(|b| b.len() == 1)
-        && body
-            .get("archived")
-            .and_then(Value::as_bool)
-            .is_some_and(|archived| archived == s.time.extra.contains_key("archived"))
+    if body.as_object().is_some_and(|b| {
+        b.iter()
+            .all(|(key, value)| key == "archived" || value.is_null())
+    }) && body
+        .get("archived")
+        .and_then(Value::as_bool)
+        .is_some_and(|archived| archived == s.time.extra.contains_key("archived"))
     {
         return Ok(StatusCode::NO_CONTENT);
     }
     let mut patch = json!({});
     for key in ["title", "metadata", "archived"] {
-        if let Some(v) = body.get(key) {
+        if let Some(v) = optional(&body, key) {
             patch[key] = v.clone();
         }
     }
-    if let Some(rules) = body.get("permissions") {
+    if let Some(rules) = optional(&body, "permissions") {
         patch["permission"] = json!(wire::rules(rules)?);
     }
     crate::sessions::update(&st.app, &s, patch).await?;
@@ -448,8 +455,7 @@ async fn select_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 fn input(body: &Value, kind: &str, payload: Value) -> Result<Input> {
-    let delivery = body
-        .get("delivery")
+    let delivery = optional(body, "delivery")
         .map(|v| {
             v.as_str()
                 .filter(|s| matches!(*s, "steer" | "queue"))
@@ -457,8 +463,7 @@ fn input(body: &Value, kind: &str, payload: Value) -> Result<Input> {
         })
         .transpose()?
         .unwrap_or("steer");
-    let resume = body
-        .get("resume")
+    let resume = optional(body, "resume")
         .map(|v| v.as_bool().ok_or_else(|| invalid("resume must be boolean")))
         .transpose()?
         .unwrap_or(true);
@@ -494,7 +499,7 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
     }
     let text = wire::string(body, "text")?;
     let mut parts = vec![json!({"type":"text","text":text})];
-    if let Some(files) = body.get("files") {
+    if let Some(files) = optional(body, "files") {
         for file in files
             .as_array()
             .ok_or_else(|| invalid("files must be an array"))?
@@ -521,7 +526,7 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
             parts.push(part);
         }
     }
-    if let Some(skills) = body.get("skills") {
+    if let Some(skills) = optional(body, "skills") {
         let cfg = Config::load_for(&s.directory).map_err(OperationError::invalid)?;
         let available = crate::inventory::skills_json_for(&s.directory, &cfg);
         for skill in skills
@@ -545,8 +550,7 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
             parts.push(json!({"type":"text","text":content,"synthetic":true}));
         }
     }
-    let id = body
-        .get("id")
+    let id = optional(body, "id")
         .map(|v| v.as_str().ok_or_else(|| invalid("id must be a string")))
         .transpose()?
         .map(str::to_owned)
@@ -557,7 +561,7 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
         v2: Some(input(
             body,
             kind,
-            json!({"text":text,"metadata":body.get("metadata").cloned().unwrap_or_else(||json!({}))}),
+            json!({"text":text,"metadata":optional(body,"metadata").cloned().unwrap_or_else(||json!({}))}),
         )?),
         ..Default::default()
     };

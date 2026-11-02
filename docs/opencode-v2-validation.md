@@ -10,7 +10,7 @@ The v2 implementation is checked against local provider/MCP fixtures and the off
 - Archive changes persist in the existing session record; repeated archive-only requests are no-ops. Native metadata, permissions, archive and usage events describe their actual changes.
 - Event filters accept repeated query parameters and inspect the shared encoded frame's type without parsing JSON for every subscriber.
 - Resource regressions have focused tests: saved session IDs are not loaded into an event cache at startup; idle execution indexes are released; an unobserved execution does not advance event counters; cached sequence IDs do not write SQLite; sibling reservations and restart invalidate old ranges; range exhaustion obtains more IDs; a blocked session event lock does not block another session's event processing.
-- Official-client conformance includes catalog/history/event decoding, tools, forms, permissions, archive/list operations and the version-2 deletion event.
+- Official-client conformance includes catalog/history/event decoding, tools, forms, permissions, archive/list operations and the version-2 deletion event. T3's pinned Effect client also creates root/child sessions, updates a title and completes a prompt with omitted optional fields encoded as null.
 
 ## Event persistence and memory
 
