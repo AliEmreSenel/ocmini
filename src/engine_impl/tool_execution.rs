@@ -84,7 +84,14 @@ async fn execute_part(
     allowed: &HashSet<String>,
 ) -> (usize, Value, Option<String>) {
     let prepared = match prepared {
-        Ok(args) => tools::prepare_input(&ctx, &name, args).await,
+        Ok(_)
+            if !allowed.contains(&name) && !allowed.contains(crate::v2::wire::tool_name(&name)) =>
+        {
+            Err(OperationError::from(format!(
+                "Tool '{name}' is not enabled for agent '{agent}'"
+            )))
+        }
+        Ok(args) => prepare_tool_input(&ctx, &name, args, cfg, request).await,
         Err(error) => Err(error),
     };
     if let Ok(input) = &prepared {
@@ -101,23 +108,15 @@ async fn execute_part(
     }
     let output = match &prepared {
         Err(error) => Err(error.clone()),
-        Ok(_)
-            if !allowed.contains(&name) && !allowed.contains(crate::v2::wire::tool_name(&name)) =>
-        {
-            Err(OperationError::from(format!(
-                "Tool '{name}' is not enabled for agent '{agent}'"
-            )))
-        }
         Ok(input) => execute_tool(&ctx, &name, input, cfg, request, repeated).await,
     };
     // Task/question tools may publish metadata while blocked. Preserve it.
     let existing = ctx
         .app
         .store
-        .message(&ctx.session_id, &ctx.message_id)
+        .message_part(&ctx.session_id, &ctx.message_id, &ctx.part_id)
         .ok()
-        .flatten()
-        .and_then(|m| m.parts.into_iter().find(|p| p["id"] == part["id"]));
+        .flatten();
     let running_metadata = existing
         .as_ref()
         .map(|p| p["state"]["metadata"].clone())
@@ -160,6 +159,11 @@ pub(super) fn execution_tool(name: &str) -> bool {
     tools::Builtin::from_name(name).is_some_and(tools::Builtin::is_execution)
         || name.starts_with("mcp_")
 }
+pub(super) fn unattended_tool_denied(name: &str, app: &App, request: &PromptRequest) -> bool {
+    request.deny_unattended_tools
+        && (execution_tool(name) || name == "webfetch" || app.mcp().route(name).is_some())
+}
+
 pub(super) fn tool_enabled(name: &str, agent: &str, cfg: &Config, request: &PromptRequest) -> bool {
     let legacy = match name {
         "shell" => "bash",
@@ -197,7 +201,68 @@ pub(super) async fn prepare_effective_input(
     request: &PromptRequest,
 ) -> Result<PreparedTool, OperationError> {
     let input = prepare_effective_args(ctx, name, input, cfg, request).await?;
-    tools::prepare_input(ctx, name, input).await
+    prepare_tool_input(ctx, name, input, cfg, request).await
+}
+
+async fn prepare_tool_input(
+    ctx: &ToolCtx,
+    name: &str,
+    args: Value,
+    cfg: &Config,
+    request: &PromptRequest,
+) -> Result<PreparedTool, OperationError> {
+    use tools::Builtin;
+    let builtin = Builtin::from_name(name);
+    if !matches!(
+        builtin,
+        Some(Builtin::Write | Builtin::Edit | Builtin::ApplyPatch)
+    ) {
+        return tools::prepare_input(ctx, name, args, |_, _| async { Ok(()) }).await;
+    }
+    let root = tools::canonical_target(Path::new(&ctx.dir))?;
+    let approval_args = args.clone();
+    let (root, approval_args) = (&root, &approval_args);
+    tools::prepare_input(ctx, name, args, move |path, canonical| async move {
+        // An earlier edit may have saved an approval while this one waited.
+        let rules = current_permission_rules(ctx, cfg, request)?;
+        if !canonical.starts_with(root) {
+            check_permission(
+                ctx,
+                &rules,
+                "external_directory",
+                &canonical.to_string_lossy(),
+                name,
+                approval_args,
+            )
+            .await?;
+        }
+        for path in std::iter::once(&path).chain((canonical != path).then_some(&canonical)) {
+            let pattern = path.to_string_lossy();
+            check_permission(ctx, &rules, "edit", &pattern, name, approval_args).await?;
+            // Edits and patches can surface existing content in diagnostics or
+            // transformed tool inputs. Apply the read policy before loading it.
+            if builtin != Some(Builtin::Write) {
+                check_permission(ctx, &rules, "read", &pattern, name, approval_args).await?;
+            }
+        }
+        ctx.app.store.check_ownership(&ctx.session_id)?;
+        Ok(())
+    })
+    .await
+}
+
+fn current_permission_rules(
+    ctx: &ToolCtx,
+    cfg: &Config,
+    request: &PromptRequest,
+) -> Result<Vec<PermissionRule>, OperationError> {
+    ctx.app.store.check_ownership(&ctx.session_id)?;
+    let session = ctx
+        .app
+        .store
+        .get_session(&ctx.session_id)?
+        .ok_or_else(|| OperationError::from("Session not found"))?;
+    Ok(permission_rules(cfg, &session, request))
 }
 
 async fn prepare_effective_args(
@@ -210,6 +275,9 @@ async fn prepare_effective_args(
     let agent = request.agent.as_deref().unwrap_or("build");
     if !input.is_object() {
         return Err("Tool input must be an object".into());
+    }
+    if unattended_tool_denied(name, &ctx.app, request) {
+        return Err(format!("Tool '{name}' requires --auto in a non-interactive run").into());
     }
     if !tool_enabled(name, agent, cfg, request)
         || (["plan", "explore"].contains(&agent)
@@ -308,39 +376,37 @@ async fn execute_authorized_tool(
     request: &PromptRequest,
     repeated: bool,
 ) -> Result<ToolOutput, OperationError> {
-    ctx.app.store.check_ownership(&ctx.session_id)?;
-    let session = ctx
-        .app
-        .store
-        .get_session(&ctx.session_id)?
-        .ok_or_else(|| OperationError::from("Session not found"))?;
-    let rules = permission_rules(cfg, &session, request);
-    let paths = input.paths(&ctx.dir);
-    let mut permission_paths = paths.clone();
-    let root = tools::canonical_target(Path::new(&ctx.dir))?;
-    for path in &paths {
-        let canonical = tools::canonical_target(path)?;
-        if !permission_paths.contains(&canonical) {
-            permission_paths.push(canonical.clone());
+    if repeated || input.file_paths().is_none() {
+        let rules = current_permission_rules(ctx, cfg, request)?;
+        if repeated {
+            check_permission(ctx, &rules, "doom_loop", name, name, input.args()).await?;
         }
-        if !canonical.starts_with(&root) {
-            check_permission(
-                ctx,
-                &rules,
-                "external_directory",
-                &canonical.to_string_lossy(),
-                name,
-                input.args(),
-            )
-            .await?;
+        if input.file_paths().is_none() {
+            let paths = input.paths(&ctx.dir);
+            let mut permission_paths = paths.clone();
+            let root = tools::canonical_target(Path::new(&ctx.dir))?;
+            for path in &paths {
+                let canonical = tools::canonical_target(path)?;
+                if !permission_paths.contains(&canonical) {
+                    permission_paths.push(canonical.clone());
+                }
+                if !canonical.starts_with(&root) {
+                    check_permission(
+                        ctx,
+                        &rules,
+                        "external_directory",
+                        &canonical.to_string_lossy(),
+                        name,
+                        input.args(),
+                    )
+                    .await?;
+                }
+            }
+            let (permission, patterns) = input.permission(name, &permission_paths);
+            for pattern in patterns {
+                check_permission(ctx, &rules, permission, &pattern, name, input.args()).await?;
+            }
         }
-    }
-    if repeated {
-        check_permission(ctx, &rules, "doom_loop", name, name, input.args()).await?;
-    }
-    let (permission, patterns) = input.permission(name, &permission_paths);
-    for pattern in patterns {
-        check_permission(ctx, &rules, permission, &pattern, name, input.args()).await?;
     }
     // Approval hooks and user input can outlive the lease that authorized them.
     ctx.app.store.check_ownership(&ctx.session_id)?;

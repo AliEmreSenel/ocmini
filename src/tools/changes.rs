@@ -1,9 +1,10 @@
 //! One file transaction for ordinary tools and hook-transformed tools.
-use super::{decode, failure, files, patch, resolve_path, ToolCtx};
+use super::{decode, failure, files, patch, resolve_path};
 use crate::types::{OperationError, ToolOutput};
 use patch::Change;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::sync::{Mutex as PathMutex, OwnedMutexGuard};
@@ -36,7 +37,7 @@ pub(super) struct PatchInput {
 enum Input {
     Write(WriteInput),
     Edit(EditInput),
-    Patch(PatchInput),
+    Patch(Vec<patch::Operation>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,14 +52,31 @@ impl Input {
         match super::Builtin::from_name(name) {
             Some(super::Builtin::Write) => Ok(Self::Write(decode(input)?)),
             Some(super::Builtin::Edit) => Ok(Self::Edit(decode(input)?)),
-            Some(super::Builtin::ApplyPatch) => Ok(Self::Patch(decode(&super::alias(
-                input,
-                "patchText",
-                "patch",
-            ))?)),
+            Some(super::Builtin::ApplyPatch) => {
+                let input: PatchInput = decode(&super::alias(input, "patchText", "patch"))?;
+                Ok(Self::Patch(patch::parse(&input.patch_text)?))
+            }
             _ => Err(failure(format!("Unknown file tool {name}"))),
         }
     }
+    fn targets(&self, directory: &str) -> Result<Targets, OperationError> {
+        let paths = match self {
+            Self::Write(input) => vec![input.file_path.as_str()],
+            Self::Edit(input) => vec![input.file_path.as_str()],
+            Self::Patch(operations) => operations
+                .iter()
+                .flat_map(patch::Operation::paths)
+                .collect(),
+        };
+        paths
+            .into_iter()
+            .map(|path| {
+                let path = resolve_path(directory, path);
+                Ok((path.clone(), target(&path)?))
+            })
+            .collect()
+    }
+
     fn kind(&self) -> Kind {
         match self {
             Self::Write(_) => Kind::Write,
@@ -66,6 +84,18 @@ impl Input {
             Self::Patch(_) => Kind::Patch,
         }
     }
+}
+
+type Targets = Vec<(PathBuf, PathBuf)>;
+
+fn checked_target(path: &Path, approved: &Path) -> Result<PathBuf, OperationError> {
+    if target(path)? != approved {
+        return Err(failure(format!(
+            "File path changed since approval: {}",
+            path.display()
+        )));
+    }
+    Ok(approved.to_owned())
 }
 
 pub struct Plan {
@@ -126,21 +156,33 @@ pub(super) fn prepare_sync(
     input: &Value,
     cancel: &CancellationToken,
 ) -> Result<Plan, OperationError> {
-    prepare_plan(directory, &Input::parse(name, input)?, cancel)
+    let input = Input::parse(name, input)?;
+    let targets = input.targets(directory)?;
+    prepare_plan(directory, input, cancel, &targets)
 }
 
 fn prepare_plan(
     directory: &str,
-    input: &Input,
+    input: Input,
     cancel: &CancellationToken,
+    targets: &Targets,
 ) -> Result<Plan, OperationError> {
-    let (kind, path, before, after, count) = match input {
+    let approved = |path: &Path| {
+        let (_, canonical) = targets
+            .iter()
+            .find(|(raw, _)| raw == path)
+            .ok_or_else(|| failure("File path was not approved"))?;
+        checked_target(path, canonical)
+    };
+    let (kind, path, canonical, before, after, count) = match input {
         Input::Write(input) => {
             let path = resolve_path(directory, &input.file_path);
-            let before = current(&path)?;
+            let canonical = approved(&path)?;
+            let before = current(&canonical)?;
             (
                 Kind::Write,
                 path,
+                canonical,
                 before,
                 input.content.as_bytes().to_vec(),
                 0,
@@ -148,20 +190,19 @@ fn prepare_plan(
         }
         Input::Edit(input) => {
             let path = resolve_path(directory, &input.file_path);
-            let (before, after, count) = files::prepare_edit(&path, input)?;
+            let canonical = approved(&path)?;
+            let (before, after, count) = files::prepare_edit(&canonical, &input)?;
             (
                 Kind::Edit,
                 path,
+                canonical,
                 Some(before.into_bytes()),
                 after.into_bytes(),
                 count,
             )
         }
-        Input::Patch(input) => {
-            let (mut changes, summaries) = patch::prepare(directory, &input.patch_text, cancel)?;
-            for change in &mut changes {
-                change.path = target(&change.path)?;
-            }
+        Input::Patch(operations) => {
+            let (changes, summaries) = patch::prepare(directory, operations, cancel, approved)?;
             return Ok(Plan {
                 changes,
                 output: patch::output(&summaries),
@@ -170,10 +211,10 @@ fn prepare_plan(
         }
     };
     let output = file_output(kind, &path, after.len(), count);
-    let permissions = std::fs::metadata(&path).ok().map(|m| m.permissions());
+    let permissions = std::fs::metadata(&canonical).ok().map(|m| m.permissions());
     Ok(Plan {
         changes: vec![Change {
-            path: target(&path)?,
+            path: canonical,
             before,
             after: Some(after),
             permissions,
@@ -203,51 +244,61 @@ fn file_output(kind: Kind, path: &Path, bytes: usize, count: usize) -> ToolOutpu
     }
 }
 
-pub(super) async fn prepare(
-    ctx: &ToolCtx,
-    name: &str,
-    args: Value,
-) -> Result<(Value, Plan), OperationError> {
-    prepare_values(
-        &ctx.dir,
-        &ctx.app.hooks,
-        super::hook_context(ctx, name),
-        ctx.cancel.clone(),
-        name,
-        args,
-    )
-    .await
-}
+#[cfg(test)]
 async fn prepare_values(
     directory: &str,
     hooks: &crate::hooks::Hooks,
     context: Value,
     cancel: CancellationToken,
     name: &str,
-    mut args: Value,
+    args: Value,
 ) -> Result<(Value, Plan), OperationError> {
+    prepare(
+        directory,
+        hooks,
+        context,
+        cancel,
+        name,
+        args,
+        |_, _| async { Ok(()) },
+    )
+    .await
+}
+
+pub(super) async fn prepare<F>(
+    directory: &str,
+    hooks: &crate::hooks::Hooks,
+    context: Value,
+    cancel: CancellationToken,
+    name: &str,
+    mut args: Value,
+    mut authorize: impl FnMut(PathBuf, PathBuf) -> F + Send,
+) -> Result<(Value, Plan), OperationError>
+where
+    F: Future<Output = Result<(), OperationError>> + Send,
+{
     let input = Input::parse(name, &args)?;
     let kind = input.kind();
     // Like upstream, an edit reads and prepares its replacement only after
     // earlier edits to the same file have finished. Keep the lock through
     // hooks, permission approval and commit, including across sessions.
-    let edit_path = match &input {
-        Input::Edit(input) => Some(target(&resolve_path(directory, &input.file_path))?),
-        _ => None,
+    let targets = input.targets(directory)?;
+    let edit_lock = if kind == Kind::Edit {
+        Some(lock_edit(&targets[0].1, &cancel).await?)
+    } else {
+        None
     };
-    let edit_lock = match &edit_path {
-        Some(path) => Some(lock_edit(path, &cancel).await?),
-        None => None,
-    };
+    for (path, canonical) in &targets {
+        authorize(path.clone(), canonical.clone()).await?;
+    }
     let work_dir = directory.to_owned();
     let work_cancel = cancel.clone();
-    let mut plan =
-        tokio::task::spawn_blocking(move || prepare_plan(&work_dir, &input, &work_cancel))
-            .await
-            .map_err(|e| failure(e.to_string()))??;
-    if edit_path.is_some_and(|path| path != plan.changes[0].path) {
-        return Err(failure("File change has a repeated or changed path"));
-    }
+    let approved = targets.clone();
+    let mut plan = tokio::task::spawn_blocking(move || {
+        prepare_plan(&work_dir, input, &work_cancel, &approved)
+    })
+    .await
+    .map_err(|e| failure(e.to_string()))??;
     *plan.edit_lock.get_mut().unwrap() = edit_lock;
     if !hooks.matches(super::hooks::FILE_CHANGE_BEFORE, &context) {
         return Ok((args, plan));
@@ -264,7 +315,7 @@ async fn prepare_values(
             |_, set| {
                 if let Some(wire) = set.get("changes") {
                     accepted = Some(
-                        transformed_changes(directory, kind, wire, &plan.changes, &cancel)
+                        transformed_changes(directory, kind, wire, &plan.changes)
                             .map_err(|error| error.message)?,
                     );
                 }
@@ -276,14 +327,48 @@ async fn prepare_values(
     if effective["changes"] == original {
         return Ok((args, plan));
     }
-    let changes = accepted.ok_or_else(|| failure("Missing accepted file changes"))?;
+    let (mut changes, redirected) =
+        accepted.ok_or_else(|| failure("Missing accepted file changes"))?;
     if kind == Kind::Edit && changes[0].path != plan.changes[0].path {
         // A hook may redirect an edit. Release its original target before
         // waiting on the new one so crossed redirects cannot deadlock.
         drop(plan.edit_lock.get_mut().unwrap().take());
         *plan.edit_lock.get_mut().unwrap() = Some(lock_edit(&changes[0].path, &cancel).await?);
-        validate_changes(&changes, &cancel)?;
     }
+    for (path, canonical) in &redirected {
+        if !targets
+            .iter()
+            .any(|(raw, target)| target == canonical && (raw == path || path == canonical))
+        {
+            authorize(path.clone(), canonical.clone()).await?;
+        }
+        checked_target(path, canonical)?;
+    }
+    let original_paths: HashSet<_> = plan.paths().map(Path::to_owned).collect();
+    let changes = tokio::task::spawn_blocking(move || {
+        for change in &mut changes {
+            if !original_paths.contains(&change.path) {
+                change.before = current(&change.path)?;
+                change.permissions = std::fs::metadata(&change.path)
+                    .ok()
+                    .map(|m| m.permissions());
+                if change
+                    .before
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.contains(&0))
+                {
+                    return Err(failure("File change contains binary content"));
+                }
+            }
+        }
+        if kind == Kind::Edit && changes[0].before.as_ref().is_none_or(Vec::is_empty) {
+            return Err(failure("Edit target must be an existing nonempty file"));
+        }
+        validate_changes(&changes, &cancel)?;
+        Ok::<_, OperationError>(changes)
+    })
+    .await
+    .map_err(|e| failure(e.to_string()))??;
     if matches!(kind, Kind::Write | Kind::Edit) {
         let change = &changes[0];
         args["filePath"] = json!(change.path);
@@ -312,17 +397,26 @@ fn transformed_changes(
     kind: Kind,
     wire: &Value,
     baseline: &[Change],
-    cancel: &CancellationToken,
-) -> Result<Vec<Change>, OperationError> {
+) -> Result<(Vec<Change>, Targets), OperationError> {
     let mut changes: Vec<Change> = serde_json::from_value(wire.clone())
         .map_err(|e| failure(format!("Invalid file changes: {e}")))?;
+    if changes.is_empty() {
+        return Err(failure("File change batch must not be empty"));
+    }
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
     for change in &mut changes {
         let text = change
             .path
             .to_str()
             .filter(|s| !s.is_empty() && !s.contains(['\0', '\n', '\r']))
             .ok_or_else(|| failure("File change path is invalid"))?;
-        change.path = target(&resolve_path(directory, text))?;
+        let path = resolve_path(directory, text);
+        change.path = target(&path)?;
+        if !seen.insert(change.path.clone()) {
+            return Err(failure("File change has a repeated or changed path"));
+        }
+        targets.push((path, change.path.clone()));
         if let Some(previous) = baseline.iter().find(|p| p.path == change.path) {
             if previous.before != change.before {
                 return Err(failure(
@@ -330,11 +424,6 @@ fn transformed_changes(
                 ));
             }
             change.permissions = previous.permissions.clone();
-        } else {
-            change.before = current(&change.path)?;
-            change.permissions = std::fs::metadata(&change.path)
-                .ok()
-                .map(|m| m.permissions());
         }
         if change
             .before
@@ -345,18 +434,14 @@ fn transformed_changes(
             return Err(failure("File change contains binary content"));
         }
     }
-    if matches!(kind, Kind::Write | Kind::Edit) {
-        if changes.len() != 1 || changes[0].after.is_none() {
-            return Err(failure(
-                "Write/edit hooks must return one file with after content",
-            ));
-        }
-        if kind == Kind::Edit && changes[0].before.as_ref().is_none_or(Vec::is_empty) {
-            return Err(failure("Edit target must be an existing nonempty file"));
-        }
+    if matches!(kind, Kind::Write | Kind::Edit)
+        && (changes.len() != 1 || changes[0].after.is_none())
+    {
+        return Err(failure(
+            "Write/edit hooks must return one file with after content",
+        ));
     }
-    validate_changes(&changes, cancel)?;
-    Ok(changes)
+    Ok((changes, targets))
 }
 
 /// A commit validates its baselines and then writes, so an unprotected commit
@@ -521,7 +606,7 @@ mod tests {
     }
     #[test]
     fn conflict_in_later_file_prevents_all_writes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let a = root.path().join("a");
         let b = root.path().join("b");
         std::fs::write(&a, "one").unwrap();
@@ -540,7 +625,7 @@ mod tests {
     }
     #[test]
     fn transaction_preserves_exact_content_and_rejects_aliases() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("file");
         plan(json!([{"path":path,"before":null,"after":"no final newline"}]))
             .commit(&CancellationToken::new())
@@ -553,7 +638,7 @@ mod tests {
         // Tool calls admitted in one model step commit on separate blocking
         // threads. Overlapping batches must serialize so exactly one plan
         // commits and the file keeps the winning plan's content.
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("file");
         for round in 0..32 {
             std::fs::write(&path, "base").unwrap();
@@ -589,7 +674,7 @@ mod tests {
     }
     #[test]
     fn commit_validates_after_a_concurrent_writer_releases_the_path() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("file");
         std::fs::write(&path, "base").unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -627,7 +712,7 @@ mod tests {
     }
     #[test]
     fn overlapping_batches_in_reverse_order_keep_the_winners_whole_batch() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let a = root.path().join("a");
         let b = root.path().join("b");
         std::fs::write(&a, "base").unwrap();
@@ -655,7 +740,7 @@ mod tests {
     }
     #[test]
     fn unrelated_paths_do_not_wait_and_unused_locks_are_reclaimed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let held = root.path().join("held");
         let unrelated = root.path().join("unrelated");
         with_path_locks([held.clone()], || {
@@ -690,7 +775,7 @@ mod tests {
     }
     #[test]
     fn patch_moves_conflict_with_edits_to_either_endpoint() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let source = root.path().join("source");
         let destination = root.path().join("destination");
         let cancel = CancellationToken::new();
@@ -720,7 +805,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_aliases_share_the_same_conflict_baseline_and_lock() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let real = root.path().join("real");
         let alias = root.path().join("alias");
         std::fs::write(&real, "base").unwrap();
@@ -764,7 +849,7 @@ mod tests {
     }
     #[tokio::test]
     async fn waiting_edits_cancel_and_release_their_path_lock() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("file");
         let held = lock_edit(&path, &CancellationToken::new()).await.unwrap();
         let cancel = CancellationToken::new();
@@ -784,7 +869,7 @@ mod tests {
     }
     #[tokio::test]
     async fn edit_lock_releases_after_commit_even_while_the_plan_is_retained() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let dir = root.path().to_str().unwrap();
         let path = root.path().join("file");
         std::fs::write(&path, "before").unwrap();
@@ -814,7 +899,7 @@ mod tests {
     }
     #[tokio::test]
     async fn a_write_waiting_on_an_edit_transaction_can_be_cancelled() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("file");
         std::fs::write(&path, "before").unwrap();
         let _held = lock_edit(&path, &CancellationToken::new()).await.unwrap();
@@ -836,7 +921,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn hook_redirects_an_edit_and_releases_its_original_lock() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let dir = root.path().to_str().unwrap();
         std::fs::write(root.path().join("original"), "before").unwrap();
         std::fs::write(root.path().join("redirected"), "target").unwrap();
@@ -880,7 +965,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn hook_redirects_path_and_content_before_any_effect() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let dir = root.path().to_str().unwrap();
         let hooks = hooks(
             dir,
@@ -911,7 +996,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn blocked_whole_patch_has_no_effects() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let dir = root.path().to_str().unwrap();
         std::fs::write(root.path().join("existing"), "original\n").unwrap();
         let hooks = hooks(
@@ -929,7 +1014,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn no_op_hook_preserves_edit_arguments_and_result() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let dir = root.path().to_str().unwrap();
         let path = root.path().join("file");
         std::fs::write(path, "one one").unwrap();

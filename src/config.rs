@@ -1,7 +1,7 @@
 use crate::types::PermissionRule;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -251,7 +251,7 @@ impl Config {
         );
         let global = PathBuf::from(config_home()).join("opencode");
         let mut value = json!({});
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
         let mut hook_sources = Vec::new();
         for name in ["opencode.json", "opencode.jsonc"] {
             merge_file(
@@ -507,12 +507,13 @@ fn merge_file(
     base: &mut Value,
     path: &Path,
     required: bool,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut HashMap<PathBuf, bool>,
     hook_sources: &mut Vec<HookConfigSource>,
     trusted: bool,
 ) -> Result<(), String> {
     let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if seen.contains(&key) {
+    let previously_read = seen.get(&key).copied();
+    if let Some(mcp_loaded) = previously_read {
         if trusted {
             for source in hook_sources.iter_mut() {
                 if Path::new(&source.source)
@@ -524,17 +525,35 @@ fn merge_file(
                 }
             }
         }
-        return Ok(());
+        if !trusted || mcp_loaded {
+            return Ok(());
+        }
     }
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
     };
-    seen.insert(key);
     let source = path.display().to_string();
     let directory = path.parent().unwrap_or(Path::new("."));
-    let overlay = parse_config(&text, &source, directory)?;
+    let mut overlay = parse_config(&text, &source, directory)?;
+    // Project overlays can replace pieces of a globally configured MCP command.
+    // Only accept the entire project MCP table with explicit launch-time trust.
+    let trust_mcp = trusted || std::env::var("OCMINI_TRUST_PROJECT_MCP").as_deref() == Ok("1");
+    seen.insert(key, trust_mcp);
+    if previously_read.is_some() {
+        // The checkout copy was seen first, but an explicit config location
+        // also names this file. Restore the MCP settings skipped earlier.
+        if let Some(mcp) = overlay.get_mut("mcp") {
+            deep_merge(base, json!({"mcp":mcp.take()}));
+        }
+        return Ok(());
+    }
+    if !trust_mcp {
+        if let Some(config) = overlay.as_object_mut() {
+            config.remove("mcp");
+        }
+    }
     collect_hook_source(&overlay, &source, directory, trusted, hook_sources);
     deep_merge(base, overlay);
     Ok(())
@@ -921,7 +940,7 @@ mod tests {
         )
         .unwrap();
         let mut value = json!({});
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
         let mut sources = Vec::new();
         merge_file(&mut value, &global, true, &mut seen, &mut sources, true).unwrap();
         merge_file(&mut value, &project, true, &mut seen, &mut sources, false).unwrap();

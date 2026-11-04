@@ -105,11 +105,13 @@ pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
     }
     let (app, _) = crate::client::activate(&app, &session, &mut request)?;
     let json = args.format == "json";
-    let tty = std::io::stdout().is_terminal();
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let deny_unattended_tools = !tty && !args.auto;
+    request.deny_unattended_tools = deny_unattended_tools;
     if !json {
         let agent = request.agent.as_deref().unwrap_or("build");
         let model = tui::display_model(request.model.as_ref(), &app.config.model);
-        println!("> {agent} · {model}");
+        println!("> {} · {}", terminal_text(agent), terminal_text(&model));
     }
     let selection = (
         request.model.clone(),
@@ -164,6 +166,7 @@ pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
             model: selection.0.clone(),
             agent: selection.1.clone(),
             variant: selection.2.clone(),
+            deny_unattended_tools,
             ..Default::default()
         };
     }
@@ -214,7 +217,7 @@ fn on_event(
                     println!("\n[response updated]");
                 }
             }
-            print!("{}", update.text);
+            print!("{}", terminal_text(&update.text));
             st.printed_answer |= update.kind == TextKind::Text && !update.text.is_empty();
             let _ = std::io::stdout().flush();
         }
@@ -241,8 +244,8 @@ fn on_event(
                         if st.headered.insert(id) {
                             println!(
                                 "\u{2192} {} {}",
-                                part["tool"].as_str().unwrap_or("tool"),
-                                tui::summarize_input(&part["state"]["input"])
+                                terminal_text(part["tool"].as_str().unwrap_or("tool")),
+                                terminal_text(&tui::summarize_input(&part["state"]["input"]))
                             );
                         }
                     } else if part["state"]["status"].as_str() == Some("completed")
@@ -294,19 +297,21 @@ fn show_interaction(st: &mut State, app: &App, args: &crate::RunArgs, tty: bool,
         event::EventKind::Permission(event::PermissionKind::Asked) => {
             let id = event.properties["id"].as_str().unwrap_or_default();
             if args.auto {
-                app.perms.reply(id, "always");
+                app.perms.reply(id, "once");
             } else if tty {
                 println!(
                     "\u{26a0} allow {}: {}? [y] once [a]lways [n]o",
-                    event.properties["permission"].as_str().unwrap_or("tool"),
-                    event.properties["patterns"]
-                        .as_array()
-                        .map(|list| list
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_default()
+                    terminal_text(event.properties["permission"].as_str().unwrap_or("tool")),
+                    terminal_text(
+                        &event.properties["patterns"]
+                            .as_array()
+                            .map(|list| list
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", "))
+                            .unwrap_or_default()
+                    )
                 );
                 let _ = std::io::stdout().flush();
                 st.pending = Some(Pending::Permission(id.to_string()));
@@ -400,7 +405,7 @@ async fn pump(
                 })?;
                 value.map_err(String::from)?;
                 if let Some(error) = st.turn_error.take() {
-                    return Err(error);
+                    return Err(if json { error } else { terminal_text(&error).into_owned() });
                 }
                 return Ok(st.printed_answer);
             }
@@ -448,6 +453,20 @@ async fn pump(
     }
 }
 
+// Removing control introducers from every delta also neutralizes escapes
+// split across stream chunks, without delaying ordinary text.
+fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let unsafe_control = |ch: char| ch.is_control() && !matches!(ch, '\n' | '\t');
+    if text.contains(unsafe_control) {
+        text.chars()
+            .filter(|&ch| !unsafe_control(ch))
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
+    }
+}
+
 fn show_question(question: &Value) {
     let labels = question["options"]
         .as_array()
@@ -461,8 +480,9 @@ fn show_question(question: &Value) {
         })
         .unwrap_or_default();
     println!(
-        "? {} ({labels})",
-        question["question"].as_str().unwrap_or_default()
+        "? {} ({})",
+        terminal_text(question["question"].as_str().unwrap_or_default()),
+        terminal_text(&labels)
     );
     let _ = std::io::stdout().flush();
 }

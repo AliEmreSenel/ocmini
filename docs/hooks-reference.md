@@ -35,7 +35,7 @@ Hooks run in registration order. A boundary defines the fields it accepts, the c
 | `session.delete.before` | Reject deletion before it begins; active-work checks still apply. Cannot cancel work or partially delete history itself. |
 | `task.spawn.before` | Validate/change child prompt, allowed agent/model, or title before creation. Recheck model access, ancestry, nesting, and permissions afterward. |
 | `skill.load.after` | Transform loaded skill text before it enters model context. Skill name, source path, and provenance remain fixed. |
-| `file.change.before` | Inspect or transform an entire proposed write/edit/patch transaction before commit. Recheck every effective path/content, permissions, and conflict conditions. |
+| `file.change.before` | Inspect or transform an authorized write/edit/patch baseline before commit. Redirected paths are authorized before loading their baselines, then the final changes are checked for conflicts. |
 
 ## Event catalog
 

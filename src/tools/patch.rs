@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
-enum Operation {
+pub(super) enum Operation {
     Add {
         path: String,
         lines: Vec<String>,
@@ -21,8 +21,21 @@ enum Operation {
     },
 }
 
+impl Operation {
+    pub(super) fn paths(&self) -> impl Iterator<Item = &str> {
+        match self {
+            Self::Add { path, .. } | Self::Delete { path } => [Some(path.as_str()), None],
+            Self::Update {
+                path, destination, ..
+            } => [Some(path.as_str()), destination.as_deref()],
+        }
+        .into_iter()
+        .flatten()
+    }
+}
+
 #[derive(Debug, Default)]
-struct Hunk {
+pub(super) struct Hunk {
     anchor: Option<String>,
     old: Vec<String>,
     new: Vec<String>,
@@ -83,10 +96,10 @@ pub(super) fn output(summaries: &[serde_json::Value]) -> ToolOutput {
 
 pub(super) fn prepare(
     directory: &str,
-    patch: &str,
+    operations: Vec<Operation>,
     cancel: &CancellationToken,
+    approved: impl Fn(&Path) -> Result<PathBuf, OperationError>,
 ) -> Result<(Vec<Change>, Vec<serde_json::Value>), OperationError> {
-    let operations = parse(patch)?;
     let mut changes = Vec::new();
     let mut touched = HashSet::new();
     let mut summaries = Vec::new();
@@ -97,8 +110,9 @@ pub(super) fn prepare(
         match operation {
             Operation::Add { path, lines } => {
                 let path = resolve_path(directory, &path);
-                unique(&mut touched, &path)?;
-                if path.symlink_metadata().is_ok() {
+                let target = approved(&path)?;
+                unique(&mut touched, &target)?;
+                if target.symlink_metadata().is_ok() {
                     return Err(failure(format!(
                         "Cannot add existing file {}",
                         path.display()
@@ -112,7 +126,7 @@ pub(super) fn prepare(
                 summaries
                     .push(json!({"path":path,"type":"add","additions":lines.len(),"deletions":0}));
                 changes.push(Change {
-                    path,
+                    path: target,
                     before: None,
                     after: Some(text.into_bytes()),
                     permissions: None,
@@ -120,18 +134,21 @@ pub(super) fn prepare(
             }
             Operation::Delete { path } => {
                 let path = resolve_path(directory, &path);
-                unique(&mut touched, &path)?;
-                let content = files::text_file(&path)?;
+                let target = approved(&path)?;
+                unique(&mut touched, &target)?;
+                let content = files::text_file(&target)?;
                 if path
                     .symlink_metadata()
                     .is_ok_and(|meta| meta.file_type().is_symlink())
                 {
                     return Err(failure("Patch delete of a symbolic link is not supported; remove it explicitly with the shell tool"));
                 }
-                let permissions = std::fs::metadata(&path).ok().map(|meta| meta.permissions());
+                let permissions = std::fs::metadata(&target)
+                    .ok()
+                    .map(|meta| meta.permissions());
                 summaries.push(json!({"path":path,"type":"delete","additions":0,"deletions":content.lines().count()}));
                 changes.push(Change {
-                    path,
+                    path: target,
                     before: Some(content.into_bytes()),
                     after: None,
                     permissions,
@@ -143,18 +160,22 @@ pub(super) fn prepare(
                 hunks,
             } => {
                 let path = resolve_path(directory, &path);
-                unique(&mut touched, &path)?;
-                let original = files::text_file(&path)?;
+                let target = approved(&path)?;
+                unique(&mut touched, &target)?;
+                let original = files::text_file(&target)?;
                 let updated = update(&original, &hunks).map_err(|error| {
                     failure(format!("Patch failed for {}: {error}", path.display()))
                 })?;
-                let permissions = std::fs::metadata(&path).ok().map(|meta| meta.permissions());
+                let permissions = std::fs::metadata(&target)
+                    .ok()
+                    .map(|meta| meta.permissions());
                 let additions: usize = hunks.iter().map(|h| h.additions).sum();
                 let deletions: usize = hunks.iter().map(|h| h.deletions).sum();
                 if let Some(destination) = destination {
                     let destination = resolve_path(directory, &destination);
-                    unique(&mut touched, &destination)?;
-                    if destination.symlink_metadata().is_ok() {
+                    let target_destination = approved(&destination)?;
+                    unique(&mut touched, &target_destination)?;
+                    if target_destination.symlink_metadata().is_ok() {
                         return Err(failure(format!(
                             "Move destination {} already exists",
                             destination.display()
@@ -168,13 +189,13 @@ pub(super) fn prepare(
                     }
                     summaries.push(json!({"path":path,"movePath":destination,"type":"move","additions":additions,"deletions":deletions}));
                     changes.push(Change {
-                        path: destination,
+                        path: target_destination,
                         before: None,
                         after: Some(updated.into_bytes()),
                         permissions: permissions.clone(),
                     });
                     changes.push(Change {
-                        path,
+                        path: target,
                         before: Some(original.into_bytes()),
                         after: None,
                         permissions,
@@ -182,7 +203,7 @@ pub(super) fn prepare(
                 } else {
                     summaries.push(json!({"path":path,"type":"update","additions":additions,"deletions":deletions}));
                     changes.push(Change {
-                        path,
+                        path: target,
                         before: Some(original.into_bytes()),
                         after: Some(updated.into_bytes()),
                         permissions,
@@ -228,7 +249,7 @@ fn unique(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<(), OperationEr
     Ok(())
 }
 
-fn parse(patch: &str) -> Result<Vec<Operation>, String> {
+pub(super) fn parse(patch: &str) -> Result<Vec<Operation>, String> {
     if patch.len() > 16 * 1024 * 1024 {
         return Err("Patch exceeds 16 MiB".into());
     }

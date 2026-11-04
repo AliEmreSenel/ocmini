@@ -480,3 +480,42 @@ async fn run_commands_use_templates_models_agents_and_allow_empty_arguments() {
         .to_string()
         .contains("PING_WITHOUT_ARGUMENTS"));
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn piped_run_requires_auto_for_shell_and_filters_terminal_controls() {
+    let provider = Provider::start(vec![
+        tool_script(
+            "bash",
+            json!({"command":"touch shell-started"}),
+            "call_unattended",
+        ),
+        text_script("before\x1b", "[2Jafter"),
+        tool_script(
+            "bash",
+            json!({"command":"touch shell-started"}),
+            "call_auto",
+        ),
+        text_script("done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let marker = server.directory.join("shell-started");
+    let output = configured_command(server.root.path(), &server.directory)
+        .args(["run", "attempt shell"])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!marker.exists());
+    assert!(!output.stdout.contains(&0x1b));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("after"));
+
+    let output = configured_command(server.root.path(), &server.directory)
+        .args(["run", "--auto", "allow shell"])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(marker.exists());
+}

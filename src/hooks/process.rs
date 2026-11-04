@@ -989,7 +989,7 @@ mod tests {
             test -n "$OCMINI_HOOK_RESPONSE_PATH" || exit 2
             test -n "$OCMINI_HOOK_PAYLOAD_DIR" || exit 3
 
-            echo -n '{"status":"ok","large":"' > "$OCMINI_HOOK_RESPONSE_PATH"
+            printf '%s' '{"status":"ok","large":"' > "$OCMINI_HOOK_RESPONSE_PATH"
             head -c 200000 /dev/zero | tr '\0' 'a' >> "$OCMINI_HOOK_RESPONSE_PATH"
             echo '"}' >> "$OCMINI_HOOK_RESPONSE_PATH"
 

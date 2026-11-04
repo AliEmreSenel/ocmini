@@ -800,6 +800,24 @@ impl Store {
         self.with_read(|c| read_message(c, session_id, id))
     }
 
+    pub fn message_part(
+        &self,
+        sid: &str,
+        mid: &str,
+        id: &str,
+    ) -> Result<Option<Value>, OperationError> {
+        self.with_read(|c| {
+            let raw: Option<String> = c
+                .prepare_cached(
+                    "SELECT json FROM part WHERE id=?1 AND message_id=?2 AND session_id=?3",
+                )?
+                .query_row(params![id, mid, sid], |row| row.get(0))
+                .optional()?;
+            raw.map(|raw| serde_json::from_str(&raw).map_err(data_error))
+                .transpose()
+        })
+    }
+
     pub fn last_model(&self, sid: &str) -> Result<Option<ModelRef>, OperationError> {
         self.with_read(|c| {
             let mut stmt = c.prepare("SELECT json FROM message WHERE session_id=?1 ORDER BY time_created DESC,rowid DESC")?;

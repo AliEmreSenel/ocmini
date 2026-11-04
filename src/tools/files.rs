@@ -156,6 +156,7 @@ pub(super) fn read(
                 output_capped = true;
             }
         }
+        index < offset || (returned < limit && !output_capped)
     })?;
     if total > 0 && offset > total {
         return Err(failure(format!(
@@ -179,7 +180,7 @@ fn scan_text(
     path: &Path,
     reader: impl BufRead,
     cancel: &CancellationToken,
-    mut visit: impl FnMut(usize, &str),
+    mut visit: impl FnMut(usize, &str) -> bool,
 ) -> Result<usize, OperationError> {
     let mut reader = reader;
     let mut line = String::new();
@@ -246,7 +247,7 @@ fn scan_text(
                 return Err(failure(format!("{} is not UTF-8 text", path.display())));
             }
             total += 1;
-            visit(
+            let continue_page = visit(
                 total,
                 if extra_characters {
                     &line
@@ -254,12 +255,72 @@ fn scan_text(
                     line.strip_suffix('\r').unwrap_or(&line)
                 },
             );
+            if !continue_page {
+                reader.consume(length + 1);
+                return count_remaining_lines(path, reader, cancel)
+                    .map(|remaining| total + remaining);
+            }
             line.clear();
             characters = 0;
             extra_characters = false;
             has_bytes = false;
         }
         reader.consume(length + usize::from(newline.is_some()));
+    }
+}
+
+// The remaining bytes need validation and a line count, but no per-line
+// decoding, copying or character counts once the page is full.
+fn count_remaining_lines(
+    path: &Path,
+    mut reader: impl BufRead,
+    cancel: &CancellationToken,
+) -> Result<usize, OperationError> {
+    let invalid = || failure(format!("{} is not UTF-8 text", path.display()));
+    let mut carry = Vec::new();
+    let mut joined = Vec::new();
+    let mut lines = 0;
+    let mut partial_line = false;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(failure("File scan cancelled"));
+        }
+        let buffer = reader
+            .fill_buf()
+            .map_err(|error| failure(format!("Cannot read {}: {error}", path.display())))?;
+        let Some(last) = buffer.last() else {
+            return if carry.is_empty() {
+                Ok(lines + usize::from(partial_line))
+            } else {
+                Err(invalid())
+            };
+        };
+        if buffer.contains(&0) {
+            return Err(failure(format!(
+                "{} is binary; use a tool appropriate for its format",
+                path.display()
+            )));
+        }
+        let bytes = if carry.is_empty() {
+            buffer
+        } else {
+            joined.clear();
+            joined.extend_from_slice(&carry);
+            joined.extend_from_slice(buffer);
+            &joined
+        };
+        carry.clear();
+        match std::str::from_utf8(bytes) {
+            Ok(_) => {}
+            Err(error) if error.error_len().is_none() => {
+                carry.extend_from_slice(&bytes[error.valid_up_to()..]);
+            }
+            Err(_) => return Err(invalid()),
+        }
+        lines += buffer.iter().filter(|&&byte| byte == b'\n').count();
+        partial_line = *last != b'\n';
+        let len = buffer.len();
+        reader.consume(len);
     }
 }
 
@@ -314,13 +375,12 @@ pub(super) fn prepare_edit(
         ));
     }
     let original = text_file(path)?;
-    let crlf = original.contains("\r\n") && !original.replace("\r\n", "").contains('\n');
     let content = original.replace("\r\n", "\n");
     let old = old.replace("\r\n", "\n");
-    let new = new.replace("\r\n", "\n");
+    let normalized_new = new.replace("\r\n", "\n");
     let count = content.matches(old.as_str()).count();
     if count == 0 {
-        if !new.is_empty() && content.contains(&new) {
+        if !normalized_new.is_empty() && content.contains(&normalized_new) {
             return Err(failure(
                 "oldString was not found; the requested change is already present",
             ));
@@ -348,16 +408,45 @@ pub(super) fn prepare_edit(
             "oldString matches {count} locations; supply more context or set replaceAll"
         )));
     }
-    let changed = if all {
-        content.replace(old.as_str(), &new)
+    let has_crlf = original.contains("\r\n");
+    let all_crlf = has_crlf
+        && original
+            .match_indices('\n')
+            .all(|(index, _)| index > 0 && original.as_bytes()[index - 1] == b'\r');
+    let replacement = if all_crlf {
+        normalized_new.replace('\n', "\r\n")
+    } else if has_crlf {
+        new.clone()
     } else {
-        content.replacen(old.as_str(), &new, 1)
+        normalized_new
     };
-    let changed = if crlf {
-        changed.replace('\n', "\r\n")
-    } else {
-        changed
+    // Match against normalized text, then splice the original bytes so an
+    // edit never normalizes unrelated lines in a mixed-ending file.
+    let mut crs = original.match_indices("\r\n").peekable();
+    let mut skipped = 0;
+    let mut original_offset = |offset| {
+        while crs
+            .peek()
+            .is_some_and(|(index, _)| *index < offset + skipped)
+        {
+            crs.next();
+            skipped += 1;
+        }
+        offset + skipped
     };
+    let mut changed = String::with_capacity(original.len());
+    let mut previous = 0;
+    for (offset, _) in content
+        .match_indices(&old)
+        .take(if all { count } else { 1 })
+    {
+        let start = original_offset(offset);
+        let end = original_offset(offset + old.len());
+        changed.push_str(&original[previous..start]);
+        changed.push_str(&replacement);
+        previous = end;
+    }
+    changed.push_str(&original[previous..]);
     Ok((original, changed, count))
 }
 
@@ -508,7 +597,10 @@ mod tests {
             Path::new("fixture"),
             reader,
             &CancellationToken::new(),
-            |_, line| lines.push(line.to_string()),
+            |_, line| {
+                lines.push(line.to_string());
+                true
+            },
         )
         .unwrap();
         assert!(lines[0].ends_with('🙂'));
@@ -555,6 +647,24 @@ mod tests {
             &flag
         )
         .is_err());
+    }
+
+    #[test]
+    fn mixed_ending_edit_preserves_untouched_bytes() {
+        let directory = Directory::new();
+        let path = directory.0.path().join("file");
+        std::fs::write(&path, "α\r\nold\nlast\r\nold\r\nend").unwrap();
+        run(
+            directory.dir(),
+            "edit",
+            &json!({"filePath":"file","oldString":"old","newString":"new","replaceAll":true}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "α\r\nnew\nlast\r\nnew\r\nend"
+        );
     }
 
     #[test]
@@ -661,7 +771,10 @@ mod tests {
             Path::new("fixture"),
             std::io::Cursor::new(b"first\nsecond\n"),
             &flag,
-            |_, _| flag.cancel(),
+            |_, _| {
+                flag.cancel();
+                true
+            },
         );
         assert!(result.unwrap_err().message.contains("cancelled"));
     }

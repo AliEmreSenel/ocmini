@@ -540,3 +540,62 @@ async fn ownership_lost_during_shell_hook_prevents_process_start() {
 async fn ownership_lost_during_child_creation_prevents_session_insert() {
     revoked_owner_cannot_execute(ExecutionGate::ChildCreation).await;
 }
+
+#[tokio::test]
+async fn denied_file_content_never_reaches_edit_diagnostics() {
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "edit",
+            json!({"filePath":"secret.txt","oldString":"missing","newString":"replacement"}),
+            "call_read_denied",
+        ),
+        text_script("handled", ""),
+        tool_script(
+            "edit",
+            json!({"filePath":"../outside.txt","oldString":"missing","newString":"replacement"}),
+            "call_external_denied",
+        ),
+        text_script("handled", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(
+        server.directory.join("secret.txt"),
+        "PRIVATE_CONTENT_SENTINEL\n",
+    )
+    .unwrap();
+    std::fs::write(
+        server.root.path().join("outside.txt"),
+        "PRIVATE_CONTENT_SENTINEL\n",
+    )
+    .unwrap();
+    let id = server
+        .session(json!([
+            {"permission":"*","pattern":"*","action":"allow"},
+            {"permission":"read","pattern":"*secret.txt","action":"deny"},
+            {"permission":"external_directory","pattern":"*","action":"deny"}
+        ]))
+        .await;
+    for (message, expected) in [
+        ("msg_read_denied", "Permission 'read' denied"),
+        (
+            "msg_external_denied",
+            "Permission 'external_directory' denied",
+        ),
+    ] {
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt(message, "Try an edit"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        provider.request().await;
+        let next = provider.request().await.to_string();
+        assert!(next.contains(expected), "{next}");
+        assert!(!next.contains("PRIVATE_CONTENT_SENTINEL"), "{next}");
+    }
+}
