@@ -190,7 +190,210 @@ async fn tool_calls_in_one_step_execute_concurrently() {
 }
 
 #[tokio::test]
-async fn conflicting_file_tools_report_one_winner_and_preserve_its_content() {
+async fn same_file_edits_use_each_preceding_edits_result() {
+    for (name, edits, expected, statuses) in [
+        (
+            "independent",
+            vec![
+                json!({"oldString":"one","newString":"ONE"}),
+                json!({"oldString":"two","newString":"TWO"}),
+            ],
+            "ONE\nTWO\n",
+            vec!["completed", "completed"],
+        ),
+        (
+            "chained",
+            vec![
+                json!({"oldString":"one","newString":"ONE"}),
+                json!({"oldString":"ONE","newString":"FIRST"}),
+            ],
+            "FIRST\ntwo\n",
+            vec!["completed", "completed"],
+        ),
+        (
+            "conflicting",
+            vec![
+                json!({"oldString":"one","newString":"FIRST"}),
+                json!({"oldString":"one","newString":"SECOND"}),
+            ],
+            "FIRST\ntwo\n",
+            vec!["completed", "error"],
+        ),
+    ] {
+        let tool_calls: Vec<_> = edits.into_iter().enumerate().map(|(index, mut args)| {
+            args["filePath"] = json!("shared.txt");
+            json!({"index":index,"id":format!("call_edit_{index}"),"type":"function","function":{"name":"edit","arguments":args.to_string()}})
+        }).collect();
+        let mut provider = Provider::start(vec![
+            Script::ok(vec![
+                json!({"choices":[{"index":0,"delta":{"tool_calls":tool_calls},"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()}),
+            ]),
+            text_script("Edits settled", ""),
+        ]).await;
+        let server = TestServer::start(&provider, json!({})).await;
+        std::fs::write(server.directory.join("shared.txt"), "one\ntwo\n").unwrap();
+        let id = server.session(allow()).await;
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt(&format!("msg_edits_{name}"), "Edit both lines"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let messages = server.messages(&id).await;
+        let parts: Vec<_> = messages
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .filter(|part| part["type"] == "tool")
+            .collect();
+        assert_eq!(parts.len(), statuses.len(), "{name}: {parts:?}");
+        for (index, status) in statuses.iter().enumerate() {
+            assert_eq!(parts[index]["callID"], format!("call_edit_{index}"));
+            assert_eq!(
+                parts[index]["state"]["status"], *status,
+                "{name}: {parts:?}"
+            );
+            if *status == "error" {
+                assert!(parts[index]["state"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("oldString was not found"));
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(server.directory.join("shared.txt")).unwrap(),
+            expected,
+            "{name}"
+        );
+        provider.request().await;
+        let continuation = provider.request().await;
+        let results: Vec<_> = continuation["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), statuses.len());
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result["tool_call_id"], format!("call_edit_{index}"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn edit_approval_serializes_one_file_without_blocking_other_tools() {
+    let calls = [
+        (
+            "edit",
+            json!({"filePath":"shared.txt","oldString":"one","newString":"ONE"}),
+        ),
+        (
+            "edit",
+            json!({"filePath":"shared.txt","oldString":"two","newString":"TWO"}),
+        ),
+        (
+            "write",
+            json!({"filePath":"unrelated.txt","content":"independent"}),
+        ),
+    ];
+    let tool_calls: Vec<_> = calls.iter().enumerate().map(|(index, (name, args))| {
+        json!({"index":index,"id":format!("call_approval_{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
+    }).collect();
+    let provider = Provider::start(vec![
+        Script::ok(vec![
+            json!({"choices":[{"index":0,"delta":{"tool_calls":tool_calls},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()}),
+        ]),
+        text_script("Edits approved", ""),
+    ]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(server.directory.join("shared.txt"), "one\ntwo\n").unwrap();
+    let id = server
+        .session(json!([
+            {"permission":"*","pattern":"*","action":"allow"},
+            {"permission":"edit","pattern":"*shared.txt","action":"ask"}
+        ]))
+        .await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt(
+                "msg_edit_approvals",
+                "Edit both lines and write another file",
+            ),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    for index in 0..2 {
+        let asked = events.through("permission.asked").await.pop().unwrap();
+        assert_eq!(
+            asked["properties"]["tool"]["callID"],
+            format!("call_approval_{index}")
+        );
+        if index == 0 {
+            let messages = poll_messages(&server, &id, |messages| {
+                messages
+                    .iter()
+                    .flat_map(|message| message["parts"].as_array().unwrap())
+                    .any(|part| {
+                        part["callID"] == "call_approval_2"
+                            && part["state"]["status"] == "completed"
+                    })
+            })
+            .await;
+            assert!(
+                messages
+                    .iter()
+                    .flat_map(|message| message["parts"].as_array().unwrap())
+                    .any(|part| {
+                        part["callID"] == "call_approval_2"
+                            && part["state"]["status"] == "completed"
+                    }),
+                "unrelated write must complete while the edit waits for approval"
+            );
+            assert_eq!(
+                std::fs::read_to_string(server.directory.join("unrelated.txt")).unwrap(),
+                "independent"
+            );
+            assert_eq!(
+                std::fs::read_to_string(server.directory.join("shared.txt")).unwrap(),
+                "one\ntwo\n"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(server.directory.join("shared.txt")).unwrap(),
+                "ONE\ntwo\n"
+            );
+        }
+        let request = asked["properties"]["id"].as_str().unwrap();
+        server
+            .post(
+                &format!("/permission/{request}/reply"),
+                &json!({"reply":"once"}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    events.through("session.idle").await;
+    assert_eq!(
+        std::fs::read_to_string(server.directory.join("shared.txt")).unwrap(),
+        "ONE\nTWO\n"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_file_tools_preserve_the_last_successful_content() {
     let calls = [
         (
             "edit",
@@ -240,26 +443,33 @@ async fn conflicting_file_tools_report_one_winner_and_preserve_its_content() {
         .filter(|part| part["type"] == "tool")
         .collect();
     assert_eq!(parts.len(), calls.len());
-    let mut winners = Vec::new();
-    for (index, (_, _, expected)) in calls.iter().enumerate() {
+    // The edit owns the path from preparation onward. A write prepared after
+    // it completes may also succeed; one prepared earlier must reject its
+    // stale baseline. Neither a stale write nor patch may discard the edit.
+    assert_eq!(parts[0]["state"]["status"], "completed", "{parts:?}");
+    assert_eq!(parts[2]["state"]["status"], "error", "{parts:?}");
+    for index in 0..calls.len() {
         let part = parts
             .iter()
             .find(|part| part["callID"] == format!("call_file_{index}"))
             .unwrap();
-        if part["state"]["status"] == "completed" {
-            winners.push(*expected);
-        } else {
+        if part["state"]["status"] != "completed" {
             assert_eq!(part["state"]["status"], "error");
-            assert!(part["state"]["error"]
-                .as_str()
-                .unwrap()
-                .contains("File changed since preparation"));
+            let error = part["state"]["error"].as_str().unwrap();
+            assert!(
+                error.contains("File changed since preparation")
+                    || (index == 2 && error.contains("Expected context was not found")),
+                "{error}"
+            );
         }
     }
-    assert_eq!(winners.len(), 1, "conflicting tool parts: {parts:?}");
     assert_eq!(
         std::fs::read_to_string(server.directory.join("shared.txt")).unwrap(),
-        winners[0]
+        if parts[1]["state"]["status"] == "completed" {
+            calls[1].2
+        } else {
+            calls[0].2
+        }
     );
 }
 
