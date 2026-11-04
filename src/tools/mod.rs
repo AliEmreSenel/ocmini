@@ -5,6 +5,7 @@ use crate::engine::{App, EngineApi};
 use crate::types::{OperationError, ToolOutput};
 pub(crate) use changes::target as canonical_target;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,15 +40,10 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     pub fn update_metadata(&self, metadata: Value) -> Result<(), OperationError> {
-        let message = self
+        let mut part = self
             .app
             .store
-            .message(&self.session_id, &self.message_id)?
-            .ok_or_else(|| failure("Tool message no longer exists"))?;
-        let mut part = message
-            .parts
-            .into_iter()
-            .find(|part| part["id"].as_str() == Some(self.part_id.as_str()))
+            .message_part(&self.session_id, &self.message_id, &self.part_id)?
             .ok_or_else(|| failure("Tool part no longer exists"))?;
         part["state"]["metadata"] = metadata;
         crate::messages::update_part(&self.app, &part)?;
@@ -243,11 +239,15 @@ impl PreparedTool {
     }
 }
 
-pub async fn prepare_input(
+pub async fn prepare_input<F>(
     ctx: &ToolCtx,
     name: &str,
     input: Value,
-) -> Result<PreparedTool, OperationError> {
+    authorize_file: impl FnMut(PathBuf, PathBuf) -> F + Send,
+) -> Result<PreparedTool, OperationError>
+where
+    F: Future<Output = Result<(), OperationError>> + Send,
+{
     if !input.is_object() {
         return Err(failure("Tool input must be an object"));
     }
@@ -257,7 +257,16 @@ pub async fn prepare_input(
     let mut args = input;
     let tool = match Builtin::from_name(name) {
         Some(Builtin::Write | Builtin::Edit | Builtin::ApplyPatch) => {
-            let (effective, plan) = changes::prepare(ctx, name, args).await?;
+            let (effective, plan) = changes::prepare(
+                &ctx.dir,
+                &ctx.app.hooks,
+                hook_context(ctx, name),
+                ctx.cancel.clone(),
+                name,
+                args,
+                authorize_file,
+            )
+            .await?;
             args = effective;
             Tool::File(Arc::new(plan))
         }

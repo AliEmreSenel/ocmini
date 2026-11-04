@@ -30,6 +30,13 @@ mod v2;
 
 use clap::{Args, Parser, Subcommand};
 
+#[cfg(test)]
+fn test_tempdir() -> std::io::Result<tempfile::TempDir> {
+    // macOS normally advertises /var/folders through a symlink. Fixtures that
+    // compare directory identities need the same spelling as the runtime.
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
+}
+
 pub const OPENCODE_COMPAT_VERSION: &str = concat!("2.2.5-ocmini.", env!("CARGO_PKG_VERSION"));
 
 #[derive(Parser)]

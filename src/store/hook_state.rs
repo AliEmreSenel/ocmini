@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn readonly_inspection_preserves_finalization_and_recovery_enqueues_its_snapshot() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("state.db");
         let (store, _hooks, mid, _sid, events) = prepared(root.path(), &path);
         assert!(
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn rollback_cannot_commit_outbox_without_domain_finalization() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("state.db");
         let (store, _hooks, mid, _sid, events) = prepared(root.path(), &path);
         store.conn.lock().unwrap().execute_batch("CREATE TRIGGER rollback_delivery AFTER INSERT ON hook_delivery BEGIN SELECT RAISE(ROLLBACK,'simulated storage failure'); END;").unwrap();
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn recovery_enqueues_another_directory_without_live_subscribers() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let source = root.path().join("source");
         let launch = root.path().join("launch");
         std::fs::create_dir_all(&source).unwrap();
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn recovery_rollback_preserves_pending_events_and_finalizing_state() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir().unwrap();
         let path = root.path().join("state.db");
         let (store, _hooks, mid, _, _) = prepared(root.path(), &path);
         store.conn.lock().unwrap().execute_batch(
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn recovered_running_turns_keep_model_and_compaction_match_metadata() {
         for command in [None, Some("__ocmini_compact")] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_tempdir().unwrap();
             let path = root.path().join("state.db");
             let directory = root.path().to_str().unwrap();
             let kind = if command.is_some() {

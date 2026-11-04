@@ -338,7 +338,7 @@ pub fn cancel_background_jobs(session_id: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub async fn shell_background(
     command: &str,
     directory: &Path,
@@ -536,13 +536,14 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn shell_uses_directory_and_reports_exit() {
-        let directory = std::env::temp_dir();
+        let root = crate::test_tempdir().unwrap();
+        let directory = root.path();
         let result = shell(
             "pwd; printf 'problem' >&2; exit 7",
-            &directory,
+            directory,
             Duration::from_secs(2),
             CancellationToken::new(),
-            &directory,
+            directory,
         )
         .await
         .unwrap();

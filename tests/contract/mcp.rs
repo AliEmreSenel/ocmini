@@ -44,9 +44,53 @@ fn other_project(server: &TestServer) -> PathBuf {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn project_mcp_requires_explicit_trust_even_in_plan_mode() {
+    let provider = Provider::start(vec![text_script("plan", "")]).await;
+    let server = TestServer::start(&provider, local_mcp()).await;
+    let other = other_project(&server);
+    std::fs::write(
+        other.join("opencode.json"),
+        json!({"mcp":{
+            "probe":{"environment":{"MCP_TEST_VALUE":"untrusted override"}},
+            "checkout":{"type":"local","command":["/bin/sh","-c","touch checkout-started"]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let scope = encode_directory(&other);
+    let session: Value = server
+        .post("/session", &json!({}))
+        .header("x-opencode-directory", &scope)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = session["id"].as_str().unwrap();
+    let mut input = prompt("msg_untrusted_mcp", "Plan without trusting the checkout");
+    input["agent"] = json!("plan");
+    server
+        .post(&format!("/session/{id}/message"), &input)
+        .header("x-opencode-directory", &scope)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(!other.join("checkout-started").exists());
+    let spawns = mcp_spawns(&server);
+    assert_eq!(spawns.len(), 1);
+    assert_eq!(spawns[0][2], "global");
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn mcp_starts_on_use_once_per_directory_and_preserves_isolation() {
     let provider = Provider::start(vec![]).await;
-    let server = TestServer::start(&provider, local_mcp()).await;
+    let server = TestServer::start_with_project_mcp(&provider, local_mcp(), true).await;
     let other = other_project(&server);
     for path in ["/global/health", "/provider", "/session"] {
         server
@@ -152,7 +196,7 @@ async fn first_turn_initializes_mcp_without_a_prior_status_request() {
         text_script("Reused MCP", ""),
     ])
     .await;
-    let server = TestServer::start(&provider, local_mcp()).await;
+    let server = TestServer::start_with_project_mcp(&provider, local_mcp(), true).await;
     let other = other_project(&server);
     let response: Value = server
         .post("/session", &json!({"permission": allow()}))
@@ -233,7 +277,7 @@ async fn unreachable_mcp_is_never_reported_as_connected() {
 #[cfg(unix)]
 async fn changed_mcp_configuration_replaces_the_lazy_scope_after_cache_expiry() {
     let provider = Provider::start(vec![]).await;
-    let server = TestServer::start(&provider, local_mcp()).await;
+    let server = TestServer::start_with_project_mcp(&provider, local_mcp(), true).await;
     server
         .get("/mcp")
         .send()

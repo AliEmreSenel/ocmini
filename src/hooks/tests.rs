@@ -713,6 +713,7 @@ async fn dropped_invocation_kills_and_reaps_process() {
     })
     .await
     .unwrap();
+    #[cfg(target_os = "linux")]
     let pid = std::fs::read_to_string(dir.path().join("pid"))
         .unwrap()
         .trim()

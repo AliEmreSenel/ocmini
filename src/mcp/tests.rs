@@ -377,7 +377,7 @@ fn bounded_reader_rejects_unterminated_oversized_messages() {
 #[tokio::test]
 #[cfg(unix)]
 async fn status_events_keep_scope_and_omit_connection_secrets() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_tempdir().unwrap();
     let directory = root.path().to_str().unwrap();
     let hooks =
         crate::hooks::Hooks::for_config(&crate::config::Config::default(), directory).unwrap();

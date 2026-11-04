@@ -40,4 +40,4 @@ provider, config file, `--agent` endpoint and the session store are trusted, and
 ocmini runs with the user's own permissions and has no privilege boundary of its
 own.
 
-Tool approval, permission rules and the sandbox are documented in `README.md`.
+The README describes tool approval and the explicit opt-in for checkout-defined MCP configuration. Tool permissions apply to operations routed through the harness. Approved shell commands and trusted MCP processes run with the account’s OS permissions.

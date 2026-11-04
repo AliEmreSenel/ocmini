@@ -1033,7 +1033,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn observers_receive_ordered_batched_envelopes_and_bus_payloads_stay_shared() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_tempdir().unwrap();
         let dir = directory.path().to_str().unwrap();
         let cfg: Config = serde_json::from_value(json!({"ocmini":{"hooks":{"observers":[{"id":"batch","on":"ocmini.turn.ended","batchSize":8,"batchMs":40,"command":["sh","-c","cat > observed.json"]}]}}})).unwrap();
         let hooks = super::super::test_runtime()

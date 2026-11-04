@@ -206,8 +206,10 @@ class Runtime:
                     info["summary"] = True
                 part = {"id": "prt_" + mid, "sessionID": self.sid, "messageID": mid,
                         "type": "text", "text": text}
-                db.execute("INSERT INTO message VALUES(?,?,?,?,?)", (mid, self.sid, role, encode(info), tick))
-                db.execute("INSERT INTO part VALUES(?,?,?,?,?)", (part["id"], mid, self.sid, encode(part), tick))
+                db.execute("INSERT INTO message(id,session_id,role,json,time_created,completed) VALUES(?,?,?,?,?,?)",
+                           (mid, self.sid, role, encode(info), tick, tick))
+                db.execute("INSERT INTO part(id,message_id,session_id,json,time_created,kind) VALUES(?,?,?,?,?,?)",
+                           (part["id"], mid, self.sid, encode(part), tick, "text"))
             add("msg_seed_user", "user", 1, GOAL)
             for i in range(count):
                 add(f"msg_seed_{i}", "assistant", i + 2, "ARCHIVED_PAYLOAD" + "a" * 3072)

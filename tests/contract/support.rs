@@ -217,7 +217,11 @@ pub(super) fn configured_command(root: &Path, directory: &Path) -> Command {
 }
 
 pub(super) async fn launch(root: &Path, directory: &Path) -> (Child, String) {
-    let mut child = configured_command(root, directory)
+    launch_command(configured_command(root, directory)).await
+}
+
+async fn launch_command(mut command: Command) -> (Child, String) {
+    let mut child = command
         .args(["serve", "--hostname=127.0.0.1", "--port=0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -254,7 +258,15 @@ pub(super) struct TestServer {
 
 impl TestServer {
     pub(super) async fn start(provider: &Provider, extra: Value) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        Self::start_with_project_mcp(provider, extra, false).await
+    }
+
+    pub(super) async fn start_with_project_mcp(
+        provider: &Provider,
+        extra: Value,
+        trusted: bool,
+    ) -> Self {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let directory = root.path().join("project café %");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::create_dir_all(root.path().join(".config/opencode")).unwrap();
@@ -276,7 +288,11 @@ impl TestServer {
             config.to_string(),
         )
         .unwrap();
-        let (child, url) = launch(root.path(), &directory).await;
+        let mut command = configured_command(root.path(), &directory);
+        if trusted {
+            command.env("OCMINI_TRUST_PROJECT_MCP", "1");
+        }
+        let (child, url) = launch_command(command).await;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,

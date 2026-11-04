@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn pasted_image_paths_are_detected_and_attached() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_tempdir().unwrap();
         let png = directory.path().join("shot.png");
         std::fs::write(&png, PNG).unwrap();
         let notes = directory.path().join("notes.txt");

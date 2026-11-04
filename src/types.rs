@@ -404,6 +404,9 @@ pub struct PromptRequest {
     pub agent: Option<String>,
     pub variant: Option<String>,
     pub no_reply: bool,
+    /// Preserve the CLI execution restriction if a queued prompt is recovered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deny_unattended_tools: bool,
     pub tools: Option<HashMap<String, bool>>,
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

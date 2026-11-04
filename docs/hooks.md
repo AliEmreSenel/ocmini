@@ -65,7 +65,7 @@ The catalog has four families. These are documentation groups; use the existing 
 - **Models:** `model.context.transform`, `model.params.transform`, `model.headers.transform`, `model.retry.before`, `message.text.complete`, `compaction.before`, `compaction.after`.
 - **Resources:** `session.create.before`, `session.update.before`, `session.fork.before`, `session.delete.before`, `task.spawn.before`, `skill.load.after`, `file.change.before`.
 
-Each hook permits specific fields. Mutation responses use `set`; accepted changes are validated before the next handler receives them. Tool arguments and file paths are authorized after preparation. Hooks cannot broaden permissions or replace runtime-owned identity, measured usage, or execution results. See the [hook catalog](hooks-reference.md#hook-catalog) for each boundary's contract.
+Each hook permits specific fields. Mutation responses use `set`; accepted changes are validated before the next handler receives them. Arguments rewritten by `tool.execute.before` are authorized before execution. File tools authorize initial paths before reading the baseline and authorize any redirected paths before reading them. Hooks cannot broaden permissions or replace runtime-owned identity, measured usage, or execution results. See the [hook catalog](hooks-reference.md#hook-catalog) for each boundary's contract.
 
 ## Subscribe to facts about execution
 

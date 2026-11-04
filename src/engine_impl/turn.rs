@@ -127,6 +127,7 @@ async fn prepare_turn(
     defs.retain(|def| {
         let name = def["function"]["name"].as_str().unwrap_or_default();
         tool_enabled(name, agent, &cfg, request)
+            && !unattended_tool_denied(name, app, request)
             && !(read_only && (execution_tool(name) || app.mcp().route(name).is_some()))
     });
     if app.hooks.has(crate::tools::hooks::TOOL_CATALOG_TRANSFORM) {
