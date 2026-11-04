@@ -122,8 +122,8 @@ pub(crate) enum RowKind {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) enum ToolView {
-    #[default]
     Grouped,
+    #[default]
     Brief,
     Full,
 }
@@ -157,7 +157,7 @@ impl Default for Visibility {
     fn default() -> Self {
         Self {
             thinking: true,
-            tools: ToolView::Grouped,
+            tools: ToolView::default(),
         }
     }
 }
@@ -672,10 +672,6 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
     prompt_history.load(session_prompts(&history));
     let mut display = Display::new(fullscreen);
     let mut ui = Ui::default();
-    if !fullscreen {
-        ui.visibility.tools = ToolView::Brief;
-        display.set_visibility(ui.visibility);
-    }
     let width = terminal_width();
     display.output(
         &format!(
@@ -1576,13 +1572,13 @@ mod tests {
         }
         // The status reports visibility; shortcuts are available in help.
         let starts = Visibility::default();
-        assert!(starts.thinking && starts.tools == ToolView::Grouped);
-        assert_eq!(starts.tools.next(), ToolView::Brief);
-        assert_eq!(starts.tools.next().next(), ToolView::Full);
-        assert_eq!(starts.tools.next().next().next(), ToolView::Grouped);
+        assert!(starts.thinking && starts.tools == ToolView::Brief);
+        assert_eq!(starts.tools.next(), ToolView::Full);
+        assert_eq!(starts.tools.next().next(), ToolView::Grouped);
+        assert_eq!(starts.tools.next().next().next(), ToolView::Brief);
         let header = plain(&prompt_header("mock/m", starts));
         assert!(header.contains("thinking on"));
-        assert!(header.contains("tools grouped"));
+        assert!(header.contains("tools brief"));
         let header = plain(&prompt_header(
             "mock/m",
             Visibility {

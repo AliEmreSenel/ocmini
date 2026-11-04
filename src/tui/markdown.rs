@@ -1,4 +1,4 @@
-//! Streaming markdown for narrative transcript rows.
+//! Streaming markdown for narrative and thinking transcript rows.
 //!
 //! Model text arrives in chunks that split anywhere, so the renderer keeps the
 //! current line's raw text and re-renders the whole line for every chunk. That
@@ -32,7 +32,7 @@ pub(super) struct Rendered {
     pub line: usize,
 }
 
-/// Narrative text as it arrives. Fenced code gets a gutter, `#` headings and
+/// Model text as it arrives. Fenced code gets a gutter, `#` headings and
 /// `**bold**` / `` `code` `` spans get the app's styling, and a delimiter with
 /// no closing match prints as typed.
 #[derive(Default)]

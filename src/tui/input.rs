@@ -821,7 +821,7 @@ pub(super) struct Display {
     thoughts: Vec<Thought>,
     thought_ids: HashMap<String, usize>,
     spacing: Spacing,
-    /// Narrative markdown state: the line being built and the open fence.
+    /// Narrative or thinking markdown state: the current line and open fence.
     markdown: Markdown,
     /// Where the markdown renderer's current row starts inside `tail`, valid
     /// only while `md_row` holds. The renderer owns that part of the row: it
@@ -901,10 +901,10 @@ impl Thought {
             // The block's rows open at the top of their own anchor, so their
             // leading blank row belongs to them; `Spacing::default` drops it.
             let mut spacing = Spacing { blank: true };
+            let rendered = Markdown::default().push(self.text.trim_end()).text;
             return std::iter::once(format!("{}◦ thinking{RESET}", super::DIM))
                 .chain(
-                    self.text
-                        .trim_end()
+                    rendered
                         .lines()
                         .filter(|line| spacing.accept(line))
                         .map(|line| format!("{line}{RESET}")),
@@ -1019,14 +1019,7 @@ impl Display {
             page: 24,
             paint_width: 80,
             tail_kind: RowKind::Plain,
-            visibility: Visibility {
-                thinking: true,
-                tools: if fullscreen {
-                    ToolView::Grouped
-                } else {
-                    ToolView::Brief
-                },
-            },
+            visibility: Visibility::default(),
             wrapped: RefCell::new(WrappedRows::default()),
             input: None,
         }
@@ -1152,6 +1145,10 @@ impl Display {
 
     fn update_thought(&mut self, update: ThoughtUpdate, width: usize) {
         if !self.fullscreen {
+            if update.new || update.reset {
+                self.finish_line();
+                self.markdown.restart();
+            }
             let mut text = String::new();
             if update.reset {
                 text.push_str(&format!("\n{}[response updated]{RESET}\n", super::DIM));
@@ -1173,6 +1170,7 @@ impl Display {
         } else {
             self.active_chain = None;
             self.finish_line();
+            self.markdown.restart();
             // The block's rows print right under this anchor, so the next
             // block's separator has to survive the blank-row collapse.
             self.spacing.blank = false;
@@ -1296,12 +1294,26 @@ impl Display {
     /// brings it back, and dropped in native mode, where the terminal's
     /// scrollback cannot be rewritten.
     pub fn output_as(&mut self, text: &str, width: usize, kind: RowKind) {
-        // Narrative rows are markdown. The renderer re-renders the whole line
+        let mut text = text;
+        if kind != self.tail_kind {
+            let committed = self.columns > 0;
+            // Finish the preceding stream before rendering the next one, so
+            // a thought's unfinished line or fence cannot reach the answer.
+            self.finish_line();
+            self.markdown.restart();
+            if committed {
+                text = text
+                    .strip_prefix("\r\n")
+                    .or_else(|| text.strip_prefix('\n'))
+                    .unwrap_or(text);
+            }
+            self.tail_kind = kind;
+        }
+        // Narrative and thinking rows are markdown. Re-render the whole line
         // for every chunk, so the row it is building is replaced rather than
         // appended: that is what lets `**bold**` style text already on screen.
-        // Tool and thinking rows are the app's own formatting and print their
-        // text verbatim.
-        if kind == RowKind::Plain {
+        // Tool rows keep their own formatting and print their text verbatim.
+        if matches!(kind, RowKind::Plain | RowKind::Thinking) {
             let rendered = self.markdown.push(text);
             if self.md_row {
                 self.tail.truncate(self.md_tail);
@@ -1310,42 +1322,31 @@ impl Display {
             // Every rendered span closes itself, so the style in effect where
             // the row starts is exactly the style the write leaves behind.
             let commits = self.committed;
-            self.write(&rendered.text, width, kind);
+            // Track the actual tail offset: expanding tabs and dropping
+            // untrusted escapes can change the rendered row's byte length.
+            self.md_tail = self.tail.len();
+            self.write(&rendered.text, width);
             // A write that committed one row per newline in the render ended
             // every row it printed: the renderer owns the row left in the tail.
             // A row that wrapped commits without a newline, so part of it is
             // in the scrollback, past rewriting: the renderer lets the line go
             // there, and ownership returns at the next row.
-            self.md_row = self.committed - commits == rendered.text.matches('\n').count();
-            self.md_tail = self.tail.len().saturating_sub(rendered.line);
+            let complete = &rendered.text[..rendered.text.len() - rendered.line];
+            self.md_row = self.committed - commits == complete.matches('\n').count();
             if !self.md_row {
                 self.markdown.restart_line();
             }
             return;
         }
-        self.write(text, width, kind);
+        self.write(text, width);
     }
 
-    fn write(&mut self, text: &str, width: usize, kind: RowKind) {
+    fn write(&mut self, text: &str, width: usize) {
         if !unstyled(text).trim().is_empty() {
             // Only consecutive tool calls belong to a group. Even when
             // thinking is collapsed, intervening messages keep their place.
             self.active_chain = None;
         }
-        let mut text = text;
-        if kind != self.tail_kind {
-            let committed = self.columns > 0;
-            // The existing tail belongs to the preceding event, even when the
-            // next event begins with its terminating newline under another kind.
-            self.finish_line();
-            if committed {
-                text = text
-                    .strip_prefix("\r\n")
-                    .or_else(|| text.strip_prefix('\n'))
-                    .unwrap_or(text);
-            }
-        }
-        self.tail_kind = kind;
         // Track SGR sequences as zero-width tokens. Replay the current style
         // when wrapping a streaming delta across committed transcript rows.
         let mut rest = text;
@@ -1376,7 +1377,7 @@ impl Display {
                 self.commit_row();
             } else if grapheme == "\t" {
                 let spaces = 4 - self.columns % 4;
-                self.output_as(&" ".repeat(spaces), width, kind);
+                self.write(&" ".repeat(spaces), width);
             } else if !grapheme.chars().any(char::is_control) {
                 // Full-screen rows wrap at paint time, so a transcript row
                 // breaks only on a real newline and resizing re-wraps it.
@@ -1394,6 +1395,7 @@ impl Display {
         let tail = std::mem::take(&mut self.tail);
         self.push_row(tail);
         self.tail.clone_from(&self.style);
+        self.md_tail = self.tail.len();
         self.columns = 0;
         self.committed += 1;
         // The renderer's row is committed, so it owns nothing in the tail.
@@ -2119,6 +2121,12 @@ mod tests {
         display.output("the answer\n", 80);
         display.output_as("pondering\n", 80, RowKind::Thinking);
         display.update_tool(sample_tool(0, "completed"));
+        let default_view = display.wrapped(80).join("|");
+        assert!(default_view.contains("command_0") && default_view.contains("result_0"));
+        display.set_visibility(Visibility {
+            tools: ToolView::Grouped,
+            ..Visibility::default()
+        });
         let grouped = display.wrapped(80).join("|");
         assert!(grouped.contains("the answer") && grouped.contains("pondering"));
         assert!(grouped.contains("1 tool call · bash × 1"));
@@ -2138,7 +2146,7 @@ mod tests {
         assert!(full.contains("full_command_0") && full.contains("full_result_0"));
         assert!(!full.contains("pondering"));
         display.set_visibility(Visibility::default());
-        assert_eq!(display.wrapped(80).join("|"), grouped);
+        assert_eq!(display.wrapped(80).join("|"), default_view);
     }
 
     #[test]
@@ -2395,7 +2403,10 @@ mod tests {
                 );
                 assert!(display.tail.is_empty());
             }
-            display.set_visibility(Visibility::default());
+            display.set_visibility(Visibility {
+                tools: ToolView::Grouped,
+                ..Visibility::default()
+            });
             assert_eq!(
                 plain(&display.wrapped(80)),
                 ["▸ 200 tool calls · bash × 200 · 200 pending"]
@@ -2413,6 +2424,10 @@ mod tests {
     #[test]
     fn all_three_views_survive_out_of_order_completion_and_repeated_toggles() {
         let mut display = Display::new(true);
+        display.set_visibility(Visibility {
+            tools: ToolView::Grouped,
+            ..Visibility::default()
+        });
         for id in 0..100 {
             let mut call = sample_tool(id, "pending");
             if id % 2 == 0 {
@@ -2449,7 +2464,10 @@ mod tests {
                 tools: ToolView::Full,
             });
             assert_eq!(display.wrapped(100).len(), 300);
-            display.set_visibility(Visibility::default());
+            display.set_visibility(Visibility {
+                tools: ToolView::Grouped,
+                ..Visibility::default()
+            });
             assert_eq!(display.wrapped(100).len(), 1);
         }
     }
@@ -2509,6 +2527,10 @@ mod tests {
     #[test]
     fn grouped_failures_stay_visible_and_closed_chains_still_expand() {
         let mut display = Display::new(true);
+        display.set_visibility(Visibility {
+            tools: ToolView::Grouped,
+            ..Visibility::default()
+        });
         display.output_as("secret thinking", 80, RowKind::Thinking);
         let mut failed = sample_tool(0, "error");
         failed.brief = "● bash command_0\n  ✗ permission denied".into();
@@ -2564,6 +2586,10 @@ mod tests {
         let mut display = Display::new(true);
         let mut ui = Ui::default();
         crate::tui::render::render_history(&mut display, &mut ui, &history);
+        display.set_visibility(Visibility {
+            tools: ToolView::Grouped,
+            ..Visibility::default()
+        });
         let grouped = display.wrapped(100).join("\n");
         assert!(grouped.contains("2 tool calls · bash × 1, read × 1 · 1 failed"));
         assert!(grouped.contains("1 tool call · bash × 1"));
@@ -2605,6 +2631,10 @@ mod tests {
     #[test]
     fn streaming_narrative_newlines_do_not_reserve_rows_for_tool_calls() {
         let mut display = Display::new(true);
+        display.set_visibility(Visibility {
+            tools: ToolView::Grouped,
+            ..Visibility::default()
+        });
         display.output("I will run fifty calls.\n", 80);
         for _ in 0..150 {
             display.output("\n", 80);
@@ -2693,6 +2723,90 @@ mod tests {
             display.finish_line();
             assert_eq!(plain(&display.wrapped(80)), expected, "chunk size {chunk}");
         }
+    }
+
+    #[test]
+    fn thinking_markdown_renders_across_chunks_and_visibility_changes() {
+        const TEXT: &str = "# Plan\nUse **bold** and `code`.\n```rust\nfn main() {}\n\n```\nDone.";
+        let expected = [
+            "◦ thinking",
+            "Plan",
+            "Use bold and code.",
+            "rust",
+            "│ fn main() {}",
+            "│",
+            "Done.",
+        ];
+        for chunk in [1, 2, 5, 17, TEXT.len()] {
+            let mut display = Display::new(true);
+            for (index, part) in TEXT.as_bytes().chunks(chunk).enumerate() {
+                display.update_thought(
+                    ThoughtUpdate {
+                        id: "r".into(),
+                        message_id: "m".into(),
+                        text: std::str::from_utf8(part).unwrap().into(),
+                        new: index == 0,
+                        reset: false,
+                        start: Some(1000),
+                        end: Some(3000),
+                    },
+                    80,
+                );
+                // Paint partial updates too, so later chunks must invalidate
+                // and restyle the existing row when a delimiter closes.
+                display.wrapped(80);
+            }
+            let rows = display.wrapped(80);
+            assert_eq!(plain(&rows), expected, "chunk size {chunk}");
+            assert!(rows[1].contains(&format!("{BOLD}Plan{RESET}")));
+            assert!(rows[2].contains(&format!("{CYAN}code{RESET}")));
+            drop(rows);
+            display.set_visibility(Visibility {
+                thinking: false,
+                ..Visibility::default()
+            });
+            assert_eq!(
+                plain(&display.wrapped(80)),
+                ["◦ Thought for 2.0s (~16 tokens)"]
+            );
+            display.set_visibility(Visibility::default());
+            assert_eq!(plain(&display.wrapped(80)), expected);
+            assert_eq!(plain(&display.export_rows().collect::<Vec<_>>()), expected);
+        }
+    }
+
+    #[test]
+    fn native_thinking_restyles_the_live_line_and_keeps_fences_inside_the_block() {
+        let mut display = Display::default();
+        let thought = |text: &str, new, reset| ThoughtUpdate {
+            id: "r".into(),
+            message_id: "m".into(),
+            text: text.into(),
+            new,
+            reset,
+            start: None,
+            end: None,
+        };
+        display.update_thought(thought("Use **bo", true, false), 80);
+        assert_eq!(unstyled(&display.tail), "Use **bo");
+        display.update_thought(thought("ld** and `code`.", false, false), 80);
+        assert_eq!(unstyled(&display.tail), "Use bold and code.");
+        assert!(display.tail.contains(&format!("{BOLD}bold{RESET}")));
+        assert!(display.tail.contains(&format!("{CYAN}code{RESET}")));
+        display.update_thought(thought("\n```rust\n\tlet x = 1;", false, false), 80);
+        assert_eq!(unstyled(&display.tail), "│   let x = 1;");
+        display.update_thought(thought("\t// note", false, false), 80);
+        assert_eq!(unstyled(&display.tail), "│   let x = 1;  // note");
+        display.update_thought(thought("# Revised", false, true), 80);
+        assert_eq!(unstyled(&display.tail), "Revised");
+        assert!(display.tail.contains(&format!("{BOLD}Revised{RESET}")));
+        display.update_thought(thought("\n```\nnew block", false, false), 80);
+        display.update_thought(thought("# Next", true, false), 80);
+        assert_eq!(unstyled(&display.tail), "Next");
+        display.update_thought(thought("\n```\nlast thought", false, false), 80);
+        display.output("**Answer**", 80);
+        assert_eq!(unstyled(&display.tail), "Answer");
+        assert!(display.tail.contains(&format!("{BOLD}Answer{RESET}")));
     }
 
     /// The renderer owns the row under construction, so a line interrupted by a
@@ -2860,7 +2974,10 @@ mod tests {
                 ),
                 120,
             );
-            let reasoning_text = format!("Thinking about batch {batch}.{}", "\n".repeat(100));
+            let reasoning_text = format!(
+                "# Thinking about batch {batch}.\nUse **bold** and `code`.\n```rust\nlet x = 1;\n```{}",
+                "\n".repeat(100)
+            );
             live.apply(crate::tui::render::render_event(&mut ui,&event("message.part.delta",serde_json::json!({"sessionID":"s","messageID":message_id,"partID":reasoning_id,"delta":reasoning_text})),"s"),120);
             reasoning["text"] = serde_json::json!(reasoning_text);
             parts.push(reasoning);
@@ -2940,7 +3057,15 @@ mod tests {
                         5
                     );
                 }
-                if !thinking {
+                if thinking {
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| *row == "Use bold and code.")
+                            .count(),
+                        5
+                    );
+                    assert_eq!(rows.iter().filter(|row| *row == "│ let x = 1;").count(), 5);
+                } else {
                     assert_eq!(
                         rows.iter()
                             .filter(|row| row.contains("Thought for 2.0s (42 tokens)"))
