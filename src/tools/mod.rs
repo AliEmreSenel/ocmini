@@ -300,12 +300,7 @@ pub async fn run_tool(
         return Err(failure("Tool cancelled"));
     }
     let result = match &prepared.tool {
-        Tool::File(plan) => {
-            let (plan, cancel) = (plan.clone(), ctx.cancel.clone());
-            tokio::task::spawn_blocking(move || plan.commit(&cancel))
-                .await
-                .map_err(|e| failure(e.to_string()))?
-        }
+        Tool::File(plan) => plan.clone().run(ctx.cancel.clone()).await,
         Tool::Task(plan) => task::run(ctx, plan).await,
         Tool::Bash(input) => process::run(ctx, input).await,
         Tool::Glob(input) => {

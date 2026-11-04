@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use tokio::sync::{Mutex as PathMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -70,6 +71,7 @@ impl Input {
 pub struct Plan {
     pub(super) changes: Vec<Change>,
     output: ToolOutput,
+    edit_lock: Mutex<Option<OwnedMutexGuard<()>>>,
 }
 pub(crate) fn target(path: &Path) -> Result<PathBuf, OperationError> {
     let mut ancestor = path;
@@ -163,6 +165,7 @@ fn prepare_plan(
             return Ok(Plan {
                 changes,
                 output: patch::output(&summaries),
+                edit_lock: Mutex::new(None),
             });
         }
     };
@@ -176,6 +179,7 @@ fn prepare_plan(
             permissions,
         }],
         output,
+        edit_lock: Mutex::new(None),
     })
 }
 
@@ -224,12 +228,27 @@ async fn prepare_values(
 ) -> Result<(Value, Plan), OperationError> {
     let input = Input::parse(name, &args)?;
     let kind = input.kind();
+    // Like upstream, an edit reads and prepares its replacement only after
+    // earlier edits to the same file have finished. Keep the lock through
+    // hooks, permission approval and commit, including across sessions.
+    let edit_path = match &input {
+        Input::Edit(input) => Some(target(&resolve_path(directory, &input.file_path))?),
+        _ => None,
+    };
+    let edit_lock = match &edit_path {
+        Some(path) => Some(lock_edit(path, &cancel).await?),
+        None => None,
+    };
     let work_dir = directory.to_owned();
     let work_cancel = cancel.clone();
     let mut plan =
         tokio::task::spawn_blocking(move || prepare_plan(&work_dir, &input, &work_cancel))
             .await
             .map_err(|e| failure(e.to_string()))??;
+    if edit_path.is_some_and(|path| path != plan.changes[0].path) {
+        return Err(failure("File change has a repeated or changed path"));
+    }
+    *plan.edit_lock.get_mut().unwrap() = edit_lock;
     if !hooks.matches(super::hooks::FILE_CHANGE_BEFORE, &context) {
         return Ok((args, plan));
     }
@@ -258,6 +277,13 @@ async fn prepare_values(
         return Ok((args, plan));
     }
     let changes = accepted.ok_or_else(|| failure("Missing accepted file changes"))?;
+    if kind == Kind::Edit && changes[0].path != plan.changes[0].path {
+        // A hook may redirect an edit. Release its original target before
+        // waiting on the new one so crossed redirects cannot deadlock.
+        drop(plan.edit_lock.get_mut().unwrap().take());
+        *plan.edit_lock.get_mut().unwrap() = Some(lock_edit(&changes[0].path, &cancel).await?);
+        validate_changes(&changes, &cancel)?;
+    }
     if matches!(kind, Kind::Write | Kind::Edit) {
         let change = &changes[0];
         args["filePath"] = json!(change.path);
@@ -340,17 +366,14 @@ fn transformed_changes(
 /// Commits take their paths in sorted order, which serializes overlapping
 /// batches (including moves, whose source and destination are separate
 /// changes) without deadlocking.
-static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<PathMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn with_path_locks<T>(
-    paths: impl IntoIterator<Item = impl Into<PathBuf>>,
-    write: impl FnOnce() -> Result<T, OperationError>,
-) -> Result<T, OperationError> {
+fn path_locks(paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Vec<Arc<PathMutex<()>>> {
     let mut keys: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
     keys.sort_unstable();
     keys.dedup();
-    let locks = {
+    {
         let mut registry = PATH_LOCKS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -365,10 +388,29 @@ fn with_path_locks<T>(
                 lock
             })
             .collect::<Vec<_>>()
-    };
+    }
+}
+
+async fn lock_edit(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<OwnedMutexGuard<()>, OperationError> {
+    let lock = path_locks([path]).pop().expect("one edit target");
+    tokio::select! {
+        guard = lock.lock_owned() => Ok(guard),
+        _ = cancel.cancelled() => Err(failure("Tool cancelled")),
+    }
+}
+
+#[cfg(test)]
+fn with_path_locks<T>(
+    paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+    write: impl FnOnce() -> Result<T, OperationError>,
+) -> Result<T, OperationError> {
+    let locks = path_locks(paths);
     let _guards = locks
         .iter()
-        .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+        .map(|lock| futures::executor::block_on(lock.lock()))
         .collect::<Vec<_>>();
     write()
 }
@@ -405,28 +447,61 @@ impl Plan {
     pub(super) fn paths(&self) -> impl Iterator<Item = &Path> {
         self.changes.iter().map(|change| change.path.as_path())
     }
-    pub fn commit(&self, cancel: &CancellationToken) -> Result<ToolOutput, OperationError> {
-        with_path_locks(self.changes.iter().map(|change| &change.path), || {
-            validate_changes(&self.changes, cancel)?;
-            for (index, change) in self.changes.iter().enumerate() {
-                if let Err(error) = patch::commit(change, false) {
-                    let rollback = self.changes[..=index]
-                        .iter()
-                        .rev()
-                        .filter_map(|c| patch::commit(c, true).err())
-                        .collect::<Vec<_>>();
-                    return Err(failure(format!(
-                        "File change failed: {error}; rollback {}",
-                        if rollback.is_empty() {
-                            "completed".into()
-                        } else {
-                            rollback.join("; ")
-                        }
-                    )));
-                }
+    pub(super) async fn run(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, OperationError> {
+        let mut guards = Vec::new();
+        let edit_lock = self.edit_lock.lock().unwrap().take();
+        if edit_lock.is_none() {
+            // Wait outside the blocking pool: another edit may be awaiting
+            // permission for this path. Cancellation must also end this wait.
+            for lock in path_locks(self.paths()) {
+                guards.push(tokio::select! {
+                    guard = lock.lock_owned() => guard,
+                    _ = cancel.cancelled() => return Err(failure("Tool cancelled")),
+                });
             }
-            Ok(self.output.clone())
+        }
+        tokio::task::spawn_blocking(move || {
+            let _edit_lock = edit_lock;
+            let _guards = guards;
+            self.commit_locked(&cancel)
         })
+        .await
+        .map_err(|e| failure(e.to_string()))?
+    }
+
+    fn commit_locked(&self, cancel: &CancellationToken) -> Result<ToolOutput, OperationError> {
+        validate_changes(&self.changes, cancel)?;
+        for (index, change) in self.changes.iter().enumerate() {
+            if let Err(error) = patch::commit(change, false) {
+                let rollback = self.changes[..=index]
+                    .iter()
+                    .rev()
+                    .filter_map(|c| patch::commit(c, true).err())
+                    .collect::<Vec<_>>();
+                return Err(failure(format!(
+                    "File change failed: {error}; rollback {}",
+                    if rollback.is_empty() {
+                        "completed".into()
+                    } else {
+                        rollback.join("; ")
+                    }
+                )));
+            }
+        }
+        Ok(self.output.clone())
+    }
+
+    #[cfg(test)]
+    pub fn commit(&self, cancel: &CancellationToken) -> Result<ToolOutput, OperationError> {
+        let edit_lock = self.edit_lock.lock().unwrap().take();
+        if edit_lock.is_some() {
+            self.commit_locked(cancel)
+        } else {
+            with_path_locks(self.paths(), || self.commit_locked(cancel))
+        }
     }
 }
 
@@ -441,6 +516,7 @@ mod tests {
                 output: String::new(),
                 metadata: json!({}),
             },
+            edit_lock: Mutex::new(None),
         }
     }
     #[test]
@@ -685,6 +761,121 @@ mod tests {
     fn hooks(directory: &str, script: &str) -> std::sync::Arc<crate::hooks::Hooks> {
         let cfg:crate::config::Config=serde_json::from_value(json!({"ocmini":{"hooks":{"handlers":[{"id":"file-hook","on":"file.change.before","command":["/bin/sh","-c",script]}]}}})).unwrap();
         crate::hooks::Hooks::for_config(&cfg, directory).unwrap()
+    }
+    #[tokio::test]
+    async fn waiting_edits_cancel_and_release_their_path_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        let held = lock_edit(&path, &CancellationToken::new()).await.unwrap();
+        let cancel = CancellationToken::new();
+        let waiting = lock_edit(&path, &cancel);
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        cancel.cancel();
+        assert!(waiting.await.err().unwrap().message.contains("cancelled"));
+        drop(held);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lock_edit(&path, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn edit_lock_releases_after_commit_even_while_the_plan_is_retained() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_str().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "before").unwrap();
+        let hooks =
+            crate::hooks::Hooks::for_config(&crate::config::Config::default(), dir).unwrap();
+        let (_, plan) = prepare_values(
+            dir,
+            &hooks,
+            json!({"directory":dir}),
+            CancellationToken::new(),
+            "edit",
+            json!({"filePath":"file","oldString":"before","newString":"after"}),
+        )
+        .await
+        .unwrap();
+        let plan = Arc::new(plan);
+        plan.clone().run(CancellationToken::new()).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lock_edit(&path, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after");
+        drop(plan);
+    }
+    #[tokio::test]
+    async fn a_write_waiting_on_an_edit_transaction_can_be_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "before").unwrap();
+        let _held = lock_edit(&path, &CancellationToken::new()).await.unwrap();
+        let cancel = CancellationToken::new();
+        let plan = prepare_sync(
+            root.path().to_str().unwrap(),
+            "write",
+            &json!({"filePath":"file","content":"after"}),
+            &cancel,
+        )
+        .unwrap();
+        let waiting = Arc::new(plan).run(cancel.clone());
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        cancel.cancel();
+        assert!(waiting.await.unwrap_err().message.contains("cancelled"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn hook_redirects_an_edit_and_releases_its_original_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_str().unwrap();
+        std::fs::write(root.path().join("original"), "before").unwrap();
+        std::fs::write(root.path().join("redirected"), "target").unwrap();
+        let hooks = hooks(
+            dir,
+            r#"cat >/dev/null; printf '%s' '{"set":{"changes":[{"path":"redirected","before":"target","after":"hook content"}]}}'"#,
+        );
+        let (args, plan) = prepare_values(
+            dir,
+            &hooks,
+            json!({"directory":dir}),
+            CancellationToken::new(),
+            "edit",
+            json!({"filePath":"original","oldString":"before","newString":"after"}),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lock_edit(&root.path().join("original"), &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            args["filePath"],
+            root.path().join("redirected").to_str().unwrap()
+        );
+        assert_eq!(args["oldString"], "target");
+        assert_eq!(args["newString"], "hook content");
+        plan.commit(&CancellationToken::new()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("original")).unwrap(),
+            "before"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("redirected")).unwrap(),
+            "hook content"
+        );
     }
     #[tokio::test]
     #[cfg(unix)]

@@ -2,10 +2,10 @@ use super::*;
 use crate::events as event;
 use tokio_util::sync::CancellationToken;
 
-/// Tool calls admitted in one model step are independent. Preparation runs in
-/// part order so persisted part state and the doom-loop window stay
-/// deterministic, then every call executes concurrently. Results are written
-/// back at their original indices, so history keeps the provider's call order.
+/// Tool calls admitted in one model step are independent. Argument hooks and
+/// doom-loop signatures run in part order, then preparation and execution run
+/// concurrently. A same-file edit can wait for its predecessor's transaction
+/// without blocking tools on unrelated paths. Results retain provider order.
 pub(super) async fn run_tools(
     base: &ToolCtx,
     cfg: &Config,
@@ -27,16 +27,11 @@ pub(super) async fn run_tools(
         ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
         ctx.part_id = part["id"].as_str().unwrap_or_default().into();
         let prepared =
-            prepare_effective_input(&ctx, &name, original_input.clone(), cfg, request).await;
+            prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await;
         let visible_input = match &prepared {
-            Ok(input) => input.args().clone(),
+            Ok(input) => input.clone(),
             Err(_) => original_input.clone(),
         };
-        if visible_input != part["state"]["input"] {
-            part["ocminiOriginalInput"] = part["state"]["input"].take();
-        }
-        part["state"] = json!({"status":"running","input":&visible_input,"time":{"start":start}});
-        crate::messages::update_part(&base.app, part)?;
         let signature = format!("{name}:{visible_input}");
         recent_calls.push_back(signature.clone());
         if recent_calls.len() > 3 {
@@ -78,8 +73,8 @@ async fn execute_part(
     ctx: ToolCtx,
     index: usize,
     name: String,
-    prepared: Result<PreparedTool, OperationError>,
-    visible_input: Value,
+    prepared: Result<Value, OperationError>,
+    mut visible_input: Value,
     mut part: Value,
     start: i64,
     repeated: bool,
@@ -88,6 +83,22 @@ async fn execute_part(
     request: &PromptRequest,
     allowed: &HashSet<String>,
 ) -> (usize, Value, Option<String>) {
+    let prepared = match prepared {
+        Ok(args) => tools::prepare_input(&ctx, &name, args).await,
+        Err(error) => Err(error),
+    };
+    if let Ok(input) = &prepared {
+        visible_input = input.args().clone();
+    }
+    // File hooks run under the edit transaction lock. Persist the complete
+    // effective input once, before permission checks and effects.
+    if visible_input != part["state"]["input"] {
+        part["ocminiOriginalInput"] = part["state"]["input"].take();
+    }
+    part["state"] = json!({"status":"running","input":&visible_input,"time":{"start":start}});
+    if let Err(error) = crate::messages::update_part(&ctx.app, &part) {
+        return (index, part, Some(error.message));
+    }
     let output = match &prepared {
         Err(error) => Err(error.clone()),
         Ok(_)
@@ -181,10 +192,21 @@ fn permission_rules(
 pub(super) async fn prepare_effective_input(
     ctx: &ToolCtx,
     name: &str,
-    mut input: Value,
+    input: Value,
     cfg: &Config,
     request: &PromptRequest,
 ) -> Result<PreparedTool, OperationError> {
+    let input = prepare_effective_args(ctx, name, input, cfg, request).await?;
+    tools::prepare_input(ctx, name, input).await
+}
+
+async fn prepare_effective_args(
+    ctx: &ToolCtx,
+    name: &str,
+    mut input: Value,
+    cfg: &Config,
+    request: &PromptRequest,
+) -> Result<Value, OperationError> {
     let agent = request.agent.as_deref().unwrap_or("build");
     if !input.is_object() {
         return Err("Tool input must be an object".into());
@@ -211,7 +233,7 @@ pub(super) async fn prepare_effective_input(
             .await?;
         input = result.input["args"].clone();
     }
-    tools::prepare_input(ctx, name, input).await
+    Ok(input)
 }
 
 pub(super) async fn execute_tool(
