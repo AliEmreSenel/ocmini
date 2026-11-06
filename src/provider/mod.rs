@@ -53,6 +53,8 @@ pub struct ProviderError {
     /// model's context window. Retrying the same request can never work;
     /// the engine compacts the history and retries once.
     pub overflow: bool,
+    /// An explicit image decoder rejection, rather than a transport failure.
+    pub image_decode: bool,
 }
 
 impl ProviderError {
@@ -63,6 +65,7 @@ impl ProviderError {
             retryable: false,
             retry_after: None,
             overflow: false,
+            image_decode: false,
         }
     }
 }
@@ -108,6 +111,19 @@ pub fn status_retryable(status: reqwest::StatusCode) -> bool {
         status.as_u16(),
         408 | 409 | 425 | 429 | 500 | 502 | 503 | 504
     )
+}
+
+fn image_decode_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "image file is truncated",
+        "cannot identify image file",
+        "invalid image data",
+        "unable to decode image",
+        "failed to decode image",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// Mid-stream failures observed before any tool executed. Transport deaths,
@@ -875,12 +891,14 @@ impl Settings {
             };
             let retryable = status_retryable(status);
             let overflow = matches!(status.as_u16(), 400 | 413 | 422) && context_overflow(&message);
+            let image_decode = matches!(status.as_u16(), 400 | 422) && image_decode_error(&message);
             return Err(ProviderError {
                 kind: FailureKind::Error,
                 message: format!("{} HTTP {status}: {message}", self.provider_id),
                 retryable,
                 retry_after: if retryable { retry_after } else { None },
                 overflow,
+                image_decode,
             });
         }
         Ok(response)

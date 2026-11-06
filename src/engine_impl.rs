@@ -4,6 +4,7 @@ mod admission;
 mod compaction;
 mod history;
 pub(crate) mod hooks;
+mod image_recovery;
 mod instructions;
 mod model_step;
 mod tool_execution;

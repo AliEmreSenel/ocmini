@@ -321,7 +321,7 @@ pub(super) async fn summarize_history(
         },
     )?;
     let result: Result<MessageWithParts, OperationError> = async {
-        let (mut request_messages, recent) = compaction_messages(messages, has_summary, policy);
+        let (mut request_messages, mut recent) = compaction_messages(messages, has_summary, policy);
         if request_messages.is_empty() {
             return Err("Nothing to compact".into());
         }
@@ -344,10 +344,19 @@ pub(super) async fn summarize_history(
         // not end recovery here, or the overflow error surfaces verbatim and the
         // turn is lost.
         let mut attempt = 0u32;
+        let mut recovered_images = false;
         let completion = loop {
             context["attempt"] = json!(attempt);
             match provider::request_text(app, adapter, &context, &request, cancel).await {
                 Ok(completion) => break completion,
+                Err(error) if error.image_decode && !recovered_images && !cancel.is_cancelled() => {
+                    if !image_recovery::recover(app, &info, &mut request.messages, Some(&mut recent)).await? {
+                        return Err(error.into());
+                    }
+                    recovered_images = true;
+                    image_recovery::announce(app, &info)?;
+                    context["requestID"] = json!(hex_id("req_"));
+                }
                 Err(error) if error.retryable && attempt < MAX_RETRIES => {
                     attempt += 1;
                     wait_retry(
