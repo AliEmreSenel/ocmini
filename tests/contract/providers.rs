@@ -1,5 +1,206 @@
 use super::*;
 
+const TRUNCATED_IMAGE: &str =
+    "Failed to load image: image file is truncated (52 bytes not processed)";
+
+fn has_image(request: &Value) -> bool {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .any(|p| p["type"] == "image_url")
+}
+
+#[tokio::test]
+async fn truncated_tool_image_recovers_and_stays_quarantined_after_restart() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"broken.png"}), "read_broken"),
+        Script::http_status_body(400, TRUNCATED_IMAGE),
+        text_script("Recovered", ""),
+        text_script("Continued", ""),
+    ])
+    .await;
+    let mut server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(
+        server.directory.join("broken.png"),
+        b"\x89PNG\r\n\x1a\ntruncated",
+    )
+    .unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_broken_image", "Read broken.png"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(!has_image(&provider.request().await));
+    assert!(has_image(&provider.request().await));
+    let recovered = provider.request().await;
+    assert!(!has_image(&recovered));
+    assert!(recovered.to_string().contains("contents were not read"));
+    let tool_results: Vec<_> = recovered["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0]["tool_call_id"], "read_broken");
+    let history = server.messages(&id).await;
+    let parts: Vec<_> = history
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .collect();
+    assert!(parts.iter().any(|p| p["text"]
+        .as_str()
+        .is_some_and(|t| t.contains("could not decode an image"))));
+    let attachment =
+        &parts.iter().find(|p| p["type"] == "tool").unwrap()["state"]["metadata"]["attachments"][0];
+    assert!(
+        attachment["data"].is_string(),
+        "original bytes must remain stored"
+    );
+    assert_eq!(attachment["ocminiImageRejected"], true);
+    server.restart().await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_after_image", "Continue"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(!has_image(&provider.request().await));
+    assert!(
+        provider.requests.try_recv().is_err(),
+        "recovery must not repeat"
+    );
+}
+
+#[tokio::test]
+async fn image_recovery_does_not_hide_other_errors_or_loop() {
+    for (status, message, recovery) in [
+        (400, "Invalid temperature", false),
+        (401, TRUNCATED_IMAGE, false),
+        (400, "Failed to load image: connection timed out", false),
+        (400, TRUNCATED_IMAGE, true),
+    ] {
+        let mut scripts = vec![Script::http_status_body(status, message)];
+        if recovery {
+            scripts.push(Script::http_status_body(400, TRUNCATED_IMAGE));
+        }
+        let mut provider = Provider::start(scripts).await;
+        let server = TestServer::start(&provider, json!({})).await;
+        let id = server.session(allow()).await;
+        let mut input = prompt("msg_image_failure", "Look");
+        input["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"file","mime":"image/png","url":"data:image/png;base64,YnJva2Vu"}));
+        let response = server
+            .post(&format!("/session/{id}/message"), &input)
+            .send()
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert!(has_image(&provider.request().await));
+        if recovery {
+            assert!(!has_image(&provider.request().await));
+        }
+        assert!(provider.requests.try_recv().is_err());
+        let history = server.messages(&id).await;
+        let file = history
+            .iter()
+            .flat_map(|m| m["parts"].as_array().unwrap())
+            .find(|p| p["type"] == "file")
+            .unwrap();
+        assert_eq!(file["ocminiImageRejected"] == true, recovery);
+    }
+}
+
+#[tokio::test]
+async fn image_recovery_covers_summary_requests_and_saved_compaction_tails() {
+    for reject_summary in [false, true] {
+        let mut scripts = vec![text_script("Before compaction", "")];
+        if reject_summary {
+            scripts.push(Script::http_status_body(422, TRUNCATED_IMAGE));
+        }
+        scripts.push(text_script("Summary", ""));
+        if !reject_summary {
+            scripts.push(Script::http_status_body(400, TRUNCATED_IMAGE));
+        }
+        scripts.push(text_script("After compaction", ""));
+        scripts.push(text_script("After restart", ""));
+        let mut provider = Provider::start(scripts).await;
+        let mut server = TestServer::start(&provider, json!({"compaction":{"auto":false}})).await;
+        let id = server.session(allow()).await;
+        let mut input = prompt("msg_summary_image", "Look at this image");
+        input["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"file","mime":"image/png","url":"data:image/png;base64,YnJva2Vu"}));
+        server
+            .post(&format!("/session/{id}/message"), &input)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert!(has_image(&provider.request().await));
+        server
+            .post(
+                &format!("/session/{id}/summarize"),
+                &json!({"providerID":"mock","modelID":"test-model"}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert!(has_image(&provider.request().await));
+        if reject_summary {
+            assert!(!has_image(&provider.request().await));
+        }
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt("msg_summary_continue", "Continue"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        if !reject_summary {
+            assert!(has_image(&provider.request().await));
+        }
+        assert!(!has_image(&provider.request().await));
+        server.restart().await;
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt("msg_summary_restart", "Continue again"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let replay = provider.request().await;
+        assert!(!has_image(&replay));
+        assert!(replay.to_string().contains("contents were not read"));
+        assert!(provider.requests.try_recv().is_err());
+    }
+}
+
 #[tokio::test]
 async fn pdf_tool_results_follow_chat_capabilities_after_restart_and_replay() {
     for supported in [false, true] {

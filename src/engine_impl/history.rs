@@ -108,7 +108,11 @@ pub(super) fn build_messages(
                 }
                 match part["type"].as_str() {
                     Some("text")=>content.push(json!({"type":"text","text":part["text"]})),
-                    Some("file")=>content.push(crate::attachments::content(part)?),
+                    Some("file")=>content.push(if part[image_recovery::REJECTED] == true {
+                        image_recovery::placeholder()
+                    } else {
+                        crate::attachments::content(part)?
+                    }),
                     Some("agent")=>content.push(json!({"type":"text","text":format!("Requested agent: {}",part["name"].as_str().unwrap_or_default())})),
                     _=>{},
                 }
@@ -172,6 +176,10 @@ pub(super) fn build_messages(
                 .filter(|_| !part["state"]["time"]["compacted"].is_number())
             {
                 for block in blocks {
+                    if block[image_recovery::REJECTED] == true {
+                        attachments.push(image_recovery::placeholder());
+                        continue;
+                    }
                     match block["type"].as_str() {
                         Some("image") => {
                             let mime = block["mimeType"].as_str().unwrap_or("image/png");

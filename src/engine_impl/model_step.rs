@@ -264,6 +264,7 @@ pub(super) async fn request_step(
     // Compaction may repeat while it reduces an overflowing request. Stop
     // when a checkpoint makes no progress, rather than after a fixed count.
     let mut previous_overflow_bytes = None;
+    let mut recovered_images = false;
     provider::prepare_hooks(app, context, &mut req, Some(cancel)).await?;
     loop {
         context["attempt"] = json!(attempt);
@@ -273,6 +274,19 @@ pub(super) async fn request_step(
             Ok(completion) => return Ok((result, completion)),
             Err(error) => error,
         };
+        if error.image_decode
+            && !recovered_images
+            && result.tools.is_empty()
+            && result.text.is_none()
+            && result.reasoning.is_none()
+            && !cancel.is_cancelled()
+            && image_recovery::recover(app, info, &mut req.messages, None).await?
+        {
+            recovered_images = true;
+            image_recovery::announce(app, info)?;
+            context["requestID"] = json!(hex_id("req_"));
+            continue;
+        }
         if error.retryable
             && result.tools.is_empty()
             && attempt < MAX_RETRIES

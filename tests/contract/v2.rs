@@ -28,6 +28,61 @@ async fn get(server: &TestServer, path: &str) -> Value {
 }
 
 #[tokio::test]
+async fn v2_truncated_image_recovers_preserves_files_and_accepts_new_images() {
+    let mut provider = Provider::start(vec![
+        Script::http_status_body(
+            400,
+            "Failed to load image: image file is truncated (52 bytes not processed)",
+        ),
+        text_script("Recovered", ""),
+        text_script("New image received", ""),
+    ])
+    .await;
+    let mut server = TestServer::start(&provider, json!({})).await;
+    let sid = session(&server).await;
+    let file =
+        |data: &str| json!({"name":"screenshot.png","uri":format!("data:image/png;base64,{data}")});
+    let mut events = server.events_at("/api/event").await;
+    post(&server, &format!("/api/session/{sid}/prompt"), json!({"id":"msg_bad_image","text":"Inspect this screenshot","files":[file("YnJva2Vu"),file("b3RoZXI="),{"name":"notes.txt","uri":"data:text/plain;base64,a2VlcCB0aGVzZSBub3Rlcw=="}]})).await;
+    events.through("session.execution.succeeded").await;
+    let rejected = provider.request().await;
+    assert!(rejected
+        .to_string()
+        .contains("data:image/png;base64,YnJva2Vu"));
+    assert!(rejected
+        .to_string()
+        .contains("data:image/png;base64,b3RoZXI="));
+    let recovered = provider.request().await.to_string();
+    assert!(!recovered.contains("data:image/png"));
+    assert!(recovered.contains("Inspect this screenshot"));
+    assert!(recovered.contains("keep these notes"));
+    assert!(recovered.contains("contents were not read"));
+    let history = get(&server, &format!("/api/session/{sid}/message")).await;
+    let messages = history["data"].as_array().unwrap();
+    let user = messages
+        .iter()
+        .find(|m| m["id"] == "msg_bad_image")
+        .unwrap();
+    assert_eq!(user["files"][0]["data"], "YnJva2Vu");
+    assert_eq!(user["files"][1]["data"], "b3RoZXI=");
+    assert!(history.to_string().contains("could not decode an image"));
+    server.restart().await;
+    let mut events = server.events_at("/api/event").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"id":"msg_new_image","text":"Here is a replacement","files":[file("bmV3")]}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    let replay = provider.request().await.to_string();
+    assert!(!replay.contains("data:image/png;base64,YnJva2Vu"));
+    assert!(!replay.contains("data:image/png;base64,b3RoZXI="));
+    assert!(replay.contains("data:image/png;base64,bmV3"));
+    assert!(provider.requests.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn v2_preserves_opaque_t3_message_ids_across_retries_and_restart() {
     let mut provider = Provider::start(vec![
         text_script("T3 reply", ""),
