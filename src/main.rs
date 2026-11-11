@@ -1,118 +1,18 @@
-mod attachments;
-mod auth;
-mod blocking;
-mod bus;
-mod client;
-mod commands;
-mod config;
-mod engine;
-mod engine_impl;
-mod events;
-mod hooks;
-mod http;
-mod inventory;
-mod mcp;
-mod messages;
-mod permission;
-mod picker;
-mod process;
-mod provider;
-mod run;
-mod server;
-mod sessions;
-mod store;
-mod title;
-mod tools;
-mod tui;
-mod types;
-mod usage_db;
-mod v2;
-
-use clap::{Args, Parser, Subcommand};
-
-#[cfg(test)]
-fn test_tempdir() -> std::io::Result<tempfile::TempDir> {
-    // macOS normally advertises /var/folders through a symlink. Fixtures that
-    // compare directory identities need the same spelling as the runtime.
-    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
-}
-
-pub const OPENCODE_COMPAT_VERSION: &str = concat!("2.2.5-ocmini.", env!("CARGO_PKG_VERSION"));
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use ocmini_core::*;
+use ocmini_server::server;
+use ocmini_tui::{run, tui, RunArgs, TuiArgs};
 
 #[derive(Parser)]
-#[command(version = OPENCODE_COMPAT_VERSION, about = "A compact OpenCode-compatible coding runtime", args_conflicts_with_subcommands = true)]
+#[command(version = OPENCODE_COMPAT_VERSION, about = "A compact OpenCode-compatible coding runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     #[command(flatten)]
     tui: TuiArgs,
-}
-
-#[derive(Args, Default)]
-struct TuiArgs {
-    #[arg(long, value_name = "PROVIDER/MODEL", value_parser = parse_model)]
-    model: Option<types::ModelRef>,
-    #[arg(long, value_name = "DIR")]
-    directory: Option<String>,
-    /// Resume the latest top-level session in this directory
-    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
-    continue_last: bool,
-    /// Resume a session by ID, using its saved directory
-    #[arg(short = 's', long, value_name = "ID")]
-    session: Option<String>,
-    /// Pick a saved session interactively (search and sort)
-    #[arg(
-        short = 'r',
-        long,
-        conflicts_with = "session",
-        conflicts_with = "continue_last"
-    )]
-    resume: bool,
-}
-
-#[derive(Args, Default)]
-pub struct RunArgs {
-    /// Prompt text; piped standard input is appended (like `opencode run`)
-    message: Vec<String>,
-    /// Resume the latest top-level session in this directory
-    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
-    continue_last: bool,
-    /// Resume a session by ID, using its saved directory
-    #[arg(short = 's', long, value_name = "ID")]
-    session: Option<String>,
-    /// Fork the resumed session instead of continuing it
-    #[arg(long, requires = "session")]
-    fork: bool,
-    #[arg(short = 'm', long, value_name = "PROVIDER/MODEL", value_parser = parse_model)]
-    model: Option<types::ModelRef>,
-    #[arg(long)]
-    agent: Option<String>,
-    #[arg(long)]
-    variant: Option<String>,
-    /// Title for a new session
-    #[arg(long)]
-    title: Option<String>,
-    /// Attach a file (repeatable)
-    #[arg(short = 'f', long = "file", value_name = "PATH")]
-    file: Vec<String>,
-    /// Output format: text prints the answer, json emits JSONL events
-    #[arg(long, value_parser = ["text", "json"], default_value = "text")]
-    format: String,
-    /// Include chain of thought in the output
-    #[arg(long)]
-    thinking: bool,
-    /// Directory for a new session (defaults to the current directory)
-    #[arg(long, value_name = "DIR")]
-    dir: Option<String>,
-    /// Enter the interactive TUI after the turn
-    #[arg(short = 'i', long)]
-    interactive: bool,
-    /// Allow tool permissions without asking
-    #[arg(long)]
-    auto: bool,
-    /// Run a configured slash command with arguments
-    #[arg(long)]
-    command: Option<String>,
+    /// Select a sandbox preset file (also OCMINI_SANDBOX_PRESET)
+    #[arg(long, global = true, value_name = "NAME")]
+    sandbox_preset: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -175,10 +75,6 @@ enum SessionCommand {
         #[arg(long, value_name = "DIR")]
         directory: Option<String>,
     },
-}
-
-fn parse_model(value: &str) -> Result<types::ModelRef, String> {
-    types::ModelRef::parse(value)
 }
 
 fn parse_hostname(value: &str) -> Result<String, String> {
@@ -312,14 +208,38 @@ async fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn main() {
-    let cli = Cli::try_parse().unwrap_or_else(|error| {
-        if error.kind() == clap::error::ErrorKind::DisplayVersion {
-            // T3's version probe expects the bare compatibility version.
-            println!("{OPENCODE_COMPAT_VERSION}");
-            std::process::exit(0);
-        }
-        error.exit()
-    });
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__runner")) {
+        let result = ocmini_core::sandbox::runner_main();
+        ocmini_tools_stop();
+        std::process::exit(if result.is_ok() { 0 } else { 78 });
+    }
+
+    let mut command = Cli::command();
+    let matches = command
+        .try_get_matches_from_mut(std::env::args_os())
+        .unwrap_or_else(|error| {
+            if error.kind() == clap::error::ErrorKind::DisplayVersion {
+                // T3's version probe expects the bare compatibility version.
+                println!("{OPENCODE_COMPAT_VERSION}");
+                std::process::exit(0);
+            }
+            error.exit()
+        });
+    // Only default-TUI options conflict with subcommands. Process-wide options
+    // such as --sandbox-preset must work before or after any subcommand.
+    if matches.subcommand_name().is_some() && matches.contains_id("tui_options") {
+        command
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "TUI options must follow the 'tui' subcommand when using a subcommand",
+            )
+            .exit();
+    }
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if let Some(preset) = &cli.sandbox_preset {
+        std::env::set_var("OCMINI_SANDBOX_PRESET", preset);
+    }
     // One async worker is enough for provider I/O. Blocking database sections
     // hand the scheduler off through block_in_place instead of stalling health,
     // streaming or cancellation. TOKIO_WORKER_THREADS still overrides the count.
@@ -336,6 +256,15 @@ fn main() {
     tools::stop_background_jobs();
     if let Err(error) = result {
         eprintln!("ocmini: {error}");
-        std::process::exit(1);
+        std::process::exit(if error.contains("Sandbox startup refused:") {
+            78
+        } else {
+            1
+        });
     }
+}
+
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+fn ocmini_tools_stop() {
+    tools::stop_background_jobs();
 }

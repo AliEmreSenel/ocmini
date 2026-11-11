@@ -187,3 +187,70 @@ The [OpenCode v2 migration plan](docs/opencode-v2-plan.md) compares our current 
 ## Hooks and event subscriptions
 
 Extensions use hooks to validate or transform operations and event subscriptions to observe execution. Register commands under `ocmini.hooks`, or consume the directory-scoped SSE stream through `GET /event`. Start with [hooks guide](docs/hooks.md) and the documentation-only [hook recipes](docs/hooks-examples.md); [hook reference](docs/hooks-reference.md) contains all 26 hooks, 49 events, and advanced settings. Inspect the active configuration with `ocmini debug hooks --json`. OpenCode JavaScript plugins use a separate interface.
+
+## Sandboxed environments
+
+Linux builds include sandbox support; the default preset is `off`. Select a preset
+in the existing OpenCode configuration:
+
+```json
+{"sandbox":{"preset":"workspace-write"}}
+```
+
+The same setting applies to T3 Code's `ocmini serve` process, `ocmini run`, and the
+interactive TUI. A process-wide override is available as
+`--sandbox-preset NAME` or `OCMINI_SANDBOX_PRESET=NAME`.
+
+On first application startup, preset files are installed in
+`$XDG_CONFIG_HOME/opencode/sandbox/presets/` (normally
+`~/.config/opencode/sandbox/presets/`). The files are the runtime source of truth:
+edit them, add presets, or remove them. Shipped presets are `off`, `read-only`,
+`workspace-write`, `strict`, and `locked-down`. Their initial filesystem roots
+use the startup project and existing toolchains; edit those absolute roots for
+other configured environments. Scratch and session tool-output storage are
+always granted separately.
+
+Sandboxed sessions require Linux 6.12 or later, Landlock ABI 6, and unprivileged
+user/mount namespaces. Network mediation additionally requires `/dev/net/tun`.
+Enforcement failures refuse startup with exit 78. Approvals cannot widen a jail.
+Policies stay frozen for the session and its subagents; a failed runner is never
+restarted and commands are never replayed.
+
+`workspace-write` provides mediated networking and publishes development servers
+on a per-runner `127.80.x.x` address. Preview URLs are printed as listeners appear.
+Inbound firewall rules remain authoritative. Localhost-only IPv4 servers work;
+servers bound exclusively to IPv6 `::1` are not published.
+
+`unix_sockets` accepts `off`, `abstract`, or `deny`. Independently, `io_uring: false`
+disables io_uring. With io_uring enabled, `IORING_OP_SOCKET` can bypass the seccomp
+socket-family gate, including UNIX and VSOCK restrictions. TCP buffers use the
+unmodified upstream smoltcp API with demand-paged backing and fixed configured
+window capacity; smoltcp is not vendored. See [the design](docs/sandbox-plan.md)
+for the policy schema and accepted compatibility limitations.
+
+Build with `cargo build --release --no-default-features` to omit the sandbox crate.
+Requesting an active sandbox in that binary is refused.
+
+## Workspace
+
+The `ocmini` binary combines these library crates without changing the runtime's
+worker model:
+
+- `ocmini-core`: LLM lifecycle, sessions, storage, providers, hooks, permissions, and application adapters.
+- `ocmini-tools`: all built-in tools, their schemas, transactions, output handling, and tool hooks.
+- `ocmini-sandbox`: Linux enforcement, runner protocol, network policy, DNS/SNI mediation, and previews.
+- `ocmini-tui`: interactive terminal and one-shot terminal frontends.
+- `ocmini-server`: HTTP/SSE and OpenCode API routes.
+
+Run workspace checks with `cargo test --workspace --all-targets` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+
+History storage uses a compile-time `HistoryBackend` contract in `ocmini-core`.
+`Store<B>` dispatches directly to its backend type; `SelectedBackend` selects
+SQLite for the application. There is no runtime backend selector. Core owns
+fork remapping, recovery transformations, compaction policy and hook/turn
+orchestration. The backend supplies queries and atomic commits across history,
+admission receipts, session state and hook delivery. SQLite retains its existing
+database, migrations, WAL connections and paging behavior. Only SQLite ships
+today; another implementation can use the same core policies and select its type
+at build time.

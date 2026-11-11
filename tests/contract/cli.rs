@@ -519,3 +519,28 @@ async fn piped_run_requires_auto_for_shell_and_filters_terminal_controls() {
     assert!(output.status.success(), "{output:?}");
     assert!(marker.exists());
 }
+
+#[tokio::test]
+async fn sandbox_preset_is_global_without_conflicting_with_subcommands() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = server.session(allow()).await;
+    for args in [
+        vec!["--sandbox-preset", "off", "session", "list"],
+        vec!["session", "--sandbox-preset", "off", "list"],
+        vec!["session", "list", "--sandbox-preset", "off"],
+    ] {
+        let output = configured_command(server.root.path(), &server.directory)
+            .env("OCMINI_SANDBOX_PRESET", "must-be-overridden")
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&sid));
+    }
+}

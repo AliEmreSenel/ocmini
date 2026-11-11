@@ -44,9 +44,9 @@ jobs:
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
       - name: Lint all targets
-        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Unit and contract tests
-        run: cargo +stable test --all-targets --locked
+        run: cargo +stable test --workspace --all-targets --locked
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -69,4 +69,19 @@ jobs:
           key: msrv-1.85.0
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check all targets on the minimum Rust version
-        run: cargo +1.85.0 check --all-targets --all-features --locked
+        run: cargo +1.85.0 check --workspace --all-targets --all-features --locked
+
+  sandbox-off:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ripgrep
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y
+      - name: Check the sandbox-free workspace
+        run: cargo +stable test --workspace --exclude ocmini-sandbox --no-default-features --all-targets --locked

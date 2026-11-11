@@ -1,36 +1,39 @@
 [package]
 name = "ocmini"
-version = "0.4.0"
+version.workspace = true
 edition = "2021"
 rust-version = "1.85"
 resolver = "3"
 
+[workspace]
+members = ["crates/ocmini-tools", "crates/ocmini-sandbox", "crates/ocmini-core", "crates/ocmini-tui", "crates/ocmini-server"]
+
+[workspace.package]
+version = "0.4.0"
+
+[features]
+default = ["sandbox"]
+sandbox = ["ocmini-core/sandbox", "dep:ocmini-sandbox"]
+
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-futures = "0.3"
-tokio-util = { version = "0.7", features = ["rt"] }
-rand = "0.9"
-base64 = "0.22"
-glob = "0.3"
-walkdir = "2"
-regex = "1"
-async-trait = "0.1"
-async-stream = "0.3"
-libc = "0.2"
-html2text = { version = "0.17", default-features = false }
+ocmini-sandbox = { path="crates/ocmini-sandbox", optional=true }
+ocmini-core = { path = "crates/ocmini-core", default-features = false }
+ocmini-tui = { path = "crates/ocmini-tui" }
+ocmini-server = { path = "crates/ocmini-server" }
+serde_json = "1"
 clap = { version = "4.6.7", features = ["derive"] }
-serde_json_lenient = "0.2.4"
-crossterm = { version = "0.29.0", features = ["event-stream"] }
-tempfile = "3.27.0"
-yaml_serde = "0.10.7"
-unicode-segmentation = "1.13"
-unicode-width = "0.2"
-schemars = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+rusqlite = { version="0.32", features=["bundled"] }
+libc = "0.2"
+async-stream = "0.3"
+axum = "0.8"
+serde_json = "1"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures = "0.3"
+base64 = "0.22"
 
 [[bin]]
 name = "ocmini"
