@@ -62,7 +62,10 @@ impl Jail {
         let folder = rootpath.join("presets");
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("test.json"), preset.to_string()).unwrap();
-        let policy = config::load(&folder, "test").unwrap().unwrap();
+        let context = config::PathContext::current(&project).unwrap();
+        let policy = config::load_for(&folder, "test", &context)
+            .unwrap()
+            .unwrap();
         let child = jail::spawn_at(
             RuntimeSpec {
                 policy: policy.clone(),

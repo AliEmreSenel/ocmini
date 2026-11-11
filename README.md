@@ -206,9 +206,30 @@ On first application startup, preset files are installed in
 `~/.config/opencode/sandbox/presets/`). The files are the runtime source of truth:
 edit them, add presets, or remove them. Shipped presets are `off`, `read-only`,
 `workspace-write`, `strict`, and `locked-down`. Their initial filesystem roots
-use the startup project and existing toolchains; edit those absolute roots for
-other configured environments. Scratch and session tool-output storage are
-always granted separately.
+use runtime placeholders, so the same preset follows each session's workspace
+and the current user's toolchains. Scratch and session tool-output storage are
+always granted separately. Existing preset files are preserved; replace any
+previously generated fixed project path with `${workspace}` to make it dynamic.
+
+Filesystem rules support `${workspace}`, `${home}`, `${user}`, `${uid}`, `${gid}`,
+`${config_home}`, `${data_home}`, `${cache_home}`, and `${env:NAME}`. For example:
+
+```json
+"fs": {
+  "readable": ["${system_readable}", "${toolchains}", "${workspace}"],
+  "writable": ["${workspace}"],
+  "exec": ["${system_exec}", "${toolchains}"]
+}
+```
+
+`${workspace}` uses the session directory, including T3's selected workspace,
+CLI directory selection, and resumed sessions. User, home and XDG variables
+describe the host process; `${uid}` and `${gid}` are its effective IDs before
+entering a user namespace. The three whole-entry list variables discover
+existing system roots and user toolchains at session start, including configured
+Cargo, rustup, mise, nvm and fnm locations. Unknown, empty or unset variables and
+paths that resolve to relative paths or contain `..` are refused. Expansion runs
+once after preset inheritance, with no shell evaluation or recursive expansion.
 
 Sandboxed sessions require Linux 6.12 or later, Landlock ABI 6, and unprivileged
 user/mount namespaces. Network mediation additionally requires `/dev/net/tun`.

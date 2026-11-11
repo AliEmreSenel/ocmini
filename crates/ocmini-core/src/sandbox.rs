@@ -27,19 +27,19 @@ impl Registry {
     pub fn new(config: &Config) -> Result<Self, String> {
         let folder = PathBuf::from(crate::config::config_home()).join("opencode/sandbox/presets");
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| cwd.clone());
-        ocmini_sandbox::config::initialize(&folder, &cwd, &home)
-            .map_err(ocmini_sandbox::refusal)?;
+        ocmini_sandbox::config::initialize(&folder).map_err(ocmini_sandbox::refusal)?;
         let registry = Self {
             entries: Default::default(),
             folder,
         };
-        registry.policy(config)?;
+        registry.policy(config, &cwd)?;
         Ok(registry)
     }
-    fn policy(&self, config: &Config) -> Result<Option<Policy>, String> {
+    fn policy(
+        &self,
+        config: &Config,
+        directory: &std::path::Path,
+    ) -> Result<Option<Policy>, String> {
         let mut selection: Selection = serde_json::from_value(
             config
                 .extra
@@ -51,7 +51,9 @@ impl Registry {
         if let Ok(name) = std::env::var("OCMINI_SANDBOX_PRESET") {
             selection.preset = name;
         }
-        let policy = ocmini_sandbox::config::load(&self.folder, selection.name())
+        let context = ocmini_sandbox::config::PathContext::current(directory)
+            .map_err(ocmini_sandbox::refusal)?;
+        let policy = ocmini_sandbox::config::load_for(&self.folder, selection.name(), &context)
             .map_err(ocmini_sandbox::refusal)?;
         #[cfg(not(target_os = "linux"))]
         if policy.is_some() {
@@ -70,7 +72,7 @@ impl Registry {
         }
         let policy = match session.parent_id.as_ref().and_then(|p| entries.get(p)) {
             Some(parent) => parent.policy.clone(),
-            None => self.policy(config)?,
+            None => self.policy(config, std::path::Path::new(&session.directory))?,
         };
         let runner = match &policy {
             Some(policy) => Some(Runner::start(session, policy.clone())?),

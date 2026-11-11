@@ -4,6 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+mod paths;
+pub use paths::PathContext;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Selection {
@@ -247,6 +250,16 @@ struct RawNetwork {
 }
 
 pub fn load(folder: &Path, selection: &str) -> Result<Option<Policy>, String> {
+    let directory = std::env::current_dir().map_err(|e| e.to_string())?;
+    load_for(folder, selection, &PathContext::current(&directory)?)
+}
+
+/// Resolve templates after inheritance, against this session's trusted context.
+pub fn load_for(
+    folder: &Path,
+    selection: &str,
+    context: &PathContext,
+) -> Result<Option<Policy>, String> {
     valid_name(selection)?;
     let mut files = BTreeMap::new();
     for entry in std::fs::read_dir(folder).map_err(|e| format!("{}: {e}", folder.display()))? {
@@ -279,7 +292,7 @@ pub fn load(folder: &Path, selection: &str) -> Result<Option<Policy>, String> {
     let mut selected = None;
     for name in files.keys() {
         let value = resolve(name, &files, &mut vec![])?;
-        let policy = validate(name, value)?;
+        let policy = validate(name, value, context)?;
         if name == selection {
             selected = Some(policy);
         }
@@ -360,7 +373,7 @@ fn resolve(
         .remove("extends");
     Ok(child)
 }
-fn validate(name: &str, value: Value) -> Result<Option<Policy>, String> {
+fn validate(name: &str, value: Value, context: &PathContext) -> Result<Option<Policy>, String> {
     let raw: Raw =
         serde_json::from_value(value.clone()).map_err(|e| format!("Preset {name}: {e}"))?;
     if raw.off == Some(true) || name == "off" {
@@ -383,28 +396,10 @@ fn validate(name: &str, value: Value) -> Result<Option<Policy>, String> {
     } else {
         ProcessIsolation::None
     });
-    let fs = raw.fs.unwrap_or_default();
-    for path in fs
-        .readable
-        .iter()
-        .chain(&fs.writable)
-        .chain(&fs.exec)
-        .chain(&fs.hide)
-    {
-        if !path.is_absolute()
-            || path
-                .to_str()
-                .is_none_or(|s| s.contains(['*', '?', '[', '\0']))
-            || path
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-        {
-            return Err(format!(
-                "Preset {name}: paths must be absolute, without globs or ..: {}",
-                path.display()
-            ));
-        }
-    }
+    let mut fs = raw.fs.unwrap_or_default();
+    context
+        .resolve(&mut fs)
+        .map_err(|e| format!("Preset {name}: {e}"))?;
     let covered = |p: &Path, roots: &[PathBuf]| roots.iter().any(|root| p.starts_with(root));
     for path in &fs.exec {
         if !covered(path, &fs.readable) {
@@ -604,7 +599,7 @@ impl Policy {
 }
 
 /// Install once using a synced directory rename. Deleting a preset never recreates it.
-pub fn initialize(folder: &Path, project: &Path, home: &Path) -> Result<(), String> {
+pub fn initialize(folder: &Path) -> Result<(), String> {
     if folder.exists() {
         return Ok(());
     }
@@ -618,43 +613,6 @@ pub fn initialize(folder: &Path, project: &Path, home: &Path) -> Result<(), Stri
     ));
     std::fs::create_dir(&staging).map_err(|e| e.to_string())?;
     let result = (|| {
-        let mut roots: Vec<PathBuf> = [
-            "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect();
-        let mut exec: Vec<PathBuf> = [
-            "/usr/bin",
-            "/usr/sbin",
-            "/bin",
-            "/sbin",
-            "/usr/lib",
-            "/lib",
-            "/lib64",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect();
-        for relative in [
-            ".cargo",
-            ".rustup",
-            ".local/share/mise",
-            ".nvm",
-            ".local/share/fnm",
-        ] {
-            let path = home.join(relative);
-            if path.exists() {
-                roots.push(path.clone());
-                exec.push(path.clone());
-                if path.join("bin").exists() {
-                    exec.push(path.join("bin"));
-                }
-            }
-        }
-        roots.push(project.to_owned());
         for name in [
             "off",
             "read-only",
@@ -675,7 +633,7 @@ pub fn initialize(folder: &Path, project: &Path, home: &Path) -> Result<(), Stri
                     net["inbound"] = json!({"default":"allow"});
                     net["outbound"] = json!({"default":"allow"});
                 }
-                json!({"fs":{"readable":roots,"writable":if name=="read-only" {vec![]} else {vec![project.to_owned()]},"exec":exec},"tmp":true,"process_isolation":if name=="strict" || name=="locked-down" {"full"} else {"none"},"unix_sockets":"abstract","io_uring":true,"env":{"clear":true,"allow":["HOME","USER","TERM","COLORTERM","LANG","LC_*","TZ"],"deny":[]},"network":net})
+                json!({"fs":{"readable":["${system_readable}","${toolchains}","${workspace}"],"writable":if name=="read-only" {vec![]} else {vec!["${workspace}"]},"exec":["${system_exec}","${toolchains}"]},"tmp":true,"process_isolation":if name=="strict" || name=="locked-down" {"full"} else {"none"},"unix_sockets":"abstract","io_uring":true,"env":{"clear":true,"allow":["HOME","USER","TERM","COLORTERM","LANG","LC_*","TZ"],"deny":[]},"network":net})
             };
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -707,6 +665,13 @@ pub fn initialize(folder: &Path, project: &Path, home: &Path) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn validate(name: &str, value: Value) -> Result<Option<Policy>, String> {
+        super::validate(
+            name,
+            value,
+            &PathContext::current(Path::new("/workspace")).unwrap(),
+        )
+    }
     fn base() -> Value {
         json!({"fs":{"readable":["/usr"],"writable":[],"exec":["/usr/bin"]},"env":{"clear":true},"network":{"mode":"isolated"}})
     }
@@ -812,12 +777,67 @@ mod tests {
     fn folder_validation_includes_unselected_presets_and_deletion_is_persistent() {
         let root = tempfile::tempdir().unwrap();
         let folder = root.path().join("presets");
-        initialize(&folder, root.path(), root.path()).unwrap();
+        initialize(&folder).unwrap();
         assert!(load(&folder, "off").unwrap().is_none());
         std::fs::remove_file(folder.join("strict.json")).unwrap();
-        initialize(&folder, root.path(), root.path()).unwrap();
+        initialize(&folder).unwrap();
         assert!(load(&folder, "strict").is_err());
         std::fs::write(folder.join("broken.json"), "[]").unwrap();
         assert!(load(&folder, "off").is_err());
+    }
+    #[test]
+    fn one_preset_resolves_each_workspace_and_user_after_inheritance() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("presets");
+        std::fs::create_dir(&folder).unwrap();
+        let parent = json!({"fs":{"readable":["${workspace}","${home}"]},"env":{"clear":true},"network":{"mode":"isolated"}});
+        let child = json!({"extends":"base","fs":{"writable":["${workspace}"],"exec":["${workspace}/bin"],"hide":["${home}/.ssh"]},"process_isolation":"full"});
+        std::fs::write(folder.join("base.json"), parent.to_string()).unwrap();
+        std::fs::write(folder.join("custom.json"), child.to_string()).unwrap();
+        for user in ["alice", "bob"] {
+            let mut context = PathContext::current(root.path()).unwrap();
+            context.workspace = root.path().join(user).join("workspace");
+            context.home = root.path().join(user).join("home");
+            let policy = load_for(&folder, "custom", &context).unwrap().unwrap();
+            assert_eq!(policy.fs.writable, vec![context.workspace.clone()]);
+            assert_eq!(policy.fs.exec, vec![context.workspace.join("bin")]);
+            assert_eq!(policy.fs.hide, vec![context.home.join(".ssh")]);
+            assert_eq!(policy.fs.readable, vec![context.workspace, context.home]);
+        }
+        let mut invalid = child;
+        invalid["fs"]["hide"] = json!(["${cache_home}/outside"]);
+        std::fs::write(folder.join("custom.json"), invalid.to_string()).unwrap();
+        let mut context = PathContext::current(root.path()).unwrap();
+        context.workspace = root.path().join("workspace");
+        context.home = root.path().join("home");
+        context.cache_home = root.path().join("outside-cache");
+        assert!(load_for(&folder, "base", &context)
+            .unwrap_err()
+            .contains("hide outside fence"));
+    }
+    #[test]
+    fn installed_defaults_store_templates_and_resolve_without_rewriting_files() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("presets");
+        initialize(&folder).unwrap();
+        let before = std::fs::read(folder.join("workspace-write.json")).unwrap();
+        let template: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(
+            template["fs"]["readable"],
+            json!(["${system_readable}", "${toolchains}", "${workspace}"])
+        );
+        for name in ["first", "second"] {
+            let path = root.path().join(name);
+            let context = PathContext::current(&path).unwrap();
+            let policy = load_for(&folder, "workspace-write", &context)
+                .unwrap()
+                .unwrap();
+            assert_eq!(policy.fs.writable, vec![path.clone()]);
+            assert!(policy.fs.readable.contains(&path));
+        }
+        assert_eq!(
+            before,
+            std::fs::read(folder.join("workspace-write.json")).unwrap()
+        );
     }
 }

@@ -86,6 +86,34 @@ Probes decide, per boot. No distro policy. macOS/Windows: requesting the sandbox
 
 Every sandboxed preset **fence-reads**: `readable` = system base ∪ toolchain roots ∪ project ∪ session scratch + spill. No default preset reads the whole filesystem; `readable: ["/"]` exists only as an explicit custom preset and means **no read fence** (documented). Writes/exec are fenced per preset.
 
+Presets store path templates rather than paths captured on first installation.
+Expansion runs in the trusted brain after inheritance and before validation and
+pre-opening, using the actual session directory. `${workspace}` follows T3's
+request directory, CLI directory selection and saved session scope. `${home}`
+uses `HOME` (`USERPROFILE` or the host account database as fallback), `${user}`
+uses `USER`/`LOGNAME` (`USERNAME` or the host account name as fallback), and
+`${uid}`/`${gid}` are the host process's effective IDs, before namespace entry.
+`${config_home}`, `${data_home}` and `${cache_home}` use their XDG environment
+overrides or the standard paths beneath the current home. `${env:NAME}` explicitly
+reads a host environment variable; its name must be an environment identifier.
+Unknown, unset or empty variables are refused. Values are inserted literally,
+without a shell or recursive expansion; the final paths must be absolute and
+contain no NUL or parent traversal. Literal path templates still refuse globs;
+metacharacters in an inserted workspace or home remain ordinary filename bytes.
+
+Three variables expand a whole `fs.*` list entry into existing paths:
+`${system_readable}` (system read roots), `${system_exec}` (system executable
+roots), and `${toolchains}` (Cargo, rustup, mise, nvm and fnm roots, plus existing
+`bin` directories). Toolchain discovery honors `CARGO_HOME`, `RUSTUP_HOME`,
+`MISE_DATA_DIR`, `NVM_DIR` and `FNM_DIR`, with current home/XDG defaults. Only these
+discovery lists omit missing optional roots; ordinary configured paths retain
+their enforce-or-refuse behavior. Shipped presets use these list variables and
+`${workspace}`. Loading performs no preset writes. Existing files and explicit
+absolute grants keep their meaning and are never automatically rewritten.
+
+The fully resolved policy is frozen at root session start and inherited by its
+subagents. A child never re-expands `${workspace}` to widen its parent's fence.
+
 The session spill dir (tool output, `tool-output/<session_id>/`) is readable+writable in every sandboxed preset — the one always-writable data-dir carve-out.
 
 There is **no built-in secret list**. The fence is a positive allow-list: a path is readable iff it sits under a `readable` root — fencing `~/.ssh`, `auth.json` or anything else is `readable`/`hide` **user configuration**, never a special case in the design.
@@ -115,10 +143,10 @@ Config file (ocmini's existing config):
 {
   "extends": "workspace-write",
   "fs": {
-    "readable": ["/usr", "/etc", "/home/me/proj"],
-    "writable": ["/home/me/proj"],
-    "exec":     ["/usr/bin", "/home/me/.cargo/bin"],
-    "hide":     ["/home/me/.ssh"]
+    "readable": ["${workspace}", "${home}/.ssh"],
+    "writable": ["${workspace}"],
+    "exec":     ["${workspace}/bin"],
+    "hide":     ["${home}/.ssh"]
   },
   "tmp": true,
   "process_isolation": "full",
@@ -141,7 +169,7 @@ Config file (ocmini's existing config):
 
 - **`sandbox.preset`** (config file) — string, default `"off"`; must name a preset **file** in the folder (the file's stem).
 - **`extends`** (preset file) — optional parent = a file in the folder; cycles refused by name. Merge: `fs.*` lists **union** with the parent; `env`, `buffers`, `network` — the child's value **overrides** the parent's wholesale. Widening between presets is legal (library definitions compose into the session's **frozen** effective policy — no runtime merge exists, §Subagents).
-- **`fs.readable` / `fs.writable` / `fs.exec`** — **absolute paths only; directories cover their subtree; no globs** (Landlock binds fds at boot — a future file matching a glob would silently be ungranted; a promise that can't be kept is a validation error). `"/"` = no fence (documented). Symlinks resolve at pre-open — the target is bound, pinned at boot. `exec` roots must also be `readable` (no implicit widening). Landlock rights.
+- **`fs.readable` / `fs.writable` / `fs.exec`** — absolute paths or runtime path templates (§Presets); directories cover their subtree; no globs (Landlock binds fds at boot — a future file matching a glob would silently be ungranted; a promise that can't be kept is a validation error). `"/"` = no fence (documented). Symlinks resolve at pre-open — the target is bound, pinned at boot. `exec` roots must also be `readable` after expansion (no implicit widening). Landlock rights.
 - **`fs.hide`** — absolute paths; each must sit under a granted root (a hide outside the fence is a no-op — refused). **Mount masking**, not fence subtraction (Landlock v6 cannot subtract a subtree from a broader directory grant): in the jail's mountns, propagation-private (§Jail boot), an **empty tmpfs dir** is bind-mounted over each hidden directory and an **empty file** over each hidden file, **before** Landlock is applied to the final mount layout; every mask is verified at boot — a missing target or failed mount = **startup refusal**. **Requires `process_isolation: "full"`** (fresh `procfs`, §Process isolation). No inherited fd and no procfs handle carries a hidden inode (fd whitelist, §Jail boot); the runner can never unmount a mask or create a namespace that reveals the underlying filesystem — the mount/namespace class, **incl. namespace-flagged `clone` and `clone3`**, is seccomp-denied and all capabilities are dropped (§Jail boot). **Alias paths are configuration, not mechanism:** a hidden file reachable through a hard link or bind path that the user's `readable`/`writable` grants explicitly expose stays readable — alias tracking (inode-wide, hard-link scanning) is out of scope. Model-blind: masked dirs read **empty**, masked files read **empty**.
 - **`tmp`** — bool, default `false`; `true` = fresh **tmpfs at `/tmp`** in the jail's mountns (tmpfs default sizing, no artificial cap).
 - **`process_isolation`** — `"none"` | `"signal"` | `"full"`, default `"none"` (§Process isolation): `full` = PID namespace + fresh procfs + PID-1 duties + signal scoping (`strict`/`locked-down`, **required by `fs.hide`**); `signal` = signal scoping with host visibility preserved, no pidns; `none` = neither. Migration: `pidns: true` → `full`, `pidns: false` → `none`.

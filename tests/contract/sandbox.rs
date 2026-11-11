@@ -181,3 +181,100 @@ async fn concurrent_session_runners_coordinate_edits_to_the_same_file() {
         assert_eq!(parts[0]["state"]["status"], "completed", "{}", parts[0]);
     }
 }
+
+#[tokio::test]
+async fn presets_follow_each_session_workspace_and_discover_current_user_toolchains() {
+    let provider = Provider::start(vec![
+        tool_script("bash", json!({"command":"printf FIRST > dynamic.txt"}), "first_workspace"),
+        text_script("Done", ""),
+        tool_script("bash", json!({"command":"pwd; dynamic-user-tool; printf SECOND > dynamic.txt; cat '../project café %/startup-secret' 2>/dev/null || printf STARTUP_WORKSPACE_BLOCKED"}), "second_workspace"),
+        text_script("Done", ""),
+    ]).await;
+    let server =
+        TestServer::start(&provider, json!({"sandbox":{"preset":"workspace-write"}})).await;
+    std::fs::write(
+        server.directory.join("startup-secret"),
+        "FIRST_WORKSPACE_SECRET",
+    )
+    .unwrap();
+    let first = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{first}/message"),
+            &prompt("msg_dynamic_first", "Write in the first workspace"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(server.directory.join("dynamic.txt")).unwrap(),
+        "FIRST"
+    );
+
+    // Neither this project nor this user's toolchain existed at installation.
+    // Literal brackets and ${home} in the project name must remain path bytes.
+    let other = server
+        .root
+        .path()
+        .join("second workspace [literal] ${home}");
+    std::fs::create_dir(&other).unwrap();
+    let bin = server.root.path().join(".cargo/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("dynamic-user-tool");
+    std::fs::write(&tool, "#!/bin/sh\nprintf '%s\\n' CURRENT_USER_TOOLCHAIN\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let response = server
+        .post("/session", &json!({"permission":allow()}))
+        .header("x-opencode-directory", encode_directory(&other))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{response}");
+    let second = response["id"].as_str().unwrap();
+    server
+        .post(
+            &format!("/session/{second}/message"),
+            &prompt("msg_dynamic_second", "Use the second workspace"),
+        )
+        .header("x-opencode-directory", encode_directory(&other))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(other.join("dynamic.txt")).unwrap(),
+        "SECOND"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.directory.join("dynamic.txt")).unwrap(),
+        "FIRST"
+    );
+    let messages: Vec<Value> = server
+        .get(&format!("/session/{second}/message"))
+        .header("x-opencode-directory", encode_directory(&other))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let part = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["callID"] == "second_workspace")
+        .unwrap();
+    assert_eq!(part["state"]["status"], "completed", "{part}");
+    let output = part["state"]["output"].as_str().unwrap();
+    assert!(output.contains(other.to_str().unwrap()), "{output}");
+    assert!(output.contains("CURRENT_USER_TOOLCHAIN"), "{output}");
+    assert!(output.contains("STARTUP_WORKSPACE_BLOCKED"), "{output}");
+    assert!(!output.contains("FIRST_WORKSPACE_SECRET"), "{output}");
+}
