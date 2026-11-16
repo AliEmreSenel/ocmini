@@ -87,7 +87,7 @@ pub fn run(policy: Policy, directory: PathBuf, command: &[OsString]) -> Result<i
     let runtime = runtime().map_err(refusal)?;
     runtime.block_on(async {
         let mut signals = Signals::new().map_err(refusal)?;
-        let child = jail::spawn_command(jail::RuntimeSpec {
+        let mut child = jail::spawn_command(jail::RuntimeSpec {
             policy: policy.clone(),
             scratch: root.clone(),
             spill: root,
@@ -96,28 +96,40 @@ pub fn run(policy: Policy, directory: PathBuf, command: &[OsString]) -> Result<i
         let control = child.control.try_clone().map_err(refusal)?;
         control.set_nonblocking(true).map_err(refusal)?;
         let mut control = tokio::net::UnixStream::from_std(control).map_err(refusal)?;
-        let packets = child.packets.as_ref().map(|p| p.try_clone()).transpose().map_err(refusal)?;
+        // The broker owns the only host end of the packet socket, so the guest
+        // relay sees it close and the jail stops if the broker stops.
+        let packets = child.packets.take();
+        let pid = child.pid;
         let broker = async {
             match packets {
-                Some(packets) => broker::run(packets, child.pid, policy, Default::default()).await,
+                Some(packets) => broker::run(packets, pid, policy, Default::default()).await,
                 None => std::future::pending().await,
             }
         };
         tokio::pin!(broker);
+        let mut stopped = None;
         let completion = wire::read_control(&mut control);
         tokio::pin!(completion);
         loop {
             tokio::select! {
                 biased;
                 result = &mut completion => {
-                    return match result.map_err(refusal)? {
-                        wire::Control::Result { id: 0, value } => value.as_i64()
+                    return match result {
+                        Ok(wire::Control::Result { id: 0, value }) => value.as_i64()
                             .filter(|code| (0..=255).contains(code))
                             .map(|code| code as i32).ok_or_else(|| refusal("invalid command exit status")),
-                        _ => Err(refusal("invalid command supervisor response")),
+                        Ok(_) => Err(refusal("invalid command supervisor response")),
+                        Err(error) => Err(refusal(match stopped {
+                            Some(result) => format!("network broker stopped: {result:?}"),
+                            None => error.to_string(),
+                        })),
                     };
                 }
-                result = &mut broker => return Err(refusal(format!("network broker stopped: {result:?}"))),
+                // The guest closes its packet relay when the command finishes,
+                // which can stop the broker before the already written
+                // completion is observed. Report the broker only if the
+                // supervisor exits without a result.
+                result = &mut broker, if stopped.is_none() => stopped = Some(result),
                 signal = signals.recv() => {
                     let result = unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
                         child.pidfd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) };
