@@ -35,7 +35,7 @@ jobs:
           - os: ubuntu-24.04
             target: arm-unknown-linux-gnueabihf
             builder: cross
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             builder: cargo
           - os: windows-2022
