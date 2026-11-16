@@ -225,6 +225,11 @@ pub(super) fn configured_command(root: &Path, directory: &Path) -> Command {
         .env("OPENCODE_SERVER_PASSWORD", PASSWORD)
         .env("OCMINI_RETRY_BASE_MS", "50")
         .current_dir(directory);
+    // Native Windows needs this to load Winsock's system providers.
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
     command
 }
 
