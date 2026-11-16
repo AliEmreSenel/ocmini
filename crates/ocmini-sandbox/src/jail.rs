@@ -1073,12 +1073,12 @@ unsafe fn configure_net(tun: RawFd, mediated: bool) -> i32 {
         }
         let mut req: libc::ifreq = std::mem::zeroed();
         req.ifr_name[..2].copy_from_slice(&[b'l' as _, b'o' as _]);
-        if libc::ioctl(socket, libc::SIOCGIFFLAGS, &mut req) < 0 {
+        if libc::ioctl(socket, libc::SIOCGIFFLAGS as libc::Ioctl, &mut req) < 0 {
             libc::close(socket);
             return -1;
         }
         req.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
-        if libc::ioctl(socket, libc::SIOCSIFFLAGS, &req) < 0 {
+        if libc::ioctl(socket, libc::SIOCSIFFLAGS as libc::Ioctl, &req) < 0 {
             libc::close(socket);
             return -1;
         }
@@ -1105,17 +1105,17 @@ unsafe fn configure_net(tun: RawFd, mediated: bool) -> i32 {
             *a = *b as _;
         }
         req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as i16;
-        if libc::ioctl(tun, 0x400454ca as libc::c_ulong, &req) < 0 {
+        if libc::ioctl(tun, 0x400454ca as libc::Ioctl, &req) < 0 {
             libc::close(socket);
             return -1;
         }
         req.ifr_ifru.ifru_flags = libc::IFF_UP as i16;
-        if libc::ioctl(socket, libc::SIOCSIFFLAGS, &req) < 0 {
+        if libc::ioctl(socket, libc::SIOCSIFFLAGS as libc::Ioctl, &req) < 0 {
             libc::close(socket);
             return -1;
         }
         req.ifr_ifru.ifru_mtu = wire::MTU as i32;
-        if libc::ioctl(socket, libc::SIOCSIFMTU, &req) < 0 {
+        if libc::ioctl(socket, libc::SIOCSIFMTU as libc::Ioctl, &req) < 0 {
             libc::close(socket);
             return -1;
         }
