@@ -23,9 +23,10 @@ The sandbox lives in a **separate crate** (`ocmini-sandbox`), wired into ocmini 
 ## Implementation layout
 
 - **`ocmini-sandbox`** (feature `sandbox`, default-on) — permission sandboxing and network relay, nothing else: the sandbox config schema + validation, the jail builder (Landlock, seccomp BPF, boot choreography, netns/TUN/pidns, mount masks), the fd-3/fd-4 frame codec, the TUN relay loop, and the brain-side broker (smoltcp stack, rule engine, SNI parser, DNS handler, **preview publisher** incl. loopback address leasing, §Automatic previews). **No tool code.**
-- The crate also builds the separate **`ocmini-sandbox` executable**, independently
-  of ocmini/core/tools. Its command supervisor reuses this jail and broker, the
-  preset loader and CLI policy overrides. It defaults to `read-only`, accepts a
+- The crate also provides the separate **`ocmini-sandbox` executable**
+  (`ocmini_sandbox::standalone`, built as a root-package bin behind the `sandbox`
+  feature so `cargo install --path .` installs it), with no ocmini/core/tools
+  code. Its command supervisor reuses this jail and broker, the preset loader and CLI policy overrides. It defaults to `read-only`, accepts a
   program after `--`, and creates no session or database. Unlike tool runners,
   it explicitly inherits the caller's stdin/stdout/stderr. A pre-opened child
   table is passed on fd 7, marked CLOEXEC at trusted startup, so it can reap and

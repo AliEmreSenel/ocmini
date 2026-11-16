@@ -66,11 +66,8 @@ jobs:
           curl --fail --location --retry 3 https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C "$RUNNER_TEMP/cross"
           echo "$RUNNER_TEMP/cross" >> "$GITHUB_PATH"
 
+      # Builds both ocmini and the standalone ocmini-sandbox binary.
       - run: ${{ matrix.builder }} build --release --locked --target ${{ matrix.target }}
-
-      - name: Build the standalone Linux sandbox
-        if: runner.os == 'Linux'
-        run: ${{ matrix.builder }} build --release --locked --target ${{ matrix.target }} -p ocmini-sandbox --bin ocmini-sandbox
 
       - name: Package
         shell: bash

@@ -1,5 +1,5 @@
 //! The standalone executable's trusted supervisor. No ocmini sessions or tools.
-use ocmini_sandbox::{broker, config::Policy, jail, refusal, wire};
+use crate::{broker, config::Policy, jail, refusal, wire};
 use std::{
     ffi::OsString,
     fs::File,

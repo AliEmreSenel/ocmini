@@ -206,12 +206,13 @@ Extensions use hooks to validate or transform operations and event subscriptions
 
 ## Sandboxed environments
 
-The sandbox also has an independent `ocmini-sandbox` binary target. Build or
-install it without ocmini, its tools, or its session database:
+The sandbox also ships a standalone `ocmini-sandbox` binary that runs one
+command without ocmini's tools or session database. `cargo install --path .`
+installs it next to `ocmini` (it needs the default `sandbox` feature):
 
 ```sh
-cargo build --release --locked -p ocmini-sandbox --bin ocmini-sandbox
-cargo install --path crates/ocmini-sandbox --locked --bin ocmini-sandbox
+cargo install --path . --locked                      # ocmini and ocmini-sandbox
+cargo install --path . --locked --bin ocmini-sandbox # only the sandbox
 
 ocmini-sandbox -- ls -la
 ocmini-sandbox --preset locked-down -C ~/project -- sh

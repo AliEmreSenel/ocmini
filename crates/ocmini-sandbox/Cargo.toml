@@ -19,7 +19,3 @@ futures = "0.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-raw", "proto-ipv4-fragmentation", "reassembly-buffer-size-65536", "fragmentation-buffer-size-65536"] }
-
-[[bin]]
-name = "ocmini-sandbox"
-path = "src/main.rs"

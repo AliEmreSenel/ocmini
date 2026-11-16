@@ -42,6 +42,12 @@ base64 = "0.22"
 name = "ocmini"
 path = "src/main.rs"
 
+# Standalone sandbox runner; installed with ocmini by `cargo install --path .`.
+[[bin]]
+name = "ocmini-sandbox"
+path = "src/bin/ocmini-sandbox.rs"
+required-features = ["sandbox"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
