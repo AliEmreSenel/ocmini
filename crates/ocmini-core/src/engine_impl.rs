@@ -139,6 +139,11 @@ impl Engine {
             if running.contains_key(&sid) {
                 return Ok(());
             }
+            let session = app
+                .store
+                .get_session(&sid)?
+                .ok_or_else(|| OperationError::not_found("Session not found"))?;
+            crate::sessions::start_sandbox(&app, &session)?;
             let cancel = self.claim(&mut running, &app, &sid, None)?;
             drop(running);
             let engine = self.clone();
@@ -177,6 +182,11 @@ impl Engine {
     }
 
     async fn drain(&self, app: App, sid: String, cancel: CancellationToken) {
+        #[cfg(feature = "sandbox")]
+        self.sandboxes
+            .lock()
+            .unwrap()
+            .insert(sid.clone(), Arc::downgrade(&app.sandbox));
         // Keep the ownership lease fresh while this instance owns the session,
         // so a sibling instance's restart recovery ignores its live work.
         let heartbeat = {

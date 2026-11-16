@@ -26,6 +26,17 @@ GET/PATCH/DELETE /api/session/{sessionID} read, update and remove sessions. GET 
 
 Agent and model selections persist through POST /api/session/{sessionID}/agent and /model. POST /move admits a directory move at a step boundary. Session reads expose saved location, model/agent selection, usage, busy/idle timestamps and the latest outcome. PATCH accepts archived:true/false; an archive-only request repeating the current state is a no-op. Archive state persists in the existing session record.
 
+Sandboxed moves retain the session's frozen grants and live runner. The runner
+checks that the destination directory is readable before changing the saved
+location; an inaccessible destination fails the move. Subsequent tools resolve
+relative paths from the new location. Moving does not add filesystem grants.
+
+Sandbox selection and effective settings persist in the existing session record.
+Restarts and resumed input retain the last settings, including CLI additions;
+workspace defaults only select a policy for sessions without saved settings.
+Explicit CLI additions update the saved settings, while a different preset
+replaces them. Children inherit the root policy and forks retain its settings.
+
 GET /api/session pages through the existing timestamp index with stable ID tie-breaking. It accepts limit (default 50), order, directory, project, search, parentID (including null for roots) and archived. Returned cursor.previous/cursor.next retain the filters and requested order. No extra maximum page size is imposed. Project-relative subpath filtering is explicitly unsupported; use directory.
 
 POST /api/session/{sessionID}/prompt accepts:

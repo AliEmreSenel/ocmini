@@ -13,6 +13,8 @@ pub enum Control {
         id: u64,
         method: String,
         args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<String>,
     },
     Cancel {
         id: u64,
@@ -351,7 +353,9 @@ pub async fn serve<F, Fut>(
     handler: F,
 ) -> io::Result<()>
 where
-    F: Fn(String, serde_json::Value, tokio_util::sync::CancellationToken) -> Fut + Clone + 'static,
+    F: Fn(String, serde_json::Value, Option<String>, tokio_util::sync::CancellationToken) -> Fut
+        + Clone
+        + 'static,
     Fut: std::future::Future<Output = Result<serde_json::Value, String>> + 'static,
 {
     use std::collections::HashMap;
@@ -364,10 +368,10 @@ where
     loop {
         tokio::select! {
             frame=frames.control()=>{match frame?{
-                Control::Request{id,method,args}=>{
+                Control::Request{id,method,args,directory}=>{
                     if id<=last{return Err(io::Error::other("request ids must increase"));}last=id;
                     let args=spill.unpack_async(args).await?;let token=CancellationToken::new();tokens.insert(id,token.clone());let handler=handler.clone();let spill=spill.clone();
-                    jobs.spawn_local(async move{let (success,value)=match handler(method,args,token).await{Ok(value)=>(true,value),Err(message)=>(false,Value::String(message))};let result=spill.pack_async(value).await.map(|value|(success,value)).unwrap_or_else(|e|(false,Value::String(e.to_string())));(id,result)});
+                    jobs.spawn_local(async move{let (success,value)=match handler(method,args,directory,token).await{Ok(value)=>(true,value),Err(message)=>(false,Value::String(message))};let result=spill.pack_async(value).await.map(|value|(success,value)).unwrap_or_else(|e|(false,Value::String(e.to_string())));(id,result)});
                 },
                 Control::Cancel{id}=>{if let Some(token)=tokens.get(&id){token.cancel();}},
                 _=>return Err(io::Error::other("unexpected runner frame")),

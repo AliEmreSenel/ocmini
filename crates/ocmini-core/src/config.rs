@@ -210,6 +210,40 @@ pub struct Config {
 }
 
 impl Config {
+    pub(crate) fn sandbox_preset(&self) -> Result<&str, String> {
+        let invalid = || {
+            "sandbox must be a preset name or an object containing only a string preset".to_owned()
+        };
+        match self.extra.get("sandbox") {
+            None => Ok("off"),
+            Some(Value::String(name)) => Ok(name),
+            Some(value) => {
+                let object = value.as_object().ok_or_else(invalid)?;
+                if object.keys().any(|key| key != "preset") {
+                    return Err(invalid());
+                }
+                match object.get("preset") {
+                    Some(value) => value.as_str().ok_or_else(invalid),
+                    None => Ok("off"),
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "sandbox"))]
+    pub(crate) fn check_sandbox_support(&self) -> Result<(), String> {
+        let configured = self
+            .sandbox_preset()
+            .map_err(|e| format!("Sandbox startup refused: {e}"))?;
+        let selected = std::env::var("OCMINI_SANDBOX_PRESET").ok();
+        if selected.as_deref().unwrap_or(configured) != "off" {
+            return Err(
+                "Sandbox startup refused: this binary was built without the sandbox feature".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn load() -> Result<Config, String> {
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self::load_for(&directory.to_string_lossy())
@@ -784,6 +818,33 @@ pub fn absolute_path(path: &Path, base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_preset_accepts_names_and_legacy_objects() {
+        for (value, expected) in [
+            (json!({}), "off"),
+            (json!({"sandbox":"off"}), "off"),
+            (json!({"sandbox":"locked-read"}), "locked-read"),
+            (
+                json!({"sandbox":{"preset":"workspace-write"}}),
+                "workspace-write",
+            ),
+            (json!({"sandbox":{}}), "off"),
+        ] {
+            let config: Config = serde_json::from_value(value).unwrap();
+            assert_eq!(config.sandbox_preset().unwrap(), expected);
+        }
+        for value in [
+            json!(null),
+            json!(true),
+            json!(["locked-read"]),
+            json!({"preset":false}),
+            json!({"preset":"off","unknown":true}),
+        ] {
+            let config: Config = serde_json::from_value(json!({"sandbox":value})).unwrap();
+            assert!(config.sandbox_preset().is_err());
+        }
+    }
     #[test]
     fn compaction_configuration_controls_headroom_and_retention() {
         let cfg: Config = serde_json::from_value(json!({"compaction": {

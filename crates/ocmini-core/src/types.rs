@@ -105,6 +105,12 @@ pub struct Session {
     pub parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<Vec<PermissionRule>>,
+    #[serde(
+        default,
+        rename = "ocminiSandbox",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sandbox: Option<Value>,
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -130,6 +136,7 @@ impl Session {
             },
             parent_id: None,
             permission: None,
+            sandbox: None,
             extra: Default::default(),
         }
     }

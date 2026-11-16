@@ -1,29 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 mod paths;
 pub use paths::PathContext;
+mod overrides;
+pub use overrides::Overrides;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Selection {
-    pub preset: String,
-}
-impl Default for Selection {
-    fn default() -> Self {
-        Self {
-            preset: "off".into(),
-        }
-    }
-}
-impl Selection {
-    pub fn name(&self) -> &str {
-        &self.preset
-    }
-}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Fs {
@@ -223,6 +208,30 @@ pub struct Policy {
     pub buffers: Buffers,
 }
 
+/// Effective preset before path expansion. Stored with a session so subsequent
+/// launches retain its settings without depending on mutable preset files.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    pub preset: String,
+    pub config: Value,
+}
+
+impl Settings {
+    pub fn apply(
+        &mut self,
+        context: &PathContext,
+        overrides: &Overrides,
+    ) -> Result<Option<Policy>, String> {
+        valid_name(&self.preset)?;
+        if self.config.get("extends").is_some() {
+            return Err("Saved sandbox settings must have resolved inheritance".into());
+        }
+        overrides.apply(&mut self.config)?;
+        validate(&self.preset, self.config.clone(), context)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
@@ -260,7 +269,41 @@ pub fn load_for(
     selection: &str,
     context: &PathContext,
 ) -> Result<Option<Policy>, String> {
-    valid_name(selection)?;
+    load_with_overrides(folder, selection, context, &Overrides::default())
+}
+
+pub fn load_with_overrides(
+    folder: &Path,
+    selection: &str,
+    context: &PathContext,
+    overrides: &Overrides,
+) -> Result<Option<Policy>, String> {
+    load_settings(folder, selection, context, overrides).map(|(_, policy)| policy)
+}
+
+pub fn load_settings(
+    folder: &Path,
+    selection: &str,
+    context: &PathContext,
+    overrides: &Overrides,
+) -> Result<(Settings, Option<Policy>), String> {
+    inspect_folder(folder, Some(selection), context, overrides)?
+        .ok_or_else(|| format!("Preset file not found: {selection}"))
+}
+
+pub fn validate_folder(folder: &Path, context: &PathContext) -> Result<(), String> {
+    inspect_folder(folder, None, context, &Overrides::default()).map(|_| ())
+}
+
+fn inspect_folder(
+    folder: &Path,
+    selection: Option<&str>,
+    context: &PathContext,
+    overrides: &Overrides,
+) -> Result<Option<(Settings, Option<Policy>)>, String> {
+    if let Some(selection) = selection {
+        valid_name(selection)?;
+    }
     let mut files = BTreeMap::new();
     for entry in std::fs::read_dir(folder).map_err(|e| format!("{}: {e}", folder.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -291,13 +334,24 @@ pub fn load_for(
     // Validate the entire folder, including presets not currently selected.
     let mut selected = None;
     for name in files.keys() {
-        let value = resolve(name, &files, &mut vec![])?;
-        let policy = validate(name, value, context)?;
-        if name == selection {
-            selected = Some(policy);
+        let mut value = resolve(name, &files, &mut vec![])?;
+        if Some(name.as_str()) == selection {
+            overrides
+                .apply(&mut value)
+                .map_err(|e| format!("Preset {name}: {e}"))?;
+        }
+        let policy = validate(name, value.clone(), context)?;
+        if Some(name.as_str()) == selection {
+            selected = Some((
+                Settings {
+                    preset: name.clone(),
+                    config: value,
+                },
+                policy,
+            ));
         }
     }
-    selected.ok_or_else(|| format!("Preset file not found: {selection}"))
+    Ok(selected)
 }
 fn valid_name(name: &str) -> Result<(), String> {
     if name.is_empty()
@@ -376,6 +430,9 @@ fn resolve(
 fn validate(name: &str, value: Value, context: &PathContext) -> Result<Option<Policy>, String> {
     let raw: Raw =
         serde_json::from_value(value.clone()).map_err(|e| format!("Preset {name}: {e}"))?;
+    if raw.off == Some(false) {
+        return Err(format!("Preset {name}: off must be true or omitted"));
+    }
     if raw.off == Some(true) || name == "off" {
         if value
             .as_object()
@@ -573,7 +630,7 @@ impl Policy {
     pub fn environment(
         &self,
         inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-    ) -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    ) -> Result<BTreeMap<std::ffi::OsString, std::ffi::OsString>, String> {
         let mut env = BTreeMap::new();
         for (key, value) in inherited {
             let name = key.to_string_lossy();
@@ -589,12 +646,12 @@ impl Policy {
                 env.insert(key, value);
             }
         }
-        let roots: BTreeSet<_> = self.fs.exec.iter().map(|p| p.as_os_str()).collect();
         env.insert(
             "PATH".into(),
-            std::env::join_paths(roots).unwrap_or_default(),
+            std::env::join_paths(&self.fs.exec)
+                .map_err(|e| format!("Invalid sandbox executable PATH: {e}"))?,
         );
-        env
+        Ok(env)
     }
 }
 
@@ -617,23 +674,42 @@ pub fn initialize(folder: &Path) -> Result<(), String> {
             "off",
             "read-only",
             "workspace-write",
-            "strict",
             "locked-down",
+            "read-all",
+            "read-all-net",
+            "locked-read",
         ] {
             let value = if name == "off" {
                 json!({"off":true})
             } else {
-                let mode = match name {
-                    "workspace-write" => "firewall",
-                    "strict" => "outbound-only",
-                    _ => "isolated",
+                let mode = if matches!(name, "workspace-write" | "read-all-net") {
+                    "firewall"
+                } else {
+                    "isolated"
                 };
+                let read_only = matches!(name, "read-only" | "locked-read");
+                let read_all = matches!(name, "read-all" | "read-all-net");
                 let mut net = json!({"mode":mode,"preview":{"mode":if mode == "isolated" {"off"} else {"auto-loopback"}}});
                 if mode == "firewall" {
                     net["inbound"] = json!({"default":"allow"});
                     net["outbound"] = json!({"default":"allow"});
                 }
-                json!({"fs":{"readable":["${system_readable}","${toolchains}","${workspace}"],"writable":if name=="read-only" {vec![]} else {vec!["${workspace}"]},"exec":["${system_exec}","${toolchains}"]},"tmp":true,"process_isolation":if name=="strict" || name=="locked-down" {"full"} else {"none"},"unix_sockets":"abstract","io_uring":true,"env":{"clear":true,"allow":["HOME","USER","TERM","COLORTERM","LANG","LC_*","TZ"],"deny":[]},"network":net})
+                let mut readable = if read_all {
+                    vec!["/"]
+                } else {
+                    vec!["${env:PATH}", "${workspace}"]
+                };
+                let mut exec = vec!["${env:PATH}"];
+                if cfg!(target_os = "linux") {
+                    if !read_all {
+                        readable.extend(["/usr", "/etc", "/lib"]);
+                        if !read_only {
+                            readable.extend(["/dev", "/proc", "/sys"]);
+                        }
+                    }
+                    exec.push("/lib");
+                }
+                json!({"fs":{"readable":readable,"writable":if read_only {vec![]} else {vec!["${workspace}"]},"exec":exec},"tmp":true,"process_isolation":if matches!(name,"locked-down"|"locked-read") {"full"} else {"none"},"unix_sockets":"abstract","io_uring":true,"env":{"clear":true,"allow":["HOME","USER","TERM","COLORTERM","LANG","LC_*","TZ"],"deny":[]},"network":net})
             };
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -674,6 +750,14 @@ mod tests {
     }
     fn base() -> Value {
         json!({"fs":{"readable":["/usr"],"writable":[],"exec":["/usr/bin"]},"env":{"clear":true},"network":{"mode":"isolated"}})
+    }
+    #[test]
+    fn off_presets_refuse_an_explicit_false_flag() {
+        assert!(validate("off", json!({"off":false})).is_err());
+        assert!(validate("custom", json!({"off":false})).is_err());
+        assert!(validate("off", json!({})).unwrap().is_none());
+        assert!(validate("off", json!({"off":true})).unwrap().is_none());
+        assert!(validate("custom", json!({"off":true})).unwrap().is_none());
     }
     #[test]
     fn schema_refuses_unknown_missing_and_incompatible_keys() {
@@ -779,9 +863,9 @@ mod tests {
         let folder = root.path().join("presets");
         initialize(&folder).unwrap();
         assert!(load(&folder, "off").unwrap().is_none());
-        std::fs::remove_file(folder.join("strict.json")).unwrap();
+        std::fs::remove_file(folder.join("locked-read.json")).unwrap();
         initialize(&folder).unwrap();
-        assert!(load(&folder, "strict").is_err());
+        assert!(load(&folder, "locked-read").is_err());
         std::fs::write(folder.join("broken.json"), "[]").unwrap();
         assert!(load(&folder, "off").is_err());
     }
@@ -822,10 +906,32 @@ mod tests {
         initialize(&folder).unwrap();
         let before = std::fs::read(folder.join("workspace-write.json")).unwrap();
         let template: Value = serde_json::from_slice(&before).unwrap();
-        assert_eq!(
-            template["fs"]["readable"],
-            json!(["${system_readable}", "${toolchains}", "${workspace}"])
-        );
+        let readable = template["fs"]["readable"].as_array().unwrap();
+        assert!(readable.contains(&json!("${workspace}")));
+        assert!(readable.contains(&json!("${env:PATH}")));
+        assert!(template["fs"]["exec"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("${env:PATH}")));
+        let read_only: Value =
+            serde_json::from_slice(&std::fs::read(folder.join("read-only.json")).unwrap()).unwrap();
+        for path in ["/dev", "/proc", "/sys"] {
+            assert!(!read_only["fs"]["readable"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(path)));
+        }
+        for paths in template["fs"].as_object().unwrap().values() {
+            for path in paths.as_array().unwrap() {
+                let path = path.as_str().unwrap();
+                assert!(!path.contains("${system_readable}"), "{path}");
+                assert!(!path.contains("${system_exec}"), "{path}");
+                assert!(!path.contains("${toolchains}"), "{path}");
+                assert!(!path.contains("${home}"), "{path}");
+                assert!(!path.contains("CARGO_HOME"), "{path}");
+                assert!(!path.contains("RUSTUP_HOME"), "{path}");
+            }
+        }
         for name in ["first", "second"] {
             let path = root.path().join(name);
             let context = PathContext::current(&path).unwrap();
@@ -839,5 +945,136 @@ mod tests {
             before,
             std::fs::read(folder.join("workspace-write.json")).unwrap()
         );
+    }
+
+    #[test]
+    fn revised_presets_have_distinct_read_write_and_network_contracts() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("presets");
+        initialize(&folder).unwrap();
+        assert!(!folder.join("strict.json").exists());
+        let context = PathContext::current(root.path()).unwrap();
+        for name in ["read-all", "read-all-net", "locked-read"] {
+            let policy = load_for(&folder, name, &context).unwrap().unwrap();
+            assert!(policy.tmp);
+            if name == "locked-read" {
+                assert!(!policy.fs.readable.contains(&PathBuf::from("/")));
+                assert!(policy.fs.writable.is_empty());
+                assert_eq!(policy.process_isolation, ProcessIsolation::Full);
+            } else {
+                assert_eq!(policy.fs.readable, vec![PathBuf::from("/")]);
+                assert_eq!(policy.fs.writable, vec![root.path().to_path_buf()]);
+            }
+            if name == "read-all-net" {
+                assert_eq!(policy.network.mode, NetMode::Firewall);
+                assert_eq!(policy.network.inbound.default, Action::Allow);
+                assert_eq!(policy.network.outbound.default, Action::Allow);
+            } else {
+                assert_eq!(policy.network.mode, NetMode::Isolated);
+            }
+        }
+    }
+
+    #[test]
+    fn overrides_apply_after_inheritance_and_before_path_expansion_without_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("presets");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("base.json"), base().to_string()).unwrap();
+        let child = json!({"extends":"base","fs":{"readable":["/inherited"]}}).to_string();
+        std::fs::write(folder.join("custom.json"), &child).unwrap();
+        let mut overrides = Overrides::default();
+        overrides
+            .merge(json!({"fs":{"readable":["${workspace}"]}}))
+            .unwrap();
+        overrides.set("fs.exec", json!([])).unwrap();
+        overrides
+            .add("fs.readable", json!(["${home}/extra", "${home}/extra"]))
+            .unwrap();
+        overrides.add("fs.writable", json!("${workspace}")).unwrap();
+        for name in ["first", "second"] {
+            let mut context = PathContext::current(&root.path().join(name)).unwrap();
+            context.home = root.path().join("home");
+            let policy = load_with_overrides(&folder, "custom", &context, &overrides)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                policy.fs.readable,
+                vec![context.workspace.clone(), context.home.join("extra")]
+            );
+            assert_eq!(policy.fs.writable, vec![context.workspace.clone()]);
+            let original = load_for(&folder, "custom", &context).unwrap().unwrap();
+            assert_eq!(
+                original.fs.readable,
+                vec![PathBuf::from("/usr"), PathBuf::from("/inherited")]
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(folder.join("custom.json")).unwrap(),
+            child
+        );
+    }
+
+    #[test]
+    fn overrides_keep_schema_and_off_preset_validation() {
+        let context = PathContext::current(Path::new("/workspace")).unwrap();
+        for (key, value, error) in [
+            ("unknown", json!(true), "unknown field"),
+            (
+                "fs.exec",
+                json!(["/outside"]),
+                "exec root must also be readable",
+            ),
+            (
+                "fs.hide",
+                json!(["/usr/secret"]),
+                "requires process_isolation full",
+            ),
+            ("buffers.tcp_recv", json!(1), "invalid buffers"),
+            (
+                "network",
+                json!({"mode":"host","preview":{"mode":"off"}}),
+                "host mode refuses",
+            ),
+        ] {
+            let mut overrides = Overrides::default();
+            overrides.set(key, value).unwrap();
+            let mut value = base();
+            overrides.apply(&mut value).unwrap();
+            assert!(
+                super::validate("test", value, &context)
+                    .unwrap_err()
+                    .contains(error),
+                "{key}"
+            );
+        }
+        let mut overrides = Overrides::default();
+        for key in ["off", "extends", "fs..readable", ""] {
+            assert!(overrides.set(key, json!(true)).is_err(), "{key}");
+        }
+        assert!(overrides.merge(json!({"extends":"other"})).is_err());
+        assert!(overrides.merge(json!([])).is_err());
+        overrides.add("tmp", json!(true)).unwrap();
+        assert!(overrides
+            .apply(&mut json!({"tmp":false}))
+            .unwrap_err()
+            .contains("not a list"));
+        let mut overrides = Overrides::default();
+        overrides.set("tmp", json!(true)).unwrap();
+        let mut off = json!({"off":true});
+        overrides.apply(&mut off).unwrap();
+        assert!(super::validate("off", off, &context)
+            .unwrap_err()
+            .contains("policy keys in off preset"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unrepresentable_exec_paths_fail_instead_of_erasing_the_path() {
+        let policy = validate("test", json!({"fs":{"readable":["/usr","/has:colon"],"exec":["/usr/bin","/has:colon"]},"env":{"clear":true},"network":{"mode":"isolated"}})).unwrap().unwrap();
+        assert!(policy
+            .environment(std::iter::empty())
+            .unwrap_err()
+            .contains("Invalid sandbox executable PATH"));
     }
 }

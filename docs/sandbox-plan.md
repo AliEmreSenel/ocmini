@@ -82,9 +82,11 @@ Probes decide, per boot. No distro policy. macOS/Windows: requesting the sandbox
 
 ## Presets
 
-**Presets are files, not built-ins.** The preset folder — `<ocmini config dir>/sandbox/presets/` — holds one JSON file per preset and is the **only** source of presets at runtime; there is no built-in preset library in the binary. **First boot writes the defaults** into the folder (atomically, via the existing storage durability rules): `off` (unjailed), `read-only` (**`isolated`** net, preview `off`), `workspace-write` (**`firewall`** net — outbound **and** inbound default-allow over the broker, **automatic previews**: dev servers and package fetches work out of the box, §Automatic previews), `strict` (**`outbound-only`** net, `process_isolation: "full"`, ships preview `auto-loopback` — the inbound-deny default gates it off, §Automatic previews), `locked-down` (**`isolated`** net, `process_isolation: "full"`, preview `off`). Every shipped sandboxed preset carries `unix_sockets: "abstract"` (§UNIX sockets). Users edit, add, and delete files; a deleted preset is simply gone. The file's stem is the preset's name; `extends` names a file in the folder.
+**Presets are files.** The preset folder — `<ocmini config dir>/sandbox/presets/` — holds one JSON file per preset. First boot installs defaults atomically: `off`, `read-only`, `workspace-write`, `locked-down`, `read-all`, `read-all-net`, and `locked-read`. `strict` is no longer shipped. Users may still define custom presets with any valid name, including custom outbound-only policies. Edited or deleted files are not recreated.
 
-Every sandboxed preset **fence-reads**: `readable` = system base ∪ toolchain roots ∪ project ∪ session scratch + spill. No default preset reads the whole filesystem; `readable: ["/"]` exists only as an explicit custom preset and means **no read fence** (documented). Writes/exec are fenced per preset.
+`read-all` reads all filesystem paths and writes only the workspace, with isolated networking. `read-all-net` uses the same filesystem grants and permits inbound and outbound networking over the broker, including automatic previews. `locked-read` reads the restricted workspace/runtime roots, denies workspace writes and external networking, and uses full PID isolation. Existing `read-only`, `workspace-write`, and `locked-down` retain their contracts. Every active default uses private `/tmp`, filtered environment, `unix_sockets: "abstract"`, and `io_uring: true`.
+
+The restricted-read presets grant the workspace, explicit runtime roots, host PATH directories, and session machinery. Linux runtime read roots are `/usr`, `/etc`, and `/lib`; writable restricted-read presets also include `/dev`, `/proc`, and `/sys`. Execute roots are `${env:PATH}` plus `/lib` for the dynamic loader. The read-all variants use `readable: ["/"]` and intentionally have no read fence; their write and execute grants remain restricted. The host's ordinary filesystem permissions still apply. The file stem is the preset name; `extends` names another file in the folder.
 
 Presets store path templates rather than paths captured on first installation.
 Expansion runs in the trusted brain after inheritance and before validation and
@@ -101,20 +103,44 @@ without a shell or recursive expansion; the final paths must be absolute and
 contain no NUL or parent traversal. Literal path templates still refuse globs;
 metacharacters in an inserted workspace or home remain ordinary filename bytes.
 
-Three variables expand a whole `fs.*` list entry into existing paths:
-`${system_readable}` (system read roots), `${system_exec}` (system executable
-roots), and `${toolchains}` (Cargo, rustup, mise, nvm and fnm roots, plus existing
-`bin` directories). Toolchain discovery honors `CARGO_HOME`, `RUSTUP_HOME`,
-`MISE_DATA_DIR`, `NVM_DIR` and `FNM_DIR`, with current home/XDG defaults. Only these
-discovery lists omit missing optional roots; ordinary configured paths retain
-their enforce-or-refuse behavior. Shipped presets use these list variables and
-`${workspace}`. Loading performs no preset writes. Existing files and explicit
-absolute grants keep their meaning and are never automatically rewritten.
+Ordinary path variables substitute a single value. A complete `${env:NAME}`
+entry in any `fs.*` list uses the host platform's path-list syntax to expand
+one or more explicitly configured paths. This applies uniformly to all
+environment variables, including `PATH`; there is no variable-name special
+case. Duplicate grants are removed in first-occurrence order. Missing entries
+in read/write/exec environment path lists are skipped as in normal command lookup;
+missing hide targets are refused. Empty,
+relative, NUL-containing, or parent-traversing entries are refused. Variables containing multiple paths
+cannot be embedded in a larger path template. Values remain literal and are
+never recursively expanded. The host environment is read before the runner's
+environment filtering and PATH reconstruction, and the policy remains frozen
+for the session and its children.
+
+List aliases and automatic filesystem/toolchain discovery are unsupported.
+First-run setup writes fixed path templates without probing the host. All
+active presets use `${env:PATH}` and `${workspace}` with explicit Linux runtime
+requirements; there are no Cargo/rustup/mise/nvm/fnm guesses or saved installation
+paths. Environment path lists resolve at root session startup. Additional tool
+or configuration data roots are explicit user grants. Ordinary literal paths
+retain their enforce-or-refuse behavior. Loading performs no preset writes;
+existing files are preserved unless explicitly edited by the user.
 
 The fully resolved policy is frozen at root session start and inherited by its
 subagents. A child never re-expands `${workspace}` to widen its parent's fence.
+After a runtime restart, starting a saved child first resolves the root's policy
+and freezes it for all restored ancestors, without spawning unused ancestor
+runners. Saved input that wakes without new admission still initializes its
+runner before any tools execute. CLI resume scopes configuration to the saved
+workspace before policy selection.
 
-The session spill dir (tool output, `tool-output/<session_id>/`) is readable+writable in every sandboxed preset — the one always-writable data-dir carve-out.
+V2 moves update the directory used for each tool request while retaining the
+frozen policy and live runner. The runner must be able to read the destination
+directory before the saved location changes; otherwise the move fails. Moves
+never expand the filesystem fence or rebuild a failed runner. Host trees
+restored below private `/tmp` are mounted read-only unless a writable grant
+covers them; explicit writable descendants are restored as separate mounts.
+
+The session spill dir (tool output, `tool-output/<session_id>/`) is readable+writable in every sandboxed preset — the one always-writable data-dir carve-out. Output written or rewritten by the trusted brain, including hook transformations, uses this same directory. Caller-supplied session IDs must be single path components before any sandbox storage path is created. Host writes to reused scratch files use a pinned directory, refuse symlinks, and verify a regular file with exactly one link before truncating it.
 
 There is **no built-in secret list**. The fence is a positive allow-list: a path is readable iff it sits under a `readable` root — fencing `~/.ssh`, `auth.json` or anything else is `readable`/`hide` **user configuration**, never a special case in the design.
 
@@ -129,12 +155,12 @@ The key in an `off` preset → startup refusal (no jail). v9 socket rights: **no
 
 ## Config schema
 
-The config file selects the preset; the **preset file** carries the policy.
+The config file selects the preset with `"sandbox": "my-dev"` (the legacy `"sandbox": {"preset":"my-dev"}` form also works); the **preset file** carries the policy. Trusted CLI overrides can replace or add policy settings for the current invocation.
 
 Config file (ocmini's existing config):
 
 ```json
-"sandbox": { "preset": "my-dev" }
+"sandbox": "my-dev"
 ```
 
 `sandbox/presets/my-dev.json` (one preset per file — §Presets):
@@ -167,24 +193,59 @@ Config file (ocmini's existing config):
 
 **Keys** (all violations = startup refusal, §Config validation):
 
-- **`sandbox.preset`** (config file) — string, default `"off"`; must name a preset **file** in the folder (the file's stem).
+- **`sandbox`** (config file) — preset-name string, default `"off"`; the object form `{ "preset": "name" }` remains accepted. The selected name must identify a preset **file** in the folder (the file's stem).
 - **`extends`** (preset file) — optional parent = a file in the folder; cycles refused by name. Merge: `fs.*` lists **union** with the parent; `env`, `buffers`, `network` — the child's value **overrides** the parent's wholesale. Widening between presets is legal (library definitions compose into the session's **frozen** effective policy — no runtime merge exists, §Subagents).
 - **`fs.readable` / `fs.writable` / `fs.exec`** — absolute paths or runtime path templates (§Presets); directories cover their subtree; no globs (Landlock binds fds at boot — a future file matching a glob would silently be ungranted; a promise that can't be kept is a validation error). `"/"` = no fence (documented). Symlinks resolve at pre-open — the target is bound, pinned at boot. `exec` roots must also be `readable` after expansion (no implicit widening). Landlock rights.
 - **`fs.hide`** — absolute paths; each must sit under a granted root (a hide outside the fence is a no-op — refused). **Mount masking**, not fence subtraction (Landlock v6 cannot subtract a subtree from a broader directory grant): in the jail's mountns, propagation-private (§Jail boot), an **empty tmpfs dir** is bind-mounted over each hidden directory and an **empty file** over each hidden file, **before** Landlock is applied to the final mount layout; every mask is verified at boot — a missing target or failed mount = **startup refusal**. **Requires `process_isolation: "full"`** (fresh `procfs`, §Process isolation). No inherited fd and no procfs handle carries a hidden inode (fd whitelist, §Jail boot); the runner can never unmount a mask or create a namespace that reveals the underlying filesystem — the mount/namespace class, **incl. namespace-flagged `clone` and `clone3`**, is seccomp-denied and all capabilities are dropped (§Jail boot). **Alias paths are configuration, not mechanism:** a hidden file reachable through a hard link or bind path that the user's `readable`/`writable` grants explicitly expose stays readable — alias tracking (inode-wide, hard-link scanning) is out of scope. Model-blind: masked dirs read **empty**, masked files read **empty**.
 - **`tmp`** — bool, default `false`; `true` = fresh **tmpfs at `/tmp`** in the jail's mountns (tmpfs default sizing, no artificial cap).
-- **`process_isolation`** — `"none"` | `"signal"` | `"full"`, default `"none"` (§Process isolation): `full` = PID namespace + fresh procfs + PID-1 duties + signal scoping (`strict`/`locked-down`, **required by `fs.hide`**); `signal` = signal scoping with host visibility preserved, no pidns; `none` = neither. Migration: `pidns: true` → `full`, `pidns: false` → `none`.
+- **`process_isolation`** — `"none"` | `"signal"` | `"full"`, default `"none"` (§Process isolation): `full` = PID namespace + fresh procfs + PID-1 duties + signal scoping (`locked-read`/`locked-down`, **required by `fs.hide`**); `signal` = signal scoping with host visibility preserved, no pidns; `none` = neither. Migration: `pidns: true` → `full`, `pidns: false` → `none`.
 - **`io_uring`** — bool, default `true`; `false` denies `io_uring_setup`/`io_uring_enter`/`io_uring_register` independently of UNIX-socket policy. This closes the family-gate bypass for every `unix_sockets` value.
 - **`unix_sockets`** — string, default `"abstract"`: `off` | `abstract` | `deny` (§UNIX sockets); any other value refused; the key in an `off` preset → refusal. Independent of `network.mode`.
 - **`env`** — `clear` **required** (bool, no default); `allow`/`deny` are **name globs** (`LC_*`), deny beats allow; `PATH` rebuilt (§Environment).
 - **`network.mode`** — one of the five shorthands, **expanded at load** to `{inbound, outbound}`: `host` → allow/allow, rules refused (no netns to enforce); `outbound-only` → out-allow/in-deny; `inbound-only` → in-allow/out-deny; `isolated` → deny/deny; `firewall` → the user's blocks, `default` **required** each direction.
 - **`network.ech`** — `"allow"` (default) | `"deny"` — ClientHello ECH handling in rule-checked modes: `deny` rejects ClientHello messages carrying the ECH extension (0xfe0d, GREASE included); enforced only where the broker inspects TLS (TCP/443); **no QUIC/UDP coverage** (§Enforcement).
-- **`network.preview`** — `{ "mode": "auto-loopback" | "off" }` — automatic discovery + publication of jailed dev servers (§Automatic previews); **refused in `host` mode** (apps bind the host network directly). Shorthand expansion: net-isolated modes default `auto-loopback` (the inbound policy gates publication); `read-only`/`locked-down` ship `off`. No per-agent / per-project / per-port configuration.
+- **`network.preview`** — `{ "mode": "auto-loopback" | "off" }` — automatic discovery + publication of jailed dev servers (§Automatic previews); **refused in `host` mode** (apps bind the host network directly). Shorthand expansion: net-isolated modes default `auto-loopback` (the inbound policy gates publication); `read-only`/`locked-read`/`locked-down`/`read-all` ship `off`. No per-agent / per-project / per-port configuration.
 - **`network.inbound` / `network.outbound`** — `{ default, allow[], deny[] }`; rule fields per §Rules (protocol `tcp|udp|icmp|any` default `any`; IP/CIDR/domain; `icmp` address-only; domains tcp/443-only).
 - **`buffers`** — §Buffer sizing: positive integers; `tcp_recv`/`tcp_send` are per-connection **window capacities**, ≥ MTU (1500); **no upper bound** (no arbitrary limits).
 
+### CLI overrides
+
+`--sandbox-preset NAME` (or `OCMINI_SANDBOX_PRESET`) selects the preset file.
+Additional options work before or after `run`, `tui`, and `serve`:
+
+- `--sandbox-read PATH`, `--sandbox-write PATH`, `--sandbox-exec PATH`, and
+  `--sandbox-hide PATH` append individual filesystem entries. They support the
+  same simple path variables, absolute-path requirements, and validation as
+  preset files, with no implicit extra grants.
+- `--sandbox-network MODE` replaces the complete network block with the selected
+  shorthand. `firewall` explicitly starts with both direction defaults `deny`;
+  allow/deny lists can then be populated with additive settings.
+- `--sandbox-config FILE` loads a partial JSON policy object, once at invocation
+  startup. Objects merge recursively; arrays and scalar values replace earlier
+  values. Multiple files are processed in order. Relative filenames use the
+  launch directory; filesystem grants still require absolute resolved paths.
+- `--sandbox-set KEY=VALUE` replaces the named field, including a complete list
+  or object. Dotted keys address nested fields; values are JSON or bare strings.
+- `--sandbox-add KEY=VALUE` appends to the named list, creating it if absent.
+  A JSON array adds its elements; any other value adds one item. Exact duplicate
+  items are omitted. Adding to a scalar/object is an error.
+
+All path, file, replacement, and addition options are repeatable, including
+across the subcommand boundary. Precedence is: resolved preset inheritance,
+overlay files in order, the network shorthand, replacement settings in order,
+then additive settings. Files and overrides cannot change `off` or `extends`;
+select a different preset instead. Policy overrides on `off` are refused.
+
+Overrides are trusted CLI input. They never modify preset files or enter the tool environment. A root session stores its selected preset name and effective unexpanded preset document in `ocminiSandbox` within the existing session JSON. Creation includes the snapshot in the normal session transaction. Resumed settings are written only when they change; repeated tool turns do not rewrite them. No new table or storage service is needed. This internal field is reserved against public metadata updates and survives forks and metadata replacement.
+
+Selection precedence is: a different explicitly selected preset replaces the saved document; otherwise the saved document is the base; a session without saved settings uses the configured default. CLI overlays, replacements and additions then apply in their existing order. Selecting the same preset retains saved additions. Saved `off` remains off until another preset is explicitly selected. Validated settings persist after successful runner initialization. Legacy sessions acquire a snapshot on first activation. Templates expand for the actual session context when the runner starts, and the resulting runtime policy is frozen. Preset edits do not change an existing session's saved settings.
+
+Children inherit the root's frozen settings without reapplying CLI additions. Restored ancestry uses the root's saved settings. Forking a child copies the root's last settings even if the child's stored snapshot predates a root selection change. Feature-off builds refuse active or malformed saved policies before tool execution; an explicit `off` selection can disable a saved root policy. A changed snapshot requires the affected session to be idle and never respawns a failed runner.
+
+
 ## Config validation
 
-The sandbox config is **hard-validated** at startup: unknown keys are refused, `env.clear` is required (no default), `extends` cycles are refused by name, every list value (paths, globs, ports) is validated, buffer sizing values (§Buffer sizing) are range-checked, mode/key combinations are checked at expansion (§Network, §Presets): a `unix_sockets` value outside `off|abstract|deny`, an `ech` value outside `allow|deny`, **any policy key in an `off` preset**, **`fs.hide` without `process_isolation: "full"`**, a `preview` key (or any network rule) in `host` mode, `ech` in `host`/`isolated` (no broker to inspect). The preset folder is validated as config: an unparseable file, a non-object preset, a duplicate preset name (stem collision across files), a `preset`/`extends` naming a file that isn't there — all startup refusals. Any violation = startup refusal (exit 78). **Nothing is silently ignored**, files included.
+The preset library is hard-validated at process startup: unknown keys are refused, `env.clear` is required (no default), inheritance cycles are refused by name, paths and network rules are validated, buffer sizes are range-checked, and incompatible mode/key combinations are rejected. Unparseable or non-object files, duplicate preset names, and missing inheritance parents refuse startup. The effective policy is validated after loading the selected thread, so saved settings can outlive a deleted preset or a missing configured default. A fresh selection still requires its named preset file. `serve` additionally validates explicit process-wide CLI settings against the fresh-session default before accepting requests. CLI policy violations refuse initialization with exit 78; HTTP session operations return the corresponding error. No overlay or setting is silently ignored.
 
 ## Network
 
@@ -256,7 +317,7 @@ The main inbound use case is **development servers**. Automatic previews are a *
 - **Per-runner host-loopback identity:** the brain **leases a unique host loopback IP per active runner** from the `127.80.0.0/16` band (`127.80.0.2`, `127.80.0.3`, …) — every runner uses the same guest TUN address `198.18.0.1` without conflict. Publishing a guest listener on port N = the brain binds `127.80.0.<runner>:N` → `127.80.0.2:5173 → Agent A:5173`. Leasing is **cross-process-safe** (independent ocmini brain processes must not lease the same identity). A socket reserves an **(address, port) pair, not an address** — a bind on some arbitrary port claims no identity — so the lease is a **marker listener**: the brain binds `127.80.0.N:32765` (the **`LEASE_PORT`** constant: rootless-bindable, below the ephemeral range) and **holds it for the runner's lifetime**; every cooperating ocmini instance runs this same protocol, so contention (`EADDRINUSE` on the marker) → next candidate address. **Crash cleanup is automatic** (the kernel releases the marker socket with the process); released addresses are reused. Preview publication is **verified by its own bind**: an occupied port (`EADDRINUSE`, incl. a host wildcard `0.0.0.0` listener squatting it) → publish on a free port **where practical** and report the **actual preview URL** — a non-cooperating host process can squat an address, never an ocmini lease. Host listeners bind **only** the leased `127/8` addresses — never a public interface.
 - **Listener discovery:** the brain reads `/proc/<runner-host-pid>/net/tcp` + `tcp6` — the runner's netns table, a read-only mechanism; runs automatically for presets with preview enabled. Ports are published **as listeners appear**, removed **as they close**; each listener's **bound address is preserved** — it is the broker's destination (§Guest-localhost delivery). Only the brain manages publication.
 - **Inbound transport:** a host TCP connection accepted on the preview address → the brain opens a smoltcp TCP connection **into that runner's netns**, traversing the existing packet transport + TUN; payloads spliced host↔jail with socket-level backpressure (§Wire encoding) and **half-close** support. Ordinary TCP dev protocols — HTTP, HTTPS, WebSockets, hot-module reload — work over the raw splice: **no HTTP reverse proxy, no application-protocol inspection**. The guest app sees the virtual broker peer, not the host client's original IP (documented).
-- **Authorization (preview ⊥ firewall):** a preview connection is permitted **only when the effective inbound policy allows it**. `auto-loopback` does not override `inbound.default: deny`; explicit inbound deny rules stay authoritative; a port the policy forbids publishes **no usable endpoint**. `workspace-write` (allow/allow) works out of the box; `strict` (outbound-only) ships `auto-loopback` gated off by its inbound default; publication **never** overrides firewall rules.
+- **Authorization (preview ⊥ firewall):** a preview connection is permitted **only when the effective inbound policy allows it**. `auto-loopback` does not override `inbound.default: deny`; explicit inbound deny rules stay authoritative; a port the policy forbids publishes **no usable endpoint**. `workspace-write` and `read-all-net` (allow/allow) work out of the box; publication **never** overrides firewall rules.
 - **Security model:** the sandbox protects the host and resources outside the jail from model-executed code. **Inbound access from the host into a deliberately published jailed dev server is not a security boundary** — no redundant inbound-restriction mechanisms are added for previews (Not goals). The essential guarantee: enabling previews **never creates an unmediated jail→host route** and never bypasses the broker's outbound restrictions.
 
 ### Guest-localhost delivery (`route_localnet`)
@@ -284,7 +345,7 @@ Upstream smoltcp fixes TCP buffer capacity at socket creation and exposes no sup
 
 ## Process isolation (`process_isolation`)
 
-Three-mode key — `none` | `signal` | `full` (`full` in the default `strict` and `locked-down`, **required by `fs.hide`**). Every mode shares the fence/mount/net machinery; the key controls process **visibility** and **signaling**:
+Three-mode key — `none` | `signal` | `full` (`full` in the default `locked-read` and `locked-down`, **required by `fs.hide`**). Every mode shares the fence/mount/net machinery; the key controls process **visibility** and **signaling**:
 
 - **`none`** — no additional isolation beyond the shared mechanisms: the jail sees the host process table and signals per OS permissions (host-visible, documented).
 - **`signal`** — **no PID namespace**: host process visibility is **intentionally preserved** (documented, not a gap); `LANDLOCK_SCOPE_SIGNAL` (ABI v6, our 6.12 floor) confines signaling to the jail's Landlock domain — jail processes signal **only each other**; a signal to a host process outside the domain → `EPERM`. No PID-1 duties.
@@ -315,7 +376,7 @@ Future extension (user-side only, model-blind unchanged): the brain can map its 
 
 ## Environment
 
-Environment policy is config, per preset: `{ "env": { "clear": true, "allow": [...], "deny": [...] } }` — **clearing is optional**, not forced; `allow`/`deny` glob lists shape the inherited environment; **deny beats allow**. `clear: true` starts from an empty env and `allow` re-adds; `clear: false` inherits and `deny` removes. `PATH` is **rebuilt** from the declared exec/toolchain roots, never inherited. `clear` is a **required key** — no default: every preset (default and custom) states it explicitly, missing = config validation failure at startup. The default presets ship `clear: true` with a base allow-list (terminal basics, locale).
+Environment policy is config, per preset: `{ "env": { "clear": true, "allow": [...], "deny": [...] } }` — **clearing is optional**, not forced; `allow`/`deny` glob lists shape the inherited environment; **deny beats allow**. `clear: true` starts from an empty env and `allow` re-adds; `clear: false` inherits and `deny` removes. `PATH` is **rebuilt** from the resolved execute roots in their configured order, never inherited implicitly. The defaults explicitly include `${env:PATH}`. Roots that cannot be represented in `PATH` refuse startup instead of silently erasing it. `clear` is a **required key** — no default: every preset (default and custom) states it explicitly, missing = config validation failure at startup. The default presets ship `clear: true` with a base allow-list (terminal basics, locale).
 
 ## Subagents
 

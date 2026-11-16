@@ -53,8 +53,7 @@ impl EngineApi for Engine {
             .get_session(&sid)?
             .ok_or_else(|| OperationError::not_found("Session not found"))?;
         let app = app.for_directory(&session.directory)?;
-        #[cfg(feature = "sandbox")]
-        crate::blocking::run(|| app.sandbox.start(&session, &app.config))?;
+        crate::sessions::start_sandbox(&app, &session)?;
         #[cfg(feature = "sandbox")]
         self.sandboxes
             .lock()
@@ -434,6 +433,8 @@ impl EngineApi for Engine {
         state.app.perms.reject_all(sid);
         state.app.questions.reject_all(sid);
         crate::tools::cancel_background_jobs(sid);
+        #[cfg(feature = "sandbox")]
+        state.app.sandbox.stop_jobs(sid);
         true
     }
 

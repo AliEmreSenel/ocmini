@@ -51,7 +51,10 @@ if mode=='same-output': changes['output']=r['input']['output']
 if mode=='small': changes['output']='replacement'
 if mode=='large': changes['output']='REPLACED\n'+'a'*35000+'\nNEW_MIDDLE\n'+'b'*35000+'\nDONE\n'
 print(json.dumps({'set':changes}))"#;
-    for mode in ["empty", "allow", "title", "same-output", "small", "large"] {
+    let modes = ["empty", "allow", "title", "same-output", "small", "large"];
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    let modes = modes.into_iter().chain(std::iter::once("large-sandbox"));
+    for mode in modes {
         let mut provider = Provider::start(vec![
             tool_script(
                 "bash",
@@ -62,8 +65,19 @@ print(json.dumps({'set':changes}))"#;
         ])
         .await;
         let mut handler = registration("tool.execute.after", code);
-        handler["command"].as_array_mut().unwrap().push(json!(mode));
-        let server = TestServer::start(&provider, hook_config(vec![handler])).await;
+        handler["command"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(if mode == "large-sandbox" {
+                "large"
+            } else {
+                mode
+            }));
+        let mut config = hook_config(vec![handler]);
+        if mode == "large-sandbox" {
+            config["sandbox"] = json!({"preset":"workspace-write"});
+        }
+        let server = TestServer::start(&provider, config).await;
         std::fs::write(server.directory.join("input.txt"), &original).unwrap();
         let sid = server.session(allow()).await;
         server
@@ -100,10 +114,20 @@ print(json.dumps({'set':changes}))"#;
             assert!(tool["state"]["metadata"].get("outputPath").is_none());
         } else {
             let path = tool["state"]["metadata"]["outputPath"].as_str().unwrap();
+            if mode == "large-sandbox" {
+                assert_eq!(
+                    Path::new(path).parent().unwrap(),
+                    server
+                        .root
+                        .path()
+                        .join(".local/share/ocmini/tool-output")
+                        .join(&sid)
+                );
+            }
             assert_eq!(tool["state"]["metadata"]["truncated"], true);
             assert_eq!(
                 std::fs::read_to_string(path).unwrap(),
-                if mode == "large" {
+                if matches!(mode, "large" | "large-sandbox") {
                     replacement.as_str()
                 } else {
                     original.as_str()

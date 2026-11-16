@@ -469,10 +469,13 @@ pub async fn run_tool<A: Host>(
             );
         }
     }
-    crate::output::limit(result, crate::output::directory()).await
+    crate::output::limit(result, ctx.app.output_directory(&ctx.session_id)).await
 }
-pub async fn limit_output(out: ToolOutput) -> Result<ToolOutput, OperationError> {
-    crate::output::relimit(out, crate::output::directory()).await
+pub async fn limit_output(
+    out: ToolOutput,
+    directory: PathBuf,
+) -> Result<ToolOutput, OperationError> {
+    crate::output::relimit(out, directory).await
 }
 pub fn cleanup_outputs() -> Result<(), String> {
     let Some(value) = std::env::var_os("OCMINI_TOOL_OUTPUT_RETENTION_DAYS") else {

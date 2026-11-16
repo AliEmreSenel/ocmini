@@ -96,34 +96,8 @@ impl PathContext {
         }
         Ok(value)
     }
-    fn expand(&self, template: &Path) -> Result<Vec<PathBuf>, String> {
+    fn expand(&self, template: &Path) -> Result<PathBuf, String> {
         let template = template.to_str().ok_or("Preset paths must be UTF-8")?;
-        // These list variables only make sense as a whole list entry. Missing
-        // optional system/toolchain roots are discovered here, never baked into
-        // the preset files or silently skipped for ordinary explicit paths.
-        let system: &[&str] = match template {
-            "${system_readable}" => &[
-                "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys",
-            ],
-            "${system_exec}" => &[
-                "/usr/bin",
-                "/usr/sbin",
-                "/bin",
-                "/sbin",
-                "/usr/lib",
-                "/lib",
-                "/lib64",
-            ],
-            "${toolchains}" => return self.toolchains(),
-            _ => &[],
-        };
-        if !system.is_empty() {
-            return Ok(system
-                .iter()
-                .map(PathBuf::from)
-                .filter(|p| p.exists())
-                .collect());
-        }
         if template.contains(['*', '?', '[', '\0']) {
             return Err(format!(
                 "Preset paths cannot contain globs or NUL: {template}"
@@ -137,63 +111,77 @@ impl PathContext {
             let end = variable
                 .find('}')
                 .ok_or_else(|| format!("Unclosed sandbox path variable: {template}"))?;
-            expanded.push(self.scalar(&variable[..end])?);
+            let variable_name = &variable[..end];
+            let value = self.scalar(variable_name)?;
+            if variable_name.starts_with("env:") && std::env::split_paths(&value).nth(1).is_some() {
+                return Err(format!("Path-list variable ${{{variable_name}}} must occupy an entire filesystem-list entry"));
+            }
+            expanded.push(value);
             rest = &variable[end + 1..];
         }
         expanded.push(rest);
         let path = PathBuf::from(expanded);
         validate_path(&path)?;
-        Ok(vec![path])
-    }
-    fn toolchains(&self) -> Result<Vec<PathBuf>, String> {
-        // A service account may have no home directory. Discovery then omits
-        // those optional defaults; an explicit ${home} reference still fails.
-        let root = |key: &str, base: &Path, suffix: &str| {
-            std::env::var_os(key)
-                .map(PathBuf::from)
-                .or_else(|| base.is_absolute().then(|| base.join(suffix)))
-        };
-        let candidates = [
-            root("CARGO_HOME", &self.home, ".cargo"),
-            root("RUSTUP_HOME", &self.home, ".rustup"),
-            root("MISE_DATA_DIR", &self.data_home, "mise"),
-            root("NVM_DIR", &self.home, ".nvm"),
-            root("FNM_DIR", &self.data_home, "fnm"),
-        ];
-        let mut paths = Vec::new();
-        for path in candidates.into_iter().flatten() {
-            validate_path(&path)?;
-            if path.exists() {
-                if !paths.contains(&path) {
-                    paths.push(path.clone());
-                }
-                let bin = path.join("bin");
-                if bin.exists() && !paths.contains(&bin) {
-                    paths.push(bin);
-                }
-            }
-        }
-        Ok(paths)
+        Ok(path)
     }
     pub(super) fn resolve(&self, fs: &mut Fs) -> Result<(), String> {
-        for list in [
-            &mut fs.readable,
-            &mut fs.writable,
-            &mut fs.exec,
-            &mut fs.hide,
+        for (list, hide) in [
+            (&mut fs.readable, false),
+            (&mut fs.writable, false),
+            (&mut fs.exec, false),
+            (&mut fs.hide, true),
         ] {
             let mut expanded = Vec::new();
             for template in &*list {
-                for path in self.expand(template)? {
-                    if !expanded.contains(&path) {
-                        expanded.push(path);
-                    }
+                let environment = template
+                    .to_str()
+                    .and_then(|s| s.strip_prefix("${"))
+                    .and_then(|s| s.strip_suffix('}'))
+                    .filter(|s| s.starts_with("env:") && !s.contains(['{', '}']));
+                if let Some(variable) = environment {
+                    append_environment_paths(
+                        &mut expanded,
+                        variable,
+                        &self.scalar(variable)?,
+                        hide,
+                    )?;
+                    continue;
+                }
+                let path = self.expand(template)?;
+                if !expanded.contains(&path) {
+                    expanded.push(path);
                 }
             }
             *list = expanded;
         }
         Ok(())
     }
+}
+
+fn append_environment_paths(
+    paths: &mut Vec<PathBuf>,
+    variable: &str,
+    value: &std::ffi::OsStr,
+    hide: bool,
+) -> Result<(), String> {
+    for path in std::env::split_paths(value) {
+        validate_path(&path).map_err(|e| format!("Sandbox path variable ${{{variable}}}: {e}"))?;
+        // Path lists may contain locations for tools that are not installed.
+        // Resolve only the supplied entries; never guess additional roots.
+        let exists = path
+            .try_exists()
+            .map_err(|e| format!("Sandbox path variable ${{{variable}}}: {e}"))?;
+        if hide && !exists {
+            return Err(format!(
+                "Sandbox path variable ${{{variable}}}: hide target does not exist: {}",
+                path.display()
+            ));
+        }
+        if exists && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
 }
 fn xdg(key: &str, root: &Path, suffix: &str) -> PathBuf {
     std::env::var_os(key)
@@ -287,7 +275,7 @@ mod tests {
             ("${data_home}/ocmini", ctx.data_home.join("ocmini")),
             ("${cache_home}/build", ctx.cache_home.join("build")),
         ] {
-            assert_eq!(ctx.expand(Path::new(template)).unwrap(), vec![expected]);
+            assert_eq!(ctx.expand(Path::new(template)).unwrap(), expected);
         }
     }
     #[test]
@@ -295,6 +283,9 @@ mod tests {
         let ctx = context();
         for template in [
             "${unknown}",
+            "${system_readable}",
+            "${system_exec}",
+            "${toolchains}",
             "${}",
             "${workspace",
             "${env:}",
@@ -316,5 +307,35 @@ mod tests {
         assert!(relative.expand(Path::new("/prefix/${user}")).is_err());
         relative.uid = None;
         assert!(relative.expand(Path::new("/run/user/${uid}")).is_err());
+    }
+
+    #[test]
+    fn environment_lists_preserve_literal_paths_and_remove_duplicate_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("space [literal] ${home}");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let missing = root.path().join("not-installed");
+        let value = std::env::join_paths([&first, &missing, &second, &first]).unwrap();
+        let mut paths = vec![first.clone()];
+        append_environment_paths(&mut paths, "env:MY_TOOLS", &value, false).unwrap();
+        assert_eq!(paths, vec![first, second]);
+        assert!(
+            append_environment_paths(&mut vec![], "env:MY_TOOLS", &value, true)
+                .unwrap_err()
+                .contains("hide target does not exist")
+        );
+    }
+
+    #[test]
+    fn environment_lists_refuse_empty_relative_and_traversing_entries() {
+        for invalid in ["", "relative", "/tools/../outside"] {
+            let value = std::env::join_paths(["/valid", invalid]).unwrap();
+            assert!(
+                append_environment_paths(&mut vec![], "env:MY_DIRS", &value, false).is_err(),
+                "{invalid}"
+            );
+        }
     }
 }

@@ -45,6 +45,13 @@ impl Jail {
             .filter(|p| p.exists())
             .collect();
         let mut preset = json!({"fs":{"readable":readable,"writable":[project],"exec":exec},"tmp":false,"process_isolation":"full","unix_sockets":"abstract","env":{"clear":true,"allow":["LANG"],"deny":[]},"network":network});
+        if extra.as_object_mut().unwrap().remove("readOnlyFixtures") == Some(Value::Bool(true)) {
+            std::fs::write(project.join("read-only"), "ORIGINAL").unwrap();
+            std::fs::create_dir(project.join("writable")).unwrap();
+            std::fs::write(project.join("writable-file"), "ORIGINAL").unwrap();
+            preset["fs"]["writable"] =
+                json!([project.join("writable"), project.join("writable-file")]);
+        }
         if extra.as_object_mut().unwrap().remove("maskFixtures") == Some(Value::Bool(true)) {
             let dir = project.join("secret-dir");
             std::fs::create_dir(&dir).unwrap();
@@ -107,6 +114,7 @@ impl Jail {
                 id,
                 method: method.into(),
                 args,
+                directory: None,
             },
         )
         .await
@@ -142,6 +150,33 @@ impl Jail {
         .unwrap()
     }
 }
+#[tokio::test]
+async fn private_tmp_preserves_read_only_host_trees_and_nested_write_grants() {
+    let mut jail = Jail::new(
+        json!({"mode":"isolated","preview":{"mode":"off"}}),
+        json!({"tmp":true,"readOnlyFixtures":true}),
+    )
+    .await;
+    let output = jail.bash("cat read-only; if printf escaped > read-only; then printf OVERWRITE_ALLOWED; fi; if touch forbidden; then printf CREATE_ALLOWED; fi; printf allowed > writable/new; printf allowed > writable-file; printf private > /tmp/private-file; cat writable/new writable-file /tmp/private-file".into()).await;
+    let output = output["output"].as_str().unwrap();
+    assert!(output.contains("ORIGINAL"), "{output}");
+    assert!(!output.contains("_ALLOWED"), "{output}");
+    assert!(output.contains("allowedallowedprivate"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(jail.project.join("read-only")).unwrap(),
+        "ORIGINAL"
+    );
+    assert_eq!(
+        std::fs::read_to_string(jail.project.join("writable/new")).unwrap(),
+        "allowed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(jail.project.join("writable-file")).unwrap(),
+        "allowed"
+    );
+    assert!(!jail.project.join("forbidden").exists());
+}
+
 #[tokio::test]
 async fn all_file_effects_and_shell_are_kernel_fenced() {
     let mut jail = Jail::new(

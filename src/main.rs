@@ -3,6 +3,9 @@ use ocmini_core::*;
 use ocmini_server::server;
 use ocmini_tui::{run, tui, RunArgs, TuiArgs};
 
+#[cfg(feature = "sandbox")]
+mod sandbox_args;
+
 #[derive(Parser)]
 #[command(version = OPENCODE_COMPAT_VERSION, about = "A compact OpenCode-compatible coding runtime")]
 struct Cli {
@@ -13,14 +16,29 @@ struct Cli {
     /// Select a sandbox preset file (also OCMINI_SANDBOX_PRESET)
     #[arg(long, global = true, value_name = "NAME")]
     sandbox_preset: Option<String>,
+    #[cfg(feature = "sandbox")]
+    #[command(flatten)]
+    sandbox: sandbox_args::SandboxArgs,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Start the interactive terminal chat (also the default)
-    Tui(TuiArgs),
+    Tui {
+        #[command(flatten)]
+        args: TuiArgs,
+        #[cfg(feature = "sandbox")]
+        #[command(flatten)]
+        sandbox: sandbox_args::SandboxArgs,
+    },
     /// Send one prompt and print the answer (like `opencode run`)
-    Run(RunArgs),
+    Run {
+        #[command(flatten)]
+        args: RunArgs,
+        #[cfg(feature = "sandbox")]
+        #[command(flatten)]
+        sandbox: sandbox_args::SandboxArgs,
+    },
     /// Inspect saved sessions
     Session {
         #[command(subcommand)]
@@ -32,6 +50,9 @@ enum Command {
         hostname: String,
         #[arg(long, default_value_t = 4096)]
         port: u16,
+        #[cfg(feature = "sandbox")]
+        #[command(flatten)]
+        sandbox: sandbox_args::SandboxArgs,
     },
     /// List available models
     Models {
@@ -51,6 +72,21 @@ enum Command {
     },
     /// Print the compatibility version
     Version,
+}
+
+#[cfg(feature = "sandbox")]
+impl Cli {
+    fn merge_sandbox(&mut self) {
+        let Some(
+            Command::Tui { sandbox, .. }
+            | Command::Run { sandbox, .. }
+            | Command::Serve { sandbox, .. },
+        ) = &mut self.command
+        else {
+            return;
+        };
+        self.sandbox.append(std::mem::take(sandbox));
+    }
 }
 
 #[derive(Subcommand)]
@@ -86,9 +122,9 @@ fn parse_hostname(value: &str) -> Result<String, String> {
 }
 
 async fn with_app<F: std::future::Future<Output = Result<(), String>>>(
+    app: engine::App,
     run: impl FnOnce(engine::App) -> F,
 ) -> Result<(), String> {
-    let app = engine::App::new()?;
     let runtime = app.hook_runtime.clone();
     let result = run(app).await;
     runtime.shutdown().await;
@@ -96,9 +132,30 @@ async fn with_app<F: std::future::Future<Output = Result<(), String>>>(
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
-    match cli.command.unwrap_or(Command::Tui(cli.tui)) {
-        Command::Tui(args) => with_app(|app| tui::run(app, args)).await,
-        Command::Run(args) => with_app(|app| run::run(app, args)).await,
+    #[cfg(feature = "sandbox")]
+    let cli = {
+        let mut cli = cli;
+        cli.merge_sandbox();
+        cli
+    };
+    let create_app = || {
+        #[cfg(feature = "sandbox")]
+        {
+            let overrides = cli.sandbox.overrides().map_err(ocmini_sandbox::refusal)?;
+            engine::App::new_with_sandbox_overrides(overrides)
+        }
+        #[cfg(not(feature = "sandbox"))]
+        {
+            engine::App::new()
+        }
+    };
+    match cli.command.unwrap_or(Command::Tui {
+        args: cli.tui,
+        #[cfg(feature = "sandbox")]
+        sandbox: Default::default(),
+    }) {
+        Command::Tui { args, .. } => with_app(create_app()?, |app| tui::run(app, args)).await,
+        Command::Run { args, .. } => with_app(create_app()?, |app| run::run(app, args)).await,
         Command::Session {
             command: SessionCommand::List { directory },
         } => {
@@ -109,8 +166,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Serve { hostname, port } => {
-            with_app(|app| server::serve(app, hostname, port)).await
+        Command::Serve { hostname, port, .. } => {
+            let app = create_app()?;
+            #[cfg(feature = "sandbox")]
+            app.sandbox.validate_cli_defaults(&app.config)?;
+            with_app(app, |app| server::serve(app, hostname, port)).await
         }
         Command::Version => {
             println!("{OPENCODE_COMPAT_VERSION}");
@@ -233,6 +293,19 @@ fn main() {
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
                 "TUI options must follow the 'tui' subcommand when using a subcommand",
+            )
+            .exit();
+    }
+    #[cfg(feature = "sandbox")]
+    if matches
+        .subcommand_name()
+        .is_some_and(|name| !matches!(name, "run" | "tui" | "serve"))
+        && matches.contains_id("sandbox_options")
+    {
+        command
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "Sandbox overrides require the default TUI or a 'run', 'tui', or 'serve' command",
             )
             .exit();
     }

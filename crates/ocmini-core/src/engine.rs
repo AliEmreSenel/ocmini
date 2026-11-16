@@ -185,27 +185,29 @@ pub struct App {
 
 impl App {
     pub fn new() -> Result<Self, String> {
-        let config = Config::load()?;
+        #[cfg(feature = "sandbox")]
+        {
+            Self::new_inner(Default::default())
+        }
         #[cfg(not(feature = "sandbox"))]
         {
-            let selected = std::env::var("OCMINI_SANDBOX_PRESET")
-                .ok()
-                .or_else(|| {
-                    config
-                        .extra
-                        .get("sandbox")
-                        .and_then(|v| v.get("preset"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| "off".into());
-            if selected != "off" {
-                return Err(
-                    "Sandbox startup refused: this binary was built without the sandbox feature"
-                        .into(),
-                );
-            }
+            Self::new_inner()
         }
+    }
+
+    #[cfg(feature = "sandbox")]
+    pub fn new_with_sandbox_overrides(
+        overrides: ocmini_sandbox::config::Overrides,
+    ) -> Result<Self, String> {
+        Self::new_inner(overrides)
+    }
+
+    fn new_inner(
+        #[cfg(feature = "sandbox")] overrides: ocmini_sandbox::config::Overrides,
+    ) -> Result<Self, String> {
+        let config = Config::load()?;
+        #[cfg(not(feature = "sandbox"))]
+        config.check_sandbox_support()?;
 
         crate::tools::cleanup_outputs()?;
         let directory = std::env::current_dir().unwrap_or_default();
@@ -228,7 +230,9 @@ impl App {
         Ok(Self {
             effects: Arc::new(Default::default()),
             #[cfg(feature = "sandbox")]
-            sandbox: Arc::new(crate::sandbox::Registry::new(&config)?),
+            sandbox: Arc::new(crate::sandbox::Registry::new_with_overrides(
+                &config, overrides,
+            )?),
             store,
             v2,
             config: Arc::new(config),
@@ -246,6 +250,10 @@ impl App {
 
     pub fn for_directory(&self, directory: &str) -> Result<Self, OperationError> {
         let config = Config::load_for(directory).map_err(OperationError::invalid)?;
+        #[cfg(not(feature = "sandbox"))]
+        config
+            .check_sandbox_support()
+            .map_err(OperationError::invalid)?;
         let hooks = self
             .hook_runtime
             .install(&config, directory)
@@ -281,6 +289,18 @@ impl App {
         scoped.config = Arc::new(config);
         scoped.hooks = hooks;
         Ok(scoped)
+    }
+
+    pub fn tool_output_directory(&self, session: &str) -> std::path::PathBuf {
+        #[cfg(feature = "sandbox")]
+        if self.sandbox.enabled(session) {
+            return std::path::PathBuf::from(crate::config::data_home())
+                .join("ocmini/tool-output")
+                .join(session);
+        }
+        #[cfg(not(feature = "sandbox"))]
+        let _ = session;
+        crate::tools::output::directory()
     }
 
     /// Producers attach immutable session scope before delivery receives an envelope.

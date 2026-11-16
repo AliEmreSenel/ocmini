@@ -335,7 +335,7 @@ pub(super) async fn execute_tool(
                 let out: ToolOutput = serde_json::from_value(result.input)
                     .map_err(|error| OperationError::from(error.to_string()))?;
                 if output_changed {
-                    tools::limit_output(out).await
+                    tools::limit_output(out, ctx.app.tool_output_directory(&ctx.session_id)).await
                 } else {
                     Ok(out)
                 }

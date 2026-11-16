@@ -544,3 +544,117 @@ async fn sandbox_preset_is_global_without_conflicting_with_subcommands() {
         assert!(String::from_utf8_lossy(&output.stdout).contains(&sid));
     }
 }
+
+#[cfg(feature = "sandbox")]
+#[tokio::test]
+async fn sandbox_overrides_refuse_non_execution_commands() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--sandbox-read", "/usr", "models"],
+        vec!["--sandbox-set", "tmp=true", "session", "list"],
+    ] {
+        let output = configured_command(root.path(), root.path())
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Sandbox overrides require"));
+    }
+}
+
+#[cfg(not(feature = "sandbox"))]
+#[tokio::test]
+async fn sandbox_free_binary_refuses_saved_active_policies_unless_explicitly_disabled() {
+    let provider = Provider::start(vec![text_script("Disabled explicitly", "")]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = server.session(allow()).await;
+    let store = ocmini_core::store::Store::open(
+        &server.root.path().join(".local/share/ocmini/ocmini.db"),
+        "saved-policy-test",
+    )
+    .unwrap();
+    store.mutate_session(&sid, |session| {
+        session.sandbox = Some(json!({"preset":"locked-read","config":{"fs":{"readable":["${workspace}"]},"env":{"clear":true},"network":{"mode":"isolated"}}}));
+        Ok(true)
+    }).unwrap();
+    let denied = configured_command(server.root.path(), &server.directory)
+        .args(["run", "--session", &sid, "--auto", "Must refuse"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status.code(),
+        Some(78),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let response = server
+        .post(
+            &format!("/session/{sid}/message"),
+            &prompt("msg_saved_active", "Must refuse"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let allowed = configured_command(server.root.path(), &server.directory)
+        .args([
+            "run",
+            "--session",
+            &sid,
+            "--auto",
+            "--sandbox-preset",
+            "off",
+            "Disable explicitly",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let saved = store.get_session(&sid).unwrap().unwrap().sandbox.unwrap();
+    assert_eq!(saved, json!({"preset":"off","config":{"off":true}}));
+}
+
+#[cfg(not(feature = "sandbox"))]
+#[tokio::test]
+async fn sandbox_free_binary_refuses_workspace_sandbox_requirements() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    for (name, sandbox) in [
+        ("restricted", json!({"preset":"locked-read"})),
+        ("restricted-name", json!("locked-read")),
+        ("malformed", json!({"preset":true})),
+    ] {
+        let directory = server.root.path().join(name);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("opencode.json"),
+            json!({"sandbox":sandbox}).to_string(),
+        )
+        .unwrap();
+        let response = server
+            .post("/session", &json!({"title":"Must refuse"}))
+            .header("x-opencode-directory", encode_directory(&directory))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{name}");
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("Sandbox startup refused:"));
+    }
+}

@@ -112,6 +112,9 @@ pub trait Host: Clone + Send + Sync + 'static {
         cancel: CancellationToken,
     ) -> Result<ToolOutput, OperationError>;
     fn remote(&self, session: &str) -> bool;
+    fn output_directory(&self, _session: &str) -> std::path::PathBuf {
+        crate::output::directory()
+    }
     fn release_file(&self, session: &str, handle: u64);
     async fn effect(
         &self,

@@ -92,13 +92,93 @@ pub async fn open_for_app(
     continue_last: bool,
 ) -> Result<Session, OperationError> {
     if id.is_some() || continue_last {
-        let session = open(&app.store, path, id, continue_last)?;
-        #[cfg(feature = "sandbox")]
-        crate::blocking::run(|| app.sandbox.start(&session, &app.config))?;
-        return Ok(session);
+        return open(&app.store, path, id, continue_last);
     }
     let path = directory(path.unwrap_or("."))?;
     create(app, Session::new("tui session", &path), None).await
+}
+
+pub fn start_sandbox(app: &App, session: &Session) -> Result<(), OperationError> {
+    #[cfg(feature = "sandbox")]
+    return crate::blocking::run(|| app.sandbox.start(session, app));
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let settings = disabled_sandbox(app, session)?;
+        if session.sandbox.as_ref() != Some(&settings) {
+            app.store.mutate_session(&session.id, |current| {
+                if current.sandbox.as_ref() == Some(&settings) {
+                    return Ok(false);
+                }
+                current.sandbox = Some(settings);
+                Ok(true)
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn prepare_sandbox(app: &App, session: &mut Session) -> Result<(), OperationError> {
+    #[cfg(feature = "sandbox")]
+    return crate::blocking::run(|| app.sandbox.prepare(session, app));
+    #[cfg(not(feature = "sandbox"))]
+    {
+        session.sandbox = Some(disabled_sandbox(app, session)?);
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "sandbox"))]
+fn disabled_sandbox(app: &App, session: &Session) -> Result<Value, OperationError> {
+    let refusal = || {
+        OperationError::invalid(
+            "Sandbox startup refused: this binary was built without the sandbox feature",
+        )
+    };
+    let is_off = |value: &Value| {
+        value.as_object().is_some_and(|o| o.len() == 2)
+            && value["preset"].as_str().is_some_and(|s| {
+                !s.is_empty()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            && value["config"] == json!({"off":true})
+    };
+    let mut parent = session.parent_id.clone();
+    let mut inherited = None;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = parent {
+        if id == session.id || !seen.insert(id.clone()) {
+            return Err(refusal());
+        }
+        let ancestor = app
+            .store
+            .get_session(&id)?
+            .ok_or_else(|| OperationError::not_found("Parent session not found"))?;
+        if ancestor.sandbox.is_some() {
+            inherited = ancestor.sandbox;
+        }
+        parent = ancestor.parent_id;
+    }
+    if let Some(settings) = inherited {
+        return if is_off(&settings) {
+            Ok(settings)
+        } else {
+            Err(refusal())
+        };
+    }
+    if std::env::var("OCMINI_SANDBOX_PRESET").as_deref() != Ok("off") {
+        if let Some(settings) = &session.sandbox {
+            return if is_off(settings) {
+                Ok(settings.clone())
+            } else {
+                Err(refusal())
+            };
+        }
+    }
+    app.config
+        .check_sandbox_support()
+        .map_err(OperationError::invalid)?;
+    Ok(json!({"preset":"off","config":{"off":true}}))
 }
 
 /// User/resource creation; automatic accounting and title updates use Store directly.
@@ -146,8 +226,7 @@ pub async fn create(
         .input;
     apply_public_fields(&mut session, &input, true)?;
     validate_parent(&app, &session)?;
-    #[cfg(feature = "sandbox")]
-    crate::blocking::run(|| app.sandbox.start(&session, &app.config))?;
+    prepare_sandbox(&app, &mut session)?;
     app.store.create_session(&session)?;
     app.hooks
         .emit(event::Session::Created { info: &session }, &context);
@@ -218,6 +297,7 @@ fn apply_public_fields(
             "share",
             "summary",
             "ocminiTitleSource",
+            "ocminiSandbox",
         ];
         if metadata.keys().any(|key| RESERVED.contains(&key.as_str())) {
             return Err(OperationError::invalid(
@@ -363,6 +443,22 @@ pub async fn fork(
         .await?
         .input;
     let mut fields = source.clone();
+    // A stored child's snapshot can predate its root's last explicit selection.
+    let mut parent = source.parent_id.clone();
+    let mut seen = std::collections::HashSet::from([source.id.clone()]);
+    while let Some(id) = parent {
+        if !seen.insert(id.clone()) {
+            return Err(OperationError::invalid("Session ancestry contains a cycle"));
+        }
+        let ancestor = app
+            .store
+            .get_session(&id)?
+            .ok_or_else(|| OperationError::not_found("Parent session not found"))?;
+        if ancestor.sandbox.is_some() {
+            fields.sandbox = ancestor.sandbox;
+        }
+        parent = ancestor.parent_id;
+    }
     fields.extra.clear();
     apply_public_fields(&mut fields, &input, true)?;
     if app.store.is_busy(&source.id)? {
@@ -373,12 +469,12 @@ pub async fn fork(
         .store
         .mutate_session(&forked.id, |session| {
             session.title = fields.title;
+            session.sandbox = fields.sandbox;
             session.extra.extend(fields.extra);
             Ok(true)
         })?
         .ok_or_else(|| OperationError::not_found("Session not found"))?;
-    #[cfg(feature = "sandbox")]
-    crate::blocking::run(|| app.sandbox.start(&session, &app.config))?;
+    start_sandbox(&app, &session)?;
     let created_context =
         json!({"directory":session.directory,"sessionID":session.id,"parentID":session.parent_id});
     app.hooks

@@ -3,11 +3,11 @@ use crate::{
     config::Config,
     types::{OperationError, Session},
 };
-use ocmini_sandbox::config::{Policy, Selection};
+use ocmini_sandbox::config::{Overrides, Policy, Settings};
 #[cfg(target_os = "linux")]
 use ocmini_sandbox::wire::{self, Control};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,45 +16,84 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 struct Entry {
     parent: Option<String>,
+    settings: Arc<Value>,
     policy: Option<Policy>,
     runner: Option<Arc<Runner>>,
 }
 pub struct Registry {
     entries: Mutex<HashMap<String, Entry>>,
     folder: PathBuf,
+    overrides: Overrides,
+    preset: Option<String>,
 }
 impl Registry {
     pub fn new(config: &Config) -> Result<Self, String> {
+        Self::new_with_overrides(config, Overrides::default())
+    }
+
+    pub fn new_with_overrides(config: &Config, overrides: Overrides) -> Result<Self, String> {
         let folder = PathBuf::from(crate::config::config_home()).join("opencode/sandbox/presets");
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         ocmini_sandbox::config::initialize(&folder).map_err(ocmini_sandbox::refusal)?;
         let registry = Self {
             entries: Default::default(),
             folder,
+            overrides,
+            preset: std::env::var("OCMINI_SANDBOX_PRESET").ok(),
         };
-        registry.policy(config, &cwd)?;
+        config.sandbox_preset().map_err(ocmini_sandbox::refusal)?;
+        // Both defaults and explicit CLI additions need the thread's saved
+        // settings before selection. Validate the library now, then validate
+        // the effective policy when the selected session is known.
+        let context =
+            ocmini_sandbox::config::PathContext::current(&cwd).map_err(ocmini_sandbox::refusal)?;
+        ocmini_sandbox::config::validate_folder(&registry.folder, &context)
+            .map_err(ocmini_sandbox::refusal)?;
         Ok(registry)
     }
-    fn policy(
+    /// A server's process-wide CLI policy must also work for new sessions.
+    pub fn validate_cli_defaults(&self, config: &Config) -> Result<(), String> {
+        if self.preset.is_some() || !self.overrides.is_empty() {
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            self.settings(config, &cwd, None, &self.overrides)?;
+        }
+        Ok(())
+    }
+    fn settings(
         &self,
         config: &Config,
         directory: &std::path::Path,
-    ) -> Result<Option<Policy>, String> {
-        let mut selection: Selection = serde_json::from_value(
-            config
-                .extra
-                .get("sandbox")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-        )
-        .map_err(ocmini_sandbox::refusal)?;
-        if let Ok(name) = std::env::var("OCMINI_SANDBOX_PRESET") {
-            selection.preset = name;
-        }
+        saved: Option<&Value>,
+        overrides: &Overrides,
+    ) -> Result<(Arc<Value>, Option<Policy>), String> {
+        let configured = config.sandbox_preset().map_err(ocmini_sandbox::refusal)?;
+        let saved: Option<Settings> = saved
+            .filter(|saved| {
+                self.preset
+                    .as_deref()
+                    .is_none_or(|name| saved["preset"].as_str() == Some(name))
+            })
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| ocmini_sandbox::refusal(format!("Invalid saved sandbox settings: {e}")))?;
         let context = ocmini_sandbox::config::PathContext::current(directory)
             .map_err(ocmini_sandbox::refusal)?;
-        let policy = ocmini_sandbox::config::load_for(&self.folder, selection.name(), &context)
-            .map_err(ocmini_sandbox::refusal)?;
+        let (settings, policy) = match saved {
+            Some(mut saved) => {
+                let policy = saved
+                    .apply(&context, overrides)
+                    .map_err(ocmini_sandbox::refusal)?;
+                (saved, policy)
+            }
+            _ => ocmini_sandbox::config::load_settings(
+                &self.folder,
+                self.preset.as_deref().unwrap_or(configured),
+                &context,
+                overrides,
+            )
+            .map_err(ocmini_sandbox::refusal)?,
+        };
         #[cfg(not(target_os = "linux"))]
         if policy.is_some() {
             return Err(ocmini_sandbox::refusal("sandbox requires Linux"));
@@ -63,30 +102,159 @@ impl Registry {
         if let Some(policy) = &policy {
             ocmini_sandbox::jail::probe(policy).map_err(ocmini_sandbox::refusal)?;
         }
-        Ok(policy)
+        let saved =
+            serde_json::to_value(settings).map_err(|e| ocmini_sandbox::refusal(e.to_string()))?;
+        Ok((Arc::new(saved), policy))
     }
-    pub fn start(&self, session: &Session, config: &Config) -> Result<(), OperationError> {
-        let mut entries = self.entries.lock().unwrap();
-        if entries.contains_key(&session.id) {
+    pub fn start(&self, session: &Session, app: &crate::engine::App) -> Result<(), OperationError> {
+        self.start_inner(session, app, true).map(|_| ())
+    }
+    pub fn prepare(
+        &self,
+        session: &mut Session,
+        app: &crate::engine::App,
+    ) -> Result<(), OperationError> {
+        session.sandbox = Some((*self.start_inner(session, app, false)?).clone());
+        Ok(())
+    }
+    fn verify_saved(
+        entries: &HashMap<String, Entry>,
+        id: &str,
+        session: Option<&Session>,
+        app: &crate::engine::App,
+    ) -> Result<(), OperationError> {
+        let mut root_id = id;
+        let mut root = entries.get(root_id).ok_or("Sandbox entry is unavailable")?;
+        while let Some(parent) = &root.parent {
+            root_id = parent;
+            root = entries
+                .get(root_id)
+                .ok_or("Sandbox ancestor is unavailable")?;
+        }
+        // The caller already loaded a root session. Descendants check the
+        // authoritative root record rather than their older copied snapshot.
+        if session
+            .is_some_and(|s| s.id == root_id && s.sandbox.as_ref() == Some(root.settings.as_ref()))
+        {
             return Ok(());
         }
-        let policy = match session.parent_id.as_ref().and_then(|p| entries.get(p)) {
-            Some(parent) => parent.policy.clone(),
-            None => self.policy(config, std::path::Path::new(&session.directory))?,
+        let current = app.store.get_session(root_id)?;
+        if current.as_ref().and_then(|s| s.sandbox.as_ref()) != Some(root.settings.as_ref()) {
+            return Err(OperationError::invalid(ocmini_sandbox::refusal(
+                "Saved sandbox settings changed; restart ocmini before resuming this session",
+            )));
+        }
+        Ok(())
+    }
+    fn start_inner(
+        &self,
+        session: &Session,
+        app: &crate::engine::App,
+        persist: bool,
+    ) -> Result<Arc<Value>, OperationError> {
+        let mut entries = self.entries.lock().unwrap();
+        if entries.contains_key(&session.id) {
+            Self::verify_saved(&entries, &session.id, Some(session), app)?;
+            let entry = entries.get_mut(&session.id).unwrap();
+            // An ancestor can have a frozen policy without having run yet.
+            // Failed runners remain present and are never respawned.
+            if entry.runner.is_none() {
+                if let Some(policy) = &entry.policy {
+                    entry.runner = Some(Runner::start(session, policy.clone())?);
+                }
+            }
+            return Ok(entry.settings.clone());
+        }
+        let mut ancestors = Vec::new();
+        let mut next = session.parent_id.clone();
+        let mut seen = HashSet::new();
+        let inherited = loop {
+            let Some(parent) = next else {
+                break None;
+            };
+            if let Some(entry) = entries.get(&parent) {
+                Self::verify_saved(&entries, &parent, None, app)?;
+                break Some((entry.settings.clone(), entry.policy.clone()));
+            }
+            if parent == session.id || !seen.insert(parent.clone()) {
+                return Err(OperationError::invalid("Session ancestry contains a cycle"));
+            }
+            let ancestor = app
+                .store
+                .get_session(&parent)?
+                .ok_or_else(|| OperationError::not_found("Parent session not found"))?;
+            next = ancestor.parent_id.clone();
+            ancestors.push(ancestor);
+        };
+        let (settings, policy) = match inherited {
+            Some(inherited) => inherited,
+            None => {
+                let root = ancestors.last().unwrap_or(session);
+                let config = if root.directory == session.directory {
+                    None
+                } else {
+                    Some(Config::load_for(&root.directory).map_err(OperationError::invalid)?)
+                };
+                self.settings(
+                    config.as_ref().unwrap_or(&app.config),
+                    std::path::Path::new(&root.directory),
+                    root.sandbox.as_ref(),
+                    &self.overrides,
+                )?
+            }
         };
         let runner = match &policy {
             Some(policy) => Some(Runner::start(session, policy.clone())?),
             None => None,
         };
+        let save = || -> Result<(), OperationError> {
+            for saved in ancestors.iter().chain(persist.then_some(session)) {
+                if saved.sandbox.as_ref() != Some(settings.as_ref()) {
+                    if saved.sandbox.is_some() && app.store.is_busy(&saved.id)? {
+                        return Err(OperationError::busy(
+                            "Cannot change sandbox settings while the session tree is busy",
+                        ));
+                    }
+                    app.store.mutate_session(&saved.id, |current| {
+                        if current.sandbox.as_ref() == Some(settings.as_ref()) {
+                            return Ok(false);
+                        }
+                        current.sandbox = Some((*settings).clone());
+                        Ok(true)
+                    })?;
+                }
+            }
+            Ok(())
+        };
+        if let Err(error) = save() {
+            if let Some(runner) = &runner {
+                runner.fail("Cannot save sandbox settings");
+            }
+            return Err(error);
+        }
+        // Restore ancestry before starting a child, without spawning unused
+        // parent runners or letting later preset edits split the tree's policy.
+        for ancestor in ancestors.iter().rev() {
+            entries.insert(
+                ancestor.id.clone(),
+                Entry {
+                    parent: ancestor.parent_id.clone(),
+                    settings: settings.clone(),
+                    policy: policy.clone(),
+                    runner: None,
+                },
+            );
+        }
         entries.insert(
             session.id.clone(),
             Entry {
                 parent: session.parent_id.clone(),
+                settings: settings.clone(),
                 policy,
                 runner,
             },
         );
-        Ok(())
+        Ok(settings)
     }
     pub fn enabled(&self, id: &str) -> bool {
         self.entries
@@ -102,7 +270,8 @@ impl Registry {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, OperationError> {
-        self.request_retained(id, method, args, cancel, None).await
+        self.request_retained(id, method, args, cancel, None, None)
+            .await
     }
     pub async fn request_retained(
         &self,
@@ -111,6 +280,7 @@ impl Registry {
         args: Value,
         cancel: CancellationToken,
         lease: Option<Box<dyn Send>>,
+        directory: Option<&str>,
     ) -> Result<Value, OperationError> {
         let runner = self
             .entries
@@ -119,7 +289,9 @@ impl Registry {
             .get(id)
             .and_then(|e| e.runner.clone())
             .ok_or("Runner is unavailable")?;
-        runner.request(method, args, cancel, lease).await
+        runner
+            .request(method, args, cancel, lease, directory.map(str::to_owned))
+            .await
     }
     pub fn stop_jobs(self: &Arc<Self>, id: &str) {
         let mut ids = vec![id.to_owned()];
@@ -225,6 +397,19 @@ impl Drop for PendingGuard {
 impl Runner {
     #[cfg(target_os = "linux")]
     fn start(session: &Session, policy: Policy) -> Result<Arc<Self>, OperationError> {
+        // v2 accepts caller-supplied IDs. They must not become path traversal
+        // when selecting the session's private scratch and spill directories.
+        if session.id.is_empty()
+            || session.id.contains(['/', '\\', '\0'])
+            || !matches!(
+                std::path::Path::new(&session.id).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(OperationError::invalid(ocmini_sandbox::refusal(
+                "session ID must be a single path component",
+            )));
+        }
         let data = PathBuf::from(crate::config::data_home()).join("ocmini");
         let spill = data.join("tool-output").join(&session.id);
         let scratch = data.join("sandbox").join(&session.id);
@@ -278,6 +463,7 @@ impl Runner {
                                                 "discard",
                                                 serde_json::json!({"handle":handle}),
                                                 CancellationToken::new(),
+                                                None,
                                                 None,
                                             )
                                             .await;
@@ -357,6 +543,7 @@ impl Runner {
         args: Value,
         cancel: CancellationToken,
         lease: Option<Box<dyn Send>>,
+        directory: Option<String>,
     ) -> Result<Value, OperationError> {
         if cancel.is_cancelled() {
             return Err("Tool cancelled".into());
@@ -387,8 +574,16 @@ impl Runner {
                     return;
                 }
             };
-            if let Err(error) =
-                wire::write_control(&mut *writer, &Control::Request { id, method, args }).await
+            if let Err(error) = wire::write_control(
+                &mut *writer,
+                &Control::Request {
+                    id,
+                    method,
+                    args,
+                    directory,
+                },
+            )
+            .await
             {
                 state.fail(&format!("Runner failed: {error}"));
             }
@@ -438,7 +633,13 @@ pub fn runner_main() -> Result<(), String> {
         let effects=Arc::new(ocmini_tools::effects::Effects::default());let directory=spec.directory.to_string_lossy().into_owned();let spill=wire::Spill::new(spec.spill).map_err(|e|e.to_string())?;
         let mut term=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e|e.to_string())?;
         let relay_end=async move{match relay{Some(mut relay)=>relay.wait().await,None=>std::future::pending().await}};
-        tokio::select!{r=wire::serve(socket,spill,move|method,args,cancel|{let effects=effects.clone();let directory=directory.clone();async move{effects.dispatch(&directory,"runner",&method,args,cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)}})=>r.map_err(|e|e.to_string()),r=relay_end=>r.map_err(|e|e.to_string()),_=term.recv()=>Ok(())}
+        tokio::select!{r=wire::serve(socket,spill,move|method,args,requested_directory,cancel|{let effects=effects.clone();let directory=requested_directory.unwrap_or_else(||directory.clone());async move{
+            if method == "check_directory" {
+                std::fs::read_dir(&directory).map_err(|e|format!("Sandbox cannot enter directory {directory}: {e}"))?;
+                return Ok(Value::Null);
+            }
+            effects.dispatch(&directory,"runner",&method,args,cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)
+        }})=>r.map_err(|e|e.to_string()),r=relay_end=>r.map_err(|e|e.to_string()),_=term.recv()=>Ok(())}
     }))
 }
 
@@ -456,6 +657,7 @@ impl Runner {
         _: Value,
         _: CancellationToken,
         _: Option<Box<dyn Send>>,
+        _: Option<String>,
     ) -> Result<Value, OperationError> {
         Err(ocmini_sandbox::refusal("sandbox requires Linux").into())
     }

@@ -12,8 +12,7 @@ pub fn activate(
 ) -> Result<(crate::engine::App, Vec<MessageWithParts>), crate::types::OperationError> {
     crate::sessions::reject_correlated_reentry(&session.id)?;
     let app = app.for_directory(&session.directory)?;
-    #[cfg(feature = "sandbox")]
-    crate::blocking::run(|| app.sandbox.start(session, &app.config))?;
+    crate::sessions::start_sandbox(&app, session)?;
     let history = app.store.messages(&session.id)?;
     restore_selection(&history, request);
     Ok((app, history))

@@ -373,6 +373,9 @@ impl Host for App {
             false
         }
     }
+    fn output_directory(&self, session: &str) -> std::path::PathBuf {
+        self.tool_output_directory(session)
+    }
     async fn effect(
         &self,
         ctx: &ToolCtx<Self>,
@@ -388,7 +391,14 @@ impl Host for App {
             let coordinate_args = json!({"name":args["name"],"handle":args["handle"]});
             let value = self
                 .sandbox
-                .request_retained(&ctx.session_id, method, args, ctx.cancel.clone(), lease)
+                .request_retained(
+                    &ctx.session_id,
+                    method,
+                    args,
+                    ctx.cancel.clone(),
+                    lease,
+                    Some(&ctx.dir),
+                )
                 .await
                 .map_err(OperationError::from)?;
             if let Err(error) = self

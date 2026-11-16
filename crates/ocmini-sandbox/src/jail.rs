@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -51,6 +54,26 @@ fn open_path(path: &Path) -> io::Result<OwnedFd> {
     let path = cstr(path)?;
     let fd = checked(unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) } as _)?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd as _) })
+}
+
+fn scratch_file(directory: &std::fs::File, name: &std::ffi::CStr, bytes: &[u8]) -> io::Result<()> {
+    let fd = checked(unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0o600,
+        )
+    } as _)?;
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd as _) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(io::Error::other(
+            "scratch file must be a regular file with one link",
+        ));
+    }
+    file.set_len(0)?;
+    file.write_all(bytes)
 }
 #[repr(C)]
 struct Rule {
@@ -169,6 +192,12 @@ pub fn spawn_at(spec: RuntimeSpec, executable: &Path) -> Result<Child, String> {
 fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
     probe(&spec.policy).map_err(io::Error::other)?;
     std::fs::create_dir_all(&spec.scratch)?;
+    // Tools can write their scratch directory. Pin it and refuse symlinks or
+    // hard links before touching files left by an earlier runner.
+    let scratch = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&spec.scratch)?;
     std::fs::create_dir_all(&spec.spill)?;
     let (control, child_control) = wire::socketpair()?;
     let packet_pair = if spec.policy.network.mode.mediated() {
@@ -315,6 +344,14 @@ fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
     // A private /tmp must not hide explicitly granted projects/toolchains or
     // machinery directories stored under /tmp (including common test setups).
     if spec.policy.tmp {
+        let writable: Vec<PathBuf> = spec
+            .policy
+            .fs
+            .writable
+            .iter()
+            .chain([&spec.scratch, &spec.spill])
+            .map(|p| p.canonicalize())
+            .collect::<io::Result<_>>()?;
         let mut paths: Vec<PathBuf> = spec
             .policy
             .fs
@@ -332,9 +369,13 @@ fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
             .collect::<io::Result<_>>()?;
         paths.retain(|p| p.starts_with("/tmp") && p != Path::new("/tmp"));
         paths.sort_by_key(|p| (p.components().count(), p.clone()));
-        let mut bound: Vec<PathBuf> = vec![];
+        let mut bound: Vec<(PathBuf, bool)> = vec![];
         for path in paths {
-            if bound.iter().any(|p| path.starts_with(p)) {
+            let can_write = writable.iter().any(|p| path.starts_with(p));
+            if bound
+                .iter()
+                .any(|(p, write)| path.starts_with(p) && (*write || !can_write))
+            {
                 continue;
             }
             // Only restore a working directory if the policy already grants it.
@@ -351,20 +392,24 @@ fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
                 source: cstr(format!("/proc/self/fd/{}", fd.as_raw_fd()))?,
                 target: cstr(path.as_os_str())?,
                 kind: None,
-                flags: libc::MS_BIND | libc::MS_REC,
+                // Landlock's /tmp write grant also covers bind mounts below it.
+                // Protect read-only host trees at the mount, restoring explicit
+                // writable descendants as separate trees afterward.
+                flags: libc::MS_BIND | libc::MS_REC | if can_write { 0 } else { libc::MS_RDONLY },
             });
             fences.push(fd);
-            bound.push(path);
+            bound.push((path, can_write));
         }
     }
     if spec.policy.network.mode != NetMode::Host {
         let resolver = spec.scratch.join("resolv.conf");
-        std::fs::write(
-            &resolver,
+        scratch_file(
+            &scratch,
+            c"resolv.conf",
             if spec.policy.network.mode.mediated() {
-                "nameserver 198.18.0.2\noptions ndots:0\n"
+                b"nameserver 198.18.0.2\noptions ndots:0\n"
             } else {
-                "nameserver 127.0.0.1\noptions ndots:0\n"
+                b"nameserver 127.0.0.1\noptions ndots:0\n"
             },
         )?;
         // Resolve the host symlink before mounts (e.g. systemd-resolved).
@@ -382,7 +427,7 @@ fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
         let empty_dir = spec.scratch.join("mask-dir");
         let empty_file = spec.scratch.join("mask-file");
         std::fs::create_dir_all(&empty_dir)?;
-        std::fs::write(&empty_file, [])?;
+        scratch_file(&scratch, c"mask-file", &[])?;
         mounts.push(Mount {
             mask: true,
             ensure: false,
@@ -473,7 +518,11 @@ fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
         .map(|s| s.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
-    for (key, value) in spec.policy.environment(std::env::vars_os()) {
+    for (key, value) in spec
+        .policy
+        .environment(std::env::vars_os())
+        .map_err(io::Error::other)?
+    {
         let mut bytes = key.as_bytes().to_vec();
         bytes.push(b'=');
         bytes.extend_from_slice(value.as_bytes());
@@ -617,6 +666,25 @@ impl Boot {
                     );
                     self.check(2, fd);
                     self.trees[index] = fd as i32;
+                    if self.mounts[index].flags & libc::MS_RDONLY != 0 {
+                        let attr = libc::mount_attr {
+                            attr_set: libc::MOUNT_ATTR_RDONLY,
+                            attr_clr: 0,
+                            propagation: 0,
+                            userns_fd: 0,
+                        };
+                        self.check(
+                            2,
+                            libc::syscall(
+                                libc::SYS_mount_setattr,
+                                fd,
+                                c"".as_ptr(),
+                                libc::AT_EMPTY_PATH | 0x8000,
+                                &attr,
+                                std::mem::size_of::<libc::mount_attr>(),
+                            ),
+                        );
+                    }
                 }
             }
             let mut children_fd = -1;
@@ -645,11 +713,16 @@ impl Boot {
                     if mount.file {
                         let fd = libc::open(
                             path.as_ptr(),
-                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
                             0o600,
                         );
-                        self.check(2, fd as _);
-                        libc::close(fd);
+                        if fd < 0 {
+                            if *libc::__errno_location() != libc::EEXIST {
+                                self.fail(2);
+                            }
+                        } else {
+                            libc::close(fd);
+                        }
                     } else {
                         self.check(
                             2,
@@ -1154,4 +1227,25 @@ pub fn finish_runtime(policy: &Policy) -> io::Result<()> {
         return Err(io::Error::other("could not synchronize syscall policy"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reused_scratch_files_cannot_overwrite_symlink_or_hard_link_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, "KEEP").unwrap();
+        std::os::unix::fs::symlink(&victim, root.path().join("resolv.conf")).unwrap();
+        assert!(scratch_file(&directory, c"resolv.conf", b"replace").is_err());
+        std::fs::hard_link(&victim, root.path().join("mask-file")).unwrap();
+        assert!(scratch_file(&directory, c"mask-file", b"").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "KEEP");
+        scratch_file(&directory, c"new-file", b"long original").unwrap();
+        scratch_file(&directory, c"new-file", b"new").unwrap();
+        assert_eq!(std::fs::read(root.path().join("new-file")).unwrap(), b"new");
+    }
 }

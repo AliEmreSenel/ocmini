@@ -228,6 +228,7 @@ pub(super) async fn run_turn(
     let mut scoped = app.for_directory(&session.directory)?;
     scoped.hooks = app.hooks.clone();
     let app = scoped;
+    crate::sessions::start_sandbox(&app, &session)?;
     let uid = request
         .message_id
         .as_deref()
@@ -245,6 +246,19 @@ pub(super) async fn run_turn(
                     .as_str()
                     .ok_or("Missing move directory")?,
             )?;
+            #[cfg(feature = "sandbox")]
+            if app.sandbox.enabled(sid) {
+                app.sandbox
+                    .request_retained(
+                        sid,
+                        "check_directory",
+                        json!({}),
+                        cancel.clone(),
+                        None,
+                        Some(&directory),
+                    )
+                    .await?;
+            }
             app.store.v2_move(sid, &directory)?;
             app.v2.emit(sid,"session.moved",json!({"sessionID":sid,"location":{"directory":directory},"projectID":session.project_id}),true);
             return app
