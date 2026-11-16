@@ -900,7 +900,7 @@ mod tests {
         assert!(err.summary().contains("byte budget"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queue_wait_separate_from_command_time() {
         let settings = test_settings();
         let sem = Arc::new(Semaphore::new(1));
@@ -910,36 +910,38 @@ mod tests {
             vec!["sh", "-c", "sleep 0.02; echo '{\"action\":\"allow\"}'"],
             PayloadMode::Inline,
         );
-        resolved.registration.timeout_ms = Some(60);
+        resolved.registration.queue_timeout_ms = Some(5000);
 
-        let sem_clone = sem.clone();
-        let handle = tokio::spawn(async move {
-            Runtime::new()
-                .run(
-                    &resolved,
-                    &settings,
-                    ".",
-                    &json!({}),
-                    None,
-                    None,
-                    sem_clone,
-                    super::super::InvocationKind::Handler,
-                    "inv_q",
-                    "ses_1",
-                )
-                .await
-        });
+        let runtime = Runtime::new();
+        let envelope = json!({});
+        let run = runtime.run(
+            &resolved,
+            &settings,
+            ".",
+            &envelope,
+            None,
+            None,
+            sem,
+            super::super::InvocationKind::Handler,
+            "inv_q",
+            "ses_1",
+        );
+        tokio::pin!(run);
+        assert!(futures::poll!(&mut run).is_pending());
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Queue longer than the two-second command budget without a real wait.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        // The child process uses real time; resume before allowing it to start.
+        tokio::time::resume();
         drop(permit);
 
-        let outcome = handle.await.unwrap().expect("run should succeed");
-        assert!(outcome.queue_ms >= 70, "queue_ms was {}", outcome.queue_ms);
+        let outcome = run.await.expect("run should succeed");
         assert!(
-            outcome.execution_ms >= 15,
-            "execution_ms was {}",
-            outcome.execution_ms
+            outcome.queue_ms >= 3000,
+            "queue_ms was {}",
+            outcome.queue_ms
         );
+        assert_eq!(outcome.stdout, b"{\"action\":\"allow\"}\n");
     }
 
     #[tokio::test]
