@@ -1124,6 +1124,7 @@ dependencies = [
 name = "ocmini-sandbox"
 version = "0.4.0"
 dependencies = [
+ "clap",
  "futures",
  "glob",
  "idna",

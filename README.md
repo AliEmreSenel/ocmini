@@ -190,6 +190,34 @@ Extensions use hooks to validate or transform operations and event subscriptions
 
 ## Sandboxed environments
 
+The sandbox also has an independent `ocmini-sandbox` binary target. Build or
+install it without ocmini, its tools, or its session database:
+
+```sh
+cargo build --release --locked -p ocmini-sandbox --bin ocmini-sandbox
+cargo install --path crates/ocmini-sandbox --locked --bin ocmini-sandbox
+
+ocmini-sandbox -- ls -la
+ocmini-sandbox --preset locked-down -C ~/project -- sh
+ocmini-sandbox --preset workspace-write --sandbox-network isolated -- make test
+```
+
+The standalone command defaults to `read-only`, or `OCMINI_SANDBOX_PRESET` when
+set. `--preset` and `--sandbox-preset` select the same preset files described
+below; all `--sandbox-*` policy overrides work here too. `--presets-dir DIR`
+selects another preset directory, installing defaults only when it does not
+exist. It does not read ocmini's application configuration. `-C`/`--directory`
+sets the working directory and `${workspace}`. Place the program and its
+arguments after `--`; they execute directly. Use `sh -c '…'` for shell syntax.
+
+Standard input, output and error pass through, including terminal input and
+pipes. Commands keep their exit code; signal exits return `128 + signal`.
+Missing commands return 127, commands that cannot execute return 126, and sandbox
+startup failures return 78. Background descendants are stopped when the command
+finishes. Temporary sandbox machinery is removed afterward; no ocmini session
+is created. Linux enforcement and networking requirements below apply equally
+to this binary. Selecting `off` explicitly executes with normal host rights.
+
 Linux builds include sandbox support; the default preset is `off`. Select a preset
 in the existing OpenCode configuration:
 
