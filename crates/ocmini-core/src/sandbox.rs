@@ -106,6 +106,108 @@ impl Registry {
             serde_json::to_value(settings).map_err(|e| ocmini_sandbox::refusal(e.to_string()))?;
         Ok((Arc::new(saved), policy))
     }
+    /// Preset files available for selection, by name.
+    pub fn presets(&self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        let entries = std::fs::read_dir(&self.folder)
+            .map_err(|e| format!("{}: {e}", self.folder.display()))?;
+        for entry in entries {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+    /// A process-wide `--sandbox-preset` that every session must use.
+    pub fn forced(&self) -> Option<&str> {
+        self.preset.as_deref()
+    }
+    /// The preset a session without saved settings starts with.
+    pub fn default_preset<'a>(&'a self, config: &'a Config) -> Result<&'a str, String> {
+        match self.preset.as_deref() {
+            Some(preset) => Ok(preset),
+            None => config.sandbox_preset(),
+        }
+    }
+    /// Saved settings for a root session in `directory` using `preset`,
+    /// validated (including process overrides and the kernel probe) as a
+    /// launch would. Saving them before the first turn avoids starting a jail
+    /// under the default policy only to replace it.
+    pub fn settings_for(&self, directory: &str, preset: &str) -> Result<Value, OperationError> {
+        if let Some(forced) = self.preset.as_deref().filter(|forced| *forced != preset) {
+            return Err(OperationError::invalid(format!(
+                "This server was started with --sandbox-preset {forced}"
+            )));
+        }
+        let context = ocmini_sandbox::config::PathContext::current(std::path::Path::new(directory))
+            .map_err(ocmini_sandbox::refusal)?;
+        let (settings, _) = ocmini_sandbox::config::load_settings(
+            &self.folder,
+            preset,
+            &context,
+            &Overrides::default(),
+        )
+        .map_err(|e| OperationError::invalid(ocmini_sandbox::refusal(e)))?;
+        let saved =
+            serde_json::to_value(&settings).map_err(|e| ocmini_sandbox::refusal(e.to_string()))?;
+        let policy = settings
+            .clone()
+            .apply(&context, &self.overrides)
+            .map_err(|e| OperationError::invalid(ocmini_sandbox::refusal(e)))?;
+        #[cfg(not(target_os = "linux"))]
+        if policy.is_some() {
+            return Err(OperationError::invalid(ocmini_sandbox::refusal(
+                "sandbox requires Linux",
+            )));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(policy) = &policy {
+            ocmini_sandbox::jail::probe(policy)
+                .map_err(|e| OperationError::invalid(ocmini_sandbox::refusal(e)))?;
+        }
+        Ok(saved)
+    }
+    /// Changes an idle root session's saved sandbox. Its runner (and any
+    /// background jobs) stops; the next turn starts from the new settings.
+    pub fn select(
+        &self,
+        session: &Session,
+        preset: &str,
+        app: &crate::engine::App,
+    ) -> Result<Value, OperationError> {
+        if session.parent_id.is_some() {
+            return Err(OperationError::invalid(
+                "A subagent session uses its parent's sandbox",
+            ));
+        }
+        let settings = self.settings_for(&session.directory, preset)?;
+        let mut tree = vec![session.id.clone()];
+        let mut at = 0;
+        while at < tree.len() {
+            tree.extend(app.store.children(&tree[at])?.into_iter().map(|c| c.id));
+            at += 1;
+        }
+        for id in &tree {
+            if app.store.is_busy(id)? {
+                return Err(OperationError::busy(
+                    "Stop the session before changing its sandbox",
+                ));
+            }
+        }
+        app.store.mutate_session(&session.id, |current| {
+            if current.sandbox.as_ref() == Some(&settings) {
+                return Ok(false);
+            }
+            current.sandbox = Some(settings.clone());
+            Ok(true)
+        })?;
+        self.end(&session.id);
+        Ok(settings)
+    }
     pub fn start(&self, session: &Session, app: &crate::engine::App) -> Result<(), OperationError> {
         self.start_inner(session, app, true).map(|_| ())
     }

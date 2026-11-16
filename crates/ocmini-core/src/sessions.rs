@@ -117,6 +117,75 @@ pub fn start_sandbox(app: &App, session: &Session) -> Result<(), OperationError>
     }
 }
 
+/// Sandbox choices for clients: available presets, the default `config`
+/// selects, and a process-wide preset that overrides any choice. A default
+/// naming a missing preset is an error, since new sessions could not start.
+pub fn sandbox_choices(app: &App, config: &crate::config::Config) -> Result<Value, OperationError> {
+    #[cfg(feature = "sandbox")]
+    {
+        let presets = app.sandbox.presets().map_err(OperationError::from)?;
+        let default = app
+            .sandbox
+            .default_preset(config)
+            .map_err(OperationError::invalid)?;
+        if !presets.iter().any(|p| p == default) {
+            return Err(OperationError::invalid(format!(
+                "Unknown sandbox preset: {default}"
+            )));
+        }
+        Ok(
+            json!({"available":true,"presets":presets,"default":default,"forced":app.sandbox.forced()}),
+        )
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let _ = app;
+        config
+            .check_sandbox_support()
+            .map_err(OperationError::invalid)?;
+        Ok(json!({"available":false,"presets":["off"],"default":"off","forced":null}))
+    }
+}
+
+/// Saved settings selecting `preset` for a new root session in `directory`.
+pub fn sandbox_settings(app: &App, directory: &str, preset: &str) -> Result<Value, OperationError> {
+    #[cfg(feature = "sandbox")]
+    return crate::blocking::run(|| app.sandbox.settings_for(directory, preset));
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let _ = (app, directory);
+        if preset != "off" {
+            return Err(OperationError::invalid(
+                "Sandbox startup refused: this binary was built without the sandbox feature",
+            ));
+        }
+        Ok(json!({"preset":"off","config":{"off":true}}))
+    }
+}
+
+/// Changes an idle root session's sandbox for its next turn.
+pub fn select_sandbox(app: &App, session: &Session, preset: &str) -> Result<Value, OperationError> {
+    #[cfg(feature = "sandbox")]
+    return crate::blocking::run(|| app.sandbox.select(session, preset, app));
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let settings = sandbox_settings(app, &session.directory, preset)?;
+        if session.parent_id.is_some() {
+            return Err(OperationError::invalid(
+                "A subagent session uses its parent's sandbox",
+            ));
+        }
+        app.store.mutate_session(&session.id, |current| {
+            if current.sandbox.as_ref() == Some(&settings) {
+                return Ok(false);
+            }
+            current.sandbox = Some(settings.clone());
+            Ok(true)
+        })?;
+        Ok(settings)
+    }
+}
+
 fn prepare_sandbox(app: &App, session: &mut Session) -> Result<(), OperationError> {
     #[cfg(feature = "sandbox")]
     return crate::blocking::run(|| app.sandbox.prepare(session, app));

@@ -45,6 +45,13 @@ enum Command {
         command: SessionCommand,
     },
     /// Start the HTTP/SSE server
+    #[cfg_attr(
+        feature = "web",
+        command(
+            visible_alias = "web",
+            long_about = "Start the HTTP/SSE server and the browser interface at /"
+        )
+    )]
     Serve {
         #[arg(long, default_value = "127.0.0.1", value_parser = parse_hostname)]
         hostname: String,
@@ -170,7 +177,14 @@ async fn run(cli: Cli) -> Result<(), String> {
             let app = create_app()?;
             #[cfg(feature = "sandbox")]
             app.sandbox.validate_cli_defaults(&app.config)?;
-            with_app(app, |app| server::serve(app, hostname, port)).await
+            #[cfg(feature = "web")]
+            let (routes, notice) = (ocmini_web::router(), Some("ocmini web interface"));
+            #[cfg(not(feature = "web"))]
+            let (routes, notice) = (Default::default(), None);
+            with_app(app, |app| {
+                server::serve_with(app, hostname, port, routes, notice)
+            })
+            .await
         }
         Command::Version => {
             println!("{OPENCODE_COMPAT_VERSION}");
