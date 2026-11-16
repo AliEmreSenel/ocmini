@@ -719,7 +719,7 @@ async fn manual_summaries_use_the_same_tool_bound_and_measured_accounting() {
     let mut provider = Provider::start(vec![
         tool_script(
             "bash",
-            json!({"command":"printf 'BEGIN_%09000d_END' 0"}),
+            json!({"command":shell_command("cat tool-output.txt", "type tool-output.txt")}),
             "call_manual_summary",
         ),
         text_script("Before summary", ""),
@@ -731,6 +731,11 @@ async fn manual_summaries_use_the_same_tool_bound_and_measured_accounting() {
         json!({"compaction":{"auto":false,"tail_turns":0}}),
     )
     .await;
+    std::fs::write(
+        server.directory.join("tool-output.txt"),
+        format!("BEGIN_{}_END", "0".repeat(9000)),
+    )
+    .unwrap();
     let sid = server.session(allow()).await;
     server
         .post(
@@ -892,7 +897,7 @@ async fn compaction_summarizer_caps_tool_outputs_like_upstream() {
     let mut provider = Provider::start(vec![
         tool_script(
             "bash",
-            json!({"command": "printf 'x%.0s' $(seq 1 9000)"}),
+            json!({"command":shell_command("cat tool-output.txt", "type tool-output.txt")}),
             "call_0",
         ),
         Script::http_status_body(400, "maximum context length is 32000 tokens"),
@@ -901,6 +906,7 @@ async fn compaction_summarizer_caps_tool_outputs_like_upstream() {
     ])
     .await;
     let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(server.directory.join("tool-output.txt"), &big).unwrap();
     let id = server.session(allow()).await;
     let mut events = server.events().await;
     let response = server

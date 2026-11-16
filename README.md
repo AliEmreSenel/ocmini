@@ -187,3 +187,200 @@ The [OpenCode v2 migration plan](docs/opencode-v2-plan.md) compares our current 
 ## Hooks and event subscriptions
 
 Extensions use hooks to validate or transform operations and event subscriptions to observe execution. Register commands under `ocmini.hooks`, or consume the directory-scoped SSE stream through `GET /event`. Start with [hooks guide](docs/hooks.md) and the documentation-only [hook recipes](docs/hooks-examples.md); [hook reference](docs/hooks-reference.md) contains all 26 hooks, 49 events, and advanced settings. Inspect the active configuration with `ocmini debug hooks --json`. OpenCode JavaScript plugins use a separate interface.
+
+## Sandboxed environments
+
+Linux builds include sandbox support; the default preset is `off`. Select a preset
+in the existing OpenCode configuration:
+
+```json
+{"sandbox":"workspace-write"}
+```
+
+The object form `{"sandbox":{"preset":"workspace-write"}}` is also supported.
+The same setting applies to T3 Code's `ocmini serve` process, `ocmini run`, and the
+interactive TUI. A process-wide override is available as
+`--sandbox-preset NAME` or `OCMINI_SANDBOX_PRESET=NAME`.
+
+On first application startup, preset files are installed in
+`$XDG_CONFIG_HOME/opencode/sandbox/presets/` (normally
+`~/.config/opencode/sandbox/presets/`). The files define new preset selections:
+edit them, add presets, or remove them. Shipped presets are `off`, `read-only`,
+`workspace-write`, `locked-down`, `read-all`, `read-all-net`, and `locked-read`.
+The former `strict` preset is no longer shipped. Their execute lists use
+`${env:PATH}` directly, alongside explicit system runtime requirements. Preset
+generation performs no filesystem or toolchain discovery. Scratch and session
+tool-output storage are always granted separately. Existing preset files are preserved; replace any
+previously generated fixed project path with `${workspace}` to make it dynamic.
+
+| Preset | Host reads | Workspace writes | External networking | Full process isolation |
+| --- | --- | --- | --- | --- |
+| `off` (default) | Normal OS rights | Normal OS rights | Host network | No jail |
+| `read-only` | Granted paths | No | Isolated | No |
+| `workspace-write` | Granted paths | Yes | Inbound and outbound allowed | No |
+| `locked-down` | Granted paths | Yes | Isolated | Yes |
+| `read-all` | All paths | Yes | Isolated | No |
+| `read-all-net` | All paths | Yes | Inbound and outbound allowed | No |
+| `locked-read` | Granted paths | No | Isolated | Yes |
+
+Every active preset uses user/mount namespaces and filesystem fences. Full
+process isolation additionally creates a PID namespace with fresh `/proc` and
+signal scoping. The read-all variants use `fs.readable: ["/"]`; their writes
+remain restricted to the workspace and temporary machinery. The other active
+defaults read the workspace and listed system runtime roots. Execute roots use
+the host PATH directories plus `/lib` for the dynamic loader. `read-only` and
+`locked-read` omit broad `/proc`, `/sys`, and `/dev` read grants; the writable
+restricted-read defaults include those roots. All active defaults provide a writable private
+`/tmp`, scratch and session output even in `read-only`. Their environment is cleared except for `HOME`, `USER`, terminal
+settings, locale and timezone; `PATH` is rebuilt from executable roots. All ship
+`unix_sockets: "abstract"` and `io_uring: true`.
+
+Filesystem rules support `${workspace}`, `${home}`, `${user}`, `${uid}`, `${gid}`,
+`${config_home}`, `${data_home}`, `${cache_home}`, and `${env:NAME}`. For example:
+
+```json
+"fs": {
+  "readable": ["${env:PATH}", "${workspace}", "/usr", "/etc", "/lib"],
+  "writable": ["${workspace}"],
+  "exec": ["${env:PATH}", "/lib"]
+}
+```
+
+`${workspace}` uses the session directory, including T3's selected workspace,
+CLI directory selection, and resumed sessions. User, home and XDG variables
+describe the host process; `${uid}` and `${gid}` are its effective IDs before
+entering a user namespace. Ordinary path variables substitute a single value.
+A whole filesystem-list entry `${env:NAME}` expands the environment variable as
+a platform-separated path list (`:` on Linux, `;` on Windows). This works for any
+environment variable, including `${env:PATH}` and your own directory lists.
+Entries must be absolute, nonempty paths without `..`; duplicate grants are
+removed while preserving order. Missing entries in an environment path list
+are skipped for read/write/exec grants, matching normal command lookup.
+Missing `fs.hide` targets are refused. Explicit literal paths retain
+their enforce-or-refuse behavior. A variable containing several paths must
+occupy the whole list entry.
+Expansion reads the host environment before the sandbox filters environment
+variables or rebuilds `PATH`. For example, add all host PATH directories:
+
+```sh
+ocmini run --sandbox-preset workspace-write \
+  --sandbox-read '${env:PATH}' --sandbox-exec '${env:PATH}' "Your prompt"
+```
+
+The same syntax works in preset `fs.readable`, `fs.writable`, `fs.exec`, and
+`fs.hide` arrays. List aliases and implicit runtime path discovery are
+unsupported. Tools that need data outside their PATH directories require
+explicit read grants, which can use additional environment variables. Unknown,
+empty or unset variables and paths that resolve to relative paths or contain `..` are
+refused. Expansion runs once after preset inheritance, with no shell evaluation
+or recursive expansion.
+
+CLI overrides apply to the current invocation and work before or after `run`,
+`tui`, or `serve`. For example, add a data directory and change networking:
+
+```sh
+ocmini run --sandbox-preset workspace-write \
+  --sandbox-read '${home}/datasets' \
+  --sandbox-write '${home}/datasets' \
+  --sandbox-network outbound-only "Work with the dataset"
+```
+
+`--sandbox-read`, `--sandbox-write`, `--sandbox-exec`, and `--sandbox-hide` append
+paths and can be repeated. Executable roots must also be readable; hidden paths
+require `process_isolation: full`. Quote path variables to keep the shell from
+expanding them. Filesystem grants must resolve to absolute paths and exist when
+the jail starts. Executable roots must also be representable in the platform's
+`PATH`; invalid entries refuse startup instead of clearing command lookup.
+
+`--sandbox-network MODE` replaces the entire network block, with modes `host`,
+`outbound-only`, `inbound-only`, `isolated`, or `firewall`. Its `firewall` policy
+starts with inbound and outbound denied; add allowed rules explicitly:
+
+```sh
+ocmini serve --sandbox-preset workspace-write \
+  --sandbox-network firewall \
+  --sandbox-add 'network.outbound.allow={"protocol":"tcp","destination":"*.github.com","port":443}'
+```
+
+`--sandbox-config FILE` overlays a JSON policy object; repeat it to load several
+files in order. Objects merge recursively; arrays and scalar values replace the
+previous value. Relative overlay filenames use the launch directory.
+`--sandbox-set KEY=VALUE` replaces any policy field, such as
+`--sandbox-set 'fs.writable=["${workspace}","/scratch"]'` or
+`--sandbox-set process_isolation=full`. `--sandbox-add KEY=VALUE` appends to a
+list, accepting one value or a JSON array of values. Values can be JSON or bare
+strings; keys use dotted field names. Both options are repeatable.
+
+Precedence is the inherited preset, overlay files, the network flag, replacement
+settings in order, then additive settings. Overrides require an active preset
+and use the same validation as preset files.
+
+Each thread saves its preset name and effective settings in its existing session
+record, including CLI additions. Resume and recovery use these saved settings
+before workspace defaults, even if the preset file has changed or been removed. Extra CLI
+arguments modify the saved settings and become the new saved settings. Selecting
+a different `--sandbox-preset` starts from that preset and replaces previous
+additions; selecting the same preset retains them. Saved `off` also stays off.
+New and older sessions without saved settings use the configured default on
+their first activation. Subagents inherit the root's settings; forks retain the
+source tree's last settings. Path variables resolve when the runner starts.
+If another process changes a thread's saved sandbox while a server retains its
+old jail, that server refuses further execution for the thread with a restart
+message. Restart the server to load the saved settings; an existing jail never
+silently continues with stale grants.
+
+Sandboxed sessions require Linux 6.12 or later, Landlock ABI 6, and unprivileged
+user/mount namespaces. Network mediation additionally requires `/dev/net/tun`.
+Enforcement failures refuse startup with exit 78. Approvals cannot widen a jail.
+A running jail's policy stays frozen and is inherited by its subagents; a failed runner is never
+restarted and commands are never replayed. Caller-supplied session IDs used for
+sandbox storage must be a single path component. Reused scratch files are
+checked before writing; symlinks and hard links refuse startup. Tool output
+rewritten by hooks is saved within the session's readable spill directory.
+Resumed and recovered work initializes the sandbox before running tools. A child
+resumed before its parent freezes the root policy for the whole restored tree.
+V2 directory moves keep that policy: tools use the new directory, and a move
+outside the runner's readable filesystem is refused. Moving never adds grants.
+With private `/tmp`, restored host folders retain their configured write access;
+read-only folders stay read-only even below the writable temporary filesystem.
+
+`workspace-write` and `read-all-net` provide mediated networking and publish development servers
+on a per-runner `127.80.x.x` address. Preview URLs are printed as listeners appear.
+Inbound firewall rules remain authoritative. Localhost-only IPv4 servers work;
+servers bound exclusively to IPv6 `::1` are not published.
+
+`unix_sockets` accepts `off`, `abstract`, or `deny`. Independently, `io_uring: false`
+disables io_uring. With io_uring enabled, `IORING_OP_SOCKET` can bypass the seccomp
+socket-family gate, including UNIX and VSOCK restrictions. TCP buffers use the
+unmodified upstream smoltcp API with demand-paged backing and fixed configured
+window capacity; smoltcp is not vendored. See [the design](docs/sandbox-plan.md)
+for the policy schema and accepted compatibility limitations.
+
+Build with `cargo build --release --no-default-features` to omit the sandbox crate.
+Requesting an active sandbox in that binary is refused, including requests for
+other workspaces served by the same process. See the
+[readiness review](docs/sandbox-validation.md) for findings and verification.
+
+## Workspace
+
+The `ocmini` binary combines these library crates without changing the runtime's
+worker model:
+
+- `ocmini-core`: LLM lifecycle, sessions, storage, providers, hooks, permissions, and application adapters.
+- `ocmini-tools`: all built-in tools, their schemas, transactions, output handling, and tool hooks.
+- `ocmini-sandbox`: Linux enforcement, runner protocol, network policy, DNS/SNI mediation, and previews.
+- `ocmini-tui`: interactive terminal and one-shot terminal frontends.
+- `ocmini-server`: HTTP/SSE and OpenCode API routes.
+
+Run workspace checks with `cargo test --workspace --all-targets` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+
+History storage uses a compile-time `HistoryBackend` contract in `ocmini-core`.
+`Store<B>` dispatches directly to its backend type; `SelectedBackend` selects
+SQLite for the application. There is no runtime backend selector. Core owns
+fork remapping, recovery transformations, compaction policy and hook/turn
+orchestration. The backend supplies queries and atomic commits across history,
+admission receipts, session state and hook delivery. SQLite retains its existing
+database, migrations, WAL connections and paging behavior. Only SQLite ships
+today; another implementation can use the same core policies and select its type
+at build time.

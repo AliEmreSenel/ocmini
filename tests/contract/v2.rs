@@ -903,7 +903,7 @@ async fn v2_failed_compaction_settles_with_native_failure_and_history() {
 #[tokio::test]
 async fn v2_cascade_deletion_preserves_hook_vetoes_before_removing_children() {
     let provider = Provider::start(vec![]).await;
-    let config = json!({"ocmini":{"hooks":{"version":1,"handlers":[{"id":"veto-parent-delete","on":"session.delete.before","command":["python3","-c","import json,sys; r=json.load(sys.stdin); print(json.dumps({'deny':'Keep this parent'} if not r['input']['info'].get('parentID') else {}))"]}]}}});
+    let config = json!({"ocmini":{"hooks":{"version":1,"handlers":[{"id":"veto-parent-delete","on":"session.delete.before","command":[PYTHON,"-S","-c","import json,sys; r=json.load(sys.stdin); print(json.dumps({'deny':'Keep this parent'} if not r['input']['info'].get('parentID') else {}))"]}]}}});
     let server = TestServer::start(&provider, config).await;
     let sid = session(&server).await;
     let child = post(&server, "/api/session", json!({"parentID":sid})).await["data"]["id"]

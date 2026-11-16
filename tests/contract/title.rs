@@ -271,7 +271,7 @@ async fn title_hooks_receive_child_ancestry_from_the_producer() {
     )
     .await;
     let command = "import json,sys,pathlib; r=json.load(sys.stdin); pathlib.Path('child-title-hook').write_text(json.dumps(r['context'])); print('{}')";
-    let server = TestServer::start(&provider, json!({"title_model":"mock/test-model","ocmini":{"hooks":{"handlers":[{"id":"child-title","on":"model.headers.transform","match":{"session":"child","requestKind":"title"},"command":["python3","-c",command]}]}}})).await;
+    let server = TestServer::start(&provider, json!({"title_model":"mock/test-model","ocmini":{"hooks":{"handlers":[{"id":"child-title","on":"model.headers.transform","match":{"session":"child","requestKind":"title"},"command":[PYTHON,"-S","-c",command]}]}}})).await;
     let root = server.session(allow()).await;
     let child: Value = server
         .post("/session", &json!({"parentID":root,"permission":allow()}))

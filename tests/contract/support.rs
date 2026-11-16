@@ -200,11 +200,23 @@ pub(super) fn encode_directory(path: &Path) -> String {
         .collect()
 }
 
+pub(super) const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
+pub(super) fn shell_command<'a>(unix: &'a str, windows: &'a str) -> &'a str {
+    if cfg!(windows) {
+        windows
+    } else {
+        unix
+    }
+}
+
 pub(super) fn configured_command(root: &Path, directory: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ocmini"));
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        // Python hook fixtures exchange UTF-8 JSON on every platform.
+        .env("PYTHONUTF8", "1")
         .env("HOME", root)
         .env("XDG_CONFIG_HOME", root.join(".config"))
         .env("XDG_DATA_HOME", root.join(".local/share"))
@@ -213,6 +225,11 @@ pub(super) fn configured_command(root: &Path, directory: &Path) -> Command {
         .env("OPENCODE_SERVER_PASSWORD", PASSWORD)
         .env("OCMINI_RETRY_BASE_MS", "50")
         .current_dir(directory);
+    // Native Windows needs this to load Winsock's system providers.
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
     command
 }
 

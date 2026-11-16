@@ -4,10 +4,12 @@ use super::*;
 mod engine;
 
 fn registration(name: &str, code: &str) -> Value {
-    json!({"id":name.replace('.',"-"),"on":name,"command":["python3","-c",code]})
+    json!({"id":name.replace('.',"-"),"on":name,"command":[PYTHON,"-S","-c",code]})
 }
 fn hook_config(handlers: Vec<Value>) -> Value {
-    json!({"ocmini":{"hooks":{"version":1,"handlers":handlers}}})
+    // These fixtures test hook behavior; allow startup within the supported
+    // admission budget even when a shared runner is slow to start Python.
+    json!({"ocmini":{"hooks":{"version":1,"admissionChainTimeoutMs":5000,"handlers":handlers}}})
 }
 async fn wait_file(path: &Path) {
     tokio::time::timeout(Duration::from_secs(8), async {
@@ -51,19 +53,33 @@ if mode=='same-output': changes['output']=r['input']['output']
 if mode=='small': changes['output']='replacement'
 if mode=='large': changes['output']='REPLACED\n'+'a'*35000+'\nNEW_MIDDLE\n'+'b'*35000+'\nDONE\n'
 print(json.dumps({'set':changes}))"#;
-    for mode in ["empty", "allow", "title", "same-output", "small", "large"] {
+    let modes = ["empty", "allow", "title", "same-output", "small", "large"];
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    let modes = modes.into_iter().chain(std::iter::once("large-sandbox"));
+    for mode in modes {
         let mut provider = Provider::start(vec![
             tool_script(
                 "bash",
-                json!({"command":"cat input.txt"}),
+                json!({"command":shell_command("cat input.txt", "type input.txt")}),
                 "call_hook_spill",
             ),
             text_script("Done", ""),
         ])
         .await;
         let mut handler = registration("tool.execute.after", code);
-        handler["command"].as_array_mut().unwrap().push(json!(mode));
-        let server = TestServer::start(&provider, hook_config(vec![handler])).await;
+        handler["command"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(if mode == "large-sandbox" {
+                "large"
+            } else {
+                mode
+            }));
+        let mut config = hook_config(vec![handler]);
+        if mode == "large-sandbox" {
+            config["sandbox"] = json!({"preset":"workspace-write"});
+        }
+        let server = TestServer::start(&provider, config).await;
         std::fs::write(server.directory.join("input.txt"), &original).unwrap();
         let sid = server.session(allow()).await;
         server
@@ -100,10 +116,20 @@ print(json.dumps({'set':changes}))"#;
             assert!(tool["state"]["metadata"].get("outputPath").is_none());
         } else {
             let path = tool["state"]["metadata"]["outputPath"].as_str().unwrap();
+            if mode == "large-sandbox" {
+                assert_eq!(
+                    Path::new(path).parent().unwrap(),
+                    server
+                        .root
+                        .path()
+                        .join(".local/share/ocmini/tool-output")
+                        .join(&sid)
+                );
+            }
             assert_eq!(tool["state"]["metadata"]["truncated"], true);
             assert_eq!(
                 std::fs::read_to_string(path).unwrap(),
-                if mode == "large" {
+                if matches!(mode, "large" | "large-sandbox") {
                     replacement.as_str()
                 } else {
                     original.as_str()
@@ -148,7 +174,7 @@ for e in r['events']:
                 "id":format!("{kind}-messages"),
                 "on":["message.updated","message.part.updated","ocmini.turn.ended"],
                 "match":{"session":kind},
-                "command":["python3","-c",code,kind]
+                "command":[PYTHON,"-S","-c",code,kind]
             })
         })
         .collect::<Vec<_>>();
@@ -276,7 +302,7 @@ if not p.exists():
 assert p.read_text()==event['id']
 pathlib.Path('delivered').write_text(event['id'])
 print('{"ack":true}')"#;
-    let config = json!({"ocmini":{"hooks":{"observers":[{"id":"durable-terminal","on":"ocmini.turn.ended","delivery":"durable","retryAttempts":2,"retryDelayMs":1500,"command":["python3","-c",observer]}]}}});
+    let config = json!({"ocmini":{"hooks":{"observers":[{"id":"durable-terminal","on":"ocmini.turn.ended","delivery":"durable","retryAttempts":2,"retryDelayMs":1500,"command":[PYTHON,"-S","-c",observer]}]}}});
     let mut server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let value = server
@@ -335,7 +361,7 @@ time.sleep(1.5)"#;
 r=json.load(sys.stdin)
 pathlib.Path('recovered_event').write_text(json.dumps(r['events'][0]))"#;
     let mut config = hook_config(vec![registration("turn.end.after", after)]);
-    config["ocmini"]["hooks"]["observers"] = json!([{"id":"recover-terminal","on":"ocmini.turn.ended","delivery":"durable","command":["python3","-c",observer]}]);
+    config["ocmini"]["hooks"]["observers"] = json!([{"id":"recover-terminal","on":"ocmini.turn.ended","delivery":"durable","command":[PYTHON,"-S","-c",observer]}]);
     let mut server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let _response = server
@@ -496,7 +522,7 @@ time.sleep(60)"#;
     )
     .await;
     let sid = server.session(allow()).await;
-    let pending = tokio::spawn(
+    let mut pending = tokio::spawn(
         server
             .post(
                 &format!("/session/{sid}/prompt_async"),
@@ -504,7 +530,15 @@ time.sleep(60)"#;
             )
             .send(),
     );
-    wait_file(&server.directory.join("admission-entered")).await;
+    let entered = server.directory.join("admission-entered");
+    tokio::select! {
+        _ = wait_file(&entered) => {}
+        response = &mut pending => {
+            let response = response.unwrap().unwrap();
+            let status = response.status();
+            panic!("admission finished before the hook boundary: {status}: {}", response.text().await.unwrap());
+        }
+    }
     assert!(server
         .post(&format!("/session/{sid}/abort"), &json!({}))
         .send()
@@ -892,7 +926,7 @@ pathlib.Path('observer-finished').touch()"#;
         r#"import json,sys
 json.load(sys.stdin);print('{}')"#,
     )]);
-    config["ocmini"]["hooks"]["observers"] = json!([{"id":"observe-completion","on":["ocmini.turn.ended"],"command":["python3","-c",observer]}]);
+    config["ocmini"]["hooks"]["observers"] = json!([{"id":"observe-completion","on":["ocmini.turn.ended"],"command":[PYTHON,"-S","-c",observer]}]);
     let server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let mut filtered = server
@@ -989,13 +1023,17 @@ r=json.load(sys.stdin);r['input']['parts'][0]['text']+=' EXPANDED_HOOK';print(js
     let sid = server.session(allow()).await;
     let mut events = server.events().await;
     let request = json!({"messageID":"msg_hook_command","command":"review","arguments":"original"});
-    assert!(server
+    let response = server
         .post(&format!("/session/{sid}/command"), &request)
         .send()
         .await
-        .unwrap()
-        .status()
-        .is_success());
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        response.text().await.unwrap()
+    );
     let body = provider.request().await.to_string();
     assert!(body.contains("HOOK_ARGUMENT"));
     assert!(body.contains("EXPANDED_HOOK"));
@@ -1006,13 +1044,17 @@ r=json.load(sys.stdin);r['input']['parts'][0]['text']+=' EXPANDED_HOOK';print(js
             .count(),
         1
     );
-    assert!(server
+    let response = server
         .post(&format!("/session/{sid}/command"), &request)
         .send()
         .await
-        .unwrap()
-        .status()
-        .is_success());
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        response.text().await.unwrap()
+    );
     assert!(provider.requests.try_recv().is_err());
 }
 

@@ -15,7 +15,7 @@ async fn explicit_shell_timeouts_and_clamped_web_timeouts_execute_normally() {
     let provider = Provider::start(vec![
         tool_script(
             "bash",
-            json!({"command":"printf BASH_OK", "timeout":3_600_000}),
+            json!({"command":shell_command("printf BASH_OK", "echo BASH_OK"), "timeout":3_600_000}),
             "long-bash",
         ),
         tool_script(
@@ -48,7 +48,10 @@ async fn explicit_shell_timeouts_and_clamped_web_timeouts_execute_normally() {
     for tool in &tools {
         assert_eq!(tool["state"]["status"], "completed", "{tool}");
     }
-    assert_eq!(tools[0]["state"]["output"], "BASH_OK");
+    assert_eq!(
+        tools[0]["state"]["output"].as_str().unwrap().trim_end(),
+        "BASH_OK"
+    );
     assert_eq!(tools[1]["state"]["output"], "WEB_OK");
     web.abort();
 }
@@ -61,7 +64,9 @@ async fn tool_output_expiry_is_opt_in_and_rejects_invalid_settings() {
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("tool_expired.txt");
     std::fs::write(&path, "saved result").unwrap();
-    std::fs::File::open(&path)
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
         .unwrap()
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
         .unwrap();
@@ -117,7 +122,10 @@ async fn large_shell_and_web_results_save_full_output_and_replay_only_the_previe
     let web = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
     for (name, input) in [
-        ("bash", json!({"command":"cat input.txt"})),
+        (
+            "bash",
+            json!({"command":shell_command("cat input.txt", "type input.txt")}),
+        ),
         ("webfetch", json!({"url":url,"format":"text"})),
     ] {
         let mut provider = Provider::start(vec![
@@ -168,7 +176,9 @@ async fn large_shell_and_web_results_save_full_output_and_replay_only_the_previe
 
         // A resumed conversation must still be able to read the full result
         // even when it has been saved for longer than the former seven days.
-        std::fs::File::open(&path)
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
             .unwrap();
@@ -185,7 +195,15 @@ async fn large_shell_and_web_results_save_full_output_and_replay_only_the_previe
             .unwrap();
         let request = provider.request().await;
         let sent = request.to_string();
-        assert!(sent.contains(&path.to_string_lossy().into_owned()));
+        assert!(request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(path.to_str().unwrap()))
+            }));
         assert!(!sent.contains("MIDDLE_SENTINEL"));
         assert!(sent.len() < 65 * 1024);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);

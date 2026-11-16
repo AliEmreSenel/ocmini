@@ -1,0 +1,22 @@
+[package]
+name = "ocmini-sandbox"
+version.workspace = true
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+libc = "0.2"
+glob = "0.3"
+idna = "1"
+futures = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-raw", "proto-ipv4-fragmentation", "reassembly-buffer-size-65536", "fragmentation-buffer-size-65536"] }
+
+[dev-dependencies]
+tempfile = "3"

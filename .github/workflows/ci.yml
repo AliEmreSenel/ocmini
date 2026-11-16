@@ -24,49 +24,100 @@ env:
 
 jobs:
   test:
+    # Hosted worker only; the build and tests run in Debian userspace.
     runs-on: ubuntu-latest
+    container:
+      image: rust:1-slim-trixie
+      options: --privileged
     timeout-minutes: 10
     steps:
+      - name: Install Debian test dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ripgrep curl unzip python3 procps util-linux
       - uses: actions/checkout@v4
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+        with:
+          persist-credentials: false
+      - name: Permit nested sandboxes in the ephemeral CI container
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            printf '0\n' > /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
+          mkdir -p /dev/net
+          if [ ! -c /dev/net/tun ]; then
+            mknod /dev/net/tun c 10 200
+          fi
+          chmod 666 /dev/net/tun
+          useradd --create-home --shell /bin/sh ci
+      - name: Check sandbox prerequisites before compiling
+        run: runuser -u ci -- sh .github/scripts/sandbox-preflight.sh
+      - name: Install formatter and linter for the image's Rust toolchain
+        run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: stable
+          key: stable-debian-13
           # PRs restore the default branch cache without uploading a copy per PR.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Ensure ripgrep is available
+      - name: Allow the unprivileged test user to use the workspace and cache
         run: |
-          if ! command -v rg >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y ripgrep
-          fi
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_HOME"
       - name: Check formatting
-        run: cargo +stable fmt --all -- --check
+        run: runuser -u ci -- env PATH="$PATH" cargo fmt --all -- --check
       - name: Lint all targets
-        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+        run: runuser -u ci -- env PATH="$PATH" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Unit and contract tests
-        run: cargo +stable test --all-targets --locked
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
+        run: runuser -u ci -- env PATH="$PATH" cargo test --workspace --all-targets --locked
+      - name: Install the development-only Bun runtime
+        run: |
+          curl --fail --location --silent --show-error https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
+          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun"
+          install -m 755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" /usr/local/bin/bun
       - name: Install development-only OpenCode clients
-        run: bun install --cwd tests/v2-client --frozen-lockfile --ignore-scripts
+        run: runuser -u ci -- env PATH="$PATH" bun install --cwd tests/v2-client --frozen-lockfile --ignore-scripts
       - name: Check official OpenCode and T3 client contracts
-        run: cargo +stable test --locked --test contract official_v2_client_and_schema_conformance -- --ignored
+        run: runuser -u ci -- env PATH="$PATH" cargo test --locked --test contract official_v2_client_and_schema_conformance -- --ignored
+      - name: Check the sandbox-free workspace using the same Linux build cache
+        run: runuser -u ci -- env PATH="$PATH" cargo test --workspace --exclude ocmini-sandbox --no-default-features --all-targets --locked
 
   msrv:
     # Stable covers PRs; check compiler compatibility once after merging.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    container:
+      image: rust:1-slim-trixie
     timeout-minutes: 10
     steps:
+      - name: Install Debian build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git
       - uses: actions/checkout@v4
       - name: Install minimum Rust version
         run: rustup toolchain install 1.85.0 --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv-1.85.0
+          key: msrv-1.85.0-debian-13
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check all targets on the minimum Rust version
-        run: cargo +1.85.0 check --all-targets --all-features --locked
+        run: cargo +1.85.0 check --workspace --all-targets --all-features --locked
+
+  sandbox-off:
+    # Avoid spending on the other runners when the primary checks already fail.
+    needs: test
+    strategy:
+      matrix:
+        os: [macos-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ripgrep
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y
+      - name: Ensure ripgrep is available on macOS
+        if: runner.os == 'macOS'
+        run: command -v rg >/dev/null || brew install ripgrep
+      - name: Check the sandbox-free workspace
+        run: cargo +stable test --workspace --exclude ocmini-sandbox --no-default-features --all-targets --locked
