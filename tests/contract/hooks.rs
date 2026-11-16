@@ -4,10 +4,12 @@ use super::*;
 mod engine;
 
 fn registration(name: &str, code: &str) -> Value {
-    json!({"id":name.replace('.',"-"),"on":name,"command":[PYTHON,"-c",code]})
+    json!({"id":name.replace('.',"-"),"on":name,"command":[PYTHON,"-S","-c",code]})
 }
 fn hook_config(handlers: Vec<Value>) -> Value {
-    json!({"ocmini":{"hooks":{"version":1,"handlers":handlers}}})
+    // These fixtures test hook behavior; allow startup within the supported
+    // admission budget even when a shared runner is slow to start Python.
+    json!({"ocmini":{"hooks":{"version":1,"admissionChainTimeoutMs":5000,"handlers":handlers}}})
 }
 async fn wait_file(path: &Path) {
     tokio::time::timeout(Duration::from_secs(8), async {
@@ -172,7 +174,7 @@ for e in r['events']:
                 "id":format!("{kind}-messages"),
                 "on":["message.updated","message.part.updated","ocmini.turn.ended"],
                 "match":{"session":kind},
-                "command":[PYTHON,"-c",code,kind]
+                "command":[PYTHON,"-S","-c",code,kind]
             })
         })
         .collect::<Vec<_>>();
@@ -300,7 +302,7 @@ if not p.exists():
 assert p.read_text()==event['id']
 pathlib.Path('delivered').write_text(event['id'])
 print('{"ack":true}')"#;
-    let config = json!({"ocmini":{"hooks":{"observers":[{"id":"durable-terminal","on":"ocmini.turn.ended","delivery":"durable","retryAttempts":2,"retryDelayMs":1500,"command":[PYTHON,"-c",observer]}]}}});
+    let config = json!({"ocmini":{"hooks":{"observers":[{"id":"durable-terminal","on":"ocmini.turn.ended","delivery":"durable","retryAttempts":2,"retryDelayMs":1500,"command":[PYTHON,"-S","-c",observer]}]}}});
     let mut server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let value = server
@@ -359,7 +361,7 @@ time.sleep(1.5)"#;
 r=json.load(sys.stdin)
 pathlib.Path('recovered_event').write_text(json.dumps(r['events'][0]))"#;
     let mut config = hook_config(vec![registration("turn.end.after", after)]);
-    config["ocmini"]["hooks"]["observers"] = json!([{"id":"recover-terminal","on":"ocmini.turn.ended","delivery":"durable","command":[PYTHON,"-c",observer]}]);
+    config["ocmini"]["hooks"]["observers"] = json!([{"id":"recover-terminal","on":"ocmini.turn.ended","delivery":"durable","command":[PYTHON,"-S","-c",observer]}]);
     let mut server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let _response = server
@@ -520,7 +522,7 @@ time.sleep(60)"#;
     )
     .await;
     let sid = server.session(allow()).await;
-    let pending = tokio::spawn(
+    let mut pending = tokio::spawn(
         server
             .post(
                 &format!("/session/{sid}/prompt_async"),
@@ -528,7 +530,15 @@ time.sleep(60)"#;
             )
             .send(),
     );
-    wait_file(&server.directory.join("admission-entered")).await;
+    let entered = server.directory.join("admission-entered");
+    tokio::select! {
+        _ = wait_file(&entered) => {}
+        response = &mut pending => {
+            let response = response.unwrap().unwrap();
+            let status = response.status();
+            panic!("admission finished before the hook boundary: {status}: {}", response.text().await.unwrap());
+        }
+    }
     assert!(server
         .post(&format!("/session/{sid}/abort"), &json!({}))
         .send()
@@ -916,7 +926,7 @@ pathlib.Path('observer-finished').touch()"#;
         r#"import json,sys
 json.load(sys.stdin);print('{}')"#,
     )]);
-    config["ocmini"]["hooks"]["observers"] = json!([{"id":"observe-completion","on":["ocmini.turn.ended"],"command":[PYTHON,"-c",observer]}]);
+    config["ocmini"]["hooks"]["observers"] = json!([{"id":"observe-completion","on":["ocmini.turn.ended"],"command":[PYTHON,"-S","-c",observer]}]);
     let server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let mut filtered = server
@@ -1013,13 +1023,17 @@ r=json.load(sys.stdin);r['input']['parts'][0]['text']+=' EXPANDED_HOOK';print(js
     let sid = server.session(allow()).await;
     let mut events = server.events().await;
     let request = json!({"messageID":"msg_hook_command","command":"review","arguments":"original"});
-    assert!(server
+    let response = server
         .post(&format!("/session/{sid}/command"), &request)
         .send()
         .await
-        .unwrap()
-        .status()
-        .is_success());
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        response.text().await.unwrap()
+    );
     let body = provider.request().await.to_string();
     assert!(body.contains("HOOK_ARGUMENT"));
     assert!(body.contains("EXPANDED_HOOK"));
@@ -1030,13 +1044,17 @@ r=json.load(sys.stdin);r['input']['parts'][0]['text']+=' EXPANDED_HOOK';print(js
             .count(),
         1
     );
-    assert!(server
+    let response = server
         .post(&format!("/session/{sid}/command"), &request)
         .send()
         .await
-        .unwrap()
-        .status()
-        .is_success());
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        response.text().await.unwrap()
+    );
     assert!(provider.requests.try_recv().is_err());
 }
 

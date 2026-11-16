@@ -443,7 +443,7 @@ async fn revoked_owner_cannot_execute(gate: ExecutionGate) {
         ),
     };
     let provider = Provider::start(vec![tool_script(name, input, "stale-owner-call")]).await;
-    let config = hook.map(|on| json!({"ocmini":{"hooks":{"handlers":[{"id":"execution-gate","on":on,"command":[PYTHON,"-c",
+    let config = hook.map(|on| json!({"ocmini":{"hooks":{"handlers":[{"id":"execution-gate","on":on,"command":[PYTHON,"-S","-c",
         "import json,sys,pathlib,time\nr=json.load(sys.stdin)\nif r['context'].get('tool') == 'bash' or r['context'].get('parentID'):\n pathlib.Path('dispatch-entered').touch()\n while not pathlib.Path('release-dispatch').exists(): time.sleep(.01)"
     ]}]}}})).unwrap_or_else(|| json!({}));
     let server = TestServer::start(&provider, config).await;

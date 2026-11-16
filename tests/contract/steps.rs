@@ -147,8 +147,8 @@ async fn tool_calls_in_one_step_execute_concurrently() {
     let provider = Provider::start(vec![
         Script::ok(vec![
             json!({"choices": [{"index": 0, "delta": {"tool_calls": [
-                {"index": 0, "id": "call_gate_a", "type": "function", "function": {"name": "bash", "arguments": json!({"command": shell_command("touch gate-a; for i in $(seq 1 200); do [ -f gate-b ] && { echo GATE_A_OPEN; exit 0; }; sleep 0.05; done; echo GATE_A_TIMEOUT", "python gate.py gate-a gate-b GATE_A_OPEN"), "timeout": 30000}).to_string()}},
-                {"index": 1, "id": "call_gate_b", "type": "function", "function": {"name": "bash", "arguments": json!({"command": shell_command("touch gate-b; for i in $(seq 1 200); do [ -f gate-a ] && { echo GATE_B_OPEN; exit 0; }; sleep 0.05; done; echo GATE_B_TIMEOUT", "python gate.py gate-b gate-a GATE_B_OPEN"), "timeout": 30000}).to_string()}}
+                {"index": 0, "id": "call_gate_a", "type": "function", "function": {"name": "bash", "arguments": json!({"command": shell_command("touch gate-a; for i in $(seq 1 200); do [ -f gate-b ] && { echo GATE_A_OPEN; exit 0; }; sleep 0.05; done; echo GATE_A_TIMEOUT", "python -S gate.py gate-a gate-b GATE_A_OPEN"), "timeout": 30000}).to_string()}},
+                {"index": 1, "id": "call_gate_b", "type": "function", "function": {"name": "bash", "arguments": json!({"command": shell_command("touch gate-b; for i in $(seq 1 200); do [ -f gate-a ] && { echo GATE_B_OPEN; exit 0; }; sleep 0.05; done; echo GATE_B_TIMEOUT", "python -S gate.py gate-b gate-a GATE_B_OPEN"), "timeout": 30000}).to_string()}}
             ]}, "finish_reason": null}]}),
             json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": usage()}),
         ]),
