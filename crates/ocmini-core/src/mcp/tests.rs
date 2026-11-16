@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::events as event;
 use std::io::BufReader;
 use tokio_util::sync::CancellationToken;

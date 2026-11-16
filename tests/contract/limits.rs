@@ -154,7 +154,7 @@ async fn pruning_old_tool_results_is_opt_in_and_keeps_the_archive() {
             .map(|index| {
                 tool_script(
                     "bash",
-                    json!({"command":format!("printf 'OLD_{index}_'; printf '%050000d' {index}")}),
+                    json!({"command":format!("{} tool-output-{index}.txt", shell_command("cat", "type"))}),
                     &format!("call_{index}"),
                 )
             })
@@ -171,6 +171,13 @@ async fn pruning_old_tool_results_is_opt_in_and_keeps_the_archive() {
             json!({"compaction":{"auto":false,"prune":enabled}}),
         )
         .await;
+        for index in 0..8 {
+            std::fs::write(
+                server.directory.join(format!("tool-output-{index}.txt")),
+                format!("OLD_{index}_{index:050000}"),
+            )
+            .unwrap();
+        }
         let id = server.session(allow()).await;
         for index in 0..3 {
             send(&server, &id, &format!("msg_prune_{index}"), "Continue").await;

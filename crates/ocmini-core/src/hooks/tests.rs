@@ -2,6 +2,7 @@ use super::*;
 use crate::config::HookConfigSource;
 use serde_json::json;
 use std::path::Path;
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
 fn source(value: Value, name: &str, trusted: bool) -> HookConfigSource {
@@ -71,6 +72,8 @@ fn project_cannot_self_authorize_replace_or_erase_trusted_handlers() {
 }
 #[test]
 fn trusted_order_policy_and_id_merge_are_stable() {
+    let directory = super::config::normalize_directory("/allowed/repo");
+    let allowed = format!("{}/*", Path::new(&directory).parent().unwrap().display());
     let cfg = sources(vec![
         source(
             json!({"handlers":[handler("one","turn.start.before","echo first"),handler("two","turn.start.before","echo second")]}),
@@ -83,12 +86,12 @@ fn trusted_order_policy_and_id_merge_are_stable() {
             false,
         ),
         source(
-            json!({"allowProjectHooks":["/allowed/*"],"handlers":[handler("one","turn.start.before","echo launch")]}),
+            json!({"allowProjectHooks":[allowed],"handlers":[handler("one","turn.start.before","echo launch")]}),
             "launch",
             true,
         ),
     ]);
-    let resolved = Resolved::from_config(&cfg, "/allowed/repo").unwrap();
+    let resolved = Resolved::from_config(&cfg, &directory).unwrap();
     let ids = resolved
         .handlers
         .iter()
@@ -109,7 +112,14 @@ fn source_resolves_only_the_direct_executable() {
     let r = Resolved::from_config(&cfg, "/project").unwrap();
     assert_eq!(
         r.handlers[0].registration.command,
-        ["/config/global/./bin/hook", "relative-script.py"]
+        [
+            Path::new("/config")
+                .join("global")
+                .join("./bin/hook")
+                .to_string_lossy()
+                .as_ref(),
+            "relative-script.py",
+        ]
     );
 }
 #[test]

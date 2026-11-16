@@ -13,7 +13,7 @@ async fn streaming_admission_attachments_and_usage_reach_t3() {
     let mut request = prompt("msg_t3_admission_1", "Say hello");
     request["system"] = json!("T3_SYSTEM_SENTINEL");
     request["variant"] = json!("high");
-    request["parts"].as_array_mut().unwrap().push(json!({"type": "file", "mime": "text/plain", "filename": "notes.txt", "url": format!("file://{}", encode_directory(&attachment).replace("%2F", "/"))}));
+    request["parts"].as_array_mut().unwrap().push(json!({"type": "file", "mime": "text/plain", "filename": "notes.txt", "url": reqwest::Url::from_file_path(&attachment).unwrap().to_string()}));
     let mut events = server.events().await;
     assert_eq!(
         server

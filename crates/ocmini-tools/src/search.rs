@@ -332,7 +332,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(included.output.contains("node_modules/explicit.rs"));
+        assert!(included.output.contains(
+            Path::new("node_modules")
+                .join("explicit.rs")
+                .to_str()
+                .unwrap()
+        ));
         assert!(included.output.contains("ignored.rs"));
     }
     #[tokio::test]

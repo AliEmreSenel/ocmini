@@ -54,7 +54,8 @@ async fn child_provider_failures_reach_the_parent_tool_and_task_event() {
 
 #[tokio::test]
 async fn an_always_approval_can_be_revoked_by_the_session_policy() {
-    let command = json!({"command":"printf x >> approval-count"});
+    let command =
+        json!({"command":shell_command("printf x >> approval-count", "echo x>> approval-count")});
     let provider = Provider::start(vec![
         tool_script("bash", command.clone(), "call_allow"),
         text_script("Allowed", ""),
@@ -102,7 +103,9 @@ async fn an_always_approval_can_be_revoked_by_the_session_policy() {
         .error_for_status()
         .unwrap();
     assert_eq!(
-        std::fs::read_to_string(server.directory.join("approval-count")).unwrap(),
+        std::fs::read_to_string(server.directory.join("approval-count"))
+            .unwrap()
+            .trim_end(),
         "x"
     );
     let messages = server.messages(&sid).await;
@@ -440,7 +443,7 @@ async fn revoked_owner_cannot_execute(gate: ExecutionGate) {
         ),
     };
     let provider = Provider::start(vec![tool_script(name, input, "stale-owner-call")]).await;
-    let config = hook.map(|on| json!({"ocmini":{"hooks":{"handlers":[{"id":"execution-gate","on":on,"command":["python3","-c",
+    let config = hook.map(|on| json!({"ocmini":{"hooks":{"handlers":[{"id":"execution-gate","on":on,"command":[PYTHON,"-c",
         "import json,sys,pathlib,time\nr=json.load(sys.stdin)\nif r['context'].get('tool') == 'bash' or r['context'].get('parentID'):\n pathlib.Path('dispatch-entered').touch()\n while not pathlib.Path('release-dispatch').exists(): time.sleep(.01)"
     ]}]}}})).unwrap_or_else(|| json!({}));
     let server = TestServer::start(&provider, config).await;

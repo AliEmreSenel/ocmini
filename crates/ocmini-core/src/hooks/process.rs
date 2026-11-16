@@ -814,6 +814,7 @@ mod tests {
     use super::*;
     use crate::hooks::config::Registration;
     use serde_json::json;
+    #[cfg(unix)]
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -842,6 +843,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn multiple_mib_stderr_plus_valid_stdout_succeeds_and_tail_bounded() {
         let settings = test_settings();
         let script = "head -c 3145728 /dev/zero | tr '\\0' 'x' >&2; echo '{\"action\":\"allow\"}'";
@@ -871,6 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn stdout_overflow_errors() {
         let mut settings = test_settings();
         settings.max_output_bytes = 1024;
@@ -907,7 +910,11 @@ mod tests {
         let permit = sem.clone().acquire_owned().await.unwrap();
 
         let mut resolved = test_resolved(
-            vec!["sh", "-c", "sleep 0.02; echo '{\"action\":\"allow\"}'"],
+            if cfg!(windows) {
+                vec!["cmd", "/C", "echo {}"]
+            } else {
+                vec!["sh", "-c", "sleep 0.02; echo '{}'"]
+            },
             PayloadMode::Inline,
         );
         resolved.registration.queue_timeout_ms = Some(5000);
@@ -941,7 +948,10 @@ mod tests {
             "queue_ms was {}",
             outcome.queue_ms
         );
-        assert_eq!(outcome.stdout, b"{\"action\":\"allow\"}\n");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&outcome.stdout).unwrap(),
+            json!({})
+        );
     }
 
     #[tokio::test]
@@ -980,6 +990,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn file_input_exact_bytes_schema_and_large_response_read() {
         let settings = test_settings();
         let dir = tempfile::tempdir().unwrap();
@@ -1055,6 +1066,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn response_file_invalid_cases_symlink_size_missing_path() {
         let settings = test_settings();
         let dir = tempfile::tempdir().unwrap();
@@ -1166,6 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn temp_cleanup_on_error_cancel_and_outcome_drop() {
         let settings = test_settings();
         let dir = tempfile::tempdir().unwrap();
@@ -1239,7 +1252,14 @@ mod tests {
         let settings = test_settings();
         let dir = tempfile::tempdir().unwrap();
         let local = Arc::new(Semaphore::new(1));
-        let resolved = test_resolved(vec!["true"], PayloadMode::Inline);
+        let resolved = test_resolved(
+            if cfg!(windows) {
+                vec!["cmd", "/C", "exit 0"]
+            } else {
+                vec!["true"]
+            },
+            PayloadMode::Inline,
+        );
         let outcome = Runtime::new()
             .run(
                 &resolved,
@@ -1291,6 +1311,7 @@ mod tests {
         assert_eq!(encodes.load(Ordering::Relaxed), 0);
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn normal_exit_stops_descendants_before_reaping_leader() {
         let settings = test_settings();
         let resolved = test_resolved(

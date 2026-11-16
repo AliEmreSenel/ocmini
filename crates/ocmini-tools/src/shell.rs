@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
+#[cfg(unix)]
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -257,6 +258,8 @@ pub fn stop_background_jobs() {
 /// Ends the background jobs one session started. Aborting a turn and deleting a
 /// session both own their sessions' work, so their jobs end with it.
 pub fn cancel_background_jobs(session_id: &str) {
+    #[cfg(not(unix))]
+    let _ = session_id;
     #[cfg(unix)]
     for pid in take_jobs(|(session, _)| session != session_id) {
         kill_group(pid);
@@ -287,6 +290,8 @@ pub async fn shell_background_with_env(
     output_directory: &Path,
     env: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<ToolOutput, OperationError> {
+    #[cfg(not(unix))]
+    let _ = session_id;
     std::fs::create_dir_all(output_directory)
         .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
     // The log lives with the other tool-output files so existing retention
@@ -676,7 +681,11 @@ mod tests {
         let key = "OCMINI_TEST_PROCESS_LOCAL_ENV";
         let env = serde_json::json!({(key):"private value"});
         let first = shell_with_env(
-            r#"printf '%s' "$OCMINI_TEST_PROCESS_LOCAL_ENV""#,
+            if cfg!(windows) {
+                "echo %OCMINI_TEST_PROCESS_LOCAL_ENV%"
+            } else {
+                r#"printf '%s' "$OCMINI_TEST_PROCESS_LOCAL_ENV""#
+            },
             root.path(),
             Duration::from_secs(5),
             CancellationToken::new(),
@@ -684,15 +693,19 @@ mod tests {
             env.as_object().unwrap(),
         );
         let second = shell(
-            r#"printf '%s' "${OCMINI_TEST_PROCESS_LOCAL_ENV-unset}""#,
+            if cfg!(windows) {
+                "if defined OCMINI_TEST_PROCESS_LOCAL_ENV (echo %OCMINI_TEST_PROCESS_LOCAL_ENV%) else (echo unset)"
+            } else {
+                r#"printf '%s' "${OCMINI_TEST_PROCESS_LOCAL_ENV-unset}""#
+            },
             root.path(),
             Duration::from_secs(5),
             CancellationToken::new(),
             root.path(),
         );
         let (first, second) = tokio::join!(first, second);
-        assert_eq!(first.unwrap().output, "private value");
-        assert_eq!(second.unwrap().output, "unset");
+        assert_eq!(first.unwrap().output.trim_end(), "private value");
+        assert_eq!(second.unwrap().output.trim_end(), "unset");
         assert!(std::env::var_os(key).is_none());
     }
 }

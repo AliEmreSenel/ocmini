@@ -180,7 +180,9 @@ mod tests {
         )
         .unwrap();
         assert!(result.output.contains("Do exactly this."));
-        assert!(result.output.contains(root.to_str().unwrap()));
+        assert!(result
+            .output
+            .contains(root.canonicalize().unwrap().to_str().unwrap()));
     }
     #[test]
     fn transformed_body_preserves_source_and_resource_provenance() {
@@ -205,7 +207,9 @@ mod tests {
         render_content(&mut out);
         assert!(out.output.contains("transformed body"));
         assert!(!out.output.contains("original body"));
-        assert!(out.output.contains(root.to_str().unwrap()));
+        assert!(out
+            .output
+            .contains(root.canonicalize().unwrap().to_str().unwrap()));
         assert!(out.output.contains("resource.txt"));
         assert_eq!(out.metadata, metadata);
         assert!(!out.metadata["sourceFingerprint"]

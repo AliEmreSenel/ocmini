@@ -4,7 +4,7 @@ use super::*;
 mod engine;
 
 fn registration(name: &str, code: &str) -> Value {
-    json!({"id":name.replace('.',"-"),"on":name,"command":["python3","-c",code]})
+    json!({"id":name.replace('.',"-"),"on":name,"command":[PYTHON,"-c",code]})
 }
 fn hook_config(handlers: Vec<Value>) -> Value {
     json!({"ocmini":{"hooks":{"version":1,"handlers":handlers}}})
@@ -58,7 +58,7 @@ print(json.dumps({'set':changes}))"#;
         let mut provider = Provider::start(vec![
             tool_script(
                 "bash",
-                json!({"command":"cat input.txt"}),
+                json!({"command":shell_command("cat input.txt", "type input.txt")}),
                 "call_hook_spill",
             ),
             text_script("Done", ""),
@@ -172,7 +172,7 @@ for e in r['events']:
                 "id":format!("{kind}-messages"),
                 "on":["message.updated","message.part.updated","ocmini.turn.ended"],
                 "match":{"session":kind},
-                "command":["python3","-c",code,kind]
+                "command":[PYTHON,"-c",code,kind]
             })
         })
         .collect::<Vec<_>>();
@@ -300,7 +300,7 @@ if not p.exists():
 assert p.read_text()==event['id']
 pathlib.Path('delivered').write_text(event['id'])
 print('{"ack":true}')"#;
-    let config = json!({"ocmini":{"hooks":{"observers":[{"id":"durable-terminal","on":"ocmini.turn.ended","delivery":"durable","retryAttempts":2,"retryDelayMs":1500,"command":["python3","-c",observer]}]}}});
+    let config = json!({"ocmini":{"hooks":{"observers":[{"id":"durable-terminal","on":"ocmini.turn.ended","delivery":"durable","retryAttempts":2,"retryDelayMs":1500,"command":[PYTHON,"-c",observer]}]}}});
     let mut server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let value = server
@@ -359,7 +359,7 @@ time.sleep(1.5)"#;
 r=json.load(sys.stdin)
 pathlib.Path('recovered_event').write_text(json.dumps(r['events'][0]))"#;
     let mut config = hook_config(vec![registration("turn.end.after", after)]);
-    config["ocmini"]["hooks"]["observers"] = json!([{"id":"recover-terminal","on":"ocmini.turn.ended","delivery":"durable","command":["python3","-c",observer]}]);
+    config["ocmini"]["hooks"]["observers"] = json!([{"id":"recover-terminal","on":"ocmini.turn.ended","delivery":"durable","command":[PYTHON,"-c",observer]}]);
     let mut server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let _response = server
@@ -916,7 +916,7 @@ pathlib.Path('observer-finished').touch()"#;
         r#"import json,sys
 json.load(sys.stdin);print('{}')"#,
     )]);
-    config["ocmini"]["hooks"]["observers"] = json!([{"id":"observe-completion","on":["ocmini.turn.ended"],"command":["python3","-c",observer]}]);
+    config["ocmini"]["hooks"]["observers"] = json!([{"id":"observe-completion","on":["ocmini.turn.ended"],"command":[PYTHON,"-c",observer]}]);
     let server = TestServer::start(&provider, config).await;
     let sid = server.session(allow()).await;
     let mut filtered = server
