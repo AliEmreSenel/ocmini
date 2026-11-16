@@ -64,7 +64,9 @@ async fn tool_output_expiry_is_opt_in_and_rejects_invalid_settings() {
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("tool_expired.txt");
     std::fs::write(&path, "saved result").unwrap();
-    std::fs::File::open(&path)
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
         .unwrap()
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
         .unwrap();
@@ -174,7 +176,9 @@ async fn large_shell_and_web_results_save_full_output_and_replay_only_the_previe
 
         // A resumed conversation must still be able to read the full result
         // even when it has been saved for longer than the former seven days.
-        std::fs::File::open(&path)
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
             .unwrap();
