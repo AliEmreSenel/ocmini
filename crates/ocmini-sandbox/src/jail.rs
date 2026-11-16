@@ -4,7 +4,7 @@ use crate::config::{NetMode, Policy, ProcessIsolation, UnixSockets};
 use crate::wire;
 use landlock::{Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, ABI};
 use serde::{Deserialize, Serialize};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::{
@@ -117,6 +117,7 @@ struct Boot {
     net: NetMode,
     directory: CString,
     _spec: std::fs::File,
+    command: bool,
 }
 // Boot is only read by the clone child, which has a private address space.
 unsafe impl Send for Boot {}
@@ -184,12 +185,32 @@ pub fn probe(policy: &Policy) -> Result<(), String> {
 }
 
 pub fn spawn(spec: RuntimeSpec) -> Result<Child, String> {
-    spawn_inner(spec, &std::env::current_exe().map_err(crate::refusal)?).map_err(crate::refusal)
+    spawn_inner(
+        spec,
+        &std::env::current_exe().map_err(crate::refusal)?,
+        None,
+    )
+    .map_err(crate::refusal)
 }
 pub fn spawn_at(spec: RuntimeSpec, executable: &Path) -> Result<Child, String> {
-    spawn_inner(spec, executable).map_err(crate::refusal)
+    spawn_inner(spec, executable, None).map_err(crate::refusal)
 }
-fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
+/// Start this executable's trusted `__command` entry point with inherited stdio.
+/// The entry point must finish runtime isolation before executing the arguments;
+/// fd 7 is its CLOEXEC child table, and fds 3–6 retain the runner contract.
+pub fn spawn_command(spec: RuntimeSpec, arguments: &[OsString]) -> Result<Child, String> {
+    spawn_inner(
+        spec,
+        &std::env::current_exe().map_err(crate::refusal)?,
+        Some(arguments),
+    )
+    .map_err(crate::refusal)
+}
+fn spawn_inner(
+    spec: RuntimeSpec,
+    executable_path: &Path,
+    command: Option<&[OsString]>,
+) -> io::Result<Child> {
     probe(&spec.policy).map_err(io::Error::other)?;
     std::fs::create_dir_all(&spec.scratch)?;
     // Tools can write their scratch directory. Pin it and refuse symlinks or
@@ -498,7 +519,15 @@ fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
         mounts,
         executable: cstr(executable_path.as_os_str())?,
         arguments: vec![],
-        _argument_storage: vec![cstr("ocmini")?, cstr("__runner")?],
+        _argument_storage: std::iter::once(executable_path.as_os_str())
+            .chain(std::iter::once(OsStr::new(if command.is_some() {
+                "__command"
+            } else {
+                "__runner"
+            })))
+            .chain(command.into_iter().flatten().map(OsString::as_os_str))
+            .map(cstr)
+            .collect::<io::Result<_>>()?,
         environment: vec![],
         _environment_storage: vec![],
         uid_map: format!("0 {} 1\n", unsafe { libc::getuid() }).into_bytes(),
@@ -507,6 +536,7 @@ fn spawn_inner(spec: RuntimeSpec, executable_path: &Path) -> io::Result<Child> {
         net: spec.policy.network.mode,
         directory: cstr(spec.directory.as_os_str())?,
         _spec: spec_file,
+        command: command.is_some(),
     };
     if let Some((_, child)) = &packet_pair {
         pinned.push(pin(child.as_raw_fd())?);
@@ -761,10 +791,11 @@ impl Boot {
                         std::ptr::null(),
                     ) as _,
                 );
-                if mount
-                    .kind
-                    .as_ref()
-                    .is_some_and(|kind| kind.as_bytes() == b"proc")
+                if !self.command
+                    && mount
+                        .kind
+                        .as_ref()
+                        .is_some_and(|kind| kind.as_bytes() == b"proc")
                 {
                     let fd = libc::open(
                         c"/proc/self/task/1/children".as_ptr(),
@@ -775,6 +806,16 @@ impl Boot {
                     self.check(2, children_fd as _);
                     libc::close(fd);
                 }
+            }
+            if self.command {
+                let fd = libc::open(
+                    c"/proc/thread-self/children".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                );
+                self.check(2, fd as _);
+                children_fd = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 16);
+                self.check(2, children_fd as _);
+                libc::close(fd);
             }
             let mut fds = self.fds;
             if self.net.mediated() {
@@ -876,7 +917,10 @@ impl Boot {
             };
             self.check(7, libc::syscall(libc::SYS_seccomp, 1, 0, &prog));
             if children_fd >= 0 {
-                self.check(8, libc::dup2(children_fd, 0) as _);
+                self.check(
+                    8,
+                    libc::dup2(children_fd, if self.command { 7 } else { 0 }) as _,
+                );
             }
             for (index, fd) in fds.iter().enumerate() {
                 if *fd >= 0 {
@@ -885,26 +929,35 @@ impl Boot {
                     libc::close(3 + index as i32);
                 }
             }
-            // Preserve only the bootstrap error pipe above fd 6 until exec.
+            // Preserve the standalone child table on fd 7 when requested,
+            // plus the bootstrap error pipe (CLOEXEC) above the reserved range.
             self.check(
                 8,
-                libc::syscall(libc::SYS_close_range, 7u32, (self.error - 1) as u32, 0),
+                libc::syscall(
+                    libc::SYS_close_range,
+                    if self.command { 8u32 } else { 7u32 },
+                    (self.error - 1) as u32,
+                    0,
+                ),
             );
             self.check(
                 8,
                 libc::syscall(libc::SYS_close_range, (self.error + 1) as u32, u32::MAX, 0),
             );
             self.check(8, libc::chdir(self.directory.as_ptr()) as _);
-            // Runner stdio cannot expose an inherited tty or arbitrary open file.
-            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
-            self.check(8, null as _);
-            for fd in 0..3 {
-                if fd == 0 && children_fd >= 0 {
-                    continue;
+            // Tool runners expose no stdio. The standalone command explicitly
+            // inherits its caller's three streams, including terminals/pipes.
+            if !self.command {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+                self.check(8, null as _);
+                for fd in 0..3 {
+                    if fd == 0 && children_fd >= 0 {
+                        continue;
+                    }
+                    self.check(8, libc::dup2(null, fd) as _);
                 }
-                self.check(8, libc::dup2(null, fd) as _);
+                libc::close(null);
             }
-            libc::close(null);
             libc::execve(
                 self.executable.as_ptr(),
                 self.arguments.as_ptr(),
@@ -1193,6 +1246,15 @@ unsafe fn nl_send(fd: i32, message: &mut [u8], len: usize, kind: u16) -> i32 {
 }
 
 pub fn inherited_spec() -> io::Result<RuntimeSpec> {
+    read_inherited_spec(false)
+}
+
+pub fn inherited_command_spec() -> io::Result<RuntimeSpec> {
+    checked(unsafe { libc::fcntl(7, libc::F_SETFD, libc::FD_CLOEXEC) } as _)?;
+    read_inherited_spec(true)
+}
+
+fn read_inherited_spec(command: bool) -> io::Result<RuntimeSpec> {
     for fd in [3, 4, 5, 6] {
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
             checked(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } as _)?;
@@ -1201,7 +1263,7 @@ pub fn inherited_spec() -> io::Result<RuntimeSpec> {
     let file = unsafe { std::fs::File::from_raw_fd(6) };
     let spec: RuntimeSpec =
         serde_json::from_reader(std::io::BufReader::new(file)).map_err(io::Error::other)?;
-    if spec.policy.process_isolation == ProcessIsolation::Full {
+    if !command && spec.policy.process_isolation == ProcessIsolation::Full {
         checked(unsafe { libc::fcntl(0, libc::F_SETFD, libc::FD_CLOEXEC) } as _)?;
     }
     Ok(spec)

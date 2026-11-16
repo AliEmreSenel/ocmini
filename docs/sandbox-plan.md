@@ -23,6 +23,17 @@ The sandbox lives in a **separate crate** (`ocmini-sandbox`), wired into ocmini 
 ## Implementation layout
 
 - **`ocmini-sandbox`** (feature `sandbox`, default-on) — permission sandboxing and network relay, nothing else: the sandbox config schema + validation, the jail builder (Landlock, seccomp BPF, boot choreography, netns/TUN/pidns, mount masks), the fd-3/fd-4 frame codec, the TUN relay loop, and the brain-side broker (smoltcp stack, rule engine, SNI parser, DNS handler, **preview publisher** incl. loopback address leasing, §Automatic previews). **No tool code.**
+- The crate also builds the separate **`ocmini-sandbox` executable**, independently
+  of ocmini/core/tools. Its command supervisor reuses this jail and broker, the
+  preset loader and CLI policy overrides. It defaults to `read-only`, accepts a
+  program after `--`, and creates no session or database. Unlike tool runners,
+  it explicitly inherits the caller's stdin/stdout/stderr. A pre-opened child
+  table is passed on fd 7, marked CLOEXEC at trusted startup, so it can reap and
+  stop adopted background descendants even without readable `/proc` or a PID
+  namespace. The command inherits none of the supervisor's private descriptors.
+  The supervisor uses the existing current-thread runtime and relay; scratch is
+  temporary and removed after completion. All enforcement requirements and
+  accepted policy limitations remain the same.
 - **`ocmini-tools`** — the tool implementations (fs, shell, webfetch) as plain functions, no sandbox dependency. The brain calls them directly (preset `off` / feature off); the runner calls them to serve frames.
 - **ocmini binary** hosts both sides: the brain's runner manager (registry with **terminal failure states**, broker task) and the `__runner` subcommand. The sandbox crate exposes the runner loop (transport + dispatch); ocmini implements the handlers over `ocmini-tools` — the sandbox crate stays tool-agnostic.
 - **The router is one point:** the tool-call entry. Feature on + preset ≠ `off` → frame to the runner; else → direct `ocmini-tools` call. Nothing above it knows.

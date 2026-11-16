@@ -1,6 +1,7 @@
 //! Linux permission jail and destination mediation. This crate contains no tools.
 #[cfg(target_os = "linux")]
 pub mod broker;
+pub mod cli;
 pub mod config;
 #[cfg(target_os = "linux")]
 pub mod jail;

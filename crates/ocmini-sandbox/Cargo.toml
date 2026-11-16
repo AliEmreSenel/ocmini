@@ -5,6 +5,8 @@ edition = "2021"
 rust-version = "1.85"
 
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -18,5 +20,6 @@ futures = "0.3"
 landlock = "0.4"
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-raw", "proto-ipv4-fragmentation", "reassembly-buffer-size-65536", "fragmentation-buffer-size-65536"] }
 
-[dev-dependencies]
-tempfile = "3"
+[[bin]]
+name = "ocmini-sandbox"
+path = "src/main.rs"
