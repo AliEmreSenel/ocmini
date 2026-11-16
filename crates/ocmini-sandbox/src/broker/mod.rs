@@ -152,6 +152,10 @@ pub async fn run(
         .map_err(io::Error::other)?;
     // Drop sockets before their demand-paged backing allocations.
     let mut tcp_flows: HashMap<Tuple, TcpFlow> = HashMap::new();
+    // Latest guest SYN per flow whose host connect is still in flight. The
+    // guest handshake completes only after the real destination accepts, so
+    // unreachable addresses are refused and clients can try another family.
+    let mut pending: HashMap<Tuple, Vec<u8>> = HashMap::new();
     let mut udp_flows: HashMap<Tuple, UdpFlow> = HashMap::new();
     let mut udp_listeners: HashMap<SocketAddr, UdpListener> = HashMap::new();
     let mut sockets = SocketSet::new(vec![]);
@@ -474,13 +478,17 @@ pub async fn run(
                     if slot.is_none(){let ring=policy.buffers.udp_ring;let bytes=ring.checked_mul(wire::MTU).ok_or_else(||io::Error::other("packet buffer overflow"))?.max(65535);let sock=raw::Socket::new(version,proto,raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY;ring],vec![0;bytes]),raw::PacketBuffer::new(vec![],vec![]));*slot=Some(sockets.add(sock));}
                 }
                 if let Some((protocol,key,syn))=tuple(&packet){
+                    if protocol==Protocol::Tcp{if let Some(held)=pending.get_mut(&key){if syn{*held=packet;}continue;}}
                     if let Some(flow)=tcp_flows.get_mut(&key){flow.touched=Instant::now();}
                     if protocol==Protocol::Tcp && syn && !tcp_flows.contains_key(&key){
                         let inspect=key.remote.port()==443 && (policy.network.outbound.inspects_tls() || policy.network.ech==Ech::Deny);
-                        if inspect || policy.network.outbound.permits(protocol,key.remote.ip(),key.remote.port(),None){
+                        if inspect{
                             let(mut sock,backing)=socket(&policy)?;sock.listen(endpoint(key.remote)).map_err(io::Error::other)?;let handle=sockets.add(sock);
-                            tcp_flows.insert(key,TcpFlow{handle,host:None,connecting:!inspect,inspect,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
-                            if !inspect{connects.push(Box::pin(async move{(key,TcpStream::connect(key.remote).await)}));}
+                            tcp_flows.insert(key,TcpFlow{handle,host:None,connecting:false,inspect,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
+                        }else if policy.network.outbound.permits(protocol,key.remote.ip(),key.remote.port(),None){
+                            pending.insert(key,packet);
+                            connects.push(Box::pin(async move{(key,TcpStream::connect(key.remote).await)}));
+                            continue;
                         }
                     }else if protocol==Protocol::Udp && !udp_listeners.contains_key(&key.remote){
                         let ring=policy.buffers.udp_ring;let bytes=ring.checked_mul(wire::MTU).ok_or_else(||io::Error::other("UDP buffer overflow"))?.max(65535);
@@ -490,7 +498,17 @@ pub async fn run(
                 }
                 device.incoming=Some(packet);
             },
-            Some((key,result))=connects.next(),if !connects.is_empty()=>{if let Some(flow)=tcp_flows.get_mut(&key){flow.connecting=false;match result{Ok(host)=>{host.set_nodelay(true)?;flow.host=Some(std::sync::Arc::new(host));},Err(_)=>sockets.get_mut::<tcp::Socket>(flow.handle).abort()}}},
+            Some((key,result))=connects.next(),if !connects.is_empty()=>{if let Some(syn)=pending.remove(&key){
+                if let Ok(host)=result{
+                    host.set_nodelay(true)?;
+                    let(mut sock,backing)=socket(&policy)?;sock.listen(endpoint(key.remote)).map_err(io::Error::other)?;let handle=sockets.add(sock);
+                    tcp_flows.insert(key,TcpFlow{handle,host:Some(std::sync::Arc::new(host)),connecting:false,inspect:false,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
+                }
+                // Replay the held SYN: the new listener answers it, or with no
+                // listener the stack resets it. A packet already queued wins;
+                // the guest retransmits its SYN.
+                if device.incoming.is_none(){device.incoming=Some(syn);}
+            }else if let Some(flow)=tcp_flows.get_mut(&key){flow.connecting=false;match result{Ok(host)=>{host.set_nodelay(true)?;flow.host=Some(std::sync::Arc::new(host));},Err(_)=>sockets.get_mut::<tcp::Socket>(flow.handle).abort()}}},
             Some((handle,guest,answer))=dns_jobs.next(),if !dns_jobs.is_empty()=>{let _=sockets.get_mut::<udp::Socket>(handle).send_slice(&answer,endpoint(guest));},
             _=ready.next(),if !ready.is_empty()=>{},
             _=udp_ready.next(),if !udp_ready.is_empty()=>{},

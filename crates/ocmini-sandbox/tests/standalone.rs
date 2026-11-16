@@ -281,6 +281,41 @@ fn mediated_networking_runs_without_ocmini() {
 }
 
 #[test]
+fn unreachable_destinations_are_refused_before_the_guest_handshake() {
+    // A destination the host cannot connect to must fail the guest connect, not
+    // reset an already established connection, so clients can try another
+    // address family.
+    let sandbox = Sandbox::new();
+    let route = UdpSocket::bind("0.0.0.0:0").unwrap();
+    route.connect("192.0.2.1:9").unwrap();
+    let address = route.local_addr().unwrap().ip();
+    let port = TcpListener::bind((address, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let output = sandbox
+        .command()
+        .args([
+            "--preset",
+            "read-all-net",
+            "--sandbox-set",
+            "network.preview.mode=off",
+            "--",
+            "curl",
+            "--noproxy",
+            "*",
+            "--max-time",
+            "5",
+            "-sS",
+            &format!("http://{address}:{port}/"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+}
+
+#[test]
 fn terminal_input_interrupts_and_foreground_restoration_work() {
     let sandbox = Sandbox::new();
     let script = r#"
