@@ -1073,7 +1073,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ocmini"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "ocmini-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "ocmini-sandbox"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "futures",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "ocmini-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "ocmini-tools"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "ocmini-tui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "ocmini-web"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "futures",
