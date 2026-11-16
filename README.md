@@ -1,6 +1,6 @@
 # ocmini
 
-A minimal OpenCode replica in Rust. One binary for terminal chat, coding tools, saved sessions and an OpenCode v2 HTTP/SSE server. Legacy v1 routes remain available during the transition.
+A minimal OpenCode replica in Rust. One binary for terminal chat, a browser interface, coding tools, saved sessions and an OpenCode v2 HTTP/SSE server. Legacy v1 routes remain available during the transition.
 
 The lightweight runtime supports use on single-core machines with roughly 500 MB of total system RAM, including embedded Linux devices using SD cards. V2 work should preserve the current approach and performance, using the same behavior across machines.
 
@@ -15,6 +15,7 @@ cargo install --path . --locked
 ocmini                                    # terminal chat
 ocmini --model local/my-model --directory ~/project
 ocmini serve --hostname 127.0.0.1 --port 4096
+ocmini web                                # same server; open http://127.0.0.1:4096/
 ```
 
 The input shows a compact status row that updates in place. Type `/help` or press F1 for the full shortcut list; F1 keeps your current draft. Help is handled locally.
@@ -55,6 +56,21 @@ Clipboard image paste needs `wl-paste` (Wayland), `xclip` (X11), `osascript` (ma
 Over SSH, ordinary terminal paste carries text, not your local image clipboard. Copy the image to the remote host (for example with `scp`) and paste its **remote** path. X11 clipboard forwarding can also work when `DISPLAY` is forwarded and `xclip` is installed on the remote host. Clipboard images are stored with the message, so they remain available when resuming a session.
 
 To use it with T3 Code, set the OpenCode provider's binary path to the installed `ocmini` executable.
+
+## Browser interface
+
+`ocmini serve` (also available as `ocmini web`) serves a browser interface at `/` alongside the API, so you can code from any device that can reach the server. It prints the address on stderr after the unchanged listening banner. The page is built into the binary: no Node.js, build step, CDN or extra process.
+
+- **Chat:** every saved session (including terminal and T3 chats), grouped by project or filtered to the current one, with search, rename, archive and delete. Opening a chat switches to its project; streamed answers, reasoning and tool calls (with edit diffs); model, variant and agent selection; steer or queue delivery while the agent works; Stop (or Esc) interrupts; file attachments by picker, paste or drop; `/` lists configured commands and `/compact`; rewind to or fork from any of your messages.
+- **Shared sessions:** any number of browsers or devices can open the same chat on one server. Each sees the live stream, the same pending inputs, approvals and questions, and can steer or queue while the agent works. Steers are taken at the next model step boundary. A chat that another ocmini process is running, such as T3's own server, is followed from its saved history every 2 seconds while it is open and running there. New input waits until that process finishes, since its live state, approvals and interrupts belong to it.
+- **Approvals and questions** appear as cards above the composer and are answered in place.
+- **Sandbox per session:** the chat header picks the sandbox preset. A new session starts directly under the chosen preset. Changing an existing root session's preset requires it to be idle: its runner and background jobs stop, and the next turn uses the new settings. Subagents keep their parent's sandbox, and `--sandbox-preset` locks the choice.
+- **Settings (⚙):** default model, small and title models, default sandbox and compaction switches, saved to the global or project `opencode.json`. The merged configuration is validated after each save, and an invalid result restores the file. JSONC files with comments are opened in the editor instead of being rewritten. Everything else (providers, agents, permissions, MCP, hooks) is edited in the file.
+- **Files:** a lazily loaded tree with new file/folder, rename/move and delete, and a tabbed editor with line numbers, indentation keys and Ctrl+S. Saves are atomic and refuse to overwrite a file that changed on disk since it was opened (for example by the agent) unless you confirm. Clean open files reload after the agent edits them. "Attach" adds the current file to the next prompt.
+
+Click the project path in the header to open another directory or a known project. The layout switches between chat and editor on narrow screens. Text files are streamed to the browser rather than buffered on the server. The editor opens binary or non-UTF-8 files read-only or not at all.
+
+The interface uses the same v2 HTTP/SSE API as other clients, plus `/web/api/*` routes for files, settings and sandbox selection. These do their work per request and keep no state between requests. Settings live only in the existing configuration files. The server adds no background work for the interface: an open page holds one event-stream connection. Browser file operations run as the server's OS user, like a local editor would. They are not routed through agent permissions or the sandbox, and they share the agent's per-file edit locks. Set `OPENCODE_SERVER_PASSWORD` before exposing the server beyond loopback; the browser then asks for the `opencode` user's password. Build with `--no-default-features --features sandbox` to leave the interface out.
 
 ## Resume a session
 
@@ -112,7 +128,7 @@ Compaction can be requested manually, runs automatically with room reserved for 
 
 ## What gets cut
 
-Desktop/web apps, hosted accounts and billing, plugin marketplaces and installers, auto-updates, telemetry, LSP management and upstream managed-service infrastructure.
+The upstream desktop and web apps (ocmini ships its own lightweight browser interface instead), hosted accounts and billing, plugin marketplaces and installers, auto-updates, telemetry, LSP management and upstream managed-service infrastructure.
 
 Provider support is limited to the three HTTP protocols above. Native Gemini, Vertex, Bedrock, Azure-specific authentication, arbitrary npm provider SDKs and WebSocket transports are excluded. Compatible HTTP endpoints can still be configured. MCP browser OAuth and legacy HTTP+SSE transport are also excluded.
 
@@ -399,6 +415,7 @@ worker model:
 - `ocmini-sandbox`: Linux enforcement, runner protocol, network policy, DNS/SNI mediation, and previews.
 - `ocmini-tui`: interactive terminal and one-shot terminal frontends.
 - `ocmini-server`: HTTP/SSE and OpenCode API routes.
+- `ocmini-web`: the embedded browser interface and its file routes, merged into the server behind the default `web` feature.
 
 Run workspace checks with `cargo test --workspace --all-targets` and
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`.

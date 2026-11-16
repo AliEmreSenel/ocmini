@@ -54,3 +54,7 @@ mod v2;
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 #[path = "contract/sandbox.rs"]
 mod sandbox;
+
+#[cfg(feature = "web")]
+#[path = "contract/web.rs"]
+mod web;

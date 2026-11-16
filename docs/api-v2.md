@@ -18,7 +18,7 @@ Provider metadata reads use local configuration and connected provider identitie
 
 ## Sessions and prompts
 
-POST /api/session creates a session with optional id, parentID, title, model, agent, location, permissions and metadata. Model references use {providerID, id, variant?}. Permissions use ordered {action, resource, effect} records; shell/subagent actions map to the runtime's existing shell/task policy checks.
+POST /api/session creates a session with optional id, parentID, title, model, agent, location, permissions and metadata. As an ocmini extension, a root session may also name a sandbox preset (`"sandbox": "workspace-write"`). The preset is validated like a launch and saved before the session's runner starts. T3 does not send this field. Model references use {providerID, id, variant?}. Permissions use ordered {action, resource, effect} records; shell/subagent actions map to the runtime's existing shell/task policy checks.
 
 Optional session creation/update and input fields accept null as omitted, matching the official Effect client's encoding. Null values inside metadata are preserved.
 

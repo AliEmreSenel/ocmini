@@ -40,4 +40,6 @@ provider, config file, `--agent` endpoint and the session store are trusted, and
 ocmini runs with the user's own permissions and has no privilege boundary of its
 own.
 
+The browser interface served by `ocmini serve` has the same trust level as the HTTP API: anyone who can reach the server, and passes the optional password, can prompt the agent and read or write files as the server's OS user. Its file and settings routes bypass agent permissions and the sandbox, like a local editor: they can change `opencode.json`, which configures providers, MCP commands and hooks. The server binds to loopback by default; set `OPENCODE_SERVER_PASSWORD` before exposing it. The interface's file-changing routes accept only JSON bodies, which a cross-site page cannot send without a CORS preflight that the server never grants. The page uses a restrictive Content-Security-Policy, cannot be framed, and inserts model, tool and file text as text, or as escaped markdown with only http(s) links.
+
 The README describes tool approval and the explicit opt-in for checkout-defined MCP configuration. Tool permissions apply to operations routed through the harness. Approved shell commands and trusted MCP processes run with the account’s OS permissions.

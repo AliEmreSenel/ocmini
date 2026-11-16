@@ -856,8 +856,15 @@ async fn not_found() -> OperationError {
 }
 
 pub fn router(state: AppState) -> Router {
+    router_with(state, Router::new())
+}
+
+/// Builds the server with additional routes, such as the optional web
+/// interface. Extra routes share the password gate, body limit and access log.
+pub fn router_with(state: AppState, extra: Router<AppState>) -> Router {
     let body_limit = state.max_request_bytes;
     Router::new()
+        .merge(extra)
         .merge(crate::v2_http::router())
         .route("/global/health", get(health))
         .route("/session", get(list_sessions).post(session_create))
@@ -902,6 +909,18 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub async fn serve(app: App, hostname: String, port: u16) -> Result<(), String> {
+    serve_with(app, hostname, port, Router::new(), None).await
+}
+
+/// Serves `extra` routes alongside the API. `notice` names a page at `/` and
+/// is announced on stderr, after the unchanged stdout listening banner.
+pub async fn serve_with(
+    app: App,
+    hostname: String,
+    port: u16,
+    extra: Router<AppState>,
+    notice: Option<&str>,
+) -> Result<(), String> {
     let max_request_bytes = match std::env::var("OCMINI_MAX_REQUEST_BYTES") {
         Ok(value) => value
             .parse::<usize>()
@@ -938,8 +957,11 @@ pub async fn serve(app: App, hostname: String, port: u16) -> Result<(), String> 
     std::io::stdout()
         .flush()
         .map_err(|error| error.to_string())?;
+    if let Some(notice) = notice {
+        eprintln!("{notice}: http://{announced_host}:{}/", address.port());
+    }
     let shutdown_state = state.clone();
-    axum::serve(listener, router(state))
+    axum::serve(listener, router_with(state, extra))
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
             {

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>ocmini</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/web/app.css">
+</head>
+<body>
+<div id="app" class="view-chat">
+  <header class="top">
+    <button id="menu" class="icon" type="button" aria-label="Toggle sidebar" title="Toggle sidebar">☰</button>
+    <span class="brand">ocmini</span>
+    <button id="project" class="project" type="button" title="Change project directory"></button>
+    <span class="spacer"></span>
+    <div class="views" role="tablist" aria-label="View">
+      <button type="button" data-view="chat" class="active">Chat</button>
+      <button type="button" data-view="editor">Editor</button>
+    </div>
+    <select id="agent" title="Agent" aria-label="Agent"></select>
+    <select id="model" title="Model" aria-label="Model"></select>
+    <select id="variant" title="Model variant" aria-label="Model variant" hidden></select>
+    <button id="settings" class="icon" type="button" title="Settings" aria-label="Settings">⚙</button>
+    <span id="conn" class="conn" title="Connecting to event stream" aria-live="polite"></span>
+  </header>
+
+  <aside id="sidebar">
+    <nav class="tabs" role="tablist">
+      <button type="button" data-tab="sessions" class="active">Sessions</button>
+      <button type="button" data-tab="files">Files</button>
+    </nav>
+    <section id="tab-sessions" class="tab">
+      <div class="row">
+        <button id="new-session" class="primary" type="button">New session</button>
+        <input id="session-search" type="search" placeholder="Search" aria-label="Search sessions">
+      </div>
+      <div class="row scope" role="radiogroup" aria-label="Show sessions from">
+        <button type="button" data-scope="all">All projects</button>
+        <button type="button" data-scope="project">This project</button>
+      </div>
+      <ul id="sessions" class="list"></ul>
+      <button id="more-sessions" type="button" class="more" hidden>Load more</button>
+    </section>
+    <section id="tab-files" class="tab" hidden>
+      <div class="row">
+        <button id="new-file" type="button" title="New file in the selected folder">New file</button>
+        <button id="new-folder" type="button" title="New folder in the selected folder">New folder</button>
+        <span class="spacer"></span>
+        <button id="refresh-files" type="button" class="icon" title="Refresh">⟳</button>
+      </div>
+      <div id="tree" class="tree" role="tree"></div>
+    </section>
+  </aside>
+
+  <main>
+    <section id="chat" class="pane">
+      <div class="pane-head">
+        <button id="session-title" type="button" class="title" title="Rename session">New session</button>
+        <span class="spacer"></span>
+        <span id="usage" class="muted"></span>
+        <select id="sandbox" title="Sandbox for this session" aria-label="Sandbox" hidden></select>
+        <button id="compact" type="button" title="Summarize older context">Compact</button>
+        <button id="fork" type="button" title="Copy this session into a new one">Fork</button>
+      </div>
+      <div id="transcript" aria-live="polite">
+        <button id="older" type="button" class="more" hidden>Load earlier messages</button>
+        <div id="messages"></div>
+        <div id="pending"></div>
+        <div id="empty" class="empty">
+          <h1>What are we building?</h1>
+          <p>Ask the agent to read, write and run code in <code id="empty-dir"></code>. Open files from the sidebar to edit them yourself.</p>
+        </div>
+      </div>
+      <div id="requests"></div>
+      <form id="composer" autocomplete="off">
+        <ul id="suggest" class="suggest" hidden></ul>
+        <div id="attachments"></div>
+        <textarea id="input" rows="3" placeholder="Ask anything…  Enter sends, Shift+Enter adds a line, / lists commands" aria-label="Prompt"></textarea>
+        <div class="actions">
+          <label class="button" title="Attach files">Attach<input id="attach" type="file" multiple hidden></label>
+          <select id="delivery" title="While the agent is working: steer joins the current turn, queue waits for it to finish" aria-label="Delivery">
+            <option value="steer">Steer</option>
+            <option value="queue">Queue</option>
+          </select>
+          <span class="spacer"></span>
+          <span id="status" class="muted"></span>
+          <button id="stop" type="button" class="danger" hidden>Stop</button>
+          <button id="send" type="submit" class="primary">Send</button>
+        </div>
+      </form>
+    </section>
+
+    <div id="divider" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
+
+    <section id="editor" class="pane">
+      <div id="editor-tabs" class="pane-head tabs-strip"></div>
+      <div id="editor-empty" class="empty">
+        <h1>No file open</h1>
+        <p>Pick a file in the <b>Files</b> tab. <kbd>Ctrl</kbd>+<kbd>S</kbd> saves.</p>
+      </div>
+      <div id="editor-body" hidden>
+        <pre id="gutter" aria-hidden="true"></pre>
+        <textarea id="code" spellcheck="false" wrap="off" autocapitalize="off" autocomplete="off" aria-label="File contents"></textarea>
+      </div>
+      <div id="editor-status" class="status-bar" hidden>
+        <span id="editor-path" class="muted"></span>
+        <span class="spacer"></span>
+        <span id="cursor" class="muted"></span>
+        <button id="attach-file" type="button" title="Attach this file to the next prompt">Attach</button>
+        <button id="reload-file" type="button" title="Discard edits and reload from disk">Reload</button>
+        <button id="save" type="button" class="primary">Save</button>
+      </div>
+    </section>
+  </main>
+</div>
+<dialog id="modal" aria-labelledby="modal-title">
+  <form method="dialog" class="modal-head">
+    <h2 id="modal-title"></h2>
+    <button class="icon" value="close" aria-label="Close">✕</button>
+  </form>
+  <div id="modal-body"></div>
+</dialog>
+<div id="toasts" aria-live="assertive"></div>
+<script src="/web/app.js"></script>
+</body>
+</html>

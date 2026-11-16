@@ -327,6 +327,16 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
     if optional(&body, "title").is_some() {
         s.title_source = Some(TitleSource::Explicit);
     }
+    // ocmini extension: choose the root session's sandbox preset at creation.
+    if let Some(preset) = optional(&body, "sandbox") {
+        if parent.is_some() {
+            return Err(invalid("A subagent session uses its parent's sandbox"));
+        }
+        let preset = preset
+            .as_str()
+            .ok_or_else(|| invalid("sandbox must be a preset name"))?;
+        s.sandbox = Some(crate::sessions::sandbox_settings(&st.app, &dir, preset)?);
+    }
     s.permission = optional(&body, "permissions")
         .map(wire::rules)
         .transpose()?;

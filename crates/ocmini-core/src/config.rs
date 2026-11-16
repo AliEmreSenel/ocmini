@@ -278,6 +278,12 @@ impl Config {
         Ok(config)
     }
 
+    /// Reads configuration from disk, bypassing the short-lived cache, so a
+    /// settings editor sees (and validates) the file it just wrote.
+    pub fn load_fresh(directory: &str) -> Result<Config, String> {
+        Self::load_uncached(directory)
+    }
+
     fn load_uncached(directory: &str) -> Result<Config, String> {
         let directory = absolute_path(
             Path::new(directory),

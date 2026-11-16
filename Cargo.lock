@@ -1085,6 +1085,7 @@ dependencies = [
  "ocmini-sandbox",
  "ocmini-server",
  "ocmini-tui",
+ "ocmini-web",
  "reqwest",
  "rusqlite",
  "serde_json",
@@ -1192,6 +1193,22 @@ dependencies = [
  "tokio-util",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "ocmini-web"
+version = "0.4.0"
+dependencies = [
+ "axum",
+ "futures",
+ "ocmini-core",
+ "ocmini-server",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
 ]
 
 [[package]]
