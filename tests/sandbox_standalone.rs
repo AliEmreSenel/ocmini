@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(feature = "sandbox", target_os = "linux"))]
 
 use std::{
     io::{BufRead, BufReader, Read, Write},

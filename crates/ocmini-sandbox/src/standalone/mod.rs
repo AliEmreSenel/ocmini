@@ -1,9 +1,11 @@
+//! The `ocmini-sandbox` executable: run one command under a sandbox preset
+//! without ocmini sessions, tools or a database.
+use crate::{cli::SandboxArgs, config, refusal, REFUSAL};
 use clap::Parser;
-use ocmini_sandbox::{cli::SandboxArgs, config, refusal, REFUSAL};
 use std::{ffi::OsString, path::PathBuf, process::Command};
 
 #[cfg(target_os = "linux")]
-mod standalone;
+mod supervisor;
 
 #[derive(Parser)]
 #[command(version, about = "Run a command in the ocmini permission sandbox")]
@@ -70,7 +72,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             .map_err(|e| e.to_string());
     };
     #[cfg(target_os = "linux")]
-    return standalone::run(policy, directory, &cli.command);
+    return supervisor::run(policy, directory, &cli.command);
     #[cfg(not(target_os = "linux"))]
     {
         let _ = policy;
@@ -78,10 +80,11 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 }
 
-fn main() {
+/// Entry point of the `ocmini-sandbox` binary.
+pub fn main() -> ! {
     #[cfg(target_os = "linux")]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__command")) {
-        let result = standalone::command_main(std::env::args_os().skip(2).collect());
+        let result = supervisor::command_main(std::env::args_os().skip(2).collect());
         exit(result);
     }
     exit(run(Cli::parse()));

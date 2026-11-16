@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 #[cfg(target_os = "linux")]
 pub mod jail;
+pub mod standalone;
 pub mod wire;
 pub const REFUSAL: i32 = 78;
 pub fn refusal(error: impl std::fmt::Display) -> String {
