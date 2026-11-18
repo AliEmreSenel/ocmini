@@ -80,7 +80,15 @@ pub(super) fn build_messages(
     chat: bool,
     model: Option<&ModelRef>,
 ) -> Result<(Vec<Value>, bool), String> {
-    let mut history = store.context_messages(sid, through)?;
+    let history = store.context_messages(sid, through)?;
+    project_messages(history, chat, model)
+}
+
+pub(super) fn project_messages(
+    mut history: Vec<MessageWithParts>,
+    chat: bool,
+    model: Option<&ModelRef>,
+) -> Result<(Vec<Value>, bool), String> {
     let summary = history.iter().rposition(|m| {
         m.info.summary == Some(true)
             && m.info.time.completed.is_some()

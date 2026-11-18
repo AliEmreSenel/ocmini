@@ -118,7 +118,7 @@ pub async fn run_effect(
             let input: search::GrepInput = decode(args)?;
             search::run(
                 directory,
-                search::Mode::Grep(input.include.as_deref()),
+                search::Mode::Grep(&input),
                 &input.search,
                 cancel.clone(),
             )
