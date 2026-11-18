@@ -50,6 +50,8 @@ pub async fn run(
         .map_err(|error| failure(format!("Cannot search {}: {error}", base.display())))?;
     let pattern = &input.pattern;
     let glob = matches!(mode, Mode::Glob);
+    let paths_only =
+        glob || matches!(mode, Mode::Grep(options) if options.files_only == Some(true));
     if !glob && pattern.is_empty() {
         return Err(failure("pattern is required"));
     }
@@ -69,7 +71,12 @@ pub async fn run(
             .args(["--files", "--null"])
             .arg(format!("--glob={pattern}"));
     } else {
-        command.args(["--json", "--hidden", "--no-messages"]);
+        command.args(["--hidden", "--no-messages"]);
+        if paths_only {
+            command.args(["--files-with-matches", "--null"]);
+        } else {
+            command.arg("--json");
+        }
         if let Mode::Grep(options) = mode {
             if let Some(include) = &options.include {
                 command.arg(format!("--glob={include}"));
@@ -131,15 +138,14 @@ pub async fn run(
         let output = async {
             let mut reader = BufReader::new(stdout);
             let mut record = Vec::new();
-            let mut output = String::new();
-            let mut count = 0;
+            let mut lines: Vec<(String, bool)> = Vec::new();
             let mut truncated = false;
-            let mut last_file = String::new();
+            let mut stopped = false;
             loop {
                 record.clear();
                 let bytes = (&mut reader)
                     .take(MAX_RECORD as u64 + 1)
-                    .read_until(if glob { 0 } else { b'\n' }, &mut record)
+                    .read_until(if paths_only { 0 } else { b'\n' }, &mut record)
                     .await
                     .map_err(|error| failure(format!("Cannot read ripgrep output: {error}")))?;
                 if bytes == 0 {
@@ -148,60 +154,67 @@ pub async fn run(
                 if record.len() > MAX_RECORD {
                     return Err(failure(format!("Ripgrep record exceeds {MAX_RECORD} bytes; narrow the pattern or search path")));
                 }
-                let line = if glob {
+                let (line, is_match) = if paths_only {
                     record.pop();
                     let path = String::from_utf8(record.clone())
                         .map_err(|_| failure("ripgrep returned a non-UTF-8 path"))?;
-                    cwd.join(path.trim_start_matches("./"))
-                        .display()
-                        .to_string()
+                    (
+                        cwd.join(path.trim_start_matches("./"))
+                            .display()
+                            .to_string(),
+                        true,
+                    )
                 } else {
                     let event: Value = serde_json::from_slice(&record)
                         .map_err(|error| failure(format!("Invalid ripgrep output: {error}")))?;
-                    let files_only =
-                        matches!(mode, Mode::Grep(options) if options.files_only == Some(true));
-                    if event["type"] != "match" && (files_only || event["type"] != "context") {
+                    let is_match = event["type"] == "match";
+                    if !is_match && event["type"] != "context" {
                         continue;
                     }
                     let data = &event["data"];
                     let path = data["path"]["text"]
                         .as_str()
                         .ok_or_else(|| failure("ripgrep returned a non-UTF-8 path"))?;
-                    if files_only {
-                        if path == last_file {
-                            continue;
-                        }
-                        last_file.clear();
-                        last_file.push_str(path);
-                        cwd.join(path.trim_start_matches("./"))
-                            .display()
-                            .to_string()
-                    } else {
-                        let text = data["lines"]["text"]
-                            .as_str()
-                            .ok_or_else(|| failure("ripgrep returned non-UTF-8 matching text"))?;
-                        let text = text.trim_end_matches(['\r', '\n']);
-                        let mut preview: String = text.chars().take(2_000).collect();
-                        if preview.len() < text.len() {
-                            preview.push_str("...");
-                        }
+                    let text = data["lines"]["text"]
+                        .as_str()
+                        .ok_or_else(|| failure("ripgrep returned non-UTF-8 matching text"))?;
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    let mut preview: String = text.chars().take(2_000).collect();
+                    if preview.len() < text.len() {
+                        preview.push_str("...");
+                    }
+                    (
                         format!(
                             "{}:{}:{preview}",
                             cwd.join(path.trim_start_matches("./")).display(),
                             data["line_number"]
-                        )
-                    }
+                        ),
+                        is_match,
+                    )
                 };
-                if count == MAX_RESULTS {
+                if lines.len() == MAX_RESULTS {
                     truncated = true;
-                    let _ = child.start_kill();
-                    break;
+                    if is_match {
+                        if let Some(index) = lines.iter().position(|(_, matched)| !matched) {
+                            lines.remove(index);
+                        } else {
+                            stopped = true;
+                            let _ = child.start_kill();
+                            break;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
+                lines.push((line, is_match));
+            }
+            let count = lines.len();
+            let mut output = String::new();
+            for (line, _) in lines {
                 output.push_str(&line);
                 output.push('\n');
-                count += 1;
             }
-            Ok((output, count, truncated))
+            Ok((output, count, truncated, stopped))
         };
         let errors = async {
             let mut errors = Vec::new();
@@ -231,8 +244,8 @@ pub async fn run(
         .wait()
         .await
         .map_err(|error| failure(format!("Cannot wait for ripgrep: {error}")))?;
-    let ((mut output, count, truncated), errors) = result?;
-    if !truncated
+    let ((mut output, count, truncated, stopped), errors) = result?;
+    if !stopped
         && !matches!(status.code(), Some(0 | 1))
         && (count == 0
             || status.code() != Some(2)
@@ -436,6 +449,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(regex.metadata["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn context_bound_preserves_late_matches_and_reports_omissions() {
+        let directory = Directory::new();
+        let mut content = "before\n".repeat(200);
+        content.push_str("needle\nafter\n");
+        std::fs::write(directory.0.path().join("late.txt"), content).unwrap();
+        let result = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern":"needle", "context":200}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.metadata["count"], 100);
+        assert_eq!(result.metadata["truncated"], true);
+        assert!(result.output.contains(":201:needle"));
+        assert!(result.output.contains("Results truncated at 100"));
+    }
+
+    #[tokio::test]
+    async fn files_only_stops_after_first_match_in_each_file() {
+        let directory = Directory::new();
+        std::fs::write(
+            directory.0.path().join("first.txt"),
+            format!("needle\nneedle{}\n", "x".repeat(MAX_RECORD)),
+        )
+        .unwrap();
+        std::fs::write(directory.0.path().join("second.txt"), "needle\nneedle\n").unwrap();
+        let result = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern":"needle", "filesOnly":true}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.metadata["count"], 2);
+        assert!(result.output.contains("first.txt"));
+        assert!(result.output.contains("second.txt"));
+        assert_eq!(result.metadata["truncated"], false);
     }
 
     #[tokio::test]
