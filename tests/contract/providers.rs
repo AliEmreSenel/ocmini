@@ -587,7 +587,8 @@ async fn nested_read_instructions_reach_model_once() {
     provider.request().await;
     let first = provider.request().await.to_string();
     assert!(first.contains("nested instruction marker"));
-    assert!(first.contains("nested/AGENTS.md"));
+    let suffix = serde_json::to_string(&std::path::Path::new("nested").join("AGENTS.md")).unwrap();
+    assert!(first.contains(suffix.trim_matches('"')));
     let second = provider.request().await.to_string();
     assert_eq!(second.matches("nested instruction marker").count(), 1);
 }
