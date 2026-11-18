@@ -2,7 +2,7 @@ use super::*;
 use crate::events as event;
 use tokio_util::sync::CancellationToken;
 
-pub(super) type DeferredMcpTool = (usize, Value, (String, String));
+pub(super) type DeferredMcpTool = (usize, Value, crate::mcp::McpToolRoute);
 type McpActivation<'a> = (&'a [DeferredMcpTool], &'a mut Vec<String>);
 
 /// Tool calls admitted in one model step are independent. Argument hooks and
@@ -33,9 +33,11 @@ pub(super) async fn run_tools(
         let stale = deferred
             .iter()
             .find(|(_, def, _)| def["function"]["name"] == name)
-            .is_some_and(|(_, _, route)| base.app.mcp().route(&name).as_ref() != Some(route));
+            .is_some_and(|(_, _, route)| !base.app.mcp().route_is_current(&name, route));
         let prepared = if stale {
-            Err(OperationError::from("MCP tool is no longer registered"))
+            Err(OperationError::from(
+                "MCP tool catalog changed. Run discover_mcp_tools again.",
+            ))
         } else {
             prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await
         };
@@ -443,14 +445,14 @@ async fn execute_authorized_tool(
             }
         }
     }
-    if let Some((deferred, _)) = &selection {
-        if deferred
+    let route = selection.as_ref().and_then(|(deferred, _)| {
+        deferred
             .iter()
             .find(|(_, def, _)| def["function"]["name"] == name)
-            .is_some_and(|(_, _, route)| ctx.app.mcp().route(name).as_ref() != Some(route))
-        {
-            return Err("MCP tool is no longer registered".into());
-        }
+            .map(|(_, _, route)| route)
+    });
+    if route.is_some_and(|route| !ctx.app.mcp().route_is_current(name, route)) {
+        return Err("MCP tool catalog changed. Run discover_mcp_tools again.".into());
     }
     // Approval hooks and user input can outlive the lease that authorized them.
     ctx.app.store.check_ownership(&ctx.session_id)?;
@@ -472,7 +474,7 @@ async fn execute_authorized_tool(
         for (_, def, route) in deferred {
             let name = def["function"]["name"].as_str().unwrap_or_default();
             let description = def["function"]["description"].as_str().unwrap_or_default();
-            if ctx.app.mcp().route(name).as_ref() == Some(route)
+            if ctx.app.mcp().route_is_current(name, route)
                 && format!("{name} {description}")
                     .to_lowercase()
                     .contains(&query)
@@ -490,6 +492,16 @@ async fn execute_authorized_tool(
         )
         .await
         .map_err(Into::into);
+    }
+    if let Some(route) = route {
+        let output = ctx
+            .app
+            .mcp()
+            .call_discovered(route, input.args().clone(), ctx.cancel.clone())
+            .await?;
+        return ocmini_tools::output::limit(output, ctx.app.tool_output_directory(&ctx.session_id))
+            .await
+            .map_err(Into::into);
     }
     tools::run_tool(ctx, name, input).await.map_err(Into::into)
 }

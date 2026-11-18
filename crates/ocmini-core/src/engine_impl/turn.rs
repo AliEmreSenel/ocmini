@@ -7,7 +7,7 @@ struct PreparedTurn {
     adapter: Box<dyn provider::ProviderAdapter>,
     request: ChatRequest,
     chat: bool,
-    deferred: Vec<DeferredMcpTool>,
+    deferred: Option<DeferredMcpCatalog>,
 }
 async fn prepare_turn(
     app: &App,
@@ -94,12 +94,132 @@ async fn prepare_turn(
             adapter,
             request: base,
             chat,
-            deferred: Vec::new(),
+            deferred: None,
         });
     }
+    tokio::select! {
+        _ = app.mcp().refresh_catalog(false) => {},
+        _ = cancel.cancelled() => return Err("Aborted".into()),
+    }
+    let catalog = deferred_mcp_enabled(&cfg)
+        .then(|| app.mcp().catalog_since(None))
+        .flatten();
+    let (tools, deferred) =
+        prepare_tool_catalog(app, sid, &cfg, request, hook_context, cancel, catalog).await?;
+    base.tools = tools;
+    Ok(PreparedTurn {
+        config: cfg,
+        adapter,
+        request: base,
+        chat,
+        deferred,
+    })
+}
+
+fn deferred_mcp_enabled(config: &Config) -> bool {
+    config
+        .extra
+        .get("deferred_mcp_discovery")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+async fn prepare_tool_catalog(
+    app: &App,
+    sid: &str,
+    cfg: &Config,
+    request: &PromptRequest,
+    hook_context: &Value,
+    cancel: &CancellationToken,
+    mut catalog: Option<crate::mcp::Catalog>,
+) -> Result<(Vec<Value>, Option<DeferredMcpCatalog>), OperationError> {
     let mut defs = tools::tool_defs();
-    if app.v2.enabled(sid) {
-        for def in &mut defs {
+    v2_tool_defs(&mut defs, app.v2.enabled(sid));
+    if catalog.is_none() {
+        defs.retain(|d| d["function"]["name"] != "discover_mcp_tools");
+    }
+    let agent = request.agent.as_deref().unwrap_or("build");
+    let read_only = ["plan", "explore"].contains(&agent);
+    defs.extend(match &mut catalog {
+        Some(snapshot) => std::mem::take(&mut snapshot.definitions),
+        None => app.mcp().tool_defs(),
+    });
+    defs.retain(|def| {
+        let name = def["function"]["name"].as_str().unwrap_or_default();
+        tool_enabled(name, agent, cfg, request)
+            && !unattended_tool_denied(name, app, request)
+            && !(read_only
+                && (execution_tool(name)
+                    || match &catalog {
+                        Some(snapshot) => snapshot.route(name).is_some(),
+                        None => app.mcp().route(name).is_some(),
+                    }))
+    });
+    if app.hooks.has(crate::tools::hooks::TOOL_CATALOG_TRANSFORM) {
+        let result = app
+            .hooks
+            .run(
+                crate::tools::hooks::TOOL_CATALOG_TRANSFORM,
+                hook_context,
+                json!({"tools":defs}),
+                Some(cancel),
+            )
+            .await?;
+        defs = result.input["tools"]
+            .as_array()
+            .ok_or("Tool catalog hook must return an array")?
+            .clone();
+    }
+    let deferred = catalog.map(|catalog| {
+        let mut tools = Vec::new();
+        let mut position = 0;
+        defs.retain(|def| {
+            let index = position;
+            position += 1;
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            if let Some(route) = catalog.route(name) {
+                tools.push((index, def.clone(), route.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        DeferredMcpCatalog {
+            version: catalog.version,
+            tools,
+        }
+    });
+    Ok((defs, deferred))
+}
+
+struct DeferredMcpCatalog {
+    version: u64,
+    tools: Vec<DeferredMcpTool>,
+}
+
+impl DeferredMcpCatalog {
+    fn expose(&self, defs: &mut Vec<Value>, active: &HashSet<String>) {
+        defs.retain(|def| {
+            !self
+                .tools
+                .iter()
+                .any(|(_, deferred, _)| deferred["function"]["name"] == def["function"]["name"])
+        });
+        let mut omitted = 0;
+        for (index, def, _) in &self.tools {
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            if active.contains(name) {
+                defs.insert(index.saturating_sub(omitted).min(defs.len()), def.clone());
+            } else {
+                omitted += 1;
+            }
+        }
+    }
+}
+
+fn v2_tool_defs(defs: &mut Vec<Value>, v2: bool) {
+    if v2 {
+        for def in defs {
             if let Some(name) = def["function"]["name"].as_str() {
                 def["function"]["name"] = json!(crate::v2::wire::tool_name(name));
                 if def["function"]["name"] == "subagent" {
@@ -122,62 +242,124 @@ async fn prepare_turn(
             }
         }
     }
-    let discovery_enabled = cfg
-        .extra
-        .get("deferred_mcp_discovery")
-        .and_then(Value::as_bool)
-        == Some(true);
-    if !discovery_enabled {
-        defs.retain(|d| d["function"]["name"] != "discover_mcp_tools");
+}
+
+/// Estimate the locally available request context without starting a turn or MCP.
+pub async fn inspect_context(
+    app: &App,
+    session: &Session,
+    selected: &PromptRequest,
+) -> Result<String, OperationError> {
+    let directory = session.directory.clone();
+    let cfg = tokio::task::spawn_blocking(move || Config::load_for(&directory))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(OperationError::invalid)?;
+    let agent = selected
+        .agent
+        .as_deref()
+        .or_else(|| cfg.extra.get("default_agent").and_then(Value::as_str))
+        .unwrap_or("build");
+    let model =
+        admission::resolve_model(&cfg, app, &session.id, selected.model.as_ref(), Some(agent))?;
+    let adapter = provider::build(
+        &model.provider_id,
+        cfg.provider(&model.provider_id),
+        &app.auth,
+    );
+    let chat = matches!(
+        adapter.protocol_of(&ChatRequest {
+            model: model.model_id.clone(),
+            ..Default::default()
+        })?,
+        provider::Protocol::Chat
+    );
+    let window = CompactionPolicy::for_model(&cfg, &model)
+        .context
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let mut system = instructions::inspection_system_prompt(
+        &cfg,
+        &session.directory,
+        agent,
+        selected.system.as_deref(),
+    )
+    .await?;
+    if ["plan", "explore"].contains(&agent) {
+        system.push_str("\n\nThis is a read-only analysis session. Use the supplied reading and search tools. Do not modify files or request execution tools.");
     }
-    defs.extend(tokio::select! {
-        value = app.mcp().tool_defs_async() => value,
-        _ = cancel.cancelled() => return Err("Aborted".into()),
-    });
+    let store = app.store.clone();
+    let sid = session.id.clone();
+    let v2 = app.v2.enabled(&sid);
+    let (messages, usage, keyed) =
+        tokio::task::spawn_blocking(move || -> Result<_, OperationError> {
+            let last = store.messages_limited(&sid, Some(1))?;
+            let saved = match last.last() {
+                Some(last) => store.context_messages(&sid, &last.info.id)?,
+                None => Vec::new(),
+            };
+            let usage = saved
+                .iter()
+                .rev()
+                .find_map(|m| {
+                    m.info
+                        .tokens
+                        .as_ref()
+                        .filter(|t| t.input > 0 || t.output > 0)
+                })
+                .cloned();
+            let messages = history::project_messages(saved, chat)?.0;
+            let keyed = if v2 {
+                store.v2_instructions(&sid)?
+            } else {
+                String::new()
+            };
+            Ok((messages, usage, keyed))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    system.push_str(&keyed);
+    let mut defs = tools::tool_defs();
+    v2_tool_defs(&mut defs, v2);
+    let mcp_defs = if deferred_mcp_enabled(&cfg) {
+        Vec::new()
+    } else {
+        defs.retain(|def| def["function"]["name"] != "discover_mcp_tools");
+        app.available_mcp_tools(&session.directory)
+    };
+    let mcp_names: HashSet<String> = mcp_defs
+        .iter()
+        .filter_map(|def| def["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    defs.extend(mcp_defs);
     defs.retain(|def| {
         let name = def["function"]["name"].as_str().unwrap_or_default();
-        tool_enabled(name, agent, &cfg, request)
-            && !unattended_tool_denied(name, app, request)
-            && !(read_only && (execution_tool(name) || app.mcp().route(name).is_some()))
+        tool_enabled(name, agent, &cfg, selected)
+            && !unattended_tool_denied(name, app, selected)
+            && !(["plan", "explore"].contains(&agent)
+                && (execution_tool(name) || mcp_names.contains(name)))
     });
-    if app.hooks.has(crate::tools::hooks::TOOL_CATALOG_TRANSFORM) {
-        let result = app
-            .hooks
-            .run(
-                crate::tools::hooks::TOOL_CATALOG_TRANSFORM,
-                hook_context,
-                json!({"tools":defs}),
-                Some(cancel),
+    let estimate = |bytes: usize| bytes.div_ceil(4);
+    let instructions = estimate(system.len());
+    let tools = estimate(serde_json::to_vec(&defs).unwrap_or_default().len());
+    let (mut conversation, mut results) = (0, 0);
+    for message in &messages {
+        let size = estimate(message.to_string().len());
+        if message["role"] == "tool" {
+            results += size;
+        } else {
+            conversation += size;
+        }
+    }
+    let usage = usage
+        .map(|t| {
+            format!(
+                "input {}, output {}, cache read {}, cache write {}",
+                t.input, t.output, t.cache.read, t.cache.write
             )
-            .await?;
-        defs = result.input["tools"]
-            .as_array()
-            .ok_or("Tool catalog hook must return an array")?
-            .clone();
-    }
-    let mut deferred = Vec::new();
-    if discovery_enabled {
-        let mut position = 0;
-        defs.retain(|def| {
-            let index = position;
-            position += 1;
-            let name = def["function"]["name"].as_str().unwrap_or_default();
-            if let Some(route) = app.mcp().route(name) {
-                deferred.push((index, def.clone(), route));
-                false
-            } else {
-                true
-            }
-        });
-    }
-    base.tools = defs;
-    Ok(PreparedTurn {
-        config: cfg,
-        adapter,
-        request: base,
-        chat,
-        deferred,
-    })
+        })
+        .unwrap_or_else(|| "unknown".into());
+    Ok(format!("Context for {model} (approximate tokens, 4 bytes/token)\n  Instructions: {instructions} (local and keyed; excludes remote and hook additions)\n  Tool schemas: {tools} (built-in and currently available MCP catalog; before catalog hooks)\n  Messages and tool calls: {conversation}\n  Tool results: {results}\n  Estimated total: {}\n  Latest observed usage (one saved provider response, not current context): {usage}\n  Model window: {window}\n", instructions + tools + conversation + results))
 }
 
 async fn end_feedback(
@@ -307,7 +489,7 @@ pub(super) async fn run_turn(
         adapter,
         request: mut base,
         chat,
-        deferred,
+        mut deferred,
     } = prepare_turn(
         &app,
         engine.clone(),
@@ -338,11 +520,13 @@ pub(super) async fn run_turn(
         .await;
     }
     let agent = request.agent.as_deref().unwrap_or("build");
-    let mut allowed: HashSet<String> = base
-        .tools
-        .iter()
-        .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
-        .collect();
+    let tool_names = |defs: &[Value]| -> HashSet<String> {
+        defs.iter()
+            .filter_map(|def| def["function"]["name"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let mut allowed = tool_names(&base.tools);
+    let mut active = HashSet::<String>::new();
     let max_steps = cfg
         .agent
         .get(agent)
@@ -358,6 +542,41 @@ pub(super) async fn run_turn(
         step = step.saturating_add(1);
         if cancel.is_cancelled() {
             return Err("Aborted".into());
+        }
+        if let Some(previous) = &deferred {
+            tokio::select! {
+                _ = app.mcp().refresh_catalog(true) => {},
+                _ = cancel.cancelled() => return Err("Aborted".into()),
+            }
+            if let Some(catalog) = app.mcp().catalog_since(Some(previous.version)) {
+                let mut catalog_context = turn_context(&app, sid, &request);
+                catalog_context["requestKind"] = json!("primary");
+                let (mut tools, next) = prepare_tool_catalog(
+                    &app,
+                    sid,
+                    &cfg,
+                    &request,
+                    &catalog_context,
+                    &cancel,
+                    Some(catalog),
+                )
+                .await?;
+                if let Some(next_catalog) = &next {
+                    active.retain(|name| {
+                        next_catalog.tools.iter().any(|(_, def, route)| {
+                            def["function"]["name"] == name.as_str()
+                                && previous
+                                    .tools
+                                    .iter()
+                                    .any(|(_, old, old_route)| old == def && old_route == route)
+                        })
+                    });
+                    next_catalog.expose(&mut tools, &active);
+                }
+                base.tools = tools;
+                allowed = tool_names(&base.tools);
+                deferred = next;
+            }
         }
         let (messages, has_summary) =
             history::load_messages(app.store.clone(), sid, uid, chat).await?;
@@ -440,28 +659,18 @@ pub(super) async fn run_turn(
                 &allowed,
                 &mut parts.tools,
                 &mut recent_calls,
-                &deferred,
+                deferred
+                    .as_ref()
+                    .map_or(&[], |catalog| catalog.tools.as_slice()),
             )
             .await?;
             // Discovery takes effect only after all sibling calls have finished.
-            allowed.extend(activated);
-            if !deferred.is_empty() {
-                let mut all = base.tools.clone();
-                all.retain(|d| {
-                    !deferred
-                        .iter()
-                        .any(|(_, v, _)| v["function"]["name"] == d["function"]["name"])
-                });
-                let mut omitted = 0;
-                for (index, def, route) in &deferred {
-                    let name = def["function"]["name"].as_str().unwrap_or_default();
-                    if allowed.contains(name) && app.mcp().route(name).as_ref() == Some(route) {
-                        all.insert(index.saturating_sub(omitted).min(all.len()), def.clone());
-                    } else {
-                        omitted += 1;
-                    }
+            if let Some(catalog) = &deferred {
+                if !activated.is_empty() {
+                    active.extend(activated);
+                    catalog.expose(&mut base.tools, &active);
+                    allowed = tool_names(&base.tools);
                 }
-                base.tools = all;
             }
             if cancel.is_cancelled() {
                 return Err("Aborted".into());

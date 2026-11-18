@@ -283,6 +283,16 @@ pub(super) async fn rpc(
         .unwrap()
         .clone()
         .ok_or("MCP server is disconnected")?;
+    rpc_on(server, transport, method, params, cancel).await
+}
+
+pub(super) async fn rpc_on(
+    server: &Server,
+    transport: Arc<Transport>,
+    method: &str,
+    params: Value,
+    cancel: Option<CancellationToken>,
+) -> Result<Value, String> {
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
     let mut guard = RpcGuard {

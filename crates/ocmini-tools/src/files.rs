@@ -8,6 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT: usize = 50 * 1024;
 const MAX_LINE: usize = 2000;
+const RANGE_PAGE_NOTES: usize = "\n[Output truncated; continue requested ranges from line ]".len()
+    + "\n[End of file after line ; requested lines beyond EOF are missing]".len()
+    + 2 * (usize::MAX.ilog10() as usize + 1);
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +20,16 @@ pub struct ReadInput {
     offset: Option<u64>,
     #[schemars(range(min = 1))]
     limit: Option<u64>,
+    /// Inclusive, one-based line ranges. Cannot be combined with offset or limit.
+    ranges: Option<Vec<LineRange>>,
+}
+
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
+struct LineRange {
+    #[schemars(range(min = 1))]
+    start: u64,
+    #[schemars(range(min = 1))]
+    end: u64,
 }
 
 #[cfg(test)]
@@ -48,6 +61,17 @@ pub fn read(
     input: &ReadInput,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, OperationError> {
+    let mut ranges = input.ranges.clone();
+    if let Some(ranges) = &mut ranges {
+        if input.offset.is_some()
+            || input.limit.is_some()
+            || ranges.is_empty()
+            || ranges.iter().any(|r| r.start == 0 || r.end < r.start)
+        {
+            return Err(failure("ranges must contain valid one-based inclusive spans and cannot be combined with offset or limit"));
+        }
+        ranges.sort_by_key(|r| r.start);
+    }
     let path = resolve_path(directory, &input.file_path);
     let metadata = std::fs::metadata(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound
@@ -70,6 +94,9 @@ pub fn read(
     let offset = input.offset.unwrap_or(1).max(1) as usize;
     let limit = input.limit.unwrap_or(2000) as usize;
     if metadata.is_dir() {
+        if ranges.is_some() {
+            return Err(failure("ranges are only supported for text files"));
+        }
         let mut entries = std::fs::read_dir(&path)
             .map_err(|e| failure(format!("Cannot list {}: {e}", path.display())))?
             .map(|entry| {
@@ -113,6 +140,9 @@ pub fn read(
         .fill_buf()
         .map_err(|e| failure(format!("Cannot read {}: {e}", path.display())))?;
     if let Some(mime) = media_type(header) {
+        if ranges.is_some() {
+            return Err(failure("ranges are only supported for text files"));
+        }
         if metadata.len() > 16 * 1024 * 1024 {
             return Err(failure("Media attachment exceeds 16 MiB"));
         }
@@ -140,24 +170,72 @@ pub fn read(
     let mut text_bytes = 0;
     let mut returned = 0;
     let mut output_capped = false;
+    let mut range_index = 0;
+    let mut next_line = None;
+    let page_size = if ranges.is_some() {
+        MAX_OUTPUT - RANGE_PAGE_NOTES
+    } else {
+        MAX_OUTPUT
+    };
     let total = scan_text(&path, reader, cancel, |index, line| {
-        if index >= offset && returned < limit && !output_capped {
+        let selected = ranges
+            .as_ref()
+            .map_or(index >= offset && returned < limit, |ranges| {
+                while range_index < ranges.len() && ranges[range_index].end < index as u64 {
+                    range_index += 1;
+                }
+                range_index < ranges.len() && ranges[range_index].start <= index as u64
+            });
+        if selected && !output_capped {
             let mut preview: String = line.chars().take(MAX_LINE).collect();
             if preview.len() < line.len() {
                 preview.push_str("... (line truncated to 2000 chars)");
             }
             let formatted = format!("{index}: {preview}\n");
-            let size = preview.len() + usize::from(returned > 0);
-            if text_bytes + size <= MAX_OUTPUT {
+            let size = if ranges.is_some() {
+                formatted.len()
+            } else {
+                preview.len() + usize::from(returned > 0)
+            };
+            if text_bytes + size <= page_size {
                 text.push_str(&formatted);
                 text_bytes += size;
                 returned += 1;
             } else {
                 output_capped = true;
+                next_line = Some(index);
             }
         }
-        index < offset || (returned < limit && !output_capped)
+        if ranges.is_some() {
+            !output_capped
+        } else {
+            index < offset || (returned < limit && !output_capped)
+        }
     })?;
+    if let Some(ranges) = &ranges {
+        let missing: Vec<_> = ranges
+            .iter()
+            .filter_map(|range| {
+                let start = range.start.max((total as u64).saturating_add(1));
+                (start <= range.end).then(|| json!({"start": start, "end": range.end}))
+            })
+            .collect();
+        if let Some(next) = next_line {
+            text.push_str(&format!(
+                "\n[Output truncated; continue requested ranges from line {next}]"
+            ));
+        }
+        if !missing.is_empty() {
+            text.push_str(&format!(
+                "\n[End of file after line {total}; requested lines beyond EOF are missing]"
+            ));
+        }
+        return output(
+            text,
+            &path,
+            json!({"filepath":path,"totalLines":total,"truncated":output_capped,"nextLine":next_line,"missingRanges":missing}),
+        );
+    }
     if total > 0 && offset > total {
         return Err(failure(format!(
             "Offset {offset} exceeds file length ({total} lines)"
@@ -510,6 +588,113 @@ mod tests {
         fn dir(&self) -> &str {
             self.0.path().to_str().unwrap()
         }
+    }
+
+    #[test]
+    fn read_disjoint_ranges_once_and_validate_the_whole_file() {
+        let directory = Directory::new();
+        let path = directory.0.path().join("ranges.txt");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let input =
+            json!({"filePath":"ranges.txt","ranges":[{"start":4,"end":5},{"start":2,"end":4}]});
+        let result = run(directory.dir(), "read", &input, &CancellationToken::new()).unwrap();
+        assert_eq!(result.output, "2: two\n3: three\n4: four\n5: five\n");
+        assert_eq!(result.metadata["totalLines"], 5);
+        assert!(run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"ranges.txt","ranges":[{"start":0,"end":1}]}),
+            &CancellationToken::new()
+        )
+        .is_err());
+        std::fs::write(path, b"one\ntwo\n\xff").unwrap();
+        assert!(run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"ranges.txt","ranges":[{"start":1,"end":1}]}),
+            &CancellationToken::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn range_pagination_and_missing_lines_are_actionable() {
+        let directory = Directory::new();
+        let path = directory.0.path().join("ranges.txt");
+        std::fs::write(
+            &path,
+            format!("{}tail\n", format!("{}\n", "x".repeat(2000)).repeat(40)),
+        )
+        .unwrap();
+        let result = run(directory.dir(), "read", &json!({"filePath":"ranges.txt", "ranges":[{"start": 1, "end": 15}, {"start": 25, "end": 45}, {"start": 50, "end": 51}]}), &CancellationToken::new()).unwrap();
+        let next = result.metadata["nextLine"].as_u64().unwrap();
+        assert!((25..=40).contains(&next));
+        assert!(result
+            .output
+            .contains(&format!("continue requested ranges from line {next}")));
+        assert_eq!(result.metadata["totalLines"], 41);
+        assert_eq!(
+            result.metadata["missingRanges"],
+            json!([{"start":42,"end":45},{"start":50,"end":51}])
+        );
+        let resumed = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"ranges.txt", "ranges":[{"start": next, "end": 45}]}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(resumed.output.starts_with(&format!("{next}: ")));
+        std::fs::write(&path, "").unwrap();
+        let empty = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"ranges.txt", "ranges":[{"start": 2, "end": 3}]}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty.metadata["missingRanges"],
+            json!([{"start":2,"end":3}])
+        );
+        assert_eq!(empty.metadata["truncated"], false);
+        for ranges in [json!([]), json!([{"start":2,"end":1}])] {
+            assert!(run(
+                directory.dir(),
+                "read",
+                &json!({"filePath":"ranges.txt", "ranges":ranges}),
+                &CancellationToken::new()
+            )
+            .is_err());
+        }
+        assert!(run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"ranges.txt", "ranges":[{"start":1,"end":1}], "offset":1}),
+            &CancellationToken::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn range_page_counts_numbered_lines_and_leaves_space_for_continuation() {
+        let directory = Directory::new();
+        std::fs::write(directory.0.path().join("short.txt"), "x\n".repeat(20_000)).unwrap();
+        let result = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"short.txt","ranges":[{"start":1,"end":20_001}]}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(result.output.len() <= MAX_OUTPUT);
+        let next = result.metadata["nextLine"].as_u64().unwrap();
+        assert!(result.output.contains(&format!("{}: x\n", next - 1)));
+        assert!(!result.output.contains(&format!("{next}: x\n")));
+        assert!(result
+            .output
+            .contains(&format!("continue requested ranges from line {next}")));
+        assert!(result.output.contains("End of file after line 20000"));
     }
 
     #[test]

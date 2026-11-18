@@ -60,7 +60,7 @@ builtin_tools! {
     Edit => "edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", changes::EditInput;
     ApplyPatch => "apply_patch", "Apply a patch using *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, optional *** Move to:, @@ context hunks, and *** End Patch. All files are validated before any are changed.", changes::PatchInput;
     Glob => "glob", "Find files using ripgrep and glob patterns (including ** and {a,b}), honoring gitignore. Returns up to 100 files. Relative path uses the session directory.", search::Input;
-    Grep => "grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob.", search::GrepInput;
+    Grep => "grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob; context adds surrounding lines, filesOnly returns paths, literal disables regex, and caseSensitive controls case matching.", search::GrepInput;
     WebFetch => "webfetch", "Fetch an HTTP(S) text resource up to 5 MiB. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds (default 30, maximum 120).", web::Input;
     TodoWrite => "todowrite", "Replace and persist the session's todo list.", todo::Input;
     Question => "question", "Ask one or more questions, with options, and wait for the user's answers.", question::Input;

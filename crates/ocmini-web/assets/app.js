@@ -902,7 +902,7 @@
       const delivery = $("#delivery").value;
       const slash = text.match(/^\/(\S+)\s*([\s\S]*)$/);
       if (slash && slash[1] === "compact") {
-        await api("POST", sessionPath(sid, "/compact"), {});
+        await api("POST", sessionPath(sid, "/compact"), slash[2] ? { ocminiFocus: slash[2] } : {});
       } else if (slash && state.commands.some((c) => c.name === slash[1])) {
         await api("POST", sessionPath(sid, "/command"), { name: slash[1], text: slash[2], delivery });
       } else {

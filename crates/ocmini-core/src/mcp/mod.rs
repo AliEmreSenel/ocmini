@@ -3,6 +3,7 @@ use crate::types::stable_hash;
 use tokio_util::sync::CancellationToken;
 mod transport;
 use futures::StreamExt;
+use ocmini_tools::types::ToolOutput;
 use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,7 +14,9 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 #[cfg(test)]
 use transport::bounded_line;
-use transport::{create_local, create_remote, end_remote_session, fail_pending, notify, rpc};
+use transport::{
+    create_local, create_remote, end_remote_session, fail_pending, notify, rpc, rpc_on,
+};
 
 const PROTOCOL: &str = "2025-03-26";
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
@@ -152,7 +155,7 @@ struct Server {
     events: EventScope,
     config: Value,
     status: Arc<Mutex<Status>>,
-    tools: Mutex<Vec<Value>>,
+    tools: Mutex<ToolList>,
     transport: Mutex<Option<Arc<Transport>>>,
     changed: Arc<AtomicBool>,
     supports_tools: AtomicBool,
@@ -160,6 +163,12 @@ struct Server {
     generation: AtomicU64,
     connect_lock: tokio::sync::Mutex<()>,
     refresh: tokio::sync::Mutex<Refresh>,
+}
+
+#[derive(Default)]
+struct ToolList {
+    revision: u64,
+    definitions: Vec<Value>,
 }
 
 impl Server {
@@ -197,7 +206,7 @@ impl Server {
                 }
             }
         }
-        self.tools.lock().unwrap().clear();
+        *self.tools.lock().unwrap() = ToolList::default();
     }
 }
 
@@ -214,11 +223,27 @@ pub struct McpHub {
     catalog: Arc<Mutex<Catalog>>,
 }
 
-#[derive(Default)]
-struct Catalog {
-    version: u64,
-    routes: HashMap<String, (String, String)>,
-    definitions: Vec<Value>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpToolRoute {
+    server: String,
+    tool: String,
+    revision: u64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Catalog {
+    pub(crate) version: u64,
+    routes: HashMap<String, McpToolRoute>,
+    pub(crate) definitions: Vec<Value>,
+}
+
+impl Catalog {
+    pub(crate) fn route(&self, name: &str) -> Option<&McpToolRoute> {
+        self.routes.get(name).or_else(|| {
+            name.strip_prefix("mcp_")
+                .and_then(|alias| self.routes.get(alias))
+        })
+    }
 }
 
 impl McpHub {
@@ -262,7 +287,7 @@ impl McpHub {
                 state: ConnectionState::Disconnected,
                 error: None,
             })),
-            tools: Mutex::new(Vec::new()),
+            tools: Mutex::new(ToolList::default()),
             transport: Mutex::new(None),
             changed: Arc::new(AtomicBool::new(false)),
             supports_tools: AtomicBool::new(false),
@@ -304,6 +329,7 @@ impl McpHub {
             .ok_or_else(|| crate::types::OperationError::not_found("MCP server not found"))?;
         server.generation.fetch_add(1, Ordering::AcqRel);
         server.stop();
+        self.events.catalog_version.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -335,6 +361,35 @@ impl McpHub {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, String> {
+        self.call_tool(name, tool, args, cancel, None).await
+    }
+
+    pub(crate) async fn call_discovered(
+        &self,
+        route: &McpToolRoute,
+        args: Value,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, String> {
+        let result = self
+            .call_tool(
+                &route.server,
+                &route.tool,
+                args,
+                cancel,
+                Some(route.revision),
+            )
+            .await?;
+        Ok(tool_output(&route.server, &route.tool, &result))
+    }
+
+    async fn call_tool(
+        &self,
+        name: &str,
+        tool: &str,
+        args: Value,
+        cancel: CancellationToken,
+        revision: Option<u64>,
+    ) -> Result<Value, String> {
         let server = self.server(name)?;
         let generation = server.generation.load(Ordering::Acquire);
         if server.status.lock().unwrap().state != ConnectionState::Connected {
@@ -345,17 +400,29 @@ impl McpHub {
                 "ocmini: MCP catalog {name} refresh failed; using the previous catalog: {error}"
             );
         }
-        if !server
-            .tools
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|t| t["name"].as_str() == Some(tool))
-        {
-            return Err(format!("MCP server {name:?} has no tool {tool:?}"));
-        }
-        let result = match rpc(
+        let transport = {
+            let transport = server.transport.lock().unwrap().clone();
+            let tools = server.tools.lock().unwrap();
+            if revision.is_some_and(|revision| {
+                tools.revision != revision
+                    || server.generation.load(Ordering::Acquire) != generation
+            }) {
+                return Err("MCP tool catalog changed. Run discover_mcp_tools again.".into());
+            }
+            if !tools
+                .definitions
+                .iter()
+                .any(|t| t["name"].as_str() == Some(tool))
+            {
+                return Err(format!("MCP server {name:?} has no tool {tool:?}"));
+            }
+            transport.ok_or("MCP server is disconnected")?
+        };
+        // Dispatch on the validated transport even if the server reconnects
+        // after the check. A replacement connection must never receive this call.
+        let result = match rpc_on(
             &server,
+            transport,
             "tools/call",
             json!({"name": tool, "arguments": args}),
             Some(cancel),
@@ -398,7 +465,19 @@ impl McpHub {
     }
 
     pub async fn tool_defs_async(&self) -> Vec<Value> {
-        let servers: Vec<_> = self.servers.lock().unwrap().values().cloned().collect();
+        self.refresh_catalog(false).await;
+        self.tool_defs()
+    }
+
+    pub(crate) async fn refresh_catalog(&self, notified_only: bool) {
+        let servers: Vec<_> = self
+            .servers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|server| !notified_only || server.changed.load(Ordering::Acquire))
+            .cloned()
+            .collect();
         futures::stream::iter(servers)
             .for_each_concurrent(8, |server| async move {
                 if let Err(error) = refresh_if_needed(&server).await {
@@ -409,7 +488,10 @@ impl McpHub {
                 }
             })
             .await;
-        self.tool_defs()
+    }
+
+    pub(crate) fn catalog_since(&self, version: Option<u64>) -> Option<Catalog> {
+        self.with_catalog(|catalog| (version != Some(catalog.version)).then(|| catalog.clone()))
     }
 
     pub fn tool_defs(&self) -> Vec<Value> {
@@ -417,8 +499,8 @@ impl McpHub {
     }
 
     fn with_catalog<T>(&self, read: impl FnOnce(&Catalog) -> T) -> T {
-        let version = self.events.catalog_version.load(Ordering::Acquire);
         let mut catalog = self.catalog.lock().unwrap();
+        let version = self.events.catalog_version.load(Ordering::Acquire);
         if catalog.version != version {
             *catalog = self.build_catalog(version);
         }
@@ -453,7 +535,8 @@ impl McpHub {
             if server.status.lock().unwrap().state != ConnectionState::Connected {
                 continue;
             }
-            for tool in server.tools.lock().unwrap().iter() {
+            let tools = server.tools.lock().unwrap();
+            for tool in &tools.definitions {
                 let Some(tool_name) = tool["name"].as_str() else {
                     continue;
                 };
@@ -485,9 +568,14 @@ impl McpHub {
                     "name":name,"description":tool["description"].as_str().unwrap_or("MCP tool"),
                     "parameters":tool.get("inputSchema").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}}))
                 }}));
-                catalog
-                    .routes
-                    .insert(name, (server_name.clone(), tool_name.into()));
+                catalog.routes.insert(
+                    name,
+                    McpToolRoute {
+                        server: server_name.clone(),
+                        tool: tool_name.into(),
+                        revision: tools.revision,
+                    },
+                );
             }
         }
         catalog
@@ -496,14 +584,13 @@ impl McpHub {
     pub fn route(&self, name: &str) -> Option<(String, String)> {
         self.with_catalog(|catalog| {
             catalog
-                .routes
-                .get(name)
-                .or_else(|| {
-                    name.strip_prefix("mcp_")
-                        .and_then(|alias| catalog.routes.get(alias))
-                })
-                .cloned()
+                .route(name)
+                .map(|r| (r.server.clone(), r.tool.clone()))
         })
+    }
+
+    pub(crate) fn route_is_current(&self, name: &str, route: &McpToolRoute) -> bool {
+        self.with_catalog(|catalog| catalog.route(name) == Some(route))
     }
 }
 
@@ -773,8 +860,11 @@ async fn refresh_tools(server: &Server) -> Result<(), String> {
                 if server.generation.load(Ordering::Acquire) != generation {
                     return Err("MCP connection changed while refreshing tools".into());
                 }
-                *current = tools;
-                server.events.catalog_version.fetch_add(1, Ordering::AcqRel);
+                if current.definitions != tools {
+                    current.revision =
+                        server.events.catalog_version.fetch_add(1, Ordering::AcqRel) + 1;
+                    current.definitions = tools;
+                }
                 return Ok(());
             }
             Some(cursor) if !seen.insert(cursor.clone()) => {
@@ -784,6 +874,24 @@ async fn refresh_tools(server: &Server) -> Result<(), String> {
         }
     }
     Err("MCP tools/list exceeded 1000 pages".into())
+}
+
+pub(crate) fn tool_output(server: &str, tool: &str, result: &Value) -> ToolOutput {
+    let attachments: Vec<Value> = result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            matches!(item["type"].as_str(), Some("image" | "audio"))
+                || item["type"] == "resource" && item["resource"]["blob"].is_string()
+        })
+        .cloned()
+        .collect();
+    ToolOutput {
+        output: render_result(result),
+        title: format!("{server}/{tool}"),
+        metadata: json!({"server":server,"tool":tool,"attachments":attachments}),
+    }
 }
 
 pub fn render_result(result: &Value) -> String {
