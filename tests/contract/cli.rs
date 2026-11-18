@@ -677,27 +677,33 @@ json.load(sys.stdin);pathlib.Path('context-hook-ran').touch();print('{}')"#;
         }),
     )
     .await;
-    let script = r#"import os,pty,select,signal,sys,time,fcntl,termios,struct
-pid,fd=pty.fork()
-if pid==0: os.execv(sys.argv[1],[sys.argv[1],'tui'])
-data=b''; deadline=time.monotonic()+15; sent=False
+    let script = r#"import errno,fcntl,os,pty,select,struct,subprocess,sys,termios,time
+fd,slave=pty.openpty()
+fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
+os.set_blocking(fd,False)
+with os.fdopen(slave, 'rb', buffering=0) as terminal:
+ child=subprocess.Popen([sys.argv[1],'tui'],stdin=terminal,stdout=terminal,stderr=terminal)
+data=b''
+deadline=time.monotonic()+15
+sent=False
 try:
- fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
- os.set_blocking(fd,False)
  while time.monotonic()<deadline:
-  if not sent and time.monotonic()>deadline-14:
+  if not sent and data:
    os.write(fd,b'/context\r'); sent=True
   ready,_,_=select.select([fd],[],[],0.1)
   if ready:
-   try: data+=os.read(fd,65536)
+   try: chunk=os.read(fd,65536)
    except BlockingIOError: continue
-   except OSError: break
+   except OSError as err:
+    if err.errno != errno.EIO: raise
+    break
+   if not chunk: break
+   data+=chunk
    if b'Context for' in data: break
 finally:
- try: os.kill(pid,signal.SIGKILL)
- except ProcessLookupError: pass
- os.waitpid(pid,0)
  os.close(fd)
+ child.kill()
+ child.wait(timeout=3)
 if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
 "#;
     let mut command = tokio::process::Command::new(PYTHON);
@@ -719,8 +725,9 @@ if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(!server.directory.join("context-hook-ran").exists());
     assert!(!server.directory.join("context-mcp-started").exists());
