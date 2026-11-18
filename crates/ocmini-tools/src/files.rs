@@ -628,7 +628,7 @@ mod tests {
         .unwrap();
         let result = run(directory.dir(), "read", &json!({"filePath":"ranges.txt", "ranges":[{"start": 1, "end": 15}, {"start": 25, "end": 45}, {"start": 50, "end": 51}]}), &CancellationToken::new()).unwrap();
         let next = result.metadata["nextLine"].as_u64().unwrap();
-        assert!(next >= 25 && next <= 40);
+        assert!((25..=40).contains(&next));
         assert!(result
             .output
             .contains(&format!("continue requested ranges from line {next}")));
