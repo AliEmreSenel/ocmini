@@ -56,9 +56,14 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         crate::provider::Protocol::Responses,
         &mut body,
     )?;
-    // Preserve raw body overlay precedence, then move the effective instructions
-    // only for endpoints known to implement OpenAI's Responses semantics.
-    if cacheable_instructions(&settings.base_url) && body["input"].is_array() {
+    // Raw overlays can deliberately use the request-specific instructions field.
+    let overrides_instructions = ["body", "extraBody"]
+        .iter()
+        .any(|key| settings.options[*key].get("instructions").is_some());
+    if !overrides_instructions
+        && cacheable_instructions(&settings.base_url)
+        && body["input"].is_array()
+    {
         if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
             let instructions = instructions.to_owned();
             body.as_object_mut().unwrap().remove("instructions");
@@ -82,6 +87,7 @@ fn cacheable_instructions(base_url: &str) -> bool {
     }
     let host = url.host_str().unwrap_or_default();
     host == "api.openai.com"
+        || host == "api.githubcopilot.com"
         || host == "chatgpt.com"
             && (url.path() == "/backend-api/codex" || url.path().starts_with("/backend-api/codex/"))
         || host.ends_with(".openai.azure.com")
@@ -376,6 +382,7 @@ mod tests {
         for url in [
             "https://api.openai.com/v1",
             "https://chatgpt.com/backend-api/codex",
+            "https://api.githubcopilot.com",
             "https://example.openai.azure.com/openai/v1",
             "https://gateway.ai.cloudflare.com/v1/account/gateway/openai",
         ] {
@@ -389,11 +396,12 @@ mod tests {
             assert_eq!(body["input"][1]["role"], "user");
             assert_eq!(body["input"][2], replay);
         }
-        settings.options = json!({"body":{"instructions":"overlay"}});
-        assert_eq!(
-            request_body(&settings, &req).unwrap()["input"][0]["content"],
-            "overlay"
-        );
+        for key in ["body", "extraBody"] {
+            settings.options = json!({key:{"instructions":"overlay"}});
+            let body = request_body(&settings, &req).unwrap();
+            assert_eq!(body["instructions"], "overlay");
+            assert_eq!(body["input"][0]["role"], "user");
+        }
         req.system.clear();
         settings.options = json!({});
         assert_eq!(
@@ -413,7 +421,6 @@ mod tests {
         for url in [
             "http://localhost/v1",
             "https://api.openai.com.example/v1",
-            "https://api.githubcopilot.com",
             "https://gateway.ai.cloudflare.com/v1/account/gateway/compat",
             "https://example.com/v1",
         ] {
