@@ -434,13 +434,18 @@ async fn historical_shell_output_is_scoped_to_its_session() {
     let provider = Provider::start(vec![
         tool_script(
             "bash",
-            json!({"command":shell_command("printf RECALL_SENTINEL", "echo RECALL_SENTINEL")}),
+            json!({"command":shell_command("cat recall-source.txt", "type recall-source.txt")}),
             "original",
         ),
         text_script("Done", ""),
     ])
     .await;
     let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(
+        server.directory.join("recall-source.txt"),
+        "RECALL_SENTINEL",
+    )
+    .unwrap();
     let first = server.session(allow()).await;
     server
         .post(
@@ -500,5 +505,42 @@ async fn historical_shell_output_is_scoped_to_its_session() {
             assert_eq!(recall["state"]["status"], "error", "{recall}");
             assert!(!recall.to_string().contains("RECALL_SENTINEL"));
         }
+    }
+    for denied in ["read_tool_output", "read", "bash"] {
+        server
+            .client
+            .patch(format!("{}/session/{first}", server.url))
+            .json(&json!({"permission":[
+                {"permission":"*","action":"allow"},
+                {"permission":denied,"action":"deny"}
+            ]}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        provider.scripts.lock().await.extend([
+            tool_script("read_tool_output", args.clone(), denied),
+            text_script("Done", ""),
+        ]);
+        server
+            .post(
+                &format!("/session/{first}/message"),
+                &prompt(&format!("msg_recall_denied_{denied}"), "Recall output"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let messages = server.messages(&first).await;
+        let recall = messages
+            .iter()
+            .flat_map(|m| m["parts"].as_array().unwrap())
+            .find(|p| p["callID"] == denied)
+            .unwrap();
+        assert_eq!(recall["state"]["status"], "error", "{recall}");
+        assert!(recall["state"]["error"].as_str().unwrap().contains(denied));
+        assert!(!recall.to_string().contains("RECALL_SENTINEL"));
     }
 }

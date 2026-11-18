@@ -379,9 +379,6 @@ async fn execute_authorized_tool(
     request: &PromptRequest,
     repeated: bool,
 ) -> Result<ToolOutput, OperationError> {
-    if name == "read_tool_output" {
-        return recall_tool_output(ctx, input, cfg, request).await;
-    }
     authorize_prepared(ctx, name, input, cfg, request, repeated).await?;
     ctx.app.store.check_ownership(&ctx.session_id)?;
     ctx.app.hooks.emit(
@@ -393,6 +390,9 @@ async fn execute_authorized_tool(
         },
         &tools::hook_context(ctx, name),
     );
+    if name == "read_tool_output" {
+        return recall_tool_output(ctx, input, cfg, request).await;
+    }
     tools::run_tool(ctx, name, input).await.map_err(Into::into)
 }
 
@@ -483,9 +483,11 @@ async fn recall_tool_output(
         .ok_or("Tool result has no text output")?
         .to_owned();
     if let Some(path) = part["state"]["metadata"]["outputPath"].as_str() {
-        output.push_str(&format!(
-            "\nFull output path: {path} (use read to access it)."
-        ));
+        if !output.contains(path) {
+            output.push_str(&format!(
+                "\nFull output path: {path} (use read to access it)."
+            ));
+        }
     }
     Ok(ToolOutput {
         output,

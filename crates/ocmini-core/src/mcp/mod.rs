@@ -429,6 +429,7 @@ impl McpHub {
         let mut used: HashSet<String> = [
             "bash",
             "read",
+            "read_tool_output",
             "write",
             "edit",
             "apply_patch",
