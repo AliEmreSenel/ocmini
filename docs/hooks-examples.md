@@ -224,7 +224,7 @@ For registration, matching, and inspection, start with [hooks guide](hooks.md). 
 
 ## Compact spilled test output with RTK
 
-This optional example uses an already installed Apache-licensed [rtk-oss v1.2 or later](https://github.com/rtk-ai/rtk/tree/v1.2.0) executable on `PATH`, plus Python 3. Copy [rtk_after.py](../examples/hooks/rtk_after.py) to a stable local path and add this handler to your configuration:
+This optional Unix example uses Python 3 and an installed Apache-licensed [rtk-oss v1.2 or later](https://github.com/rtk-ai/rtk/tree/v1.2.0) executable on `PATH`. Copy [rtk_after.py](../examples/hooks/rtk_after.py) to a stable local path and add the following handler to your configuration.
 
 ```json
 {
@@ -242,6 +242,6 @@ This optional example uses an already installed Apache-licensed [rtk-oss v1.2 or
 }
 ```
 
-The example recognizes only the exact authorized commands `cargo test` and `pytest`, with a successful shell exit and an existing raw output spill containing a recognizable successful test summary. It sends the captured spill to `rtk pipe --filter cargo-test` or `rtk pipe --filter pytest` on stdin; it never invokes the original command again. Other commands, failures, missing or malformed input, a missing spill or RTK executable, and filter failures leave the result unchanged. The filtered text includes the original raw spill path for the complete trace. Exit status and runtime-owned metadata are not supplied as hook mutations; ocmini reapplies its usual output bounds and spill metadata to a changed result. The original spill remains subject to ocmini's normal retention policy. This example does not install or configure RTK and is not part of the default runtime.
+The example recognizes the exact authorized commands `cargo test` and `pytest` with a successful exit and a raw spill containing a recognized test summary. It sends the captured bytes to `rtk pipe --filter cargo-test` or `rtk pipe --filter pytest` on stdin. Spills must be regular files reached without symlinks, with one link and within RTK's 10 MiB stdin limit. The hook replaces the preview only when the filtered text and raw file reference take fewer bytes. ocmini retains the authoritative exit status and applies the normal spill retention policy.
 
 Run the fixture smoke test from the repository root with `python3 -m unittest examples/hooks/test_rtk_after.py`. It uses a fake RTK executable and needs no RTK installation.

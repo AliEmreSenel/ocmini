@@ -1,14 +1,41 @@
 #!/usr/bin/env python3
 """Optional ocmini after-tool hook; see docs/hooks-examples.md."""
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
+# RTK v1.2's stdin filter rejects input above this size.
+RTK_INPUT_BYTES = 10 * 1024 * 1024
+
+
+def read_spill(path):
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts or os.open not in os.supports_dir_fd:
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    directory = os.open(path.anchor, flags | os.O_DIRECTORY)
+    try:
+        for name in path.parts[1:-1]:
+            child = os.open(name, flags | os.O_DIRECTORY, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(path.name, flags | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as spill:
+            info = os.fstat(spill.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > RTK_INPUT_BYTES:
+                return None
+            raw = spill.read(RTK_INPUT_BYTES + 1)
+        return raw.decode("utf-8") if len(raw) <= RTK_INPUT_BYTES else None
+    finally:
+        os.close(directory)
+
 
 def transform(request):
-    if request.get("hook") != "tool.execute.after":
+    if not isinstance(request, dict) or request.get("hook") != "tool.execute.after":
         return {}
     context = request.get("context")
     data = request.get("input")
@@ -26,7 +53,9 @@ def transform(request):
     if name is None:
         return {}
     path = meta["outputPath"]
-    raw = Path(path).read_text(encoding="utf-8")
+    raw = read_spill(path)
+    if raw is None:
+        return {}
     # Refuse unexpected output and failures even if a wrapper reported exit zero.
     if name == "cargo-test":
         valid = re.search(r"(?m)^test result: ok\. \d+ passed; 0 failed;", raw)
@@ -41,7 +70,8 @@ def transform(request):
         return {}
     # This wording intentionally differs from ocmini's generated spill suffix:
     # relimiting a changed output removes that suffix and regenerates metadata.
-    return {"set": {"output": result.stdout.rstrip() + "\n\n[Original raw tool output: " + path + "]"}}
+    output = result.stdout.rstrip() + "\n\n[Original raw tool output: " + path + "]"
+    return {"set": {"output": output}} if len(output.encode()) < len(data["output"].encode()) else {}
 
 
 def main():

@@ -9,10 +9,11 @@ import unittest
 HOOK = Path(__file__).with_name("rtk_after.py")
 
 
+@unittest.skipUnless(os.open in os.supports_dir_fd, "requires Unix directory-relative opens")
 class RtkHookSmoke(unittest.TestCase):
     def test_filter_and_passthrough(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             spill = root / "raw output.txt"
             raw = "running 1 test\ntest demo ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n"
             spill.write_text(raw)
@@ -20,7 +21,7 @@ class RtkHookSmoke(unittest.TestCase):
             rtk.write_text("#!/usr/bin/env python3\nimport sys\nassert sys.argv[1:] == ['pipe', '--filter', 'cargo-test']\nassert 'test result: ok.' in sys.stdin.read()\nprint('1 test passed')\n")
             rtk.chmod(0o755)
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ.get("PATH", ""))
-            request = {"hook": "tool.execute.after", "context": {"tool": "bash"}, "input": {"status": "completed", "args": {"command": "cargo test"}, "output": "preview", "title": "shell", "metadata": {"exit": 0, "truncated": True, "outputPath": str(spill), "outputBytes": len(raw)}}}
+            request = {"hook": "tool.execute.after", "context": {"tool": "bash"}, "input": {"status": "completed", "args": {"command": "cargo test"}, "output": "preview\n" * 30, "title": "shell", "metadata": {"exit": 0, "truncated": True, "outputPath": str(spill), "outputBytes": len(raw)}}}
 
             def run(value):
                 result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(value), text=True, capture_output=True, check=True, env=env)
@@ -29,6 +30,20 @@ class RtkHookSmoke(unittest.TestCase):
             response = run(request)
             self.assertEqual(response, {"set": {"output": "1 test passed\n\n[Original raw tool output: " + str(spill) + "]"}})
             self.assertEqual(spill.read_text(), raw)
+            for link, make_link in [
+                (root / "symlink", lambda p: p.symlink_to(spill)),
+                (root / "hardlink", lambda p: os.link(spill, p)),
+            ]:
+                make_link(link)
+                case = json.loads(json.dumps(request))
+                case["input"]["metadata"]["outputPath"] = str(link)
+                self.assertEqual(run(case), {})
+                link.unlink()
+            with spill.open("wb") as log:
+                log.truncate(10 * 1024 * 1024 + 1)
+            self.assertEqual(run(request), {})
+            spill.write_text(raw)
+            self.assertEqual(run([]), {})
             for change in (lambda r: r["input"]["metadata"].update(exit=1),
                            lambda r: r["input"]["args"].update(command="cargo test; echo unsafe"),
                            lambda r: r["input"]["metadata"].update(outputPath="/missing"),
