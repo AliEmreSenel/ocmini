@@ -7,7 +7,7 @@ struct PreparedTurn {
     adapter: Box<dyn provider::ProviderAdapter>,
     request: ChatRequest,
     chat: bool,
-    deferred: Vec<(usize, Value, (String, String))>,
+    deferred: Vec<DeferredMcpTool>,
 }
 async fn prepare_turn(
     app: &App,

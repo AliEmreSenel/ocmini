@@ -2,6 +2,9 @@ use super::*;
 use crate::events as event;
 use tokio_util::sync::CancellationToken;
 
+pub(super) type DeferredMcpTool = (usize, Value, (String, String));
+type McpActivation<'a> = (&'a [DeferredMcpTool], &'a mut Vec<String>);
+
 /// Tool calls admitted in one model step are independent. Argument hooks and
 /// doom-loop signatures run in part order, then preparation and execution run
 /// concurrently. A same-file edit can wait for its predecessor's transaction
@@ -13,7 +16,7 @@ pub(super) async fn run_tools(
     allowed: &HashSet<String>,
     tool_parts: &mut [Value],
     recent_calls: &mut VecDeque<String>,
-    deferred: &[(usize, Value, (String, String))],
+    deferred: &[DeferredMcpTool],
 ) -> Result<Vec<String>, String> {
     let agent = request.agent.as_deref().unwrap_or("build");
     let mut running = Vec::new();
@@ -93,7 +96,7 @@ async fn execute_part(
     cfg: &Config,
     request: &PromptRequest,
     allowed: &HashSet<String>,
-    deferred: &[(usize, Value, (String, String))],
+    deferred: &[DeferredMcpTool],
 ) -> (usize, Value, Option<String>, Vec<String>) {
     let prepared = match prepared {
         Ok(_)
@@ -341,7 +344,7 @@ pub(super) async fn execute_tool(
     cfg: &Config,
     request: &PromptRequest,
     repeated: bool,
-    selection: Option<(&[(usize, Value, (String, String))], &mut Vec<String>)>,
+    selection: Option<McpActivation<'_>>,
 ) -> Result<ToolOutput, OperationError> {
     let result = execute_authorized_tool(ctx, name, input, cfg, request, repeated, selection).await;
     let mut context = tools::hook_context(ctx, name);
@@ -406,7 +409,7 @@ async fn execute_authorized_tool(
     cfg: &Config,
     request: &PromptRequest,
     repeated: bool,
-    selection: Option<(&[(usize, Value, (String, String))], &mut Vec<String>)>,
+    selection: Option<McpActivation<'_>>,
 ) -> Result<ToolOutput, OperationError> {
     if repeated || input.file_paths().is_none() {
         let rules = current_permission_rules(ctx, cfg, request)?;
