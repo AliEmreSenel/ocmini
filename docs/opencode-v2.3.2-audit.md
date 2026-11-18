@@ -158,3 +158,12 @@ TUI picker already normalize Unicode case.
   remain distinct upstream behavior.
   [Shell timeout handoff](https://github.com/anomalyco/opencode/pull/63699)
   · [Background compaction](https://github.com/anomalyco/opencode/pull/64290)
+
+### Validation against main
+
+The scoped fixes were validated after integrating the context inspection and
+focused compaction changes from main. Context inspection and model requests
+now use the same model-aware history projection. The contract suite and the
+explicit OpenCode 2.2.5 and T3 2.0.28 SDK conformance test passed, as did
+workspace Clippy. These checks cover the selected T3 contract. The native
+v2.3.2 differences above remain applicable.
