@@ -658,3 +658,70 @@ async fn sandbox_free_binary_refuses_workspace_sandbox_requirements() {
             .contains("Sandbox startup refused:"));
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn context_inspection_does_not_run_turn_hooks_or_start_mcp() {
+    let hook = r#"import json,sys,pathlib
+json.load(sys.stdin);pathlib.Path('context-hook-ran').touch();print('{}')"#;
+    let mcp = r#"import pathlib;pathlib.Path('context-mcp-started').touch()"#;
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(
+        &provider,
+        json!({
+            "ocmini":{"hooks":{"version":1,"handlers":[
+                {"id":"turn-start","on":"turn.start.before","command":[PYTHON,"-S","-c",hook]},
+                {"id":"catalog","on":"tool.catalog.transform","command":[PYTHON,"-S","-c",hook]}
+            ]}},
+            "mcp":{"probe":{"type":"local","command":[PYTHON,"-S","-c",mcp],"enabled":true}}
+        }),
+    )
+    .await;
+    let script = r#"import os,pty,select,signal,sys,time,fcntl,termios,struct
+pid,fd=pty.fork()
+if pid==0: os.execv(sys.argv[1],[sys.argv[1],'tui'])
+data=b''; deadline=time.monotonic()+15; sent=False
+try:
+ fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
+ os.set_blocking(fd,False)
+ while time.monotonic()<deadline:
+  if not sent and time.monotonic()>deadline-14:
+   os.write(fd,b'/context\r'); sent=True
+  ready,_,_=select.select([fd],[],[],0.1)
+  if ready:
+   try: data+=os.read(fd,65536)
+   except BlockingIOError: continue
+   except OSError: break
+   if b'Context for' in data: break
+finally:
+ try: os.kill(pid,signal.SIGKILL)
+ except ProcessLookupError: pass
+ os.waitpid(pid,0)
+ os.close(fd)
+if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
+"#;
+    let mut command = tokio::process::Command::new(PYTHON);
+    command
+        .args(["-S", "-c", script, env!("CARGO_BIN_EXE_ocmini")])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", server.root.path())
+        .env("XDG_CONFIG_HOME", server.root.path().join(".config"))
+        .env("XDG_DATA_HOME", server.root.path().join(".local/share"))
+        .env("OPENCODE_CONFIG_CONTENT", "{}")
+        .env("OPENCODE_AUTH_CONTENT", "{}")
+        .env("TERM", "xterm")
+        .current_dir(&server.directory)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(25), command.output())
+        .await
+        .expect("terminal context test timed out")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!server.directory.join("context-hook-ran").exists());
+    assert!(!server.directory.join("context-mcp-started").exists());
+}
