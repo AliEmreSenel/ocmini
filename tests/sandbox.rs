@@ -289,6 +289,39 @@ async fn fresh_tmp_keeps_declared_project_and_spill_mounts() {
         "kept"
     );
 }
+
+#[tokio::test]
+async fn background_polling_uses_the_runner_session_and_byte_offset() {
+    use std::time::Duration;
+    let mut jail = Jail::new(json!({"mode":"isolated"}), json!({})).await;
+    let launched = jail
+        .request(
+            "run",
+            json!({"_ocmini_session":"poll-owner","name":"bash","args":{
+                "command":"printf firstsecond; exit 7", "background":true
+            }}),
+        )
+        .await
+        .unwrap();
+    let job = launched["metadata"]["jobID"].as_str().unwrap();
+    let poll = |session, offset| json!({"_ocmini_session":session,"name":"background_read","args":{"job_id":job,"offset":offset}});
+    assert!(jail.request("run", poll("poll-sibling", 0)).await.is_err());
+    let page = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let result = jail.request("run", poll("poll-owner", 5)).await.unwrap();
+            if result["metadata"]["status"] == "exited" {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(page["output"].as_str().unwrap().starts_with("second\n"));
+    assert_eq!(page["metadata"]["exit"], 7);
+    assert_eq!(page["metadata"]["nextOffset"], 11);
+}
+
 #[tokio::test]
 async fn localhost_preview_completes_handshake_and_tears_down() {
     let mut jail = Jail::new(

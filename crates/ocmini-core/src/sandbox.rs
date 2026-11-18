@@ -742,7 +742,8 @@ pub fn runner_main() -> Result<(), String> {
                 std::fs::read_dir(&directory).map_err(|e|format!("Sandbox cannot enter directory {directory}: {e}"))?;
                 return Ok(Value::Null);
             }
-            effects.dispatch(&directory,args["_ocmini_session"].as_str().unwrap_or("runner"),&method,args.clone(),cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)
+            let session=args["_ocmini_session"].as_str().unwrap_or("runner").to_owned();
+            effects.dispatch(&directory,&session,&method,args,cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)
         }})=>r.map_err(|e|e.to_string()),r=relay_end=>r.map_err(|e|e.to_string()),_=term.recv()=>Ok(())}
     }))
 }
