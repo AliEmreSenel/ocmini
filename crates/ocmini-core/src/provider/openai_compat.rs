@@ -37,7 +37,10 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
             if let Some(metadata) = map.remove("providerMetadata") {
                 if metadata["provider"] == "openai-chat" {
                     let source = &metadata["message"];
-                    let field = settings.reasoning_field.as_deref();
+                    let text_fields = ["reasoning_content", "reasoning", "reasoning_text"];
+                    let field = settings.reasoning_field.as_deref().filter(|field| {
+                        *field == "reasoning_details" || text_fields.contains(field)
+                    });
                     if field.is_none() || field == Some("reasoning_details") {
                         for key in ["reasoning_details", "reasoning_opaque"] {
                             if let Some(value) = source.get(key) {
@@ -45,11 +48,21 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
                             }
                         }
                     }
-                    for key in ["reasoning_content", "reasoning", "reasoning_text"] {
-                        if let Some(value) = source.get(key) {
-                            let target = field.unwrap_or(key);
-                            if target != "reasoning_details" {
-                                map.insert(target.into(), value.clone());
+                    match field {
+                        Some("reasoning_details") => {}
+                        Some(field) => {
+                            if let Some(value) = source
+                                .get(field)
+                                .or_else(|| text_fields.iter().find_map(|key| source.get(key)))
+                            {
+                                map.insert(field.into(), value.clone());
+                            }
+                        }
+                        None => {
+                            for key in text_fields {
+                                if let Some(value) = source.get(key) {
+                                    map.insert(key.into(), value.clone());
+                                }
                             }
                         }
                     }
@@ -345,6 +358,10 @@ mod tests {
         );
         assert_eq!(structured["messages"][0]["reasoning_opaque"], "opaque");
         assert!(structured["messages"][0].get("reasoning").is_none());
+        settings.reasoning_field = Some("content".into());
+        let unknown = request_body(&settings, &req).unwrap();
+        assert_eq!(unknown["messages"][0]["content"], "hello");
+        assert_eq!(unknown["messages"][0]["reasoning"], "thinking");
     }
 
     #[test]
