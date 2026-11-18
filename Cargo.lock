@@ -1153,6 +1153,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "tower",
 ]
 
 [[package]]

@@ -160,7 +160,13 @@ impl PreparedTool {
                 ),
                 Some(Builtin::WebFetch) => (
                     name,
-                    vec![self.args["url"].as_str().unwrap_or_default().into()],
+                    vec![self.args["url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .split('#')
+                        .next()
+                        .unwrap_or_default()
+                        .into()],
                 ),
                 Some(Builtin::Skill) => (
                     name,
@@ -175,6 +181,7 @@ impl PreparedTool {
         }
     }
 }
+
 pub async fn prepare_input<A: Host, F>(
     ctx: &ToolCtx<A>,
     name: &str,
@@ -501,4 +508,21 @@ pub fn cleanup_outputs() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn webfetch_permission_ignores_fragment_but_keeps_query() {
+        let tool = PreparedTool {
+            args: json!({"url": "https://example.com/page?q=1#section"}),
+            tool: Tool::Effect,
+        };
+        assert_eq!(
+            tool.permission("webfetch", &[]),
+            ("webfetch", vec!["https://example.com/page?q=1".into()])
+        );
+    }
 }

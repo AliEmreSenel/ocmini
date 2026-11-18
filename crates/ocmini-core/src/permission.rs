@@ -165,6 +165,55 @@ impl PermissionState {
         true
     }
 
+    /// Settle a v2 rejection and other pending requests from the same model step.
+    /// The session check and removal share the lock so a stale reply cannot
+    /// settle another request after its authority has expired.
+    pub fn reply_v2(&self, sid: &str, id: &str, response: &str, message: Option<&str>) -> bool {
+        let Some(reply) = event::PermissionReply::parse(response) else {
+            return false;
+        };
+        let mut pending = self.pending.lock().unwrap();
+        let Some(index) = pending
+            .iter()
+            .position(|(r, _)| r.id == id && r.session_id == sid)
+        else {
+            return false;
+        };
+        let step = pending[index].0.context["messageID"]
+            .as_str()
+            .map(str::to_owned);
+        let mut settled = vec![pending.remove(index)];
+        if response == "reject" {
+            if let Some(step) = step {
+                let mut i = 0;
+                while i < pending.len() {
+                    let req = &pending[i].0;
+                    if req.session_id == sid && req.context["messageID"].as_str() == Some(&step) {
+                        settled.push(pending.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        drop(pending);
+        for (req, tx) in settled {
+            crate::engine::bus().emit(
+                event::Permission::Replied {
+                    session_id: &req.session_id,
+                    request_id: &req.id,
+                    reply,
+                },
+                req.context,
+            );
+            let _ = tx.send(Response {
+                decision: reply.as_str().into(),
+                message: message.map(str::to_owned),
+            });
+        }
+        true
+    }
+
     pub fn list(&self) -> Vec<PermissionRequest> {
         self.pending
             .lock()
@@ -217,6 +266,29 @@ mod tests {
             crate::types::PermissionAction::Deny
         );
     }
+    #[tokio::test]
+    async fn v2_rejection_is_scoped_to_session_and_model_step() {
+        let state = PermissionState::default();
+        let ask = |session, step| {
+            state.ask_for_tool(
+                json!({"sessionID":session,"messageID":step}),
+                "shell",
+                "*",
+                &json!({}),
+            )
+        };
+        let (first, a) = ask("parent", "one");
+        let (_, b) = ask("parent", "one");
+        let (other, _) = ask("parent", "two");
+        let (child, _) = ask("child", "one");
+        assert!(!state.reply_v2("child", &first.id, "reject", None));
+        assert!(state.reply_v2("parent", &first.id, "reject", None));
+        assert_eq!(a.await.unwrap().decision, "reject");
+        assert_eq!(b.await.unwrap().decision, "reject");
+        let ids: Vec<_> = state.list().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![other.id, child.id]);
+    }
+
     #[tokio::test]
     async fn invalid_reply_does_not_consume_request() {
         let state = PermissionState::default();

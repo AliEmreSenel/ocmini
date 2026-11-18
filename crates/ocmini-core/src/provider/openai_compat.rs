@@ -36,14 +36,34 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
             map.remove(super::TEXT_TRANSFORMED);
             if let Some(metadata) = map.remove("providerMetadata") {
                 if metadata["provider"] == "openai-chat" {
-                    for key in [
-                        "reasoning_content",
-                        "reasoning",
-                        "reasoning_text",
-                        "reasoning_details",
-                    ] {
-                        if let Some(value) = metadata["message"].get(key) {
-                            map.insert(key.into(), value.clone());
+                    let source = &metadata["message"];
+                    let text_fields = ["reasoning_content", "reasoning", "reasoning_text"];
+                    let field = settings.reasoning_field.as_deref().filter(|field| {
+                        *field == "reasoning_details" || text_fields.contains(field)
+                    });
+                    if field.is_none() || field == Some("reasoning_details") {
+                        for key in ["reasoning_details", "reasoning_opaque"] {
+                            if let Some(value) = source.get(key) {
+                                map.insert(key.into(), value.clone());
+                            }
+                        }
+                    }
+                    match field {
+                        Some("reasoning_details") => {}
+                        Some(field) => {
+                            if let Some(value) = source
+                                .get(field)
+                                .or_else(|| text_fields.iter().find_map(|key| source.get(key)))
+                            {
+                                map.insert(field.into(), value.clone());
+                            }
+                        }
+                        None => {
+                            for key in text_fields {
+                                if let Some(value) = source.get(key) {
+                                    map.insert(key.into(), value.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -84,6 +104,7 @@ struct ChatState {
     reasoning: String,
     reasoning_key: String,
     reasoning_details: Vec<Value>,
+    reasoning_opaque: Option<Value>,
     seen: bool,
 }
 
@@ -135,6 +156,9 @@ impl Decoder for ChatState {
                 events.push(ProviderEvent::ReasoningDelta(text.into()));
                 break;
             }
+        }
+        if let Some(opaque) = delta.get("reasoning_opaque") {
+            self.reasoning_opaque = Some(opaque.clone());
         }
         if let Some(details) = delta["reasoning_details"].as_array() {
             for detail in details {
@@ -243,6 +267,9 @@ impl Decoder for ChatState {
         if !self.reasoning_details.is_empty() {
             message["reasoning_details"] = json!(self.reasoning_details);
         }
+        if let Some(opaque) = self.reasoning_opaque.take() {
+            message["reasoning_opaque"] = opaque;
+        }
         events.push(ProviderEvent::Metadata(
             json!({"provider":"openai-chat","message":message}),
         ));
@@ -301,6 +328,40 @@ mod tests {
         assert!(request_body(&settings, &req)
             .unwrap_err()
             .contains("base64 data URL or file ID"));
+    }
+
+    #[test]
+    fn replay_obeys_destination_reasoning_field() {
+        let mut settings = super::super::test_settings(json!({}));
+        let req = ChatRequest {
+            messages: vec![
+                json!({"role":"assistant","content":"hello","providerMetadata":{"provider":"openai-chat","message":{"reasoning":"thinking","reasoning_details":[{"signature":"signed"}],"reasoning_opaque":"opaque"}}}),
+            ],
+            ..Default::default()
+        };
+        let default = request_body(&settings, &req).unwrap();
+        assert_eq!(
+            default["messages"][0]["reasoning_details"][0]["signature"],
+            "signed"
+        );
+        assert_eq!(default["messages"][0]["reasoning_opaque"], "opaque");
+        settings.reasoning_field = Some("reasoning_content".into());
+        let scalar = request_body(&settings, &req).unwrap();
+        assert_eq!(scalar["messages"][0]["reasoning_content"], "thinking");
+        assert!(scalar["messages"][0].get("reasoning_details").is_none());
+        assert!(scalar["messages"][0].get("reasoning_opaque").is_none());
+        settings.reasoning_field = Some("reasoning_details".into());
+        let structured = request_body(&settings, &req).unwrap();
+        assert_eq!(
+            structured["messages"][0]["reasoning_details"][0]["signature"],
+            "signed"
+        );
+        assert_eq!(structured["messages"][0]["reasoning_opaque"], "opaque");
+        assert!(structured["messages"][0].get("reasoning").is_none());
+        settings.reasoning_field = Some("content".into());
+        let unknown = request_body(&settings, &req).unwrap();
+        assert_eq!(unknown["messages"][0]["content"], "hello");
+        assert_eq!(unknown["messages"][0]["reasoning"], "thinking");
     }
 
     #[test]

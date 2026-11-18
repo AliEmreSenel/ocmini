@@ -291,6 +291,7 @@ pub async fn inspect_context(
     let store = app.store.clone();
     let sid = session.id.clone();
     let v2 = app.v2.enabled(&sid);
+    let model_for_history = model.clone();
     let (messages, usage, keyed) =
         tokio::task::spawn_blocking(move || -> Result<_, OperationError> {
             let last = store.messages_limited(&sid, Some(1))?;
@@ -308,7 +309,7 @@ pub async fn inspect_context(
                         .filter(|t| t.input > 0 || t.output > 0)
                 })
                 .cloned();
-            let messages = history::project_messages(saved, chat)?.0;
+            let messages = history::project_messages(saved, chat, Some(&model_for_history))?.0;
             let keyed = if v2 {
                 store.v2_instructions(&sid)?
             } else {
@@ -505,7 +506,8 @@ pub(super) async fn run_turn(
             .store
             .message(sid, uid)?
             .ok_or("Compaction prompt not found")?;
-        let (messages, summary) = history::load_messages(app.store.clone(), sid, uid, chat).await?;
+        let (messages, summary) =
+            history::load_messages(app.store.clone(), sid, uid, chat, model).await?;
         return summarize_history(
             &app,
             adapter.as_ref(),
@@ -579,7 +581,7 @@ pub(super) async fn run_turn(
             }
         }
         let (messages, has_summary) =
-            history::load_messages(app.store.clone(), sid, uid, chat).await?;
+            history::load_messages(app.store.clone(), sid, uid, chat, model).await?;
         let mut info = MessageInfo::assistant(sid, Some(uid.into()), model, agent);
         info.variant = request.variant.clone();
         let amid = info.id.clone();
@@ -700,7 +702,7 @@ pub(super) async fn run_turn(
                 .usable()
                 .is_some_and(|limit| u64::try_from(used).unwrap_or(0) >= limit)
         {
-            match history::load_messages(app.store.clone(), sid, uid, chat).await {
+            match history::load_messages(app.store.clone(), sid, uid, chat, model).await {
                 Ok((history, has_summary)) => {
                     if let Err(error) = compact_history(
                         &app,

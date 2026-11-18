@@ -343,8 +343,17 @@ pub(super) async fn request_step(
             .await
             {
                 Ok(()) => {
-                    (req.messages, has_summary) =
-                        history::load_messages(app.store.clone(), sid, uid, chat).await?;
+                    (req.messages, has_summary) = history::load_messages(
+                        app.store.clone(),
+                        sid,
+                        uid,
+                        chat,
+                        &ModelRef {
+                            provider_id: info.provider_id.clone().ok_or("Missing provider")?,
+                            model_id: info.model_id.clone().ok_or("Missing model")?,
+                        },
+                    )
+                    .await?;
                     req.system = system.clone();
                     req.options = Value::Null;
                     req.headers.clear();

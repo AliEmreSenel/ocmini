@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn chat_requests_merge_the_turn_into_one_assistant_message() {
         let (store, sid) = two_step_turn_store();
-        let (messages, _) = build_messages(&store, &sid, "prompt", true).unwrap();
+        let (messages, _) = build_messages(&store, &sid, "prompt", true, None).unwrap();
         let assistants: Vec<&Value> = messages
             .iter()
             .filter(|m| m["role"] == "assistant")
@@ -663,9 +663,50 @@ mod tests {
     }
 
     #[test]
+    fn chat_reasoning_replay_respects_model_provenance_and_legacy_turns() {
+        let (store, sid) = two_step_turn_store();
+        let target = ModelRef {
+            provider_id: "provider".into(),
+            model_id: "model".into(),
+        };
+        // Old records without provenance retain their existing replay behavior.
+        let (legacy, _) = build_messages(&store, &sid, "prompt", true, Some(&target)).unwrap();
+        assert_eq!(
+            legacy[1]["providerMetadata"]["message"]["reasoning_content"],
+            "first thinking\nsecond thinking"
+        );
+        let mut prompt = store.message(&sid, "prompt").unwrap().unwrap();
+        prompt.info.provider_id = Some("provider".into());
+        prompt.info.model_id = Some("old-model".into());
+        store.add_message(&prompt).unwrap();
+        let (inferred, _) = build_messages(&store, &sid, "prompt", true, Some(&target)).unwrap();
+        assert!(inferred[1].get("providerMetadata").is_none());
+        let mut first = store.message(&sid, "step-1").unwrap().unwrap();
+        first.info.provider_id = Some("provider".into());
+        first.info.model_id = Some("old-model".into());
+        store.add_message(&first).unwrap();
+        let mut second = store.message(&sid, "step-2").unwrap().unwrap();
+        second.info.provider_id = Some("other-provider".into());
+        second.info.model_id = Some("model".into());
+        store.add_message(&second).unwrap();
+        let (switched, _) = build_messages(&store, &sid, "prompt", true, Some(&target)).unwrap();
+        assert!(switched[1].get("providerMetadata").is_none());
+        assert_eq!(switched[1]["content"], "done");
+        assert_eq!(switched[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(switched[2]["tool_call_id"], "call_1");
+        first.info.model_id = Some("model".into());
+        store.add_message(&first).unwrap();
+        let (same, _) = build_messages(&store, &sid, "prompt", true, Some(&target)).unwrap();
+        assert_eq!(
+            same[1]["providerMetadata"]["message"]["reasoning_details"][0]["id"],
+            "rs_1"
+        );
+    }
+
+    #[test]
     fn responses_history_keeps_one_assistant_message_per_step() {
         let (store, sid) = two_step_turn_store();
-        let (messages, _) = build_messages(&store, &sid, "prompt", false).unwrap();
+        let (messages, _) = build_messages(&store, &sid, "prompt", false, None).unwrap();
         let assistants: Vec<&Value> = messages
             .iter()
             .filter(|m| m["role"] == "assistant")

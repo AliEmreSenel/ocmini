@@ -309,7 +309,7 @@ async fn read(headers: HeaderMap, Query(query): Query<PathQuery>) -> Result<Resp
     } else {
         "text/plain; charset=utf-8"
     };
-    Ok((
+    let mut response = (
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(kind)),
             (
@@ -320,7 +320,22 @@ async fn read(headers: HeaderMap, Query(query): Query<PathQuery>) -> Result<Resp
         ],
         Body::from_stream(body),
     )
-        .into_response())
+        .into_response();
+    if query.raw {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("sandbox"),
+        );
+        response.headers_mut().insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -478,6 +493,48 @@ mod tests {
             }
         }
         encoded
+    }
+
+    #[tokio::test]
+    async fn raw_download_is_sandboxed_and_editor_text_is_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("test.html");
+        std::fs::write(&file, "<script>alert(1)</script>").unwrap();
+        for raw in [false, true] {
+            let uri = format!("/web/api/fs/read?path={}&raw={raw}", query(&file));
+            let response = files::<()>()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if raw {
+                assert_eq!(
+                    response.headers()[header::CONTENT_SECURITY_POLICY],
+                    "sandbox"
+                );
+                assert_eq!(
+                    response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                    "nosniff"
+                );
+                assert_eq!(
+                    response.headers()[header::CONTENT_DISPOSITION],
+                    "attachment"
+                );
+            } else {
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "text/plain; charset=utf-8"
+                );
+                assert!(!response.headers().contains_key(header::CONTENT_DISPOSITION));
+            }
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"<script>alert(1)</script>"
+            );
+        }
     }
 
     #[tokio::test]
