@@ -143,6 +143,39 @@ impl Draft {
             .map_or_else(|| byte_index(&self.text, self.cursor), |(_, offset)| offset)
     }
 
+    pub fn command_prefix(&self) -> Option<&str> {
+        let (name, suffix) = crate::commands::split_slash(&self.text)?;
+        let end = self.text.len() - suffix.len();
+        let start = end - name.len();
+        let cursor = self.offset();
+        if cursor > end || self.selection().is_some() {
+            return None;
+        }
+        self.text.get(start..cursor)
+    }
+
+    /// Replace the entire command name, even when completing from inside it.
+    pub fn complete_command(&mut self, name: &str) {
+        let Some((current, suffix)) = crate::commands::split_slash(&self.text) else {
+            return;
+        };
+        let end = self.text.len() - suffix.len();
+        let separator = suffix.chars().next();
+        let replacement = if separator.is_some() {
+            std::borrow::Cow::Borrowed(name)
+        } else {
+            std::borrow::Cow::Owned(format!("{name} "))
+        };
+        let start = end - current.len();
+        let after = start + replacement.len() + separator.map_or(0, char::len_utf8);
+        self.replace(start..end, &replacement, false);
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .take_while(|(index, _)| *index < after)
+            .count();
+    }
+
     fn insert_text(&mut self, text: &str, typing: bool) {
         let (lo, hi) = self.selection().unwrap_or((self.cursor, self.cursor));
         let start = if lo == self.cursor {
@@ -1606,8 +1639,27 @@ impl Display {
             });
         }
         let layout = self.input.as_ref().unwrap().layout.clone();
+        let available = height.saturating_sub(layout.rows.len());
+        let suggestions: Vec<_> = if ui.prompt.is_none() {
+            ui.completion
+                .visible(available.saturating_sub(1).min((height / 3).max(1)))
+                .map(|(name, description, selected)| {
+                    let marker = if selected {
+                        format!("{CYAN}›{RESET}")
+                    } else {
+                        " ".into()
+                    };
+                    let description = clean_input(description.lines().next().unwrap_or_default());
+                    let row = format!("  {marker} /{name}  {description}");
+                    let row = wrap_row(&row, width).into_iter().next().unwrap_or_default();
+                    format!("{row}{RESET}")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if self.fullscreen {
-            self.draw_screen(&layout);
+            self.draw_screen(&layout, &suggestions);
             return;
         }
         self.drawn_rows = 0;
@@ -1615,7 +1667,7 @@ impl Display {
         // Bound and wrap every live row before drawing. Counting a long or
         // multiline header as one row makes erase leave a row behind on each
         // event, even while the model is only generating pending calls.
-        let live = self.native_live_rows(width, height.saturating_sub(layout.rows.len()));
+        let live = self.native_live_rows(width, available.saturating_sub(suggestions.len()));
         for row in &live {
             crate::println!("{row}{RESET}");
         }
@@ -1623,7 +1675,7 @@ impl Display {
         // A flushed transcript row sits above the draft, so the block starts
         // one row lower and the caret moves with it.
         let first = self.drawn_rows;
-        for (index, row) in layout.rows.iter().enumerate() {
+        for (index, row) in layout.rows.iter().chain(&suggestions).enumerate() {
             if index > 0 {
                 crate::print!("\r\n");
             }
@@ -1670,9 +1722,9 @@ impl Display {
     /// clear replaces every cell, so nothing needs row-by-row erase
     /// bookkeeping, and rows are joined without a trailing newline so the
     /// bottom row never scrolls the screen.
-    fn draw_screen(&mut self, layout: &Layout) {
+    fn draw_screen(&mut self, layout: &Layout, suggestions: &[String]) {
         let (width, height) = terminal_size();
-        self.page = height.saturating_sub(layout.rows.len());
+        self.page = height.saturating_sub(layout.rows.len() + suggestions.len());
         self.paint_width = width;
         // The tail is the unfinished transcript row: paint it, never commit
         // it. Committing on every repaint would stack a snapshot of the text
@@ -1685,7 +1737,7 @@ impl Display {
         }
         let mut out = String::from("\x1b[2J\x1b[H");
         let mut drawn = 0usize;
-        for row in rows.iter().chain(layout.rows.iter()) {
+        for row in rows.iter().chain(&layout.rows).chain(suggestions) {
             if drawn > 0 {
                 out.push_str("\r\n");
             }
@@ -2005,6 +2057,7 @@ mod tests {
         // draft stays hidden underneath it.
         let ui = Ui {
             interactions: Default::default(),
+            completion: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
             answer_labelled: false,
@@ -2056,6 +2109,7 @@ mod tests {
     fn erasing_the_draft_starts_at_the_caret_row() {
         let ui = Ui {
             interactions: Default::default(),
+            completion: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
             answer_labelled: false,
@@ -2153,6 +2207,7 @@ mod tests {
     fn a_hidden_streaming_row_never_peeks_above_the_draft() {
         let ui = Ui {
             interactions: Default::default(),
+            completion: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
             answer_labelled: false,
@@ -2178,6 +2233,7 @@ mod tests {
     fn fullscreen_repaint_keeps_the_streaming_tail_uncommitted() {
         let ui = crate::tui::Ui {
             interactions: Default::default(),
+            completion: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
             answer_labelled: false,
@@ -2231,6 +2287,7 @@ mod tests {
     fn status_redraws_stay_one_row_and_never_enter_the_transcript() {
         let mut ui = Ui {
             interactions: Default::default(),
+            completion: Default::default(),
             text: crate::client::TextState::default(),
             tool_done: std::collections::HashSet::new(),
             answer_labelled: false,
