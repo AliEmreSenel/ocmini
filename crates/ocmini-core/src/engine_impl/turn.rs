@@ -7,6 +7,7 @@ struct PreparedTurn {
     adapter: Box<dyn provider::ProviderAdapter>,
     request: ChatRequest,
     chat: bool,
+    deferred: Option<DeferredMcpCatalog>,
 }
 async fn prepare_turn(
     app: &App,
@@ -93,19 +94,66 @@ async fn prepare_turn(
             adapter,
             request: base,
             chat,
+            deferred: None,
         });
     }
+    tokio::select! {
+        _ = app.mcp().refresh_catalog(false) => {},
+        _ = cancel.cancelled() => return Err("Aborted".into()),
+    }
+    let catalog = deferred_mcp_enabled(&cfg)
+        .then(|| app.mcp().catalog_since(None))
+        .flatten();
+    let (tools, deferred) =
+        prepare_tool_catalog(app, sid, &cfg, request, hook_context, cancel, catalog).await?;
+    base.tools = tools;
+    Ok(PreparedTurn {
+        config: cfg,
+        adapter,
+        request: base,
+        chat,
+        deferred,
+    })
+}
+
+fn deferred_mcp_enabled(config: &Config) -> bool {
+    config
+        .extra
+        .get("deferred_mcp_discovery")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+async fn prepare_tool_catalog(
+    app: &App,
+    sid: &str,
+    cfg: &Config,
+    request: &PromptRequest,
+    hook_context: &Value,
+    cancel: &CancellationToken,
+    mut catalog: Option<crate::mcp::Catalog>,
+) -> Result<(Vec<Value>, Option<DeferredMcpCatalog>), OperationError> {
     let mut defs = tools::tool_defs();
     v2_tool_defs(&mut defs, app.v2.enabled(sid));
-    defs.extend(tokio::select! {
-        value = app.mcp().tool_defs_async() => value,
-        _ = cancel.cancelled() => return Err("Aborted".into()),
+    if catalog.is_none() {
+        defs.retain(|d| d["function"]["name"] != "discover_mcp_tools");
+    }
+    let agent = request.agent.as_deref().unwrap_or("build");
+    let read_only = ["plan", "explore"].contains(&agent);
+    defs.extend(match &mut catalog {
+        Some(snapshot) => std::mem::take(&mut snapshot.definitions),
+        None => app.mcp().tool_defs(),
     });
     defs.retain(|def| {
         let name = def["function"]["name"].as_str().unwrap_or_default();
-        tool_enabled(name, agent, &cfg, request)
+        tool_enabled(name, agent, cfg, request)
             && !unattended_tool_denied(name, app, request)
-            && !(read_only && (execution_tool(name) || app.mcp().route(name).is_some()))
+            && !(read_only
+                && (execution_tool(name)
+                    || match &catalog {
+                        Some(snapshot) => snapshot.route(name).is_some(),
+                        None => app.mcp().route(name).is_some(),
+                    }))
     });
     if app.hooks.has(crate::tools::hooks::TOOL_CATALOG_TRANSFORM) {
         let result = app
@@ -122,13 +170,51 @@ async fn prepare_turn(
             .ok_or("Tool catalog hook must return an array")?
             .clone();
     }
-    base.tools = defs;
-    Ok(PreparedTurn {
-        config: cfg,
-        adapter,
-        request: base,
-        chat,
-    })
+    let deferred = catalog.map(|catalog| {
+        let mut tools = Vec::new();
+        let mut position = 0;
+        defs.retain(|def| {
+            let index = position;
+            position += 1;
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            if let Some(route) = catalog.route(name) {
+                tools.push((index, def.clone(), route.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        DeferredMcpCatalog {
+            version: catalog.version,
+            tools,
+        }
+    });
+    Ok((defs, deferred))
+}
+
+struct DeferredMcpCatalog {
+    version: u64,
+    tools: Vec<DeferredMcpTool>,
+}
+
+impl DeferredMcpCatalog {
+    fn expose(&self, defs: &mut Vec<Value>, active: &HashSet<String>) {
+        defs.retain(|def| {
+            !self
+                .tools
+                .iter()
+                .any(|(_, deferred, _)| deferred["function"]["name"] == def["function"]["name"])
+        });
+        let mut omitted = 0;
+        for (index, def, _) in &self.tools {
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            if active.contains(name) {
+                defs.insert(index.saturating_sub(omitted).min(defs.len()), def.clone());
+            } else {
+                omitted += 1;
+            }
+        }
+    }
 }
 
 fn v2_tool_defs(defs: &mut Vec<Value>, v2: bool) {
@@ -235,7 +321,12 @@ pub async fn inspect_context(
     system.push_str(&keyed);
     let mut defs = tools::tool_defs();
     v2_tool_defs(&mut defs, v2);
-    let mcp_defs = app.available_mcp_tools(&session.directory);
+    let mcp_defs = if deferred_mcp_enabled(&cfg) {
+        Vec::new()
+    } else {
+        defs.retain(|def| def["function"]["name"] != "discover_mcp_tools");
+        app.available_mcp_tools(&session.directory)
+    };
     let mcp_names: HashSet<String> = mcp_defs
         .iter()
         .filter_map(|def| def["function"]["name"].as_str().map(str::to_owned))
@@ -396,8 +487,9 @@ pub(super) async fn run_turn(
     let PreparedTurn {
         config: cfg,
         adapter,
-        request: base,
+        request: mut base,
         chat,
+        mut deferred,
     } = prepare_turn(
         &app,
         engine.clone(),
@@ -428,11 +520,13 @@ pub(super) async fn run_turn(
         .await;
     }
     let agent = request.agent.as_deref().unwrap_or("build");
-    let allowed: HashSet<String> = base
-        .tools
-        .iter()
-        .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
-        .collect();
+    let tool_names = |defs: &[Value]| -> HashSet<String> {
+        defs.iter()
+            .filter_map(|def| def["function"]["name"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let mut allowed = tool_names(&base.tools);
+    let mut active = HashSet::<String>::new();
     let max_steps = cfg
         .agent
         .get(agent)
@@ -448,6 +542,41 @@ pub(super) async fn run_turn(
         step = step.saturating_add(1);
         if cancel.is_cancelled() {
             return Err("Aborted".into());
+        }
+        if let Some(previous) = &deferred {
+            tokio::select! {
+                _ = app.mcp().refresh_catalog(true) => {},
+                _ = cancel.cancelled() => return Err("Aborted".into()),
+            }
+            if let Some(catalog) = app.mcp().catalog_since(Some(previous.version)) {
+                let mut catalog_context = turn_context(&app, sid, &request);
+                catalog_context["requestKind"] = json!("primary");
+                let (mut tools, next) = prepare_tool_catalog(
+                    &app,
+                    sid,
+                    &cfg,
+                    &request,
+                    &catalog_context,
+                    &cancel,
+                    Some(catalog),
+                )
+                .await?;
+                if let Some(next_catalog) = &next {
+                    active.retain(|name| {
+                        next_catalog.tools.iter().any(|(_, def, route)| {
+                            def["function"]["name"] == name.as_str()
+                                && previous
+                                    .tools
+                                    .iter()
+                                    .any(|(_, old, old_route)| old == def && old_route == route)
+                        })
+                    });
+                    next_catalog.expose(&mut tools, &active);
+                }
+                base.tools = tools;
+                allowed = tool_names(&base.tools);
+                deferred = next;
+            }
         }
         let (messages, has_summary) =
             history::load_messages(app.store.clone(), sid, uid, chat).await?;
@@ -523,15 +652,26 @@ pub(super) async fn run_turn(
                 call_id: String::new(),
                 part_id: String::new(),
             };
-            run_tools(
+            let activated = run_tools(
                 &tools_context,
                 &cfg,
                 &request,
                 &allowed,
                 &mut parts.tools,
                 &mut recent_calls,
+                deferred
+                    .as_ref()
+                    .map_or(&[], |catalog| catalog.tools.as_slice()),
             )
             .await?;
+            // Discovery takes effect only after all sibling calls have finished.
+            if let Some(catalog) = &deferred {
+                if !activated.is_empty() {
+                    active.extend(activated);
+                    catalog.expose(&mut base.tools, &active);
+                    allowed = tool_names(&base.tools);
+                }
+            }
             if cancel.is_cancelled() {
                 return Err("Aborted".into());
             }
