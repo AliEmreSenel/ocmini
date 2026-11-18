@@ -330,7 +330,7 @@ pub(super) async fn summarize_history(
         let mut request = ChatRequest {
             model: model.model_id.clone(),
             system: {
-                let mut prompt = compaction_prompt(app, &context, COMPACTION_PROMPT, cancel).await?;
+                let mut prompt = COMPACTION_PROMPT.to_owned();
                 if current.role == "user" {
                     if let Some(focus) = app.store.message(sid, &current.id)?.and_then(|m| m.parts.iter().find_map(|p| p["ocminiFocus"].as_str().map(str::to_owned))) {
                         if !focus.trim().is_empty() {
@@ -339,6 +339,7 @@ pub(super) async fn summarize_history(
                         }
                     }
                 }
+                let prompt = compaction_prompt(app, &context, &prompt, cancel).await?;
                 system.map_or(prompt.clone(), |system| format!("{system}\n\n{prompt}"))
             },
             messages: request_messages,

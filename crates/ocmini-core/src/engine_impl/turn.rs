@@ -96,30 +96,7 @@ async fn prepare_turn(
         });
     }
     let mut defs = tools::tool_defs();
-    if app.v2.enabled(sid) {
-        for def in &mut defs {
-            if let Some(name) = def["function"]["name"].as_str() {
-                def["function"]["name"] = json!(crate::v2::wire::tool_name(name));
-                if def["function"]["name"] == "subagent" {
-                    let parameters = &mut def["function"]["parameters"];
-                    if let Some(properties) = parameters["properties"].as_object_mut() {
-                        for (old, new) in [("subagent_type", "agent"), ("task_id", "sessionID")] {
-                            if let Some(v) = properties.remove(old) {
-                                properties.insert(new.into(), v);
-                            }
-                        }
-                    }
-                    if let Some(required) = parameters["required"].as_array_mut() {
-                        for v in required {
-                            if v == "subagent_type" {
-                                *v = json!("agent");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    v2_tool_defs(&mut defs, app.v2.enabled(sid));
     defs.extend(tokio::select! {
         value = app.mcp().tool_defs_async() => value,
         _ = cancel.cancelled() => return Err("Aborted".into()),
@@ -154,54 +131,127 @@ async fn prepare_turn(
     })
 }
 
-/// Inspect the same prepared request and history projection used by a normal turn.
+fn v2_tool_defs(defs: &mut Vec<Value>, v2: bool) {
+    if v2 {
+        for def in defs {
+            if let Some(name) = def["function"]["name"].as_str() {
+                def["function"]["name"] = json!(crate::v2::wire::tool_name(name));
+                if def["function"]["name"] == "subagent" {
+                    let parameters = &mut def["function"]["parameters"];
+                    if let Some(properties) = parameters["properties"].as_object_mut() {
+                        for (old, new) in [("subagent_type", "agent"), ("task_id", "sessionID")] {
+                            if let Some(v) = properties.remove(old) {
+                                properties.insert(new.into(), v);
+                            }
+                        }
+                    }
+                    if let Some(required) = parameters["required"].as_array_mut() {
+                        for v in required {
+                            if v == "subagent_type" {
+                                *v = json!("agent");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Estimate the locally available request context without starting a turn or MCP.
 pub async fn inspect_context(
     app: &App,
-    engine: Engine,
+    _engine: Engine,
     session: &Session,
     selected: &PromptRequest,
 ) -> Result<String, OperationError> {
-    let model = admission::resolve_model(
-        &app.config,
-        app,
-        &session.id,
-        selected.model.as_ref(),
-        selected.agent.as_deref().or(Some("build")),
-    )?;
-    let mut request = selected.clone();
-    request.model = Some(model.clone());
-    request.command = None;
-    let context = turn_context(app, &session.id, &request);
-    let prepared = prepare_turn(
-        app,
-        Arc::new(engine),
-        session,
-        &request,
-        &model,
-        &context,
-        &CancellationToken::new(),
+    let directory = session.directory.clone();
+    let cfg = tokio::task::spawn_blocking(move || Config::load_for(&directory))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(OperationError::invalid)?;
+    let agent = selected
+        .agent
+        .as_deref()
+        .or_else(|| cfg.extra.get("default_agent").and_then(Value::as_str))
+        .unwrap_or("build");
+    let model =
+        admission::resolve_model(&cfg, app, &session.id, selected.model.as_ref(), Some(agent))?;
+    let adapter = provider::build(
+        &model.provider_id,
+        cfg.provider(&model.provider_id),
+        &app.auth,
+    );
+    let chat = matches!(
+        adapter.protocol_of(&ChatRequest {
+            model: model.model_id.clone(),
+            ..Default::default()
+        })?,
+        provider::Protocol::Chat
+    );
+    let window = CompactionPolicy::for_model(&cfg, &model)
+        .context
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let mut system = instructions::inspection_system_prompt(
+        &cfg,
+        &session.directory,
+        agent,
+        selected.system.as_deref(),
     )
     .await?;
-    let last = app.store.messages_limited(&session.id, Some(1))?;
-    let saved = if let Some(last) = last.last() {
-        app.store.context_messages(&session.id, &last.info.id)?
-    } else {
-        Vec::new()
-    };
-    let messages = if let Some(last) = last.last() {
-        history::load_messages(app.store.clone(), &session.id, &last.info.id, prepared.chat)
-            .await?
-            .0
-    } else {
-        Vec::new()
-    };
+    if ["plan", "explore"].contains(&agent) {
+        system.push_str("\n\nThis is a read-only analysis session. Use the supplied reading and search tools. Do not modify files or request execution tools.");
+    }
+    let store = app.store.clone();
+    let sid = session.id.clone();
+    let v2 = app.v2.enabled(&sid);
+    let (messages, usage, keyed) =
+        tokio::task::spawn_blocking(move || -> Result<_, OperationError> {
+            let last = store.messages_limited(&sid, Some(1))?;
+            let saved = match last.last() {
+                Some(last) => store.context_messages(&sid, &last.info.id)?,
+                None => Vec::new(),
+            };
+            let usage = saved
+                .iter()
+                .rev()
+                .find_map(|m| {
+                    m.info
+                        .tokens
+                        .as_ref()
+                        .filter(|t| t.input > 0 || t.output > 0)
+                })
+                .cloned();
+            let messages = history::project_messages(saved, chat)?.0;
+            let keyed = if v2 {
+                store.v2_instructions(&sid)?
+            } else {
+                String::new()
+            };
+            Ok((messages, usage, keyed))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    system.push_str(&keyed);
+    let mut defs = tools::tool_defs();
+    v2_tool_defs(&mut defs, v2);
+    let mcp_defs = app.available_mcp_tools(&session.directory);
+    let mcp_names: HashSet<String> = mcp_defs
+        .iter()
+        .filter_map(|def| def["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    defs.extend(mcp_defs);
+    defs.retain(|def| {
+        let name = def["function"]["name"].as_str().unwrap_or_default();
+        tool_enabled(name, agent, &cfg, &selected)
+            && !unattended_tool_denied(name, app, &selected)
+            && !(["plan", "explore"].contains(&agent)
+                && (execution_tool(name) || mcp_names.contains(name)))
+    });
     let estimate = |bytes: usize| (bytes + 3) / 4;
-    let instructions = estimate(prepared.request.system.len());
-    let tools = estimate(
-        serde_json::to_vec(&prepared.request.tools)
-            .unwrap_or_default()
-            .len(),
-    );
+    let instructions = estimate(system.len());
+    let tools = estimate(serde_json::to_vec(&defs).unwrap_or_default().len());
     let (mut conversation, mut results) = (0, 0);
     for message in &messages {
         let size = estimate(message.to_string().len());
@@ -211,12 +261,6 @@ pub async fn inspect_context(
             conversation += size;
         }
     }
-    let usage = saved.iter().rev().find_map(|m| {
-        m.info
-            .tokens
-            .as_ref()
-            .filter(|t| t.input > 0 || t.output > 0)
-    });
     let usage = usage
         .map(|t| {
             format!(
@@ -225,11 +269,7 @@ pub async fn inspect_context(
             )
         })
         .unwrap_or_else(|| "unknown".into());
-    let window = CompactionPolicy::for_model(&prepared.config, &model)
-        .context
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "unknown".into());
-    Ok(format!("Context for {model} (approximate tokens, 4 bytes/token)\n  Instructions: {instructions}\n  Tool schemas: {tools}\n  Messages and tool calls: {conversation}\n  Tool results: {results}\n  Estimated total: {}\n  Latest observed usage: {usage}\n  Model window: {window}\n", instructions + tools + conversation + results))
+    Ok(format!("Context for {model} (approximate tokens, 4 bytes/token)\n  Instructions: {instructions} (local and keyed; excludes remote and hook additions)\n  Tool schemas: {tools} (built-in and currently available MCP catalog; before catalog hooks)\n  Messages and tool calls: {conversation}\n  Tool results: {results}\n  Estimated total: {}\n  Latest observed usage (one saved provider response, not current context): {usage}\n  Model window: {window}\n", instructions + tools + conversation + results))
 }
 
 async fn end_feedback(
