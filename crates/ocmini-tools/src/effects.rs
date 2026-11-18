@@ -297,6 +297,7 @@ fn instruction_effect(
             let flags = libc::O_RDONLY
                 | libc::O_CLOEXEC
                 | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
                 | if i + 1 < components.len() {
                     libc::O_DIRECTORY
                 } else {

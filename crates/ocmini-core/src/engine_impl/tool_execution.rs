@@ -194,22 +194,6 @@ async fn discover_read_instructions(
             if seen.contains(candidate.to_string_lossy().as_ref()) {
                 continue;
             }
-            let Ok(rules) = current_permission_rules(&ctx, cfg, request) else {
-                continue;
-            };
-            if check_permission(
-                &ctx,
-                &rules,
-                "read",
-                &candidate.to_string_lossy(),
-                "read",
-                &part["state"]["input"],
-            )
-            .await
-            .is_err()
-            {
-                continue;
-            }
             let Ok(result) = tools::host::Host::effect(
                 &ctx.app,
                 &ctx,
@@ -232,6 +216,22 @@ async fn discover_read_instructions(
             }
             let key = canonical.to_string_lossy().into_owned();
             if seen.contains(&key) {
+                continue;
+            }
+            let Ok(rules) = current_permission_rules(&ctx, cfg, request) else {
+                continue;
+            };
+            if check_permission(
+                &ctx,
+                &rules,
+                "read",
+                &candidate.to_string_lossy(),
+                "read",
+                &part["state"]["input"],
+            )
+            .await
+            .is_err()
+            {
                 continue;
             }
             if canonical != candidate
