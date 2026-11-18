@@ -122,6 +122,14 @@ async fn prepare_turn(
             }
         }
     }
+    let discovery_enabled = cfg
+        .extra
+        .get("deferred_mcp_discovery")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !discovery_enabled {
+        defs.retain(|d| d["function"]["name"] != "discover_mcp_tools");
+    }
     defs.extend(tokio::select! {
         value = app.mcp().tool_defs_async() => value,
         _ = cancel.cancelled() => return Err("Aborted".into()),
@@ -148,16 +156,7 @@ async fn prepare_turn(
             .clone();
     }
     let mut deferred = Vec::new();
-    if cfg
-        .extra
-        .get("deferred_mcp_discovery")
-        .and_then(Value::as_bool)
-        == Some(true)
-        && tool_enabled("discover_mcp_tools", agent, &cfg, request)
-        && !defs
-            .iter()
-            .any(|d| d["function"]["name"] == "discover_mcp_tools")
-    {
+    if discovery_enabled {
         let mut position = 0;
         defs.retain(|def| {
             let index = position;
@@ -170,9 +169,6 @@ async fn prepare_turn(
                 true
             }
         });
-        if !deferred.is_empty() {
-            defs.push(json!({"type":"function","function":{"name":"discover_mcp_tools", "description":"Find and activate available MCP tools for later steps. Search their names and descriptions; use an empty query to list all.", "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}));
-        }
     }
     base.tools = defs;
     Ok(PreparedTurn {
@@ -437,7 +433,7 @@ pub(super) async fn run_turn(
                 call_id: String::new(),
                 part_id: String::new(),
             };
-            run_tools(
+            let activated = run_tools(
                 &tools_context,
                 &cfg,
                 &request,
@@ -447,16 +443,8 @@ pub(super) async fn run_turn(
                 &deferred,
             )
             .await?;
-            // Discovery affects the next model step, never sibling calls in this step.
-            for part in &parts.tools {
-                if part["tool"] == "discover_mcp_tools" && part["state"]["status"] == "completed" {
-                    if let Some(names) = part["state"]["metadata"]["activated"].as_array() {
-                        for name in names.iter().filter_map(Value::as_str) {
-                            allowed.insert(name.to_owned());
-                        }
-                    }
-                }
-            }
+            // Discovery takes effect only after all sibling calls have finished.
+            allowed.extend(activated);
             if !deferred.is_empty() {
                 let mut all = base.tools.clone();
                 all.retain(|d| {

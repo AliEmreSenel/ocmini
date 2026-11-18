@@ -440,6 +440,7 @@ impl McpHub {
             "question",
             "task",
             "skill",
+            "discover_mcp_tools",
         ]
         .into_iter()
         .map(str::to_owned)

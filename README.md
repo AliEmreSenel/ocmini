@@ -140,17 +140,17 @@ MCP configuration from a checkout or its ancestor directories requires `OCMINI_T
 
 Set `"deferred_mcp_discovery": true` to hide MCP schemas until the model searches for them using `discover_mcp_tools`. Matching tools become available on subsequent steps of the same turn; the next turn starts with discovery again. It defaults to false. Discovery searches names and descriptions from the approved, hook-transformed catalog and does not bypass permissions.
 
-For example, configure Serena in a trusted project or global configuration, and scope its access with permissions:
+For example, set `read_only: true` in Serena’s `/path/to/project/.serena/project.yml` (create the project configuration with `serena project create` if needed). Then configure the single-project `ide` context in a trusted ocmini configuration. The permission rules allow only the listed navigation tools:
 
 ```json
 {
   "deferred_mcp_discovery": true,
-  "mcp": {"serena": {"type": "local", "command": ["uvx", "--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "ide-assistant", "--project", "/path/to/project"]}},
-  "permission": {"serena_*": "ask"}
+  "mcp": {"serena": {"type": "local", "command": ["uvx", "--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "ide", "--project", "/path/to/project"]}},
+  "permission": {"serena_*": "deny", "serena_find_file": "allow", "serena_find_referencing_symbols": "allow", "serena_find_symbol": "allow", "serena_get_symbols_overview": "allow", "serena_list_dir": "allow", "serena_search_for_pattern": "allow"}
 }
 ```
 
-Replace the project path and adjust permissions to your needs. MCP servers run with the server process's OS permissions.
+Replace the project path. Serena’s project read-only setting disables editing tools; ocmini permissions further restrict which Serena tools can run. MCP servers run with the server process's OS permissions.
 
 `title_model` names new sessions with a model: `provider/model` picks one, `small` starts at `small_model`, and the default `""` writes titles from the first prompt's first line with no model call. A title model that is unavailable, fails or answers with nothing usable moves to the next (`small_model`, then the session's model), and the prompt's first line remains the last resort. Terminal chat shows `◦ generating title…` while a title is written.
 

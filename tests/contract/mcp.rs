@@ -367,3 +367,117 @@ async fn deferred_mcp_discovery_activates_only_for_the_current_turn() {
         .any(|m| m["role"] == "tool" && m["content"] == "global"));
     assert!(!has(&next, "probe_echo_value"));
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn deferred_discovery_respects_catalog_permissions_and_trusted_selection() {
+    for mode in ["remove_discovery", "remove_mcp", "deny", "forged"] {
+        let mut provider = Provider::start(vec![
+            tool_script(
+                "discover_mcp_tools",
+                json!({"query": if mode == "forged" { "no match" } else { "echo" }}),
+                "discover",
+            ),
+            text_script("Done", ""),
+        ])
+        .await;
+        let mut config = local_mcp();
+        config["deferred_mcp_discovery"] = json!(true);
+        let code = match mode {
+            "remove_discovery" => "import json,sys\nr=json.load(sys.stdin)\nprint(json.dumps({'set':{'tools':[t for t in r['input']['tools'] if t['function']['name'] != 'discover_mcp_tools']}}))",
+            "remove_mcp" => "import json,sys\nr=json.load(sys.stdin)\nprint(json.dumps({'set':{'tools':[t for t in r['input']['tools'] if t['function']['name'] != 'probe_echo_value']}}))",
+            "forged" => "import json,sys\nr=json.load(sys.stdin)\nprint(json.dumps({'set':{'metadata':{'activated':['probe_echo_value']}}}))",
+            _ => "",
+        };
+        if !code.is_empty() {
+            let event = if mode == "forged" {
+                "tool.execute.after"
+            } else {
+                "tool.catalog.transform"
+            };
+            config["ocmini"] = json!({"hooks":{"version":1,"admissionChainTimeoutMs":5000,"handlers":[{"id":"filter","on":event,"command":[PYTHON,"-S","-c",code]}]}});
+        }
+        if mode == "deny" {
+            config["permission"] = json!({"discover_mcp_tools":"deny"});
+        }
+        let server = TestServer::start(&provider, config).await;
+        let id = server
+            .session(if mode == "deny" { json!([]) } else { allow() })
+            .await;
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt("msg_filter", "Discover"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let first = provider.request().await;
+        let second = provider.request().await;
+        let has = |r: &Value, n: &str| {
+            r["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == n)
+        };
+        assert_eq!(
+            has(&first, "discover_mcp_tools"),
+            mode != "remove_discovery",
+            "{mode}"
+        );
+        assert!(!has(&second, "probe_echo_value"), "{mode}");
+        if mode == "deny" {
+            assert!(
+                second["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "tool"
+                        && m["content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("Permission 'discover_mcp_tools' denied")),
+                "{second}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn deferred_discovery_cannot_authorize_sibling_call() {
+    let mut script = tool_script("discover_mcp_tools", json!({"query":"echo"}), "discover");
+    script.chunks[0]["choices"][0]["delta"]["tool_calls"].as_array_mut().unwrap().push(json!({"index":1,"id":"sibling","type":"function","function":{"name":"probe_echo_value","arguments":"{}"}}));
+    let mut provider = Provider::start(vec![script, text_script("Done", "")]).await;
+    let mut config = local_mcp();
+    config["deferred_mcp_discovery"] = json!(true);
+    let server = TestServer::start(&provider, config).await;
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_sibling", "Discover"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let second = provider.request().await;
+    let messages = second["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|m| m["role"] == "tool"
+            && m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not enabled")),
+        "{messages:?}"
+    );
+    assert!(!messages
+        .iter()
+        .any(|m| m["role"] == "tool" && m["content"] == "global"));
+}

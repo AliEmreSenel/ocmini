@@ -14,7 +14,7 @@ pub(super) async fn run_tools(
     tool_parts: &mut [Value],
     recent_calls: &mut VecDeque<String>,
     deferred: &[(usize, Value, (String, String))],
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let agent = request.agent.as_deref().unwrap_or("build");
     let mut running = Vec::new();
     for (index, part) in tool_parts.iter_mut().enumerate() {
@@ -23,80 +23,6 @@ pub(super) async fn run_tools(
         }
         let name = part["tool"].as_str().unwrap_or_default().to_string();
         let original_input = part["state"]["input"].clone();
-        if name == "discover_mcp_tools" && allowed.contains(&name) {
-            let start = now_ms();
-            let mut ctx = base.clone();
-            ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
-            ctx.part_id = part["id"].as_str().unwrap_or_default().into();
-            let effective =
-                prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await;
-            let input = effective.as_ref().unwrap_or(&original_input);
-            let query = input["query"].as_str();
-            let mut names = Vec::new();
-            if let Some(query) = query.filter(|_| effective.is_ok()) {
-                let query = query.to_lowercase();
-                for (_, def, route) in deferred {
-                    let name = def["function"]["name"].as_str().unwrap_or_default();
-                    let description = def["function"]["description"].as_str().unwrap_or_default();
-                    if base.app.mcp().route(name).as_ref() == Some(route)
-                        && format!("{name} {description}")
-                            .to_lowercase()
-                            .contains(&query)
-                    {
-                        names.push(name.to_owned());
-                    }
-                }
-                part["state"] = json!({"status":"completed","input":input,"output":format!("Activated MCP tools: {}", names.join(", ")),"title":"Discover MCP tools","metadata":{"activated":names},"time":{"start":start,"end":now_ms()}});
-            } else {
-                part["state"] = json!({"status":"error","input":original_input,"error":effective.err().map(|e| e.message).unwrap_or_else(|| "query must be a string".into()),"time":{"start":start,"end":now_ms()}});
-            }
-            let completed = part["state"]["status"] == "completed";
-            let mut context = tools::hook_context(&ctx, &name);
-            context["outcome"] = json!(if completed { "completed" } else { "error" });
-            if completed
-                && ctx
-                    .app
-                    .hooks
-                    .matches(crate::tools::hooks::TOOL_EXECUTE_AFTER, &context)
-            {
-                let state = &part["state"];
-                let result = ctx.app.hooks.run(crate::tools::hooks::TOOL_EXECUTE_AFTER, &context,
-                    json!({"status":"completed", "args":state["input"], "output":state["output"], "title":state["title"], "metadata":state["metadata"]}), Some(&ctx.cancel)).await;
-                match result {
-                    Ok(result) => {
-                        if let Some(output) = result.input["output"].as_str() {
-                            part["state"]["output"] = json!(output);
-                        }
-                        if let Some(title) = result.input["title"].as_str() {
-                            part["state"]["title"] = json!(title);
-                        }
-                    }
-                    Err(error) => {
-                        part["state"]["status"] = json!("error");
-                        part["state"]["error"] = json!(error.message);
-                    }
-                }
-            }
-            crate::messages::update_part(&base.app, part)?;
-            let error = part["state"]["error"].clone();
-            let event = if part["state"]["status"] == "completed" {
-                event::Tool::Completed {
-                    call_id: &ctx.call_id,
-                    message_id: &ctx.message_id,
-                    part_id: &ctx.part_id,
-                    error: &error,
-                }
-            } else {
-                event::Tool::Failed {
-                    call_id: &ctx.call_id,
-                    message_id: &ctx.message_id,
-                    part_id: &ctx.part_id,
-                    error: &error,
-                }
-            };
-            ctx.app.hooks.emit(event, &context);
-            continue;
-        }
         let start = now_ms();
         let mut ctx = base.clone();
         ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
@@ -133,17 +59,20 @@ pub(super) async fn run_tools(
             cfg,
             request,
             allowed,
+            deferred,
         ));
     }
     let mut first_error = None;
-    for (index, part, error) in futures::future::join_all(running).await {
+    let mut activated = Vec::new();
+    for (index, part, error, selected) in futures::future::join_all(running).await {
         tool_parts[index] = part;
+        activated.extend(selected);
         if let Some(error) = error.filter(|_| first_error.is_none()) {
             first_error = Some(error);
         }
     }
     match first_error {
-        None => Ok(()),
+        None => Ok(activated),
         Some(error) => Err(error),
     }
 }
@@ -164,7 +93,8 @@ async fn execute_part(
     cfg: &Config,
     request: &PromptRequest,
     allowed: &HashSet<String>,
-) -> (usize, Value, Option<String>) {
+    deferred: &[(usize, Value, (String, String))],
+) -> (usize, Value, Option<String>, Vec<String>) {
     let prepared = match prepared {
         Ok(_)
             if !allowed.contains(&name) && !allowed.contains(crate::v2::wire::tool_name(&name)) =>
@@ -186,11 +116,23 @@ async fn execute_part(
     }
     part["state"] = json!({"status":"running","input":&visible_input,"time":{"start":start}});
     if let Err(error) = crate::messages::update_part(&ctx.app, &part) {
-        return (index, part, Some(error.message));
+        return (index, part, Some(error.message), Vec::new());
     }
+    let mut selected = Vec::new();
     let output: Result<_, OperationError> = match &prepared {
         Err(error) => Err(error.clone()),
-        Ok(input) => execute_tool(&ctx, &name, input, cfg, request, repeated).await,
+        Ok(input) => {
+            execute_tool(
+                &ctx,
+                &name,
+                input,
+                cfg,
+                request,
+                repeated,
+                Some((deferred, &mut selected)),
+            )
+            .await
+        }
     };
     // Task/question tools may publish metadata while blocked. Preserve it.
     let existing = ctx
@@ -213,6 +155,9 @@ async fn execute_part(
     };
     let update = crate::messages::update_part(&ctx.app, &part);
     let completed = part["state"]["status"] == "completed";
+    if !completed {
+        selected.clear();
+    }
     let error_value = part["state"]["error"].clone();
     let event = if completed {
         event::Tool::Completed {
@@ -234,7 +179,7 @@ async fn execute_part(
         Ok(()) => None,
         Err(error) => Some(error.message),
     };
-    (index, part, failure)
+    (index, part, failure, selected)
 }
 
 pub(super) fn execution_tool(name: &str) -> bool {
@@ -396,8 +341,9 @@ pub(super) async fn execute_tool(
     cfg: &Config,
     request: &PromptRequest,
     repeated: bool,
+    selection: Option<(&[(usize, Value, (String, String))], &mut Vec<String>)>,
 ) -> Result<ToolOutput, OperationError> {
-    let result = execute_authorized_tool(ctx, name, input, cfg, request, repeated).await;
+    let result = execute_authorized_tool(ctx, name, input, cfg, request, repeated, selection).await;
     let mut context = tools::hook_context(ctx, name);
     context["outcome"] = json!(if result.is_ok() { "completed" } else { "error" });
     if !ctx
@@ -460,6 +406,7 @@ async fn execute_authorized_tool(
     cfg: &Config,
     request: &PromptRequest,
     repeated: bool,
+    selection: Option<(&[(usize, Value, (String, String))], &mut Vec<String>)>,
 ) -> Result<ToolOutput, OperationError> {
     if repeated || input.file_paths().is_none() {
         let rules = current_permission_rules(ctx, cfg, request)?;
@@ -493,6 +440,15 @@ async fn execute_authorized_tool(
             }
         }
     }
+    if let Some((deferred, _)) = &selection {
+        if deferred
+            .iter()
+            .find(|(_, def, _)| def["function"]["name"] == name)
+            .is_some_and(|(_, _, route)| ctx.app.mcp().route(name).as_ref() != Some(route))
+        {
+            return Err("MCP tool is no longer registered".into());
+        }
+    }
     // Approval hooks and user input can outlive the lease that authorized them.
     ctx.app.store.check_ownership(&ctx.session_id)?;
     ctx.app.hooks.emit(
@@ -504,6 +460,34 @@ async fn execute_authorized_tool(
         },
         &tools::hook_context(ctx, name),
     );
+    if name == "discover_mcp_tools" {
+        let (deferred, selected) = selection.ok_or("Discovery unavailable")?;
+        let query = input.args()["query"]
+            .as_str()
+            .ok_or("query must be a string")?
+            .to_lowercase();
+        for (_, def, route) in deferred {
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            let description = def["function"]["description"].as_str().unwrap_or_default();
+            if ctx.app.mcp().route(name).as_ref() == Some(route)
+                && format!("{name} {description}")
+                    .to_lowercase()
+                    .contains(&query)
+            {
+                selected.push(name.to_owned());
+            }
+        }
+        return tools::limit_output(
+            ToolOutput {
+                output: format!("Activated MCP tools: {}", selected.join(", ")),
+                title: "Discover MCP tools".into(),
+                metadata: json!({"activated":selected}),
+            },
+            ctx.app.tool_output_directory(&ctx.session_id),
+        )
+        .await
+        .map_err(Into::into);
+    }
     tools::run_tool(ctx, name, input).await.map_err(Into::into)
 }
 
@@ -635,7 +619,7 @@ pub(super) async fn expand_shell_templates(
             let input = prepare_effective_input(&ctx, "bash", input, cfg, request)
                 .await
                 .map_err(|e| e.message)?;
-            let output = execute_tool(&ctx, "bash", &input, cfg, request, false)
+            let output = execute_tool(&ctx, "bash", &input, cfg, request, false, None)
                 .await
                 .map_err(|e| e.message)?;
             replaced.push_str(&original[offset..matched.start()]);
