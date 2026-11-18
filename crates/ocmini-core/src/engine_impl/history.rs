@@ -204,6 +204,13 @@ pub(super) fn build_messages(
                 }
             }
         }
+        for part in &message.parts {
+            if part["ocminiInstructionPath"].is_string() {
+                if let Some(text) = part["text"].as_str() {
+                    tail.push(json!({"role":"user","content":text}));
+                }
+            }
+        }
         if !attachments.is_empty() {
             tail.push(json!({"role":"user","content":attachments}));
         }

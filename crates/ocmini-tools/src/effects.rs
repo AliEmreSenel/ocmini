@@ -234,16 +234,15 @@ impl Effects {
                     crate::run_effect(directory, session, name, &args["args"], cancel).await?,
                 ))
             }
-            "instruction" => {
-                let root = std::fs::canonicalize(directory).map_err(|e| e.to_string())?;
-                let requested = args["path"].as_str().ok_or("Missing instruction path")?;
-                let path = std::fs::canonicalize(crate::resolve_path(directory, requested))
-                    .map_err(|e| e.to_string())?;
-                if !path.starts_with(&root) || args["expected"].as_str() != path.to_str() {
-                    return Err("Instruction outside workspace".into());
-                }
-                let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-                json!(text)
+            "instruction_resolve_read" | "instruction_resolve" | "instruction" => {
+                let directory = directory.to_owned();
+                let method = method.to_owned();
+                let args = args.clone();
+                return tokio::task::spawn_blocking(move || {
+                    instruction_effect(&directory, &method, &args)
+                })
+                .await
+                .map_err(|e| OperationError::from(e.to_string()))?;
             }
             "skill" => {
                 return Ok(EffectResult::Output(crate::skills::load_content(
@@ -256,5 +255,68 @@ impl Effects {
             _ => return Err(format!("Unknown tool operation: {method}").into()),
         };
         Ok(EffectResult::Json(value))
+    }
+}
+
+// Resolve and open in the effect process, so sandbox mounts apply. The final
+// open walks the authorized canonical path without following replacement links.
+fn instruction_effect(
+    directory: &str,
+    method: &str,
+    args: &Value,
+) -> Result<EffectResult, OperationError> {
+    let root = std::fs::canonicalize(directory).map_err(|e| e.to_string())?;
+    let requested = args["path"].as_str().ok_or("Missing instruction path")?;
+    let path = std::fs::canonicalize(crate::resolve_path(directory, requested))
+        .map_err(|e| e.to_string())?;
+    if !path.starts_with(&root) {
+        return Err("Instruction outside workspace".into());
+    }
+    if method == "instruction_resolve_read" {
+        return Ok(EffectResult::Json(
+            json!({"root":root,"target":path,"directory":path.is_dir()}),
+        ));
+    }
+    if method == "instruction_resolve" {
+        return Ok(EffectResult::Json(json!(path)));
+    }
+    if args["expected"].as_str() != path.to_str() {
+        return Err("Instruction target changed".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        let mut file = std::fs::File::open(&root).map_err(|e| e.to_string())?;
+        let relative = path.strip_prefix(&root).map_err(|e| e.to_string())?;
+        let components: Vec<_> = relative.components().collect();
+        for (i, component) in components.iter().enumerate() {
+            let name = std::ffi::CString::new(component.as_os_str().as_bytes())
+                .map_err(|e| e.to_string())?;
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if i + 1 < components.len() {
+                    libc::O_DIRECTORY
+                } else {
+                    0
+                };
+            let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().to_string().into());
+            }
+            file = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("Instruction is not a regular file".into());
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(|e| e.to_string())?;
+        Ok(EffectResult::Json(json!(text)))
+    }
+    #[cfg(not(unix))]
+    {
+        Err("Instruction discovery requires secure file access".into())
     }
 }

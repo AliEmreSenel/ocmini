@@ -632,3 +632,73 @@ async fn nested_instruction_read_deny_is_respected() {
     assert!(model_request.contains("public file marker"));
     assert!(!model_request.contains("private instruction marker"));
 }
+
+#[tokio::test]
+async fn parallel_reads_share_nested_instructions() {
+    let calls = ["one.txt", "two.txt"].iter().enumerate().map(|(i, name)| {
+        json!({"index":i,"id":format!("read_{i}"),"type":"function","function":{"name":"read","arguments":json!({"filePath":format!("nested/{name}")}).to_string()}})
+    }).collect::<Vec<_>>();
+    let mut provider = Provider::start(vec![Script::ok(vec![
+        json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()})
+    ]), text_script("Done", "")]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(
+        server.directory.join("nested/AGENTS.md"),
+        "parallel instruction marker",
+    )
+    .unwrap();
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(server.directory.join("nested").join(name), "content").unwrap();
+    }
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_parallel_instructions", "Read both"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert_eq!(request.matches("parallel instruction marker").count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_instruction_symlink_is_not_loaded() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "read_file"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), "external instruction secret").unwrap();
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(server.directory.join("nested/file.txt"), "public content").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret"),
+        server.directory.join("nested/AGENTS.md"),
+    )
+    .unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_external_instruction", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert!(request.contains("public content"));
+    assert!(!request.contains("external instruction secret"));
+}
