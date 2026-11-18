@@ -207,7 +207,11 @@ async fn pruning_old_tool_results_is_opt_in_and_keeps_the_archive() {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|message| message["content"] == "[Old tool result content cleared]")
+            .filter(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("[Old tool result content cleared"))
+            })
             .count();
         assert_eq!(cleared, pruned);
     }

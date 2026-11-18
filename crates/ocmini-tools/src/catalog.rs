@@ -22,6 +22,13 @@ pub struct ShellInput {
     pub background: bool,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadToolOutputInput {
+    pub message_id: String,
+    pub part_id: String,
+}
+
 /// The built-in catalog and its closed Rust identity share one spelling table.
 macro_rules! builtin_tools {
     ($($variant:ident => $name:literal, $description:literal, $parameters:ty;)+) => {
@@ -49,6 +56,7 @@ macro_rules! builtin_tools {
 }
 builtin_tools! {
     Bash => "bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once and keeps running across tool calls, ending when its session is aborted or deleted, or when ocmini exits. A timed-out command completes with the output captured before the limit and a shell_metadata timeout notice.", ShellInput;
+    ReadToolOutput => "read_tool_output", "Recall a saved foreground bash result by its session messageId and partId. If a full output path is provided, use read to access it.", ReadToolOutputInput;
     Read => "read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", files::ReadInput;
     Write => "write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", changes::WriteInput;
     Edit => "edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", changes::EditInput;
@@ -313,6 +321,9 @@ where
             match kind {
                 Builtin::Bash => {
                     let _: ShellInput = decode(&alias(&args, "workdir", "cwd"))?;
+                }
+                Builtin::ReadToolOutput => {
+                    let _: ReadToolOutputInput = decode(&args)?;
                 }
                 Builtin::Read => {
                     let _: files::ReadInput = decode(&args)?;

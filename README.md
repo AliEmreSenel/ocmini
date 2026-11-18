@@ -145,7 +145,7 @@ Agent turns have no step limit by default. To cap model/tool rounds explicitly, 
 `subagent_depth` sets the maximum nesting depth and defaults to **8**; `0` disables child tasks. The `compaction` object supports OpenCode's settings:
 
 - `auto`: automatic proactive and overflow-triggered compaction, default `true`. Manual summaries remain available when disabled.
-- `prune`: clear older completed tool results from model context, default `false`. The latest two user turns, roughly 40,000 tokens of tool results and skill outputs are protected; pruning runs when more than 20,000 older tokens can be cleared. Original results remain browsable.
+- `prune`: clear older completed tool results from model context, default `false`. The latest two user turns, roughly 40,000 tokens of tool results and skill outputs are protected; pruning runs when more than 20,000 older tokens can be cleared. Original results remain browsable. Cleared foreground shell results include message and part IDs that the model can use with `read_tool_output` to recall the saved preview, subject to current read and shell permissions. If the result references a full output file, the model can use `read` to access it.
 - `reserved`: override the token reserve when the model supplies a separate `limit.input`; otherwise usable context is `limit.context` minus the output allowance.
 - `preserve_recent_tokens`: override the adaptive verbatim-tail budget; `0` keeps only the summary.
 - `tail_turns`: limit the number of recent user turns retained verbatim; `0` disables the verbatim tail. When omitted, only the token budget limits the tail.

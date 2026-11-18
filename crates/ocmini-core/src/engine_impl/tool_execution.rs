@@ -379,6 +379,31 @@ async fn execute_authorized_tool(
     request: &PromptRequest,
     repeated: bool,
 ) -> Result<ToolOutput, OperationError> {
+    if name == "read_tool_output" {
+        return recall_tool_output(ctx, input, cfg, request).await;
+    }
+    authorize_prepared(ctx, name, input, cfg, request, repeated).await?;
+    ctx.app.store.check_ownership(&ctx.session_id)?;
+    ctx.app.hooks.emit(
+        event::Tool::Started {
+            call_id: &ctx.call_id,
+            message_id: &ctx.message_id,
+            part_id: &ctx.part_id,
+            name,
+        },
+        &tools::hook_context(ctx, name),
+    );
+    tools::run_tool(ctx, name, input).await.map_err(Into::into)
+}
+
+async fn authorize_prepared(
+    ctx: &ToolCtx,
+    name: &str,
+    input: &PreparedTool,
+    cfg: &Config,
+    request: &PromptRequest,
+    repeated: bool,
+) -> Result<(), OperationError> {
     if repeated || input.file_paths().is_none() {
         let rules = current_permission_rules(ctx, cfg, request)?;
         if repeated {
@@ -411,18 +436,62 @@ async fn execute_authorized_tool(
             }
         }
     }
-    // Approval hooks and user input can outlive the lease that authorized them.
     ctx.app.store.check_ownership(&ctx.session_id)?;
-    ctx.app.hooks.emit(
-        event::Tool::Started {
-            call_id: &ctx.call_id,
-            message_id: &ctx.message_id,
-            part_id: &ctx.part_id,
-            name,
-        },
-        &tools::hook_context(ctx, name),
-    );
-    tools::run_tool(ctx, name, input).await.map_err(Into::into)
+    Ok(())
+}
+
+async fn recall_tool_output(
+    ctx: &ToolCtx,
+    input: &PreparedTool,
+    cfg: &Config,
+    request: &PromptRequest,
+) -> Result<ToolOutput, OperationError> {
+    let args = input.args();
+    let mid = args["messageId"].as_str().ok_or("Missing messageId")?;
+    let pid = args["partId"].as_str().ok_or("Missing partId")?;
+    let part = ctx
+        .app
+        .store
+        .message_part(&ctx.session_id, mid, pid)?
+        .ok_or("Tool result not found")?;
+    let name = part["tool"].as_str().unwrap_or_default();
+    if part["type"] != "tool"
+        || part["state"]["status"] != "completed"
+        || !matches!(name, "bash" | "shell")
+        || part["state"]["input"]["background"] == true
+    {
+        return Err("Tool result is not eligible for recall".into());
+    }
+    let agent = request.agent.as_deref().unwrap_or("build");
+    if !tool_enabled(name, agent, cfg, request)
+        || unattended_tool_denied(name, &ctx.app, request)
+        || ["plan", "explore"].contains(&agent)
+    {
+        return Err("Original tool is disabled for this request".into());
+    }
+    // Bash preparation only validates its saved arguments; it does not run hooks or effects.
+    let original = tools::prepare_input(ctx, name, part["state"]["input"].clone(), |_, _| async {
+        Ok(())
+    })
+    .await?;
+    authorize_prepared(ctx, name, &original, cfg, request, false).await?;
+    let rules = current_permission_rules(ctx, cfg, request)?;
+    check_permission(ctx, &rules, "read", "*", "read_tool_output", args).await?;
+    ctx.app.store.check_ownership(&ctx.session_id)?;
+    let mut output = part["state"]["output"]
+        .as_str()
+        .ok_or("Tool result has no text output")?
+        .to_owned();
+    if let Some(path) = part["state"]["metadata"]["outputPath"].as_str() {
+        output.push_str(&format!(
+            "\nFull output path: {path} (use read to access it)."
+        ));
+    }
+    Ok(ToolOutput {
+        output,
+        title: "Saved tool output".into(),
+        metadata: json!({}),
+    })
 }
 
 async fn check_permission(

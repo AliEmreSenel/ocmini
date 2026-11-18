@@ -156,7 +156,13 @@ pub(super) fn build_messages(
         for part in &calls {
             let content = match part["state"]["status"].as_str() {
                 Some("completed") if part["state"]["time"]["compacted"].is_number() => {
-                    "[Old tool result content cleared]".into()
+                    if matches!(part["tool"].as_str(), Some("bash" | "shell"))
+                        && part["state"]["input"]["background"] != true
+                    {
+                        format!("[Old tool result content cleared. Recall with read_tool_output using messageId {} and partId {}.]", message.info.id, part["id"].as_str().unwrap_or_default())
+                    } else {
+                        "[Old tool result content cleared]".into()
+                    }
                 }
                 Some("completed") => part["state"]["output"]
                     .as_str()

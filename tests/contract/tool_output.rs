@@ -428,3 +428,77 @@ async fn malformed_optional_shell_fields_fail_without_effects_and_remain_visible
                 .as_str()
                 .is_some_and(|text| text.contains("boolean"))));
 }
+
+#[tokio::test]
+async fn historical_shell_output_is_scoped_to_its_session() {
+    let provider = Provider::start(vec![
+        tool_script(
+            "bash",
+            json!({"command":shell_command("printf RECALL_SENTINEL", "echo RECALL_SENTINEL")}),
+            "original",
+        ),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let first = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{first}/message"),
+            &prompt("msg_recall_source", "Run command"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let messages = server.messages(&first).await;
+    let part = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["type"] == "tool")
+        .unwrap();
+    let args = json!({"messageId":part["messageID"], "partId":part["id"]});
+    for (session, success) in [
+        (first.clone(), true),
+        (server.session(allow()).await, false),
+    ] {
+        provider.scripts.lock().await.extend([
+            tool_script("read_tool_output", args.clone(), "recall"),
+            text_script("Done", ""),
+        ]);
+        server
+            .post(
+                &format!("/session/{session}/message"),
+                &prompt(
+                    if success {
+                        "msg_recall_allowed"
+                    } else {
+                        "msg_recall_denied"
+                    },
+                    "Recall output",
+                ),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let messages = server.messages(&session).await;
+        let recall = messages
+            .iter()
+            .flat_map(|m| m["parts"].as_array().unwrap())
+            .find(|p| p["tool"] == "read_tool_output")
+            .unwrap();
+        if success {
+            assert_eq!(recall["state"]["status"], "completed", "{recall}");
+            assert!(recall["state"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("RECALL_SENTINEL"));
+        } else {
+            assert_eq!(recall["state"]["status"], "error", "{recall}");
+            assert!(!recall.to_string().contains("RECALL_SENTINEL"));
+        }
+    }
+}

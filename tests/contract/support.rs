@@ -138,6 +138,7 @@ pub(super) async fn provider_reply(
 }
 
 pub(super) struct Provider {
+    pub(super) scripts: Arc<Mutex<VecDeque<Script>>>,
     pub(super) url: String,
     pub(super) requests: mpsc::UnboundedReceiver<Value>,
     pub(super) task: tokio::task::JoinHandle<()>,
@@ -155,6 +156,7 @@ impl Provider {
             title_scripts: Arc::new(Mutex::new(titles.into())),
             requests,
         };
+        let scripts = state.scripts.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let router = Router::new()
@@ -166,6 +168,7 @@ impl Provider {
             axum::serve(listener, router).await.unwrap();
         });
         Self {
+            scripts,
             url,
             requests: receiver,
             task,
