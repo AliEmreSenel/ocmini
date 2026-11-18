@@ -887,13 +887,6 @@ async fn permission_reply(
     Json(body): Json<Value>,
 ) -> Result<StatusCode> {
     required(&st, &sid)?;
-    let request = st
-        .app
-        .perms
-        .list()
-        .into_iter()
-        .find(|p| p.id == id && p.session_id == sid)
-        .ok_or_else(|| missing("PermissionNotFoundError", &sid, "requestID", &id))?;
     let decision = wire::string(&body, "decision")?;
     if !matches!(decision, "once" | "always" | "reject") {
         return Err(invalid("Invalid decision"));
@@ -901,12 +894,9 @@ async fn permission_reply(
     if !st
         .app
         .perms
-        .reply_with_message(&request.id, decision, body["message"].as_str())
+        .reply_v2(&sid, &id, decision, body["message"].as_str())
     {
         return Err(missing("PermissionNotFoundError", &sid, "requestID", &id));
-    }
-    if decision == "reject" && !body["message"].is_string() {
-        st.engine.interrupt(&sid);
     }
     Ok(StatusCode::NO_CONTENT)
 }

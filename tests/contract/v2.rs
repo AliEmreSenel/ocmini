@@ -815,6 +815,66 @@ async fn v2_mcp_registration_reuses_the_connection_and_removal_stops_tools() {
 }
 
 #[tokio::test]
+async fn v2_rejection_settles_only_the_current_step() {
+    let calls = ["one", "two"].into_iter().enumerate().map(|(index, name)|
+        json!({"index":index,"id":format!("call_{name}"),"type":"function","function":{"name":"shell","arguments":json!({"command":format!("touch {name}")}).to_string()}})
+    ).collect::<Vec<_>>();
+    let mut provider = Provider::start(vec![
+        Script::ok(vec![
+            json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()}),
+        ]),
+        tool_script("shell", json!({"command":"touch later"}), "call_later"),
+        text_script("Done", ""),
+    ]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = session(&server).await;
+    server
+        .client
+        .patch(format!("{}/api/session/{sid}", server.url))
+        .json(&json!({"permissions":[{"action":"shell","resource":"*","effect":"ask"}]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut events = server.events_at("/api/event").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"text":"Run commands"}),
+    )
+    .await;
+    events.through("permission.asked").await;
+    events.through("permission.asked").await;
+    let pending = get(&server, &format!("/api/session/{sid}/permission")).await;
+    let requests = pending["data"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    let id = requests[0]["id"].as_str().unwrap();
+    post(
+        &server,
+        &format!("/api/session/{sid}/permission/{id}/reply"),
+        json!({"decision":"reject"}),
+    )
+    .await;
+    let observed = events.through("permission.asked").await;
+    let later = observed.last().unwrap()["data"]["id"].as_str().unwrap();
+    post(
+        &server,
+        &format!("/api/session/{sid}/permission/{later}/reply"),
+        json!({"decision":"once"}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    for _ in 0..3 {
+        provider.request().await;
+    }
+    assert!(!server.directory.join("one").exists());
+    assert!(!server.directory.join("two").exists());
+    assert!(server.directory.join("later").exists());
+}
+
+#[tokio::test]
 async fn v2_permission_denial_feedback_reaches_the_model_without_executing_the_tool() {
     let mut provider = Provider::start(vec![
         tool_script(
