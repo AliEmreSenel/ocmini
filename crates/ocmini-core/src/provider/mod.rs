@@ -553,8 +553,10 @@ impl Adapter {
 fn resolve_options(cfg: &ProviderCfg, req: &ChatRequest) -> Result<Value, String> {
     let model = cfg.models.get(&req.model);
     let mut options = serde_json::to_value(&cfg.options).map_err(|e| e.to_string())?;
-    if let Some(api) = cfg.extra.get("api").and_then(Value::as_str) {
-        options["baseURL"] = json!(api);
+    if options["baseURL"].as_str().unwrap_or_default().is_empty() {
+        if let Some(api) = cfg.extra.get("api").and_then(Value::as_str) {
+            options["baseURL"] = json!(api);
+        }
     }
     let mut options = merge_model_options(options, model)?;
     if let Some(variant) = &req.variant {
@@ -1060,6 +1062,24 @@ mod tests {
             .unwrap()
             .contains("unknown model variant"));
     }
+    #[test]
+    fn legacy_api_is_a_fallback_for_explicit_provider_base_url() {
+        for (base, expected) in [
+            ("http://explicit/v1", "http://explicit/v1"),
+            ("", "http://legacy/v1"),
+        ] {
+            let cfg: ProviderCfg = serde_json::from_value(
+                json!({"api":"http://legacy/v1","options":{"baseURL":base}}),
+            )
+            .unwrap();
+            let req = ChatRequest {
+                model: "m".into(),
+                ..Default::default()
+            };
+            assert_eq!(resolve_options(&cfg, &req).unwrap()["baseURL"], expected);
+        }
+    }
+
     #[tokio::test]
     async fn custom_variants_apply_options_without_sending_the_variant_name_as_effort() {
         let cfg: ProviderCfg = serde_json::from_value(json!({"options":{"baseURL":"http://localhost/v1","apiKey":"test"},"models":{"model":{"variants":{"focused":{"reasoningEffort":"high","headers":{"x-mode":"focused"}}}}}})).unwrap();
