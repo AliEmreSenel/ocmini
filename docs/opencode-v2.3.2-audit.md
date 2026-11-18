@@ -1,6 +1,6 @@
-# OpenCode v2.3.2 compatibility audit (in progress)
+# OpenCode v2.3.2 compatibility audit
 
-This is a preliminary audit, not an acceptance report. It compares ocmini commit
+This audit compares ocmini commit
 `f123b3f71d4a499dcdd34af41ee6ac33faa756e2` with the recorded native baseline
 [2.2.5](https://github.com/anomalyco/opencode/releases/tag/v2.2.5) and the
 versioned v2 tags published through 2026-11-18. GitHub's `latest` release points
@@ -14,7 +14,8 @@ tags are [2.2.6](https://github.com/anomalyco/opencode/releases/tag/v2.2.6)
 [2.3.1](https://github.com/anomalyco/opencode/releases/tag/v2.3.1)
 `c769de83007e3584b5b395176c9fcde2d3231e88`, and
 [2.3.2](https://github.com/anomalyco/opencode/releases/tag/v2.3.2)
-`c0ad18b402eb2827fc1ee71c171b1177b3fc02d1`. Recheck tags before review.
+`c0ad18b402eb2827fc1ee71c171b1177b3fc02d1`. The v2 tag list was rechecked
+after the fixes.
 
 ## Protocol findings
 
@@ -30,13 +31,12 @@ large generated diffs).
 The [session schema changes](https://github.com/anomalyco/opencode/compare/v2.2.5...v2.3.2)
 include durable `session.step.first-token`, optional assistant `time.firstToken`,
 and `generate` as a usage source. `session.generate` now returns tokens and
-cost; it was already deferred in the baseline endpoint inventory and T3's pinned
-text helper uses session create/prompt/events/delete instead. First-token event
-and replay behavior still need an end-to-end compatibility assessment; ocmini's
-`v2/events.rs` currently emits `session.step.streamed` but no first-token event.
-Other schema changes include optional freeform tool capabilities, MCP pooling,
-provider TLS and background compaction. Their T3 impact needs further checking.
-The accepted older-client compaction schema limitation remains unchanged.
+cost. The baseline endpoint inventory defers generation and the pinned T3 text
+helper uses session create, prompt, events and delete. First-token streaming has
+a confirmed decoder compatibility issue described below. Freeform tool
+capabilities, MCP pooling, provider TLS and background compaction describe
+capabilities outside the selected endpoint inventory. The older T3 compaction
+schema limitation remains part of that inventory's acceptance criteria.
 
 ## Release classification
 
@@ -52,10 +52,10 @@ parity gaps, not implied prerequisites for the existing 2.2.5 contract.
 
 | Release | Selected runtime changes and disposition |
 | --- | --- |
-| 2.2.6 | Webfetch fragment matching fixed on this branch; initial credential rejection exists. MCP connection behavior is covered by concurrent narrow MCP work. External-directory approval for session moves, browser-origin/download restrictions, noninteractive run background settlement and provider unreachable retry require separate verification. Partial provider limits are represented as JSON, so are not rejected by deserialization. Warming, pool, worktree CLI, archive CLI, Azure Messages and VM are optional. |
+| 2.2.6 | This PR fixes webfetch fragment matching and adds browser request-site and raw-download protections. The provider transport retries connection errors. The external-directory approval applies to upstream's model-facing `session_move` tool. Standalone run background settlement remains a CLI difference. Partial provider limits already use JSON. Warming, MCP pool, worktree CLI, archive CLI, Azure Messages and VM are outside scope. |
 | 2.2.7 | Read, shell output, and deferred MCP have separate feature PRs. This PR fixes title model variants, explicit URL precedence, and individual bad legacy credential entries. The runtime does not query the remote catalog for configured models, so partial model overrides can still omit provider metadata. Generation usage and warming are deferred with `session.generate`. |
-| 2.3.0 | Subagent always-background/report/restart semantics remain a larger gap requiring behavioral tests. Shell handoff/output and narrow MCP changes are concurrent. Provider retry/interruption and local catalog refresh warrant targeted verification; freeform tools, TLS, video, Code Mode and process daemon are optional. |
-| 2.3.1 | This PR fixes step-scoped rejection and cross-model Chat reasoning replay. Nested instructions/read/glob/grep, diagnostics, shell output and narrow MCP are separate PRs. Unicode title search and JSON panic errors need targeted verification. Background compaction is a larger optional behavior. The accepted older T3 compaction schema limitation remains. Automations and Code Mode are deferred. |
+| 2.3.0 | Always-background subagents, restart recovery and shell handoff remain behavioral differences. Catalog discovery uses saved credentials and parallel lookups through existing provider settings. See the known differences below for retry interruptions and catalog refresh. Freeform tools, TLS, video, Code Mode and the process daemon are outside scope. |
+| 2.3.1 | This PR fixes step-scoped rejection, cross-model Chat reasoning replay and Unicode title search. Nested instructions, selective reads and grep, diagnostics, shell output and narrow MCP discovery are separate PRs. JSON panic errors, automatic shell handoff and background compaction remain different. Automations and Code Mode are outside scope. |
 | 2.3.2 | Responses caching is PR #68 (OpenAI and Copilot); other upstream provider routes are outside the selected provider scope. Webfetch structured output is a Code Mode/plugin interface, deferred. |
 
 ### First-token and replay
@@ -109,9 +109,52 @@ legacy behavior when provenance is absent, and honors supported destination
 reasoning field configuration. Focused tests cover the preserved tool linkage,
 prompt-derived legacy provenance, and known versus unknown destination fields.
 
-### Remaining acceptance work
+### HTTP and search
 
-1. Verify the 2.2.6 move/origin and run/retry behavior, 2.3.0 child recovery,
-   and 2.3.1 Unicode search/server error behavior against the selected scope.
-2. Integrate and validate the separately owned changes and run the existing T3
-   acceptance matrix; do not assume their assignment means they have landed.
+V2 API routes and the optional web API now reject cross-site browser
+navigations and disallowed origins identified by Fetch Metadata. The optional
+web editor's raw downloads now carry attachment, sandbox and no-sniff
+headers. The official OpenCode file and blob routes are outside the selected
+endpoint inventory. The user-facing HTTP session move continues to accept a
+directory from T3, and ocmini has no model-facing `session_move` tool.
+[Request-site and download changes](https://github.com/anomalyco/opencode/pull/62422)
+· [External-directory permission](https://github.com/anomalyco/opencode/pull/62204)
+
+V2 session listing now matches single-character upper and lower case forms
+in SQLite, including Cyrillic and accented letters. Existing `%` and `_`
+wildcards and cursor filters keep their meaning. The legacy session list and
+TUI picker already normalize Unicode case.
+[Unicode title search](https://github.com/anomalyco/opencode/pull/64259)
+
+### Known behavioral differences
+
+- Upstream's CLI waits for background jobs and processes their results before
+  exiting. ocmini's one-shot `run` follows the admitted turn and stops
+  runtime-owned shell jobs at shutdown.
+  [Standalone run settlement](https://github.com/anomalyco/opencode/pull/61911)
+- The provider transport marks connection failures retryable and the model
+  loop retries failed steps with no tool calls. ocmini can clear partial text
+  while retrying an incomplete step. Equivalent interruption handling for
+  every upstream provider stream remains unverified.
+  [Unreachable provider retry](https://github.com/anomalyco/opencode/pull/61880)
+- The existing runtime supports foreground and explicitly background child
+  tasks. Background delivery uses a task in the originating process.
+  Startup finalizes interrupted turns through the persisted hook recovery
+  path. Upstream resumes previously admitted and directly driven child work
+  and can report completion after a restart.
+  [Background subagent lifecycle](https://github.com/anomalyco/opencode/pull/63382)
+  · [Upstream recovery cases](https://github.com/anomalyco/opencode/blob/v2.3.2/packages/core/test/session-execution.test.ts)
+- Local provider discovery uses the same credential-keyed cache and timeout
+  settings as other providers. One catalog request awaits its concurrent
+  lookups, and configuration reload has no dependency on the discovery
+  tasks. Upstream's provider-specific refresh behavior remains different.
+  [Local catalog refresh](https://github.com/anomalyco/opencode/pull/63700)
+- Ordinary server errors already return typed JSON. An arbitrary handler
+  panic has no v2 JSON `UnknownError` recovery wrapper.
+  [Server error response](https://github.com/anomalyco/opencode/pull/64022)
+- The existing shell timeout and compaction contracts still use ocmini's
+  runtime behavior. Incremental shell polling is a separate PR, while
+  automatic timeout-to-background handoff and speculative summarization
+  remain distinct upstream behavior.
+  [Shell timeout handoff](https://github.com/anomalyco/opencode/pull/63699)
+  · [Background compaction](https://github.com/anomalyco/opencode/pull/64290)
