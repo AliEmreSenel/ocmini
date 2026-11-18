@@ -8,6 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT: usize = 50 * 1024;
 const MAX_LINE: usize = 2000;
+const RANGE_PAGE_NOTES: usize = "\n[Output truncated; continue requested ranges from line ]".len()
+    + "\n[End of file after line ; requested lines beyond EOF are missing]".len()
+    + 2 * (usize::MAX.ilog10() as usize + 1);
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +172,11 @@ pub fn read(
     let mut output_capped = false;
     let mut range_index = 0;
     let mut next_line = None;
+    let page_size = if ranges.is_some() {
+        MAX_OUTPUT - RANGE_PAGE_NOTES
+    } else {
+        MAX_OUTPUT
+    };
     let total = scan_text(&path, reader, cancel, |index, line| {
         let selected = ranges
             .as_ref()
@@ -184,8 +192,12 @@ pub fn read(
                 preview.push_str("... (line truncated to 2000 chars)");
             }
             let formatted = format!("{index}: {preview}\n");
-            let size = preview.len() + usize::from(returned > 0);
-            if text_bytes + size <= MAX_OUTPUT {
+            let size = if ranges.is_some() {
+                formatted.len()
+            } else {
+                preview.len() + usize::from(returned > 0)
+            };
+            if text_bytes + size <= page_size {
                 text.push_str(&formatted);
                 text_bytes += size;
                 returned += 1;
@@ -662,6 +674,27 @@ mod tests {
             &CancellationToken::new()
         )
         .is_err());
+    }
+
+    #[test]
+    fn range_page_counts_numbered_lines_and_leaves_space_for_continuation() {
+        let directory = Directory::new();
+        std::fs::write(directory.0.path().join("short.txt"), "x\n".repeat(20_000)).unwrap();
+        let result = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"short.txt","ranges":[{"start":1,"end":20_001}]}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(result.output.len() <= MAX_OUTPUT);
+        let next = result.metadata["nextLine"].as_u64().unwrap();
+        assert!(result.output.contains(&format!("{}: x\n", next - 1)));
+        assert!(!result.output.contains(&format!("{next}: x\n")));
+        assert!(result
+            .output
+            .contains(&format!("continue requested ranges from line {next}")));
+        assert!(result.output.contains("End of file after line 20000"));
     }
 
     #[test]
