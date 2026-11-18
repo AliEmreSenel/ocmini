@@ -161,7 +161,6 @@ fn v2_tool_defs(defs: &mut Vec<Value>, v2: bool) {
 /// Estimate the locally available request context without starting a turn or MCP.
 pub async fn inspect_context(
     app: &App,
-    _engine: Engine,
     session: &Session,
     selected: &PromptRequest,
 ) -> Result<String, OperationError> {
@@ -244,12 +243,12 @@ pub async fn inspect_context(
     defs.extend(mcp_defs);
     defs.retain(|def| {
         let name = def["function"]["name"].as_str().unwrap_or_default();
-        tool_enabled(name, agent, &cfg, &selected)
-            && !unattended_tool_denied(name, app, &selected)
+        tool_enabled(name, agent, &cfg, selected)
+            && !unattended_tool_denied(name, app, selected)
             && !(["plan", "explore"].contains(&agent)
                 && (execution_tool(name) || mcp_names.contains(name)))
     });
-    let estimate = |bytes: usize| (bytes + 3) / 4;
+    let estimate = |bytes: usize| bytes.div_ceil(4);
     let instructions = estimate(system.len());
     let tools = estimate(serde_json::to_vec(&defs).unwrap_or_default().len());
     let (mut conversation, mut results) = (0, 0);

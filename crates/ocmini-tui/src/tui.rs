@@ -818,7 +818,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     Key::Enter if draft.text.trim() == "/context" => {
                         draft.clear_text();
                         display.finish_line();
-                        match crate::engine_impl::inspect_context(&app, engine.clone(), &session, &selected).await {
+                        match crate::engine_impl::inspect_context(&app, &session, &selected).await {
                             Ok(report) => display.output(&format!("\n{report}"), terminal_width()),
                             Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
                         }
