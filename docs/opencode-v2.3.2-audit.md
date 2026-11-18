@@ -69,18 +69,20 @@ parity gaps, not implied prerequisites for the existing 2.2.5 contract.
 | 2.2.6 | Webfetch fragment matching fixed on this branch; initial credential rejection exists. MCP connection behavior is covered by concurrent narrow MCP work. External-directory approval for session moves, browser-origin/download restrictions, noninteractive run background settlement and provider unreachable retry require separate verification. Partial provider limits are represented as JSON, so are not rejected by deserialization. Warming, pool, worktree CLI, archive CLI, Azure Messages and VM are optional. |
 | 2.2.7 | Read offsets, diagnostics and paging; shell output; MCP refresh/output are concurrent assignments. Config normalization preserves inline model variants and merges native settings with legacy options. Partial capabilities, legacy `api` versus `options.baseURL`, credential import and provider cost/refresh need targeted verification. Generation usage and warming are deferred with `session.generate`. |
 | 2.3.0 | Subagent always-background/report/restart semantics remain a larger gap requiring behavioral tests. Shell handoff/output and narrow MCP changes are concurrent. Provider retry/interruption and local catalog refresh warrant targeted verification; freeform tools, TLS, video, Code Mode and process daemon are optional. |
-| 2.3.1 | Nested instructions/read/glob/grep, diagnostics, shell output and narrow MCP are concurrent. Rejection scope and cross-model reasoning replay are unresolved below. Unicode title search and JSON panic errors need targeted verification. Background compaction is a larger optional behavior; the accepted older T3 compaction schema limitation remains. Automations and Code Mode are deferred. |
+| 2.3.1 | This PR fixes step-scoped rejection and cross-model Chat reasoning replay. Nested instructions/read/glob/grep, diagnostics, shell output and narrow MCP are separate PRs. Unicode title search and JSON panic errors need targeted verification. Background compaction is a larger optional behavior. The accepted older T3 compaction schema limitation remains. Automations and Code Mode are deferred. |
 | 2.3.2 | Responses caching is PR #68 (OpenAI and Copilot); other upstream provider routes are outside the selected provider scope. Webfetch structured output is a Code Mode/plugin interface, deferred. |
 
 ### First-token and replay
 
 The 2.3.2 schema defines durable `session.step.first-token` with session and
 assistant message IDs, and adds optional assistant `time.firstToken`. ocmini's
-`v2/events.rs` sends durable `session.step.streamed` at step finish but has no
-first-token emission; its history projection has no first-token timestamp. The
-pinned T3 adapter at `47f2c8d29e981c7723467efe137ee19e91df924e` handles
-step started/ended/failed and does not reference first-token. Thus this is a
-native 2.3.2 event/history parity gap, not evidence of a pinned T3 regression.
+`v2/events.rs` sends durable `session.step.streamed` at step finish. The latest
+first-token event remains a native 2.3.2 parity gap. The actual OpenCode 2.2.5
+and T3 2.0.28 protocol packages in the conformance fixture both reject a
+`session.step.first-token` envelope at its `type` field when decoded via
+`Schema.decodeUnknownSync(OpenCodeEvent)`. Emitting it on the shared stream
+would fail the pinned clients' conformance test. The pinned T3 stream remains
+the selected compatibility target.
 Upstream publishes the event once per physical attempt before the first
 text-start, reasoning-start, tool-input-start, tool-input-error, or tool-call;
 its message updater projects the event creation time into `time.firstToken` and
@@ -94,14 +96,12 @@ implemented or end-to-end tested here.
 
 ### Rejection scope
 
-`v2_http.rs` replies to the selected request and interrupts the whole session
-when a rejection has no message. Session interruption invokes `reject_all` for
-that session. This differs from 2.3.1's same-step rejection scope. A rejection
-with feedback instead returns an error to that tool. The pinned adapter tracks
-permission replies by request ID. Fixing the no-message case needs a step-scoped
-cancellation/settlement path, including parallel tool requests and children;
-simply removing the interrupt would leave sibling requests pending. This remains
-an in-scope behavioral blocker and requires regression tests.
+Before this PR, a v2 rejection without feedback interrupted the session and
+invoked `reject_all`. The new v2 reply path settles pending requests sharing the
+selected request's session and assistant message ID under one lock. Other
+steps and child sessions keep their own requests. The v1 reply remains on its
+existing path. The scoped unit test and parallel-tool v2 contract cover
+these boundaries and continuing with the next step.
 
 ### Provider migration and replay
 
@@ -111,21 +111,18 @@ JSON. It does not establish that partial capability overrides preserve the
 catalog defaults, or that legacy `api` and explicit `options.baseURL` resolve
 correctly in every combination. Legacy OpenCode `auth.json` import is distinct
 from preserving ocmini's own credentials and is not established by these checks.
-`provider/openai_compat.rs` replays all four saved reasoning fields for any
-`openai-chat` provenance; it does not distinguish the destination model's
-reasoning field. Cross-model replay can therefore send `reasoning_details` to
-a model expecting `reasoning_content`. A fix needs destination capability and
-provenance tests without discarding same-model signed reasoning.
+`provider/openai_compat.rs` previously replayed all saved reasoning fields
+for any `openai-chat` provenance. This PR filters incompatible saved reasoning
+before merging Chat history, retains same-model signed reasoning and existing
+legacy behavior when provenance is absent, and honors supported destination
+reasoning field configuration. Focused tests cover the preserved tool linkage,
+prompt-derived legacy provenance, and known versus unknown destination fields.
 
 ### Remaining acceptance work
 
-1. Exercise durable first-token replay and history semantics, or explicitly
-   retain the native 2.3.2 gap in the supported contract.
-2. Implement and test same-step permission rejection without cancelling other
-   steps; verify child and parallel requests.
-3. Verify and fix cross-model reasoning-field replay and the listed provider
-   migration cases with actual catalog/config fixtures.
-4. Verify the 2.2.6 move/origin and run/retry behavior, 2.3.0 child recovery,
+1. Verify the listed provider migration cases with actual catalog/config
+   fixtures.
+2. Verify the 2.2.6 move/origin and run/retry behavior, 2.3.0 child recovery,
    and 2.3.1 Unicode search/server error behavior against the selected scope.
-5. Integrate and validate the separately owned changes and run the existing T3
+3. Integrate and validate the separately owned changes and run the existing T3
    acceptance matrix; do not assume their assignment means they have landed.
