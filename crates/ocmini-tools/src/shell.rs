@@ -236,9 +236,41 @@ struct BackgroundJob {
     session: String,
     id: String,
     pid: u32,
-    log: File,
+    log: Option<File>,
+    path: std::path::PathBuf,
+    identity: LogIdentity,
     // None is running; Some(None) is an observed termination without an exit code.
     exit: Option<Option<i32>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct LogIdentity {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+impl LogIdentity {
+    fn from_metadata(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        }
+    }
+    fn matches(self, m: &std::fs::Metadata) -> bool {
+        let other = Self::from_metadata(m);
+        m.is_file()
+            && self.dev == other.dev
+            && self.ino == other.ino
+            && self.ctime == other.ctime
+            && self.ctime_nsec == other.ctime_nsec
+    }
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -255,47 +287,107 @@ pub fn read_background(
 ) -> Result<ToolOutput, OperationError> {
     #[cfg(unix)]
     {
-        let jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
-        let job = jobs
-            .iter()
-            .find(|job| job.session == session && job.id == input.job_id)
-            .ok_or_else(|| failure("Background job not found in this session"))?;
-        use std::os::unix::fs::FileExt;
-        let mut bytes = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let limit = input.limit.unwrap_or(output::MAX_OUTPUT);
-        while bytes.len() < limit {
-            let size = chunk.len().min(limit - bytes.len());
-            let count = job
-                .log
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let (id, exit, handle, path, identity) = {
+            let jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+            let job = jobs
+                .iter()
+                .find(|job| job.session == session && job.id == input.job_id)
+                .ok_or_else(|| failure("Background job not found in this session"))?;
+            (
+                job.id.clone(),
+                job.exit,
+                job.log
+                    .as_ref()
+                    .map(File::try_clone)
+                    .transpose()
+                    .map_err(|e| failure(e.to_string()))?,
+                job.path.clone(),
+                job.identity,
+            )
+        };
+        let file = match handle {
+            Some(file) => file,
+            None => {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|e| failure(format!("Cannot reopen background output: {e}")))?;
+                if !identity.matches(&file.metadata().map_err(|e| failure(e.to_string()))?) {
+                    return Err(failure(
+                        "Background output no longer has its original identity",
+                    ));
+                }
+                file
+            }
+        };
+        // Reserve room for the status and for lossy UTF-8 expansion. Never let
+        // the generic output limiter discard bytes covered by nextOffset.
+        let limit = input
+            .limit
+            .unwrap_or(output::MAX_OUTPUT)
+            .min((output::MAX_OUTPUT - 512) / 3);
+        let requested = limit;
+        let limit = if limit == 0 { 0 } else { limit.max(4) };
+        let mut bytes = vec![0; limit];
+        let mut filled = 0;
+        while filled < limit {
+            let count = file
                 .read_at(
-                    &mut chunk[..size],
-                    input.offset.saturating_add(bytes.len() as u64),
+                    &mut bytes[filled..],
+                    input.offset.saturating_add(filled as u64),
                 )
                 .map_err(|e| failure(format!("Cannot read background output: {e}")))?;
             if count == 0 {
                 break;
             }
-            bytes.extend_from_slice(&chunk[..count]);
+            filled += count;
+        }
+        bytes.truncate(filled);
+        if bytes.len() > requested {
+            let mut end = requested;
+            if requested > 0 {
+                if let Err(error) = std::str::from_utf8(&bytes[..requested]) {
+                    if error.error_len().is_none() && error.valid_up_to() == 0 {
+                        while end < bytes.len() && std::str::from_utf8(&bytes[..end]).is_err() {
+                            end += 1;
+                        }
+                    }
+                }
+            }
+            bytes.truncate(end);
+        }
+        // Keep an incomplete suffix for the next page while the process runs.
+        // Invalid complete sequences remain visible as replacement characters.
+        let mut at = 0;
+        while at < bytes.len() {
+            match std::str::from_utf8(&bytes[at..]) {
+                Ok(_) => break,
+                Err(error) => match error.error_len() {
+                    Some(len) => at += error.valid_up_to() + len,
+                    None => {
+                        if exit.is_none() || at + error.valid_up_to() > 0 {
+                            bytes.truncate(at + error.valid_up_to());
+                        }
+                        break;
+                    }
+                },
+            }
         }
         let next = input.offset.saturating_add(bytes.len() as u64);
         Ok(ToolOutput {
-            title: format!("background {}", job.id),
+            title: format!("background {}", id),
             output: format!(
                 "{}\n[background job {}; status: {}; exit: {}; next byte offset: {}]",
                 String::from_utf8_lossy(&bytes),
-                job.id,
-                if job.exit.is_some() {
-                    "exited"
-                } else {
-                    "running"
-                },
-                job.exit
-                    .flatten()
+                id,
+                if exit.is_some() { "exited" } else { "running" },
+                exit.flatten()
                     .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
                 next
             ),
-            metadata: json!({"jobID":job.id,"offset":input.offset,"nextOffset":next,"status":if job.exit.is_some() {"exited"} else {"running"},"exit":job.exit.flatten()}),
+            metadata: json!({"jobID":id,"offset":input.offset,"nextOffset":next,"status":if exit.is_some() {"exited"} else {"running"},"exit":exit.flatten()}),
         })
     }
     #[cfg(not(unix))]
@@ -380,6 +472,11 @@ pub async fn shell_background_with_env(
         .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
     #[cfg(unix)]
     let log_handle = file.try_clone().map_err(|e| failure(e.to_string()))?;
+    #[cfg(unix)]
+    let identity =
+        LogIdentity::from_metadata(&file.metadata().map_err(|e| failure(e.to_string()))?);
+    #[cfg(unix)]
+    let waiter_handle = file.try_clone().map_err(|e| failure(e.to_string()))?;
     let mut process = shell_command(command, directory);
     for (key, value) in env {
         if let Some(value) = value.as_str() {
@@ -416,13 +513,25 @@ pub async fn shell_background_with_env(
             session: session_id.to_string(),
             id: job_id.clone(),
             pid,
-            log: log_handle,
+            log: Some(log_handle),
+            path: log.clone(),
+            identity,
             exit: None,
         });
     // Reap the job so an exited command never becomes a zombie.
+    #[cfg(unix)]
     let waiter_id = job_id.clone();
     tokio::spawn(async move {
         let status = child.wait().await.ok().and_then(|status| status.code());
+        #[cfg(not(unix))]
+        let _ = status;
+        #[cfg(unix)]
+        let identity = waiter_handle
+            .metadata()
+            .ok()
+            .map(|m| LogIdentity::from_metadata(&m));
+        #[cfg(unix)]
+        drop(waiter_handle);
         #[cfg(unix)]
         if let Some(job) = BACKGROUND
             .lock()
@@ -430,16 +539,25 @@ pub async fn shell_background_with_env(
             .iter_mut()
             .find(|job| job.id == waiter_id)
         {
+            if let Some(identity) = identity {
+                job.identity = identity;
+            }
+            job.log = None;
             job.exit = Some(status);
         }
     });
+    let polling = if cfg!(unix) {
+        "Use background_read with job_id and offset for progress; "
+    } else {
+        ""
+    };
     Ok(ToolOutput {
         title: format!(
             "background {}",
             command.chars().take(60).collect::<String>()
         ),
         output: format!(
-            "Started in the background as job {job_id} (pid {pid}).\nOutput: {}\nUse background_read with job_id and offset for progress; `kill {pid}` stops it. It keeps running across tool calls and is stopped when ocmini exits.",
+            "Started in the background as job {job_id} (pid {pid}).\nOutput: {}\n{polling}`kill {pid}` stops it. It keeps running across tool calls and is stopped when ocmini exits.",
             log.display()
         ),
         metadata: json!({"background":true,"jobID":job_id,"pid":pid,"outputPath":log.to_string_lossy()}),
@@ -791,6 +909,49 @@ mod tests {
         .unwrap();
         cancel_background_jobs("poll_owner");
         assert!(read_background("poll_owner", &input(0, None)).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn polling_pages_are_bounded_and_reject_replaced_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = format!("{}🙂end", "x".repeat(output::MAX_OUTPUT));
+        std::fs::write(root.path().join("source"), &source).unwrap();
+        let launch = shell_background_with_env(
+            "cat source",
+            root.path(),
+            "page_owner",
+            root.path(),
+            &serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+        let id = launch.metadata["jobID"].as_str().unwrap().to_owned();
+        let input = |offset| BackgroundReadInput {
+            job_id: id.clone(),
+            offset,
+            limit: Some(usize::MAX),
+        };
+        let mut offset = 0;
+        let mut text = String::new();
+        loop {
+            let page = read_background("page_owner", &input(offset)).unwrap();
+            let end = page.metadata["nextOffset"].as_u64().unwrap();
+            assert!(page.output.len() <= output::MAX_OUTPUT);
+            let content = page.output.split("\n[background job ").next().unwrap();
+            text.push_str(content);
+            offset = end;
+            if page.metadata["status"] == "exited" && offset == source.len() as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(text, source);
+        let path = launch.metadata["outputPath"].as_str().unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::write(path, "replacement").unwrap();
+        assert!(read_background("page_owner", &input(0)).is_err());
+        cancel_background_jobs("page_owner");
     }
 
     #[cfg(target_os = "linux")]

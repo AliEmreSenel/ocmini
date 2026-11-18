@@ -97,7 +97,16 @@ pub async fn run_effect(
     cancel: CancellationToken,
 ) -> Result<ToolOutput, OperationError> {
     let result = match name {
-        "background_read" => shell::read_background(session, &decode(args)?),
+        "background_read" => {
+            let input = decode(args)?;
+            let session = session.to_owned();
+            let task =
+                tokio::task::spawn_blocking(move || shell::read_background(&session, &input));
+            tokio::select! {
+                result = task => result.map_err(|e| failure(e.to_string()))?,
+                _ = cancel.cancelled() => Err(failure("Background read cancelled")),
+            }
+        }
         "read" => {
             let input = decode(args)?;
             let dir = directory.to_owned();

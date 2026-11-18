@@ -43,7 +43,7 @@ macro_rules! builtin_tools {
         }
         pub fn tool_defs() -> Vec<Value> {
             static DEFINITIONS: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
-            DEFINITIONS.get_or_init(|| vec![$(definition::<$parameters>($name, $description)),+]).clone()
+            DEFINITIONS.get_or_init(|| vec![$(definition::<$parameters>($name, $description)),+]).iter().filter(|def| cfg!(unix) || def["function"]["name"] != "background_read").cloned().collect()
         }
     };
 }

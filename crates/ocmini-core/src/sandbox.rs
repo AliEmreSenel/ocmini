@@ -391,6 +391,8 @@ impl Registry {
             .get(id)
             .and_then(|e| e.runner.clone())
             .ok_or("Runner is unavailable")?;
+        let mut args = args;
+        args["_ocmini_session"] = id.into();
         runner
             .request(method, args, cancel, lease, directory.map(str::to_owned))
             .await
@@ -740,7 +742,7 @@ pub fn runner_main() -> Result<(), String> {
                 std::fs::read_dir(&directory).map_err(|e|format!("Sandbox cannot enter directory {directory}: {e}"))?;
                 return Ok(Value::Null);
             }
-            effects.dispatch(&directory,"runner",&method,args,cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)
+            effects.dispatch(&directory,args["_ocmini_session"].as_str().unwrap_or("runner"),&method,args.clone(),cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)
         }})=>r.map_err(|e|e.to_string()),r=relay_end=>r.map_err(|e|e.to_string()),_=term.recv()=>Ok(())}
     }))
 }
