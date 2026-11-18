@@ -243,6 +243,7 @@ pub(super) struct Settings {
     pub provider_id: String,
     pub base_url: String,
     pub api_model: String,
+    pub reasoning_field: Option<String>,
     pub token: String,
     pub headers: BTreeMap<String, String>,
     pub bearer: bool,
@@ -525,6 +526,11 @@ impl Adapter {
                 provider_id: self.provider_id.clone(),
                 base_url,
                 api_model,
+                reasoning_field: model
+                    .and_then(|m| m.extra.get("compatibility"))
+                    .and_then(|v| v.get("reasoningField"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 token,
                 headers,
                 bearer,
@@ -992,6 +998,7 @@ pub(super) fn test_settings(options: Value) -> Settings {
         provider_id: "test".into(),
         base_url: "http://localhost/v1".into(),
         api_model: "wire-model".into(),
+        reasoning_field: None,
         token: "test".into(),
         headers: BTreeMap::new(),
         bearer: true,

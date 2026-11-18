@@ -296,7 +296,8 @@ pub(super) async fn run_turn(
             .store
             .message(sid, uid)?
             .ok_or("Compaction prompt not found")?;
-        let (messages, summary) = history::load_messages(app.store.clone(), sid, uid, chat).await?;
+        let (messages, summary) =
+            history::load_messages(app.store.clone(), sid, uid, chat, model).await?;
         return summarize_history(
             &app,
             adapter.as_ref(),
@@ -333,7 +334,7 @@ pub(super) async fn run_turn(
             return Err("Aborted".into());
         }
         let (messages, has_summary) =
-            history::load_messages(app.store.clone(), sid, uid, chat).await?;
+            history::load_messages(app.store.clone(), sid, uid, chat, model).await?;
         let mut info = MessageInfo::assistant(sid, Some(uid.into()), model, agent);
         info.variant = request.variant.clone();
         let amid = info.id.clone();
@@ -443,7 +444,7 @@ pub(super) async fn run_turn(
                 .usable()
                 .is_some_and(|limit| u64::try_from(used).unwrap_or(0) >= limit)
         {
-            match history::load_messages(app.store.clone(), sid, uid, chat).await {
+            match history::load_messages(app.store.clone(), sid, uid, chat, model).await {
                 Ok((history, has_summary)) => {
                     if let Err(error) = compact_history(
                         &app,
