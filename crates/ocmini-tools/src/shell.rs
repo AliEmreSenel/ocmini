@@ -229,18 +229,95 @@ pub async fn shell_with_env(
 /// started them, so they need an owner: the session that started them ends them
 /// when it is aborted or deleted, and the runtime ends the rest when it exits.
 #[cfg(unix)]
-static BACKGROUND: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+static BACKGROUND: Mutex<Vec<BackgroundJob>> = Mutex::new(Vec::new());
+
+#[cfg(unix)]
+struct BackgroundJob {
+    session: String,
+    id: String,
+    pid: u32,
+    log: File,
+    // None is running; Some(None) is an observed termination without an exit code.
+    exit: Option<Option<i32>>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct BackgroundReadInput {
+    pub job_id: String,
+    #[serde(default)]
+    pub offset: u64,
+    pub limit: Option<usize>,
+}
+
+pub fn read_background(
+    session: &str,
+    input: &BackgroundReadInput,
+) -> Result<ToolOutput, OperationError> {
+    #[cfg(unix)]
+    {
+        let jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+        let job = jobs
+            .iter()
+            .find(|job| job.session == session && job.id == input.job_id)
+            .ok_or_else(|| failure("Background job not found in this session"))?;
+        use std::os::unix::fs::FileExt;
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let limit = input.limit.unwrap_or(output::MAX_OUTPUT);
+        while bytes.len() < limit {
+            let size = chunk.len().min(limit - bytes.len());
+            let count = job
+                .log
+                .read_at(
+                    &mut chunk[..size],
+                    input.offset.saturating_add(bytes.len() as u64),
+                )
+                .map_err(|e| failure(format!("Cannot read background output: {e}")))?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        let next = input.offset.saturating_add(bytes.len() as u64);
+        Ok(ToolOutput {
+            title: format!("background {}", job.id),
+            output: format!(
+                "{}\n[background job {}; status: {}; exit: {}; next byte offset: {}]",
+                String::from_utf8_lossy(&bytes),
+                job.id,
+                if job.exit.is_some() {
+                    "exited"
+                } else {
+                    "running"
+                },
+                job.exit
+                    .flatten()
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                next
+            ),
+            metadata: json!({"jobID":job.id,"offset":input.offset,"nextOffset":next,"status":if job.exit.is_some() {"exited"} else {"running"},"exit":job.exit.flatten()}),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session, input);
+        Err(failure(
+            "Background job polling is unavailable on this platform",
+        ))
+    }
+}
 
 #[cfg(unix)]
 use crate::process_group::kill_group;
 
 #[cfg(unix)]
-fn take_jobs(keep: impl Fn(&(String, u32)) -> bool) -> Vec<u32> {
+fn take_jobs(keep: impl Fn(&BackgroundJob) -> bool) -> Vec<u32> {
     let mut jobs = BACKGROUND.lock().unwrap();
     let pids = jobs
         .iter()
         .filter(|job| !keep(job))
-        .map(|(_, pid)| *pid)
+        .filter(|job| job.exit.is_none())
+        .map(|job| job.pid)
         .collect();
     jobs.retain(keep);
     pids
@@ -261,7 +338,7 @@ pub fn cancel_background_jobs(session_id: &str) {
     #[cfg(not(unix))]
     let _ = session_id;
     #[cfg(unix)]
-    for pid in take_jobs(|(session, _)| session != session_id) {
+    for pid in take_jobs(|job| job.session != session_id) {
         kill_group(pid);
     }
 }
@@ -301,6 +378,8 @@ pub async fn shell_background_with_env(
         .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?
         .keep()
         .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
+    #[cfg(unix)]
+    let log_handle = file.try_clone().map_err(|e| failure(e.to_string()))?;
     let mut process = shell_command(command, directory);
     for (key, value) in env {
         if let Some(value) = value.as_str() {
@@ -328,16 +407,31 @@ pub async fn shell_background_with_env(
     let pid = child
         .id()
         .ok_or_else(|| failure("Shell has no process id"))?;
+    let job_id = crate::types::hex_id("job_");
     #[cfg(unix)]
     BACKGROUND
         .lock()
         .map_err(|e| failure(e.to_string()))?
-        .push((session_id.to_string(), pid));
+        .push(BackgroundJob {
+            session: session_id.to_string(),
+            id: job_id.clone(),
+            pid,
+            log: log_handle,
+            exit: None,
+        });
     // Reap the job so an exited command never becomes a zombie.
+    let waiter_id = job_id.clone();
     tokio::spawn(async move {
-        let _ = child.wait().await;
+        let status = child.wait().await.ok().and_then(|status| status.code());
         #[cfg(unix)]
-        BACKGROUND.lock().unwrap().retain(|(_, job)| *job != pid);
+        if let Some(job) = BACKGROUND
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|job| job.id == waiter_id)
+        {
+            job.exit = Some(status);
+        }
     });
     Ok(ToolOutput {
         title: format!(
@@ -345,17 +439,21 @@ pub async fn shell_background_with_env(
             command.chars().take(60).collect::<String>()
         ),
         output: format!(
-            "Started in the background as pid {pid}.\nOutput: {}\nRead that file for progress; `kill {pid}` stops it. It keeps running across tool calls and is stopped when ocmini exits.",
+            "Started in the background as job {job_id} (pid {pid}).\nOutput: {}\nUse background_read with job_id and offset for progress; `kill {pid}` stops it. It keeps running across tool calls and is stopped when ocmini exits.",
             log.display()
         ),
-        metadata: json!({"background":true,"pid":pid,"outputPath":log.to_string_lossy()}),
+        metadata: json!({"background":true,"jobID":job_id,"pid":pid,"outputPath":log.to_string_lossy()}),
     })
 }
 
 pub fn tracked_background(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        BACKGROUND.lock().unwrap().iter().any(|(_, p)| *p == pid)
+        BACKGROUND
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|job| job.pid == pid && job.exit.is_none())
     }
     #[cfg(not(unix))]
     {
@@ -651,6 +749,48 @@ mod tests {
         assert!(Path::new(&format!("/proc/{pid}")).exists());
         cancel_background_jobs("ses_owner");
         assert_process_stopped(pid).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_poll_tracks_offsets_status_and_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let result = shell_background_with_env(
+            "printf first; sleep 0.2; printf second; exit 7",
+            root.path(),
+            "poll_owner",
+            root.path(),
+            &serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+        let id = result.metadata["jobID"].as_str().unwrap().to_owned();
+        let input = |offset, limit| BackgroundReadInput {
+            job_id: id.clone(),
+            offset,
+            limit,
+        };
+        assert!(read_background("poll_other", &input(0, None)).is_err());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let first = read_background("poll_owner", &input(0, Some(5))).unwrap();
+        assert!(first.output.starts_with("first\n[background job"));
+        assert_eq!(first.metadata["status"], "running");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let next = read_background("poll_owner", &input(5, None)).unwrap();
+                if next.metadata["status"] == "exited" {
+                    assert!(next.output.starts_with("second\n[background job"));
+                    assert_eq!(next.metadata["nextOffset"], 11);
+                    assert_eq!(next.metadata["exit"], 7);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel_background_jobs("poll_owner");
+        assert!(read_background("poll_owner", &input(0, None)).is_err());
     }
 
     #[cfg(target_os = "linux")]

@@ -97,6 +97,7 @@ pub async fn run_effect(
     cancel: CancellationToken,
 ) -> Result<ToolOutput, OperationError> {
     let result = match name {
+        "background_read" => shell::read_background(session, &decode(args)?),
         "read" => {
             let input = decode(args)?;
             let dir = directory.to_owned();

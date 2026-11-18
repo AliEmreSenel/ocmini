@@ -49,6 +49,7 @@ macro_rules! builtin_tools {
 }
 builtin_tools! {
     Bash => "bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once and keeps running across tool calls, ending when its session is aborted or deleted, or when ocmini exits. A timed-out command completes with the output captured before the limit and a shell_metadata timeout notice.", ShellInput;
+    BackgroundRead => "background_read", "Read incremental output from a background shell job owned by this session. Use job_id from the launch and nextOffset as the next byte offset; status and observed exit code are returned in metadata.", crate::shell::BackgroundReadInput;
     Read => "read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", files::ReadInput;
     Write => "write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", changes::WriteInput;
     Edit => "edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", changes::EditInput;
@@ -140,6 +141,10 @@ impl PreparedTool {
                 Some(Builtin::Bash) => (
                     "bash",
                     vec![self.args["command"].as_str().unwrap_or_default().into()],
+                ),
+                Some(Builtin::BackgroundRead) => (
+                    "background_read",
+                    vec![self.args["job_id"].as_str().unwrap_or_default().into()],
                 ),
                 Some(Builtin::Read) => (
                     "read",
@@ -313,6 +318,9 @@ where
             match kind {
                 Builtin::Bash => {
                     let _: ShellInput = decode(&alias(&args, "workdir", "cwd"))?;
+                }
+                Builtin::BackgroundRead => {
+                    let _: crate::shell::BackgroundReadInput = decode(&args)?;
                 }
                 Builtin::Read => {
                     let _: files::ReadInput = decode(&args)?;
