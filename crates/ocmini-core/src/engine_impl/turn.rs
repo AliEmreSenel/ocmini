@@ -7,6 +7,7 @@ struct PreparedTurn {
     adapter: Box<dyn provider::ProviderAdapter>,
     request: ChatRequest,
     chat: bool,
+    deferred: Vec<(usize, Value, (String, String))>,
 }
 async fn prepare_turn(
     app: &App,
@@ -93,6 +94,7 @@ async fn prepare_turn(
             adapter,
             request: base,
             chat,
+            deferred: Vec::new(),
         });
     }
     let mut defs = tools::tool_defs();
@@ -145,12 +147,40 @@ async fn prepare_turn(
             .ok_or("Tool catalog hook must return an array")?
             .clone();
     }
+    let mut deferred = Vec::new();
+    if cfg
+        .extra
+        .get("deferred_mcp_discovery")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && tool_enabled("discover_mcp_tools", agent, &cfg, request)
+        && !defs
+            .iter()
+            .any(|d| d["function"]["name"] == "discover_mcp_tools")
+    {
+        let mut position = 0;
+        defs.retain(|def| {
+            let index = position;
+            position += 1;
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            if let Some(route) = app.mcp().route(name) {
+                deferred.push((index, def.clone(), route));
+                false
+            } else {
+                true
+            }
+        });
+        if !deferred.is_empty() {
+            defs.push(json!({"type":"function","function":{"name":"discover_mcp_tools", "description":"Find and activate available MCP tools for later steps. Search their names and descriptions; use an empty query to list all.", "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}));
+        }
+    }
     base.tools = defs;
     Ok(PreparedTurn {
         config: cfg,
         adapter,
         request: base,
         chat,
+        deferred,
     })
 }
 
@@ -279,8 +309,9 @@ pub(super) async fn run_turn(
     let PreparedTurn {
         config: cfg,
         adapter,
-        request: base,
+        request: mut base,
         chat,
+        deferred,
     } = prepare_turn(
         &app,
         engine.clone(),
@@ -311,7 +342,7 @@ pub(super) async fn run_turn(
         .await;
     }
     let agent = request.agent.as_deref().unwrap_or("build");
-    let allowed: HashSet<String> = base
+    let mut allowed: HashSet<String> = base
         .tools
         .iter()
         .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
@@ -413,8 +444,37 @@ pub(super) async fn run_turn(
                 &allowed,
                 &mut parts.tools,
                 &mut recent_calls,
+                &deferred,
             )
             .await?;
+            // Discovery affects the next model step, never sibling calls in this step.
+            for part in &parts.tools {
+                if part["tool"] == "discover_mcp_tools" && part["state"]["status"] == "completed" {
+                    if let Some(names) = part["state"]["metadata"]["activated"].as_array() {
+                        for name in names.iter().filter_map(Value::as_str) {
+                            allowed.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+            if !deferred.is_empty() {
+                let mut all = base.tools.clone();
+                all.retain(|d| {
+                    !deferred
+                        .iter()
+                        .any(|(_, v, _)| v["function"]["name"] == d["function"]["name"])
+                });
+                let mut omitted = 0;
+                for (index, def, route) in &deferred {
+                    let name = def["function"]["name"].as_str().unwrap_or_default();
+                    if allowed.contains(name) && app.mcp().route(name).as_ref() == Some(route) {
+                        all.insert(index.saturating_sub(omitted).min(all.len()), def.clone());
+                    } else {
+                        omitted += 1;
+                    }
+                }
+                base.tools = all;
+            }
             if cancel.is_cancelled() {
                 return Err("Aborted".into());
             }

@@ -319,3 +319,51 @@ async fn changed_mcp_configuration_replaces_the_lazy_scope_after_cache_expiry() 
         .unwrap();
     assert_eq!(mcp_spawns(&server).len(), 2);
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn deferred_mcp_discovery_activates_only_for_the_current_turn() {
+    let mut provider = Provider::start(vec![
+        tool_script("discover_mcp_tools", json!({"query":"echo"}), "discover"),
+        tool_script("probe_echo_value", json!({}), "mcp-call"),
+        text_script("Done", ""),
+        text_script("Next turn", ""),
+    ])
+    .await;
+    let mut config = local_mcp();
+    config["deferred_mcp_discovery"] = json!(true);
+    let server = TestServer::start(&provider, config).await;
+    let id = server.session(allow()).await;
+    for message_id in ["msg_discover", "msg_new_turn"] {
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt(message_id, "Use the probe"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let first = provider.request().await;
+    let second = provider.request().await;
+    let third = provider.request().await;
+    let next = provider.request().await;
+    let has = |request: &Value, name: &str| {
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == name)
+    };
+    assert!(has(&first, "discover_mcp_tools"));
+    assert!(!has(&first, "probe_echo_value"));
+    assert!(has(&second, "probe_echo_value"));
+    assert!(third["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "tool" && m["content"] == "global"));
+    assert!(!has(&next, "probe_echo_value"));
+}

@@ -13,6 +13,7 @@ pub(super) async fn run_tools(
     allowed: &HashSet<String>,
     tool_parts: &mut [Value],
     recent_calls: &mut VecDeque<String>,
+    deferred: &[(usize, Value, (String, String))],
 ) -> Result<(), String> {
     let agent = request.agent.as_deref().unwrap_or("build");
     let mut running = Vec::new();
@@ -22,12 +23,93 @@ pub(super) async fn run_tools(
         }
         let name = part["tool"].as_str().unwrap_or_default().to_string();
         let original_input = part["state"]["input"].clone();
+        if name == "discover_mcp_tools" && allowed.contains(&name) {
+            let start = now_ms();
+            let mut ctx = base.clone();
+            ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
+            ctx.part_id = part["id"].as_str().unwrap_or_default().into();
+            let effective =
+                prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await;
+            let input = effective.as_ref().unwrap_or(&original_input);
+            let query = input["query"].as_str();
+            let mut names = Vec::new();
+            if let Some(query) = query.filter(|_| effective.is_ok()) {
+                let query = query.to_lowercase();
+                for (_, def, route) in deferred {
+                    let name = def["function"]["name"].as_str().unwrap_or_default();
+                    let description = def["function"]["description"].as_str().unwrap_or_default();
+                    if base.app.mcp().route(name).as_ref() == Some(route)
+                        && format!("{name} {description}")
+                            .to_lowercase()
+                            .contains(&query)
+                    {
+                        names.push(name.to_owned());
+                    }
+                }
+                part["state"] = json!({"status":"completed","input":input,"output":format!("Activated MCP tools: {}", names.join(", ")),"title":"Discover MCP tools","metadata":{"activated":names},"time":{"start":start,"end":now_ms()}});
+            } else {
+                part["state"] = json!({"status":"error","input":original_input,"error":effective.err().map(|e| e.message).unwrap_or_else(|| "query must be a string".into()),"time":{"start":start,"end":now_ms()}});
+            }
+            let completed = part["state"]["status"] == "completed";
+            let mut context = tools::hook_context(&ctx, &name);
+            context["outcome"] = json!(if completed { "completed" } else { "error" });
+            if completed
+                && ctx
+                    .app
+                    .hooks
+                    .matches(crate::tools::hooks::TOOL_EXECUTE_AFTER, &context)
+            {
+                let state = &part["state"];
+                let result = ctx.app.hooks.run(crate::tools::hooks::TOOL_EXECUTE_AFTER, &context,
+                    json!({"status":"completed", "args":state["input"], "output":state["output"], "title":state["title"], "metadata":state["metadata"]}), Some(&ctx.cancel)).await;
+                match result {
+                    Ok(result) => {
+                        if let Some(output) = result.input["output"].as_str() {
+                            part["state"]["output"] = json!(output);
+                        }
+                        if let Some(title) = result.input["title"].as_str() {
+                            part["state"]["title"] = json!(title);
+                        }
+                    }
+                    Err(error) => {
+                        part["state"]["status"] = json!("error");
+                        part["state"]["error"] = json!(error.message);
+                    }
+                }
+            }
+            crate::messages::update_part(&base.app, part)?;
+            let error = part["state"]["error"].clone();
+            let event = if part["state"]["status"] == "completed" {
+                event::Tool::Completed {
+                    call_id: &ctx.call_id,
+                    message_id: &ctx.message_id,
+                    part_id: &ctx.part_id,
+                    error: &error,
+                }
+            } else {
+                event::Tool::Failed {
+                    call_id: &ctx.call_id,
+                    message_id: &ctx.message_id,
+                    part_id: &ctx.part_id,
+                    error: &error,
+                }
+            };
+            ctx.app.hooks.emit(event, &context);
+            continue;
+        }
         let start = now_ms();
         let mut ctx = base.clone();
         ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
         ctx.part_id = part["id"].as_str().unwrap_or_default().into();
-        let prepared =
-            prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await;
+        let stale = deferred
+            .iter()
+            .find(|(_, def, _)| def["function"]["name"] == name)
+            .is_some_and(|(_, _, route)| base.app.mcp().route(&name).as_ref() != Some(route));
+        let prepared = if stale {
+            Err(OperationError::from("MCP tool is no longer registered"))
+        } else {
+            prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await
+        };
         let visible_input = match &prepared {
             Ok(input) => input.clone(),
             Err(_) => original_input.clone(),

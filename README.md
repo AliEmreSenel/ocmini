@@ -138,6 +138,20 @@ Uses OpenCode-shaped `opencode.json` or `opencode.jsonc`. Global configuration l
 
 MCP configuration from a checkout or its ancestor directories requires `OCMINI_TRUST_PROJECT_MCP=1` in the launch environment. Global and explicitly supplied configuration can still register MCP servers. Set the opt-in only when you trust the project configuration, since a local MCP command runs with your OS permissions.
 
+Set `"deferred_mcp_discovery": true` to hide MCP schemas until the model searches for them using `discover_mcp_tools`. Matching tools become available on subsequent steps of the same turn; the next turn starts with discovery again. It defaults to false. Discovery searches names and descriptions from the approved, hook-transformed catalog and does not bypass permissions.
+
+For example, configure Serena in a trusted project or global configuration, and scope its access with permissions:
+
+```json
+{
+  "deferred_mcp_discovery": true,
+  "mcp": {"serena": {"type": "local", "command": ["uvx", "--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "ide-assistant", "--project", "/path/to/project"]}},
+  "permission": {"serena_*": "ask"}
+}
+```
+
+Replace the project path and adjust permissions to your needs. MCP servers run with the server process's OS permissions.
+
 `title_model` names new sessions with a model: `provider/model` picks one, `small` starts at `small_model`, and the default `""` writes titles from the first prompt's first line with no model call. A title model that is unavailable, fails or answers with nothing usable moves to the next (`small_model`, then the session's model), and the prompt's first line remains the last resort. Terminal chat shows `◦ generating title…` while a title is written.
 
 Agent turns have no step limit by default. To cap model/tool rounds explicitly, set `agent.<name>.steps` (or the legacy `maxSteps`) to a positive integer. Ctrl+C or the abort endpoint stops an active turn.
