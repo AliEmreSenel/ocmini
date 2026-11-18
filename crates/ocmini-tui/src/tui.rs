@@ -240,6 +240,8 @@ fn help_text(fullscreen: bool) -> String {
     };
     format!(
         "\n{BOLD}Help{RESET}\n\
+  /context               Inspect approximate context usage\n\
+  /compact [instructions] Summarize context with optional focus\n\
   /help or F1            Show this help\n\
   /quit or Ctrl+D        Quit\n\
   Enter                  Send\n\
@@ -812,6 +814,27 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                         display.finish_line();
                         display.output(&help_text(fullscreen), terminal_width());
                         display.scroll_bottom();
+                    }
+                    Key::Enter if draft.text.trim() == "/context" => {
+                        draft.clear_text();
+                        display.finish_line();
+                        match crate::engine_impl::inspect_context(&app, engine.clone(), &session, &selected).await {
+                            Ok(report) => display.output(&format!("\n{report}"), terminal_width()),
+                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                        }
+                        display.scroll_bottom();
+                    }
+                    Key::Enter if draft.text.trim() == "/compact" || draft.text.trim().starts_with("/compact ") => {
+                        let text = draft.text.trim().to_owned();
+                        draft.clear_text();
+                        display.finish_line();
+                        display.user_prompt(&text, terminal_width());
+                        let focus = text.strip_prefix("/compact").unwrap_or_default().trim();
+                        let part = if focus.is_empty() { serde_json::json!({"type":"compaction","auto":false}) } else { serde_json::json!({"type":"compaction","auto":false,"ocminiFocus":focus}) };
+                        let request = PromptRequest { message_id: Some(crate::types::hex_id("msg_")), parts: vec![part], command: Some("__ocmini_compact".into()), ..selected.clone() };
+                        if let Err(error) = engine.admit(app.clone(), session.id.clone(), request).await {
+                            display.output(&format!("{RED}error:{RESET} {error}\n"), terminal_width());
+                        }
                     }
                     Key::Enter => {
                         display.finish_line();

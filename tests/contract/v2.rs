@@ -631,7 +631,7 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
     post(
         &server,
         &format!("/api/session/{sid}/compact"),
-        json!({"id":"msg_compact"}),
+        json!({"id":"msg_compact","ocminiFocus":"Preserve the deployment decision"}),
     )
     .await;
     let compacted = events.through("session.execution.succeeded").await;
@@ -658,7 +658,10 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
     .await;
     events.through("session.execution.succeeded").await;
     provider.request().await;
-    provider.request().await;
+    let compact_request = provider.request().await;
+    assert!(compact_request
+        .to_string()
+        .contains("Preserve the deployment decision"));
     assert!(provider.request().await["messages"]
         .as_array()
         .unwrap()

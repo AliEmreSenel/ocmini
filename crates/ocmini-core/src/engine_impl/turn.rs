@@ -154,6 +154,84 @@ async fn prepare_turn(
     })
 }
 
+/// Inspect the same prepared request and history projection used by a normal turn.
+pub async fn inspect_context(
+    app: &App,
+    engine: Engine,
+    session: &Session,
+    selected: &PromptRequest,
+) -> Result<String, OperationError> {
+    let model = admission::resolve_model(
+        &app.config,
+        app,
+        &session.id,
+        selected.model.as_ref(),
+        selected.agent.as_deref().or(Some("build")),
+    )?;
+    let mut request = selected.clone();
+    request.model = Some(model.clone());
+    request.command = None;
+    let context = turn_context(app, &session.id, &request);
+    let prepared = prepare_turn(
+        app,
+        Arc::new(engine),
+        session,
+        &request,
+        &model,
+        &context,
+        &CancellationToken::new(),
+    )
+    .await?;
+    let last = app.store.messages_limited(&session.id, Some(1))?;
+    let saved = if let Some(last) = last.last() {
+        app.store.context_messages(&session.id, &last.info.id)?
+    } else {
+        Vec::new()
+    };
+    let messages = if let Some(last) = last.last() {
+        history::load_messages(app.store.clone(), &session.id, &last.info.id, prepared.chat)
+            .await?
+            .0
+    } else {
+        Vec::new()
+    };
+    let estimate = |bytes: usize| (bytes + 3) / 4;
+    let instructions = estimate(prepared.request.system.len());
+    let tools = estimate(
+        serde_json::to_vec(&prepared.request.tools)
+            .unwrap_or_default()
+            .len(),
+    );
+    let (mut conversation, mut results) = (0, 0);
+    for message in &messages {
+        let size = estimate(message.to_string().len());
+        if message["role"] == "tool" {
+            results += size;
+        } else {
+            conversation += size;
+        }
+    }
+    let usage = saved.iter().rev().find_map(|m| {
+        m.info
+            .tokens
+            .as_ref()
+            .filter(|t| t.input > 0 || t.output > 0)
+    });
+    let usage = usage
+        .map(|t| {
+            format!(
+                "input {}, output {}, cache read {}, cache write {}",
+                t.input, t.output, t.cache.read, t.cache.write
+            )
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let window = CompactionPolicy::for_model(&prepared.config, &model)
+        .context
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    Ok(format!("Context for {model} (approximate tokens, 4 bytes/token)\n  Instructions: {instructions}\n  Tool schemas: {tools}\n  Messages and tool calls: {conversation}\n  Tool results: {results}\n  Estimated total: {}\n  Latest observed usage: {usage}\n  Model window: {window}\n", instructions + tools + conversation + results))
+}
+
 async fn end_feedback(
     app: &App,
     engine: &Arc<dyn EngineApi>,

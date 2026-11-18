@@ -15,6 +15,7 @@ use crate::provider::{self, ChatRequest};
 use crate::store::Store;
 use crate::title;
 use crate::tools::{self, PreparedTool};
+pub use turn::inspect_context;
 type ToolCtx = ocmini_tools::ToolCtx<App>;
 use crate::types::*;
 use compaction::*;
