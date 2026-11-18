@@ -81,9 +81,14 @@ first-token emission; its history projection has no first-token timestamp. The
 pinned T3 adapter at `47f2c8d29e981c7723467efe137ee19e91df924e` handles
 step started/ended/failed and does not reference first-token. Thus this is a
 native 2.3.2 event/history parity gap, not evidence of a pinned T3 regression.
-Correct implementation requires recording the first actual provider output once
-per physical attempt, retaining its timestamp in the durable replay/projection,
-and tests across restart and empty/failed streams. Emitting at step finish or
+Upstream publishes the event once per physical attempt before the first
+text-start, reasoning-start, tool-input-start, tool-input-error, or tool-call;
+its message updater projects the event creation time into `time.firstToken` and
+clears that field on step start. Correct implementation needs the equivalent
+persistence and ordering, plus tests across restart and empty/failed streams.
+ocmini receives text/reasoning deltas and tool-call starts in `model_step.rs`,
+but its current v2 event sender only publishes while subscribers are present,
+so emitting there alone would not make the history timestamp durable. Emitting at step finish or
 fabricating historical timestamps would be incorrect. This has not been
 implemented or end-to-end tested here.
 
