@@ -680,20 +680,28 @@ json.load(sys.stdin);pathlib.Path('context-hook-ran').touch();print('{}')"#;
     let script = r#"import os,pty,select,signal,sys,time,fcntl,termios,struct
 pid,fd=pty.fork()
 if pid==0: os.execv(sys.argv[1],[sys.argv[1],'tui'])
-fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
 data=b''; deadline=time.monotonic()+15; sent=False
-while time.monotonic()<deadline:
- if not sent and time.monotonic()>deadline-14:
-  os.write(fd,b'/context\r'); sent=True
- ready,_,_=select.select([fd],[],[],0.1)
- if ready:
-  try: data+=os.read(fd,65536)
-  except OSError: break
-  if b'Context for' in data: break
-os.kill(pid,signal.SIGTERM); os.waitpid(pid,0)
+try:
+ fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
+ os.set_blocking(fd,False)
+ while time.monotonic()<deadline:
+  if not sent and time.monotonic()>deadline-14:
+   os.write(fd,b'/context\r'); sent=True
+  ready,_,_=select.select([fd],[],[],0.1)
+  if ready:
+   try: data+=os.read(fd,65536)
+   except BlockingIOError: continue
+   except OSError: break
+   if b'Context for' in data: break
+finally:
+ try: os.kill(pid,signal.SIGKILL)
+ except ProcessLookupError: pass
+ os.waitpid(pid,0)
+ os.close(fd)
 if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
 "#;
-    let output = tokio::process::Command::new(PYTHON)
+    let mut command = tokio::process::Command::new(PYTHON);
+    command
         .args(["-S", "-c", script, env!("CARGO_BIN_EXE_ocmini")])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -704,8 +712,10 @@ if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
         .env("OPENCODE_AUTH_CONTENT", "{}")
         .env("TERM", "xterm")
         .current_dir(&server.directory)
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(25), command.output())
         .await
+        .expect("terminal context test timed out")
         .unwrap();
     assert!(
         output.status.success(),
