@@ -38,21 +38,7 @@ Other schema changes include optional freeform tool capabilities, MCP pooling,
 provider TLS and background compaction. Their T3 impact needs further checking.
 The accepted older-client compaction schema limitation remains unchanged.
 
-## Release classification to date
-
-| Release | Finding and current treatment |
-| --- | --- |
-| 2.2.6 | MCP pooling/events and connection behavior belong to the concurrent MCP assignment. Webfetch rejects initial URL credentials already (`crates/ocmini-tools/src/web.rs`); this change removes fragments from permission matching. Browser-origin/file-download restrictions need further server review. CLI worktree/archive, cache warming, Code Mode and upstream product-specific features require scope decisions, not wholesale porting. |
-| 2.2.7 | Negative-offset reads, paging and discovery belong to the concurrent read/search assignment; shell output belongs to the concurrent shell assignment; MCP refresh and output handling belong to the concurrent MCP assignment. Legacy provider/config migration fixes still require individual verification. |
-| 2.3.0 | Subagent background lifecycle and restart behavior require further verification. Shell handoff/output belongs to the concurrent shell assignment. MCP events/Code Mode belong to the concurrent MCP assignment. Video, mutual TLS and freeform tools are optional capabilities, not proof of a T3 requirement. |
-| 2.3.1 | Background compaction belongs to the concurrent compaction assignment; CLAUDE.md fallback, read, glob and grep belong to the concurrent scope-aware search/read assignment; shell timeout/output belongs to the concurrent shell assignment. Permission rejection scope, cross-model reasoning metadata, non-ASCII session search and JSON server errors need separate verification. Automations, Code Mode and desktop/TUI changes are upstream product features. |
-| 2.3.2 | Responses prompt caching is owned by the concurrent GPT-6.2 assignment. Webfetch structured output is a Code Mode/plugin interface change; ocmini has no equivalent structured Code Mode surface in the baseline scope. |
-
-The pinned T3 source and all changed schemas, endpoint behavior, migration paths,
-and release fixes have not yet been checked exhaustively. Do not treat the table
-as a complete classification or infer that an item assigned elsewhere is fixed.
-
-## Additional source-level findings
+## Release classification
 
 The release notes for all five tags and the 2.2.5-to-2.3.2 OpenAPI were
 reviewed against this branch. This is a compatibility classification, not a
@@ -67,7 +53,7 @@ parity gaps, not implied prerequisites for the existing 2.2.5 contract.
 | Release | Selected runtime changes and disposition |
 | --- | --- |
 | 2.2.6 | Webfetch fragment matching fixed on this branch; initial credential rejection exists. MCP connection behavior is covered by concurrent narrow MCP work. External-directory approval for session moves, browser-origin/download restrictions, noninteractive run background settlement and provider unreachable retry require separate verification. Partial provider limits are represented as JSON, so are not rejected by deserialization. Warming, pool, worktree CLI, archive CLI, Azure Messages and VM are optional. |
-| 2.2.7 | Read offsets, diagnostics and paging; shell output; MCP refresh/output are concurrent assignments. Config normalization preserves inline model variants and merges native settings with legacy options. Partial capabilities, legacy `api` versus `options.baseURL`, credential import and provider cost/refresh need targeted verification. Generation usage and warming are deferred with `session.generate`. |
+| 2.2.7 | Read, shell output, and deferred MCP have separate feature PRs. This PR fixes title model variants, explicit URL precedence, and individual bad legacy credential entries. The runtime does not query the remote catalog for configured models, so partial model overrides can still omit provider metadata. Generation usage and warming are deferred with `session.generate`. |
 | 2.3.0 | Subagent always-background/report/restart semantics remain a larger gap requiring behavioral tests. Shell handoff/output and narrow MCP changes are concurrent. Provider retry/interruption and local catalog refresh warrant targeted verification; freeform tools, TLS, video, Code Mode and process daemon are optional. |
 | 2.3.1 | This PR fixes step-scoped rejection and cross-model Chat reasoning replay. Nested instructions/read/glob/grep, diagnostics, shell output and narrow MCP are separate PRs. Unicode title search and JSON panic errors need targeted verification. Background compaction is a larger optional behavior. The accepted older T3 compaction schema limitation remains. Automations and Code Mode are deferred. |
 | 2.3.2 | Responses caching is PR #68 (OpenAI and Copilot); other upstream provider routes are outside the selected provider scope. Webfetch structured output is a Code Mode/plugin interface, deferred. |
@@ -105,12 +91,17 @@ these boundaries and continuing with the next step.
 
 ### Provider migration and replay
 
-`v2/config.rs` splits inline `#variant` in global, agent and command selections,
-merges native provider settings into legacy options, and keeps model `limit` as
-JSON. It does not establish that partial capability overrides preserve the
-catalog defaults, or that legacy `api` and explicit `options.baseURL` resolve
-correctly in every combination. Legacy OpenCode `auth.json` import is distinct
-from preserving ocmini's own credentials and is not established by these checks.
+`v2/config.rs` already splits inline `#variant` in global, agent and command
+selections, merges native provider settings into legacy options, and keeps
+model `limit` as JSON. This PR picks up inline variants in `small_model` and
+`title_model`, uses a nonempty explicit `options.baseURL` ahead of legacy
+`api`, and reads valid entries from OpenCode's `auth.json` even when another
+entry fails validation. Credential values stay out of the warning. No
+credential migration writes to the source file.
+
+Configured models skip remote catalog discovery. When a configured model
+leaves a capability unspecified, the runtime therefore has no remote value
+to merge. This remains a difference from upstream's catalog behavior.
 `provider/openai_compat.rs` previously replayed all saved reasoning fields
 for any `openai-chat` provenance. This PR filters incompatible saved reasoning
 before merging Chat history, retains same-model signed reasoning and existing
@@ -120,9 +111,7 @@ prompt-derived legacy provenance, and known versus unknown destination fields.
 
 ### Remaining acceptance work
 
-1. Verify the listed provider migration cases with actual catalog/config
-   fixtures.
-2. Verify the 2.2.6 move/origin and run/retry behavior, 2.3.0 child recovery,
+1. Verify the 2.2.6 move/origin and run/retry behavior, 2.3.0 child recovery,
    and 2.3.1 Unicode search/server error behavior against the selected scope.
-3. Integrate and validate the separately owned changes and run the existing T3
+2. Integrate and validate the separately owned changes and run the existing T3
    acceptance matrix; do not assume their assignment means they have landed.

@@ -146,9 +146,7 @@ impl AuthStore {
                 Ok(entry) => {
                     entries.insert(id.trim_end_matches('/').to_string(), entry);
                 }
-                Err(error) => {
-                    eprintln!("ocmini: skipped invalid credential for provider {id}: {error}")
-                }
+                Err(_) => eprintln!("ocmini: skipped invalid credential for provider {id}"),
             }
         }
         Ok(Self {
