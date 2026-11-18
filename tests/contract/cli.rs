@@ -677,19 +677,56 @@ json.load(sys.stdin);pathlib.Path('context-hook-ran').touch();print('{}')"#;
         }),
     )
     .await;
-    let script = r#"import errno,fcntl,os,pty,select,struct,subprocess,sys,termios,time
+    tui_terminal(
+        &server,
+        json!([
+            [["F1 help"], "/co"],
+            [["/compact  Summarize", "/context  Inspect"], "\u{1b}[B\t\r"],
+            [["Context for"], ""]
+        ]),
+    )
+    .await;
+    assert!(!server.directory.join("context-hook-ran").exists());
+    assert!(!server.directory.join("context-mcp-started").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tui_completes_and_runs_configured_commands() {
+    let mut provider = Provider::start(vec![text_script("Reviewed", "")]).await;
+    let server = TestServer::start(&provider, json!({"ui": {"scroll_mode": "fullscreen"}})).await;
+    tui_terminal(
+        &server,
+        json!([
+            [["F1 help"], "/rev"],
+            [
+                ["/review  Review arguments"],
+                "\t\"alpha beta\" gamma delta\r"
+            ],
+            [["Reviewed"], ""]
+        ]),
+    )
+    .await;
+    assert!(provider
+        .request()
+        .await
+        .to_string()
+        .contains("First alpha beta. Rest gamma delta."));
+}
+
+#[cfg(unix)]
+async fn tui_terminal(server: &TestServer, interactions: Value) {
+    let script = r#"import errno,fcntl,json,os,pty,select,struct,subprocess,sys,termios,time
 fd,slave=pty.openpty()
 fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
 os.set_blocking(fd,False)
 with os.fdopen(slave, 'rb', buffering=0) as terminal:
  child=subprocess.Popen([sys.argv[1],'tui'],stdin=terminal,stdout=terminal,stderr=terminal)
-data=b''
 deadline=time.monotonic()+15
-sent=False
-try:
- while time.monotonic()<deadline:
-  if not sent and data:
-   os.write(fd,b'/context\r'); sent=True
+def expect(markers):
+ data=b''
+ markers=[marker.encode() for marker in markers]
+ while time.monotonic()<deadline and not all(marker in data for marker in markers):
   ready,_,_=select.select([fd],[],[],0.1)
   if ready:
    try: chunk=os.read(fd,65536)
@@ -699,16 +736,24 @@ try:
     break
    if not chunk: break
    data+=chunk
-   if b'Context for' in data: break
+ missing=[marker for marker in markers if marker not in data]
+ if missing:
+  print(data.decode(errors='replace'))
+  sys.exit(f'Missing terminal output: {missing!r}')
+try:
+ for markers, keys in json.loads(sys.argv[2]):
+  expect(markers)
+  if keys:
+   os.write(fd,keys.encode())
 finally:
  os.close(fd)
  child.kill()
  child.wait(timeout=3)
-if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
 "#;
     let mut command = tokio::process::Command::new(PYTHON);
     command
         .args(["-S", "-c", script, env!("CARGO_BIN_EXE_ocmini")])
+        .arg(interactions.to_string())
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", server.root.path())
@@ -721,7 +766,7 @@ if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
         .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(25), command.output())
         .await
-        .expect("terminal context test timed out")
+        .expect("terminal interaction test timed out")
         .unwrap();
     assert!(
         output.status.success(),
@@ -729,6 +774,4 @@ if b'Context for' not in data: print(data.decode(errors='replace'));sys.exit(1)
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!server.directory.join("context-hook-ran").exists());
-    assert!(!server.directory.join("context-mcp-started").exists());
 }
