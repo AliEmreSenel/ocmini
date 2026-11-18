@@ -556,3 +556,79 @@ async fn disabled_generated_variants_stay_disabled_during_execution() {
     assert_eq!(response.status(), 400);
     assert!(response.text().await.unwrap().contains("disabled"));
 }
+
+#[tokio::test]
+async fn nested_read_instructions_reach_model_once() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "first_read"),
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "second_read"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(
+        server.directory.join("nested/AGENTS.md"),
+        "nested instruction marker",
+    )
+    .unwrap();
+    std::fs::write(server.directory.join("nested/file.txt"), "file content").unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_nested", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let first = provider.request().await.to_string();
+    assert!(first.contains("nested instruction marker"));
+    assert!(first.contains("nested/AGENTS.md"));
+    let second = provider.request().await.to_string();
+    assert_eq!(second.matches("nested instruction marker").count(), 1);
+}
+
+#[tokio::test]
+async fn nested_instruction_read_deny_is_respected() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "read_file"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(
+        server.directory.join("nested/AGENTS.md"),
+        "private instruction marker",
+    )
+    .unwrap();
+    std::fs::write(
+        server.directory.join("nested/file.txt"),
+        "public file marker",
+    )
+    .unwrap();
+    let id = server
+        .session(json!([
+            {"permission":"*","pattern":"*","action":"allow"},
+            {"permission":"read","pattern":"*AGENTS.md","action":"deny"}
+        ]))
+        .await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_denied_instruction", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let model_request = provider.request().await.to_string();
+    assert!(model_request.contains("public file marker"));
+    assert!(!model_request.contains("private instruction marker"));
+}

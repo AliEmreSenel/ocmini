@@ -234,6 +234,17 @@ impl Effects {
                     crate::run_effect(directory, session, name, &args["args"], cancel).await?,
                 ))
             }
+            "instruction" => {
+                let root = std::fs::canonicalize(directory).map_err(|e| e.to_string())?;
+                let requested = args["path"].as_str().ok_or("Missing instruction path")?;
+                let path = std::fs::canonicalize(crate::resolve_path(directory, requested))
+                    .map_err(|e| e.to_string())?;
+                if !path.starts_with(&root) || args["expected"].as_str() != path.to_str() {
+                    return Err("Instruction outside workspace".into());
+                }
+                let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+                json!(text)
+            }
             "skill" => {
                 return Ok(EffectResult::Output(crate::skills::load_content(
                     directory,
