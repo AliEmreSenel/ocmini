@@ -21,12 +21,22 @@ pub struct GrepInput {
     #[serde(flatten)]
     pub search: Input,
     pub include: Option<String>,
+    /// Number of lines of context before and after each match.
+    pub context: Option<usize>,
+    /// Return only paths containing matches.
+    #[serde(rename = "filesOnly")]
+    pub files_only: Option<bool>,
+    /// Treat the pattern as literal text instead of a regular expression.
+    pub literal: Option<bool>,
+    /// Whether matching is case sensitive (defaults to true).
+    #[serde(rename = "caseSensitive")]
+    pub case_sensitive: Option<bool>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub enum Mode<'a> {
     Glob,
-    Grep(Option<&'a str>),
+    Grep(&'a GrepInput),
 }
 
 pub async fn run(
@@ -60,8 +70,21 @@ pub async fn run(
             .arg(format!("--glob={pattern}"));
     } else {
         command.args(["--json", "--hidden", "--no-messages"]);
-        if let Mode::Grep(Some(include)) = mode {
-            command.arg(format!("--glob={include}"));
+        if let Mode::Grep(options) = mode {
+            if let Some(include) = &options.include {
+                command.arg(format!("--glob={include}"));
+            }
+            if options.literal == Some(true) {
+                command.arg("--fixed-strings");
+            }
+            if options.case_sensitive == Some(false) {
+                command.arg("--ignore-case");
+            }
+            if options.files_only != Some(true) {
+                if let Some(context) = options.context {
+                    command.arg(format!("--context={context}"));
+                }
+            }
         }
     }
     command.arg("--glob=!**/.git/**").arg("--");
@@ -111,6 +134,7 @@ pub async fn run(
             let mut output = String::new();
             let mut count = 0;
             let mut truncated = false;
+            let mut last_file = String::new();
             loop {
                 record.clear();
                 let bytes = (&mut reader)
@@ -134,26 +158,39 @@ pub async fn run(
                 } else {
                     let event: Value = serde_json::from_slice(&record)
                         .map_err(|error| failure(format!("Invalid ripgrep output: {error}")))?;
-                    if event["type"] != "match" {
+                    let files_only =
+                        matches!(mode, Mode::Grep(options) if options.files_only == Some(true));
+                    if event["type"] != "match" && (files_only || event["type"] != "context") {
                         continue;
                     }
                     let data = &event["data"];
                     let path = data["path"]["text"]
                         .as_str()
                         .ok_or_else(|| failure("ripgrep returned a non-UTF-8 path"))?;
-                    let text = data["lines"]["text"]
-                        .as_str()
-                        .ok_or_else(|| failure("ripgrep returned non-UTF-8 matching text"))?;
-                    let text = text.trim_end_matches(['\r', '\n']);
-                    let mut preview: String = text.chars().take(2_000).collect();
-                    if preview.len() < text.len() {
-                        preview.push_str("...");
+                    if files_only {
+                        if path == last_file {
+                            continue;
+                        }
+                        last_file.clear();
+                        last_file.push_str(path);
+                        cwd.join(path.trim_start_matches("./"))
+                            .display()
+                            .to_string()
+                    } else {
+                        let text = data["lines"]["text"]
+                            .as_str()
+                            .ok_or_else(|| failure("ripgrep returned non-UTF-8 matching text"))?;
+                        let text = text.trim_end_matches(['\r', '\n']);
+                        let mut preview: String = text.chars().take(2_000).collect();
+                        if preview.len() < text.len() {
+                            preview.push_str("...");
+                        }
+                        format!(
+                            "{}:{}:{preview}",
+                            cwd.join(path.trim_start_matches("./")).display(),
+                            data["line_number"]
+                        )
                     }
-                    format!(
-                        "{}:{}:{preview}",
-                        cwd.join(path.trim_start_matches("./")).display(),
-                        data["line_number"]
-                    )
                 };
                 if count == MAX_RESULTS {
                     truncated = true;
@@ -237,13 +274,7 @@ mod tests {
             }
             "grep" => {
                 let input: GrepInput = crate::tools::decode(input)?;
-                super::run(
-                    directory,
-                    Mode::Grep(input.include.as_deref()),
-                    &input.search,
-                    cancel,
-                )
-                .await
+                super::run(directory, Mode::Grep(&input), &input.search, cancel).await
             }
             _ => panic!("unknown search tool"),
         }
@@ -358,6 +389,55 @@ mod tests {
         assert!(found.output.contains(".visible.txt:1:needle"));
         assert!(!found.output.contains("ignored.txt"));
     }
+    #[tokio::test]
+    async fn ripgrep_context_files_and_matching_options() {
+        let directory = Directory::new();
+        std::fs::create_dir(directory.0.path().join(".git")).unwrap();
+        std::fs::write(directory.0.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(directory.0.path().join("ignored.txt"), "A.B\n").unwrap();
+        std::fs::write(
+            directory.0.path().join("visible.txt"),
+            "one\na.b\nthree\nA.B\nfive\n",
+        )
+        .unwrap();
+        let context = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern":"a.b", "literal":true, "caseSensitive":false, "context":1}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let lines: Vec<_> = context.output.lines().collect();
+        assert_eq!(lines.len(), 5, "{}", context.output);
+        for (index, text) in ["one", "a.b", "three", "A.B", "five"].iter().enumerate() {
+            assert!(lines[index].ends_with(&format!(":{}:{text}", index + 1)));
+        }
+        let files = run(directory.dir(), "grep", &json!({"pattern":"a.b", "literal":true, "caseSensitive":false, "filesOnly":true, "context":1}), CancellationToken::new()).await.unwrap();
+        assert_eq!(files.metadata["count"], 1);
+        assert!(files.output.trim_end().ends_with("visible.txt"));
+        assert!(!files.output.contains("ignored.txt"));
+        let sensitive = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern":"A.B", "literal":true}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sensitive.metadata["count"], 1);
+        assert!(sensitive.output.contains(":4:A.B"));
+        let regex = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern":"a.b"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(regex.metadata["count"], 1);
+    }
+
     #[tokio::test]
     async fn glob_search_does_not_drop_brace_alternatives() {
         let directory = Directory::new();
