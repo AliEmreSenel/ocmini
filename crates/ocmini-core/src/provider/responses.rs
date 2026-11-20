@@ -56,7 +56,42 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         crate::provider::Protocol::Responses,
         &mut body,
     )?;
+    // Raw overlays can deliberately use the request-specific instructions field.
+    let overrides_instructions = ["body", "extraBody"]
+        .iter()
+        .any(|key| settings.options[*key].get("instructions").is_some());
+    if !overrides_instructions
+        && cacheable_instructions(&settings.base_url)
+        && body["input"].is_array()
+    {
+        if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+            let instructions = instructions.to_owned();
+            body.as_object_mut().unwrap().remove("instructions");
+            if !instructions.is_empty() {
+                body["input"].as_array_mut().unwrap().insert(
+                    0,
+                    json!({"type":"message","role":"developer","content":instructions}),
+                );
+            }
+        }
+    }
     Ok(body)
+}
+
+fn cacheable_instructions(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default();
+    host == "api.openai.com"
+        || host == "api.githubcopilot.com"
+        || host == "chatgpt.com"
+            && (url.path() == "/backend-api/codex" || url.path().starts_with("/backend-api/codex/"))
+        || host.ends_with(".openai.azure.com")
+        || host == "gateway.ai.cloudflare.com" && url.path().split('/').nth(4) == Some("openai")
 }
 
 pub(super) async fn stream(
@@ -332,6 +367,69 @@ impl Decoder for ResponseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn openai_routes_cache_effective_instructions_before_replay() {
+        let mut settings = super::super::test_settings(json!({}));
+        let replay = json!({"type":"reasoning","id":"r","encrypted_content":"opaque","summary":[]});
+        let mut req = ChatRequest {
+            system: "base\nupdated instruction".into(),
+            messages: vec![
+                json!({"role":"user","content":"hello"}),
+                json!({"role":"assistant","content":null,"providerMetadata":{"provider":"openai-responses","output":[replay.clone()]}}),
+            ],
+            ..Default::default()
+        };
+        for url in [
+            "https://api.openai.com/v1",
+            "https://chatgpt.com/backend-api/codex",
+            "https://api.githubcopilot.com",
+            "https://example.openai.azure.com/openai/v1",
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/openai",
+        ] {
+            settings.base_url = url.into();
+            let body = request_body(&settings, &req).unwrap();
+            assert!(body.get("instructions").is_none(), "{url}");
+            assert_eq!(
+                body["input"][0],
+                json!({"type":"message","role":"developer","content":"base\nupdated instruction"})
+            );
+            assert_eq!(body["input"][1]["role"], "user");
+            assert_eq!(body["input"][2], replay);
+        }
+        for key in ["body", "extraBody"] {
+            settings.options = json!({key:{"instructions":"overlay"}});
+            let body = request_body(&settings, &req).unwrap();
+            assert_eq!(body["instructions"], "overlay");
+            assert_eq!(body["input"][0]["role"], "user");
+        }
+        req.system.clear();
+        settings.options = json!({});
+        assert_eq!(
+            request_body(&settings, &req).unwrap()["input"][0]["role"],
+            "user"
+        );
+    }
+
+    #[test]
+    fn compatible_responses_endpoints_keep_instructions() {
+        let mut settings = super::super::test_settings(json!({}));
+        let req = ChatRequest {
+            system: "system".into(),
+            messages: vec![json!({"role":"user","content":"hello"})],
+            ..Default::default()
+        };
+        for url in [
+            "http://localhost/v1",
+            "https://api.openai.com.example/v1",
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/compat",
+            "https://example.com/v1",
+        ] {
+            settings.base_url = url.into();
+            let body = request_body(&settings, &req).unwrap();
+            assert_eq!(body["instructions"], "system", "{url}");
+            assert_eq!(body["input"][0]["role"], "user");
+        }
+    }
     #[test]
     fn transformed_public_text_reaches_replay_without_changing_reasoning_or_calls() {
         let settings = super::super::test_settings(json!({}));

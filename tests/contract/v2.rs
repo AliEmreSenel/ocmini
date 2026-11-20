@@ -631,7 +631,7 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
     post(
         &server,
         &format!("/api/session/{sid}/compact"),
-        json!({"id":"msg_compact"}),
+        json!({"id":"msg_compact","ocminiFocus":"Preserve the deployment decision"}),
     )
     .await;
     let compacted = events.through("session.execution.succeeded").await;
@@ -658,7 +658,10 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
     .await;
     events.through("session.execution.succeeded").await;
     provider.request().await;
-    provider.request().await;
+    let compact_request = provider.request().await;
+    assert!(compact_request
+        .to_string()
+        .contains("Preserve the deployment decision"));
     assert!(provider.request().await["messages"]
         .as_array()
         .unwrap()
@@ -666,6 +669,35 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
         .any(|m| m["content"]
             .as_str()
             .is_some_and(|t| t.contains("Continuation summary"))));
+}
+
+#[tokio::test]
+async fn v2_compaction_hook_replacement_overrides_manual_focus() {
+    let mut provider =
+        Provider::start(vec![text_script("answer", ""), text_script("summary", "")]).await;
+    let code = r#"import json,sys
+json.load(sys.stdin);print('{"set":{"prompt":"HOOK_REPLACEMENT"}}')"#;
+    let server = TestServer::start(&provider, json!({"ocmini":{"hooks":{"version":1,"handlers":[{"id":"replace-compact","on":"compaction.before","command":[PYTHON,"-S","-c",code]}]}}})).await;
+    let sid = session(&server).await;
+    let mut events = server.events_at("/api/event").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"text":"work"}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/compact"),
+        json!({"id":"msg_hook_compact","ocminiFocus":"FOCUS_MUST_BE_REPLACED"}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert!(request.contains("HOOK_REPLACEMENT"), "{request}");
+    assert!(!request.contains("FOCUS_MUST_BE_REPLACED"), "{request}");
 }
 
 #[tokio::test]
@@ -812,6 +844,66 @@ async fn v2_mcp_registration_reuses_the_connection_and_removal_stops_tools() {
         .await
         .unwrap();
     assert!(!response.status().is_success());
+}
+
+#[tokio::test]
+async fn v2_rejection_settles_only_the_current_step() {
+    let calls = ["one", "two"].into_iter().enumerate().map(|(index, name)|
+        json!({"index":index,"id":format!("call_{name}"),"type":"function","function":{"name":"shell","arguments":json!({"command":format!("touch {name}")}).to_string()}})
+    ).collect::<Vec<_>>();
+    let mut provider = Provider::start(vec![
+        Script::ok(vec![
+            json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()}),
+        ]),
+        tool_script("shell", json!({"command":"touch later"}), "call_later"),
+        text_script("Done", ""),
+    ]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = session(&server).await;
+    server
+        .client
+        .patch(format!("{}/api/session/{sid}", server.url))
+        .json(&json!({"permissions":[{"action":"shell","resource":"*","effect":"ask"}]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut events = server.events_at("/api/event").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"text":"Run commands"}),
+    )
+    .await;
+    events.through("permission.asked").await;
+    events.through("permission.asked").await;
+    let pending = get(&server, &format!("/api/session/{sid}/permission")).await;
+    let requests = pending["data"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    let id = requests[0]["id"].as_str().unwrap();
+    post(
+        &server,
+        &format!("/api/session/{sid}/permission/{id}/reply"),
+        json!({"decision":"reject"}),
+    )
+    .await;
+    let observed = events.through("permission.asked").await;
+    let later = observed.last().unwrap()["data"]["id"].as_str().unwrap();
+    post(
+        &server,
+        &format!("/api/session/{sid}/permission/{later}/reply"),
+        json!({"decision":"once"}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    for _ in 0..3 {
+        provider.request().await;
+    }
+    assert!(!server.directory.join("one").exists());
+    assert!(!server.directory.join("two").exists());
+    assert!(server.directory.join("later").exists());
 }
 
 #[tokio::test]

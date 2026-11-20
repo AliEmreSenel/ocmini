@@ -71,7 +71,7 @@ POST /fork accepts an optional before message ID, which is excluded from the cop
 
 ## Approvals, forms, instructions and MCP
 
-GET /api/session/{sessionID}/permission lists pending requests. POST /permission/{requestID}/reply accepts {decision: "once" | "always" | "reject", message?}. Rejection with feedback allows the runtime to continue without that tool; rejection without feedback interrupts execution. Runtime session policy still controls subsequent decisions.
+GET /api/session/{sessionID}/permission lists pending requests. POST /permission/{requestID}/reply accepts {decision: "once" | "always" | "reject", message?}. Rejection settles pending permission requests from the same model step; optional feedback is returned to the model with the denied tool results. Runtime session policy still controls subsequent decisions.
 
 Questions appear through GET /api/session/{sessionID}/form and form.created events. String and multiselect fields use stable string keys. POST /form/{formID}/reply accepts {answer: {key: string | string[]}}. DELETE /form/{formID} cancels the question. Session ownership and answer validity are checked before settlement.
 

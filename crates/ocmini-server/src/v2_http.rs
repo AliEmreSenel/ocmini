@@ -647,7 +647,13 @@ async fn control(
                 .map(str::to_owned)
                 .unwrap_or_else(|| hex_id("msg_")),
         ),
-        parts: vec![json!({"type":"compaction","auto":false})],
+        parts: vec![match body["ocminiFocus"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(focus) => json!({"type":"compaction","auto":false,"ocminiFocus":focus}),
+            None => json!({"type":"compaction","auto":false}),
+        }],
         command: Some("__ocmini_compact".into()),
         v2: Some(input(body, kind, payload)?),
         ..Default::default()
@@ -669,14 +675,11 @@ async fn compact(
     Path(sid): Path<String>,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>> {
-    control(
-        &st,
-        &sid,
-        &body.map(|b| b.0).unwrap_or_else(|| json!({})),
-        "compaction",
-        json!({}),
-    )
-    .await
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    if optional(&body, "ocminiFocus").is_some_and(|v| !v.is_string()) {
+        return Err(invalid("ocminiFocus must be a string"));
+    }
+    control(&st, &sid, &body, "compaction", json!({})).await
 }
 async fn relocate(
     State(st): State<AppState>,
@@ -887,13 +890,6 @@ async fn permission_reply(
     Json(body): Json<Value>,
 ) -> Result<StatusCode> {
     required(&st, &sid)?;
-    let request = st
-        .app
-        .perms
-        .list()
-        .into_iter()
-        .find(|p| p.id == id && p.session_id == sid)
-        .ok_or_else(|| missing("PermissionNotFoundError", &sid, "requestID", &id))?;
     let decision = wire::string(&body, "decision")?;
     if !matches!(decision, "once" | "always" | "reject") {
         return Err(invalid("Invalid decision"));
@@ -901,12 +897,9 @@ async fn permission_reply(
     if !st
         .app
         .perms
-        .reply_with_message(&request.id, decision, body["message"].as_str())
+        .reply_v2(&sid, &id, decision, body["message"].as_str())
     {
         return Err(missing("PermissionNotFoundError", &sid, "requestID", &id));
-    }
-    if decision == "reject" && !body["message"].is_string() {
-        st.engine.interrupt(&sid);
     }
     Ok(StatusCode::NO_CONTENT)
 }

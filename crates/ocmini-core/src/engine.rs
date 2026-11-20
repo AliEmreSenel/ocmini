@@ -317,6 +317,16 @@ impl App {
         &self.mcp_scope.hub
     }
 
+    /// Snapshot only an already-created directory scope; never start MCP.
+    pub fn available_mcp_tools(&self, directory: &str) -> Vec<serde_json::Value> {
+        self.mcp_scopes
+            .lock()
+            .unwrap()
+            .get(directory)
+            .map(|scope| scope.hub.tool_defs())
+            .unwrap_or_default()
+    }
+
     pub async fn wait_mcp_ready(&self) {
         self.mcp_scope.start();
         let mut ready = self.mcp_scope.ready.subscribe();

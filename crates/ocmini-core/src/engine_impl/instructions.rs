@@ -6,7 +6,21 @@ pub(super) async fn system_prompt(
     agent: &str,
     provided: Option<&str>,
 ) -> Result<String, String> {
-    let mut system = system_prompt_base(cfg, directory, agent).await?;
+    let mut system = system_prompt_base(cfg, directory, agent, false).await?;
+    if let Some(provided) = provided {
+        system.push_str("\n\n");
+        system.push_str(provided);
+    }
+    Ok(system)
+}
+
+pub(super) async fn inspection_system_prompt(
+    cfg: &Config,
+    directory: &str,
+    agent: &str,
+    provided: Option<&str>,
+) -> Result<String, String> {
+    let mut system = system_prompt_base(cfg, directory, agent, true).await?;
     if let Some(provided) = provided {
         system.push_str("\n\n");
         system.push_str(provided);
@@ -16,11 +30,16 @@ pub(super) async fn system_prompt(
 
 /// The AGENTS.md/skills/agent-prompt base is identical for every turn in a
 /// directory; reading those files per turn scales with sessions, so cache it.
-async fn system_prompt_base(cfg: &Config, directory: &str, agent: &str) -> Result<String, String> {
-    type PromptCache = Mutex<HashMap<(String, String), (std::time::Instant, String)>>;
+async fn system_prompt_base(
+    cfg: &Config,
+    directory: &str,
+    agent: &str,
+    local_only: bool,
+) -> Result<String, String> {
+    type PromptCache = Mutex<HashMap<(String, String, bool), (std::time::Instant, String)>>;
     static CACHE: std::sync::OnceLock<PromptCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let key = (directory.to_string(), agent.to_string());
+    let key = (directory.to_string(), agent.to_string(), local_only);
     if let Some((created, prompt)) = cache.lock().unwrap().get(&key) {
         if created.elapsed() < std::time::Duration::from_secs(10) {
             return Ok(prompt.clone());
@@ -51,6 +70,9 @@ async fn system_prompt_base(cfg: &Config, directory: &str, agent: &str) -> Resul
     let mut seen = HashSet::new();
     for instruction in &cfg.instructions {
         if instruction.starts_with("https://") || instruction.starts_with("http://") {
+            if local_only {
+                continue;
+            }
             let response = provider::client()
                 .get(instruction)
                 .timeout(std::time::Duration::from_secs(15))

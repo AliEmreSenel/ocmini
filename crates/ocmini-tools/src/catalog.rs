@@ -22,6 +22,11 @@ pub struct ShellInput {
     pub background: bool,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DiscoverInput {
+    pub query: String,
+}
+
 /// The built-in catalog and its closed Rust identity share one spelling table.
 macro_rules! builtin_tools {
     ($($variant:ident => $name:literal, $description:literal, $parameters:ty;)+) => {
@@ -48,13 +53,14 @@ macro_rules! builtin_tools {
     };
 }
 builtin_tools! {
+    DiscoverMcpTools => "discover_mcp_tools", "Find and activate available MCP tools for later steps by name or description.", DiscoverInput;
     Bash => "bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once and keeps running across tool calls, ending when its session is aborted or deleted, or when ocmini exits. A timed-out command completes with the output captured before the limit and a shell_metadata timeout notice.", ShellInput;
     Read => "read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", files::ReadInput;
     Write => "write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", changes::WriteInput;
     Edit => "edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", changes::EditInput;
     ApplyPatch => "apply_patch", "Apply a patch using *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, optional *** Move to:, @@ context hunks, and *** End Patch. All files are validated before any are changed.", changes::PatchInput;
     Glob => "glob", "Find files using ripgrep and glob patterns (including ** and {a,b}), honoring gitignore. Returns up to 100 files. Relative path uses the session directory.", search::Input;
-    Grep => "grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob.", search::GrepInput;
+    Grep => "grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob; context adds surrounding lines, filesOnly returns paths, literal disables regex, and caseSensitive controls case matching.", search::GrepInput;
     WebFetch => "webfetch", "Fetch an HTTP(S) text resource up to 5 MiB. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds (default 30, maximum 120).", web::Input;
     TodoWrite => "todowrite", "Replace and persist the session's todo list.", todo::Input;
     Question => "question", "Ask one or more questions, with options, and wait for the user's answers.", question::Input;
@@ -154,7 +160,13 @@ impl PreparedTool {
                 ),
                 Some(Builtin::WebFetch) => (
                     name,
-                    vec![self.args["url"].as_str().unwrap_or_default().into()],
+                    vec![self.args["url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .split('#')
+                        .next()
+                        .unwrap_or_default()
+                        .into()],
                 ),
                 Some(Builtin::Skill) => (
                     name,
@@ -169,6 +181,7 @@ impl PreparedTool {
         }
     }
 }
+
 pub async fn prepare_input<A: Host, F>(
     ctx: &ToolCtx<A>,
     name: &str,
@@ -311,6 +324,9 @@ where
         Some(Builtin::Skill) => Tool::Skill(decode(&alias(&args, "name", "id"))?),
         Some(kind) => {
             match kind {
+                Builtin::DiscoverMcpTools => {
+                    let _: DiscoverInput = decode(&args)?;
+                }
                 Builtin::Bash => {
                     let _: ShellInput = decode(&alias(&args, "workdir", "cwd"))?;
                 }
@@ -340,15 +356,55 @@ where
     };
     Ok(PreparedTool { args, tool })
 }
-pub async fn run_tool<A: Host>(
+pub async fn run_tool<A: Host, F>(
     ctx: &ToolCtx<A>,
     name: &str,
     input: &PreparedTool,
-) -> Result<ToolOutput, OperationError> {
+    mut authorize_redirect: impl FnMut(String, Value) -> F + Send,
+) -> Result<ToolOutput, OperationError>
+where
+    F: Future<Output = Result<(), OperationError>> + Send,
+{
     if ctx.cancel.is_cancelled() {
         return Err(failure("Tool cancelled"));
     }
     let result = match &input.tool {
+        Tool::Effect if Builtin::from_name(name) == Some(Builtin::WebFetch) => {
+            let mut hop_args = input.args.clone();
+            let mut final_output = None;
+            for step in 0..=web::MAX_REDIRECTS {
+                ctx.app.ownership(&ctx.session_id)?;
+                let value = ctx
+                    .app
+                    .effect(ctx, "webfetch_hop", hop_args.clone())
+                    .await?
+                    .json()?;
+                if let Some(done) = value.get("done") {
+                    final_output = Some(
+                        serde_json::from_value::<ToolOutput>(done.clone())
+                            .map_err(|error| failure(error.to_string()))?,
+                    );
+                    break;
+                }
+                let next = value["redirect"]
+                    .as_str()
+                    .ok_or_else(|| failure("Invalid webfetch redirect response"))?;
+                if step == web::MAX_REDIRECTS {
+                    return Err(failure(format!(
+                        "Too many redirects (more than {})",
+                        web::MAX_REDIRECTS
+                    )));
+                }
+                hop_args["url"] = json!(next);
+                authorize_redirect(next.to_owned(), hop_args.clone()).await?;
+            }
+            final_output.ok_or_else(|| {
+                failure(format!(
+                    "Too many redirects (more than {})",
+                    web::MAX_REDIRECTS
+                ))
+            })
+        }
         Tool::Effect => {
             let mut args = input.args.clone();
             if Builtin::from_name(name) == Some(Builtin::Bash)
@@ -492,4 +548,21 @@ pub fn cleanup_outputs() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn webfetch_permission_ignores_fragment_but_keeps_query() {
+        let tool = PreparedTool {
+            args: json!({"url": "https://example.com/page?q=1#section"}),
+            tool: Tool::Effect,
+        };
+        assert_eq!(
+            tool.permission("webfetch", &[]),
+            ("webfetch", vec!["https://example.com/page?q=1".into()])
+        );
+    }
 }

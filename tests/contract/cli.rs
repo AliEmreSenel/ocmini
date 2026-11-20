@@ -658,3 +658,120 @@ async fn sandbox_free_binary_refuses_workspace_sandbox_requirements() {
             .contains("Sandbox startup refused:"));
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn context_inspection_does_not_run_turn_hooks_or_start_mcp() {
+    let hook = r#"import json,sys,pathlib
+json.load(sys.stdin);pathlib.Path('context-hook-ran').touch();print('{}')"#;
+    let mcp = r#"import pathlib;pathlib.Path('context-mcp-started').touch()"#;
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(
+        &provider,
+        json!({
+            "ocmini":{"hooks":{"version":1,"handlers":[
+                {"id":"turn-start","on":"turn.start.before","command":[PYTHON,"-S","-c",hook]},
+                {"id":"catalog","on":"tool.catalog.transform","command":[PYTHON,"-S","-c",hook]}
+            ]}},
+            "mcp":{"probe":{"type":"local","command":[PYTHON,"-S","-c",mcp],"enabled":true}}
+        }),
+    )
+    .await;
+    tui_terminal(
+        &server,
+        json!([
+            [["F1 help"], "/co"],
+            [["/compact  Summarize", "/context  Inspect"], "\u{1b}[B\t\r"],
+            [["Context for"], ""]
+        ]),
+    )
+    .await;
+    assert!(!server.directory.join("context-hook-ran").exists());
+    assert!(!server.directory.join("context-mcp-started").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tui_completes_and_runs_configured_commands() {
+    let mut provider = Provider::start(vec![text_script("Reviewed", "")]).await;
+    let server = TestServer::start(&provider, json!({"ui": {"scroll_mode": "fullscreen"}})).await;
+    tui_terminal(
+        &server,
+        json!([
+            [["F1 help"], "/rev"],
+            [
+                ["/review  Review arguments"],
+                "\t\"alpha beta\" gamma delta\r"
+            ],
+            [["Reviewed"], ""]
+        ]),
+    )
+    .await;
+    assert!(provider
+        .request()
+        .await
+        .to_string()
+        .contains("First alpha beta. Rest gamma delta."));
+}
+
+#[cfg(unix)]
+async fn tui_terminal(server: &TestServer, interactions: Value) {
+    let script = r#"import errno,fcntl,json,os,pty,select,struct,subprocess,sys,termios,time
+fd,slave=pty.openpty()
+fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
+os.set_blocking(fd,False)
+with os.fdopen(slave, 'rb', buffering=0) as terminal:
+ child=subprocess.Popen([sys.argv[1],'tui'],stdin=terminal,stdout=terminal,stderr=terminal)
+deadline=time.monotonic()+15
+def expect(markers):
+ data=b''
+ markers=[marker.encode() for marker in markers]
+ while time.monotonic()<deadline and not all(marker in data for marker in markers):
+  ready,_,_=select.select([fd],[],[],0.1)
+  if ready:
+   try: chunk=os.read(fd,65536)
+   except BlockingIOError: continue
+   except OSError as err:
+    if err.errno != errno.EIO: raise
+    break
+   if not chunk: break
+   data+=chunk
+ missing=[marker for marker in markers if marker not in data]
+ if missing:
+  print(data.decode(errors='replace'))
+  sys.exit(f'Missing terminal output: {missing!r}')
+try:
+ for markers, keys in json.loads(sys.argv[2]):
+  expect(markers)
+  if keys:
+   os.write(fd,keys.encode())
+finally:
+ os.close(fd)
+ child.kill()
+ child.wait(timeout=3)
+"#;
+    let mut command = tokio::process::Command::new(PYTHON);
+    command
+        .args(["-S", "-c", script, env!("CARGO_BIN_EXE_ocmini")])
+        .arg(interactions.to_string())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", server.root.path())
+        .env("XDG_CONFIG_HOME", server.root.path().join(".config"))
+        .env("XDG_DATA_HOME", server.root.path().join(".local/share"))
+        .env("OPENCODE_CONFIG_CONTENT", "{}")
+        .env("OPENCODE_AUTH_CONTENT", "{}")
+        .env("TERM", "xterm")
+        .current_dir(&server.directory)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(25), command.output())
+        .await
+        .expect("terminal interaction test timed out")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

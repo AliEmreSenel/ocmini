@@ -624,7 +624,7 @@ fn normalize_request(
     Ok(agent)
 }
 
-fn resolve_model(
+pub(super) fn resolve_model(
     cfg: &Config,
     app: &App,
     sid: &str,

@@ -324,21 +324,7 @@ impl Host for App {
             .mcp()
             .call_result_async(server, tool, args, cancel)
             .await?;
-        let attachments: Vec<Value> = result["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|item| {
-                matches!(item["type"].as_str(), Some("image" | "audio"))
-                    || item["type"] == "resource" && item["resource"]["blob"].is_string()
-            })
-            .cloned()
-            .collect();
-        Ok(ToolOutput {
-            output: crate::mcp::render_result(&result),
-            title: format!("{server}/{tool}"),
-            metadata: json!({"server":server,"tool":tool,"attachments":attachments}),
-        })
+        Ok(crate::mcp::tool_output(server, tool, &result))
     }
     fn release_file(&self, session: &str, handle: u64) {
         self.effects.release_remote(session, handle);

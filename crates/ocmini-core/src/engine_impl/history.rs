@@ -5,9 +5,11 @@ pub(super) async fn load_messages(
     sid: &str,
     through: &str,
     chat: bool,
+    model: &ModelRef,
 ) -> Result<(Vec<Value>, bool), String> {
+    let model = model.clone();
     let (sid, through) = (sid.to_owned(), through.to_owned());
-    tokio::task::spawn_blocking(move || build_messages(&store, &sid, &through, chat))
+    tokio::task::spawn_blocking(move || build_messages(&store, &sid, &through, chat, Some(&model)))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -21,6 +23,8 @@ struct ChatRun {
     calls: Vec<Value>,
     reasoning: Vec<(String, String)>,
     details: Vec<Value>,
+    opaque: Option<Value>,
+    model: Option<ModelRef>,
     tail: Vec<Value>,
 }
 
@@ -34,7 +38,7 @@ fn flush_chat_run(out: &mut Vec<Value>, run: Option<ChatRun>) {
     if !run.calls.is_empty() {
         message["tool_calls"] = json!(run.calls);
     }
-    if !run.reasoning.is_empty() || !run.details.is_empty() {
+    if !run.reasoning.is_empty() || !run.details.is_empty() || run.opaque.is_some() {
         let mut meta_message = json!({"role":"assistant"});
         let mut keys: Vec<String> = Vec::new();
         let mut joined: HashMap<String, Vec<String>> = HashMap::new();
@@ -50,7 +54,14 @@ fn flush_chat_run(out: &mut Vec<Value>, run: Option<ChatRun>) {
         if !run.details.is_empty() {
             meta_message["reasoning_details"] = json!(run.details);
         }
+        if let Some(opaque) = run.opaque {
+            meta_message["reasoning_opaque"] = opaque;
+        }
         message["providerMetadata"] = json!({"provider":"openai-chat","message":meta_message});
+        if let Some(model) = run.model {
+            message["providerMetadata"]["providerID"] = json!(model.provider_id);
+            message["providerMetadata"]["modelID"] = json!(model.model_id);
+        }
     }
     if message.get("content").is_none()
         && message.get("tool_calls").is_none()
@@ -67,8 +78,17 @@ pub(super) fn build_messages(
     sid: &str,
     through: &str,
     chat: bool,
+    model: Option<&ModelRef>,
 ) -> Result<(Vec<Value>, bool), String> {
-    let mut history = store.context_messages(sid, through)?;
+    let history = store.context_messages(sid, through)?;
+    project_messages(history, chat, model)
+}
+
+pub(super) fn project_messages(
+    mut history: Vec<MessageWithParts>,
+    chat: bool,
+    model: Option<&ModelRef>,
+) -> Result<(Vec<Value>, bool), String> {
     let summary = history.iter().rposition(|m| {
         m.info.summary == Some(true)
             && m.info.time.completed.is_some()
@@ -79,6 +99,7 @@ pub(super) fn build_messages(
     });
     let mut out = Vec::new();
     let mut run: Option<ChatRun> = None;
+    let mut turn_model: Option<(String, String)> = None;
     let start = if let Some(index) = summary {
         let text = crate::types::text_parts(&history[index].parts)
             .collect::<Vec<_>>()
@@ -87,7 +108,23 @@ pub(super) fn build_messages(
         for part in &mut history[index].parts {
             if let Some(value) = part.get_mut("compactionRecent") {
                 if let Value::Array(recent) = value.take() {
-                    out.extend(recent);
+                    out.extend(recent.into_iter().map(|mut message| {
+                        let meta = &message["providerMetadata"];
+                        if model.is_some_and(|model| {
+                            meta["provider"] == "openai-chat"
+                                && (meta["providerID"]
+                                    .as_str()
+                                    .is_some_and(|id| id != model.provider_id)
+                                    || meta["modelID"]
+                                        .as_str()
+                                        .is_some_and(|id| id != model.model_id))
+                        }) {
+                            message
+                                .as_object_mut()
+                                .map(|m| m.remove("providerMetadata"));
+                        }
+                        message
+                    }));
                 }
             }
         }
@@ -100,6 +137,11 @@ pub(super) fn build_messages(
             continue;
         }
         if message.info.role == "user" {
+            turn_model = message
+                .info
+                .provider_id
+                .clone()
+                .zip(message.info.model_id.clone());
             flush_chat_run(&mut out, run.take());
             let mut content = Vec::new();
             for part in &message.parts {
@@ -215,16 +257,33 @@ pub(super) fn build_messages(
             tail.push(json!({"role":"user","content":attachments}));
         }
         if chat {
-            let chat_run = run.get_or_insert_with(ChatRun::default);
+            let chat_run = run.get_or_insert_with(|| ChatRun {
+                model: model.cloned(),
+                ..Default::default()
+            });
             if !text.is_empty() {
                 chat_run.texts.push(text);
             }
             for part in &calls {
                 chat_run.calls.push(json!({"id":part["callID"],"type":"function","function":{"name":part["tool"],"arguments":part["state"]["input"].to_string()}}));
             }
+            let compatible = model.is_none_or(|model| {
+                let provider = message
+                    .info
+                    .provider_id
+                    .as_deref()
+                    .or_else(|| turn_model.as_ref().map(|m| m.0.as_str()));
+                let source_model = message
+                    .info
+                    .model_id
+                    .as_deref()
+                    .or_else(|| turn_model.as_ref().map(|m| m.1.as_str()));
+                provider.is_none_or(|id| id == model.provider_id)
+                    && source_model.is_none_or(|id| id == model.model_id)
+            });
             if let Some(meta) = metadata
                 .as_ref()
-                .filter(|m| m["provider"] == "openai-chat")
+                .filter(|m| compatible && m["provider"] == "openai-chat")
                 .and_then(|m| m.get("message"))
             {
                 for key in ["reasoning_content", "reasoning", "reasoning_text"] {
@@ -235,6 +294,9 @@ pub(super) fn build_messages(
                                 .push((key.to_string(), value.to_string()));
                         }
                     }
+                }
+                if let Some(opaque) = meta.get("reasoning_opaque") {
+                    chat_run.opaque = Some(opaque.clone());
                 }
                 if let Some(list) = meta["reasoning_details"].as_array() {
                     chat_run.details.extend(list.iter().cloned());
