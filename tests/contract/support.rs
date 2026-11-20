@@ -139,6 +139,7 @@ pub(super) async fn provider_reply(
 
 pub(super) struct Provider {
     pub(super) url: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) scripts: Arc<Mutex<VecDeque<Script>>>,
     pub(super) requests: mpsc::UnboundedReceiver<Value>,
     pub(super) task: tokio::task::JoinHandle<()>,
@@ -175,6 +176,7 @@ impl Provider {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) async fn push(&self, script: Script) {
         self.scripts.lock().await.push_back(script);
     }
