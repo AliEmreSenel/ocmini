@@ -356,15 +356,55 @@ where
     };
     Ok(PreparedTool { args, tool })
 }
-pub async fn run_tool<A: Host>(
+pub async fn run_tool<A: Host, F>(
     ctx: &ToolCtx<A>,
     name: &str,
     input: &PreparedTool,
-) -> Result<ToolOutput, OperationError> {
+    mut authorize_redirect: impl FnMut(String, Value) -> F + Send,
+) -> Result<ToolOutput, OperationError>
+where
+    F: Future<Output = Result<(), OperationError>> + Send,
+{
     if ctx.cancel.is_cancelled() {
         return Err(failure("Tool cancelled"));
     }
     let result = match &input.tool {
+        Tool::Effect if Builtin::from_name(name) == Some(Builtin::WebFetch) => {
+            let mut hop_args = input.args.clone();
+            let mut final_output = None;
+            for step in 0..=web::MAX_REDIRECTS {
+                ctx.app.ownership(&ctx.session_id)?;
+                let value = ctx
+                    .app
+                    .effect(ctx, "webfetch_hop", hop_args.clone())
+                    .await?
+                    .json()?;
+                if let Some(done) = value.get("done") {
+                    final_output = Some(
+                        serde_json::from_value::<ToolOutput>(done.clone())
+                            .map_err(|error| failure(error.to_string()))?,
+                    );
+                    break;
+                }
+                let next = value["redirect"]
+                    .as_str()
+                    .ok_or_else(|| failure("Invalid webfetch redirect response"))?;
+                if step == web::MAX_REDIRECTS {
+                    return Err(failure(format!(
+                        "Too many redirects (more than {})",
+                        web::MAX_REDIRECTS
+                    )));
+                }
+                hop_args["url"] = json!(next);
+                authorize_redirect(next.to_owned(), hop_args.clone()).await?;
+            }
+            final_output.ok_or_else(|| {
+                failure(format!(
+                    "Too many redirects (more than {})",
+                    web::MAX_REDIRECTS
+                ))
+            })
+        }
         Tool::Effect => {
             let mut args = input.args.clone();
             if Builtin::from_name(name) == Some(Builtin::Bash)

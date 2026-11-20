@@ -157,7 +157,10 @@ impl Decoder for ChatState {
                 break;
             }
         }
-        if let Some(opaque) = delta.get("reasoning_opaque") {
+        if let Some(opaque) = delta
+            .get("reasoning_opaque")
+            .filter(|value| !value.is_null() && value.as_str() != Some(""))
+        {
             self.reasoning_opaque = Some(opaque.clone());
         }
         if let Some(details) = delta["reasoning_details"].as_array() {
@@ -362,6 +365,30 @@ mod tests {
         let unknown = request_body(&settings, &req).unwrap();
         assert_eq!(unknown["messages"][0]["content"], "hello");
         assert_eq!(unknown["messages"][0]["reasoning"], "thinking");
+    }
+
+    #[test]
+    fn null_or_empty_reasoning_opaque_deltas_do_not_clear_captured_token() {
+        let mut state = ChatState::default();
+        for chunk in [
+            json!({"choices":[{"index":0,"delta":{"reasoning_opaque":"signed-token"}}]}),
+            json!({"choices":[{"index":0,"delta":{"content":"hi","reasoning_opaque":null}}]}),
+            json!({"choices":[{"index":0,"delta":{"reasoning_opaque":""},"finish_reason":"stop"}]}),
+        ] {
+            state.consume(&chunk).unwrap();
+        }
+        let events = state.finish("model").unwrap();
+        let metadata = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Metadata(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            metadata["message"]["reasoning_opaque"],
+            json!("signed-token")
+        );
     }
 
     #[test]

@@ -503,7 +503,14 @@ async fn execute_authorized_tool(
             .await
             .map_err(Into::into);
     }
-    tools::run_tool(ctx, name, input).await.map_err(Into::into)
+    tools::run_tool(ctx, name, input, |next, hop_args| async move {
+        let rules = current_permission_rules(ctx, cfg, request)?;
+        check_permission(ctx, &rules, "webfetch", &next, "webfetch", &hop_args).await?;
+        ctx.app.store.check_ownership(&ctx.session_id)?;
+        Ok(())
+    })
+    .await
+    .map_err(Into::into)
 }
 
 async fn check_permission(

@@ -7,8 +7,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const MAX_BODY: usize = 5 * 1024 * 1024;
+pub const MAX_REDIRECTS: usize = 10;
 
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub enum Hop {
+    Done(ToolOutput),
+    Redirect(String),
+}
+
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct Input {
     pub url: String,
     #[serde(default)]
@@ -38,8 +44,7 @@ fn request_timeout(seconds: Option<u64>) -> Result<Duration, OperationError> {
     Ok(Duration::from_secs(seconds.min(120)))
 }
 
-pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutput, OperationError> {
-    let url = &input.url;
+fn validate_url(url: &str) -> Result<reqwest::Url, OperationError> {
     let parsed = reqwest::Url::parse(url).map_err(|e| failure(format!("Invalid URL: {e}")))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(failure("webfetch accepts HTTP and HTTPS URLs"));
@@ -47,12 +52,37 @@ pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutpu
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(failure("URL credentials are not supported"));
     }
+    Ok(parsed)
+}
+
+pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutput, OperationError> {
+    let mut hop = input.clone();
+    for step in 0..=MAX_REDIRECTS {
+        match fetch_hop(&hop, cancel.clone()).await? {
+            Hop::Done(output) => return Ok(output),
+            Hop::Redirect(next) => {
+                if step == MAX_REDIRECTS {
+                    return Err(failure(format!(
+                        "Too many redirects (more than {MAX_REDIRECTS})"
+                    )));
+                }
+                hop.url = next;
+            }
+        }
+    }
+    Err(failure(format!(
+        "Too many redirects (more than {MAX_REDIRECTS})"
+    )))
+}
+
+pub async fn fetch_hop(input: &Input, cancel: CancellationToken) -> Result<Hop, OperationError> {
+    let parsed = validate_url(&input.url)?;
     let format = input.format;
     let timeout = request_timeout(input.timeout)?;
     let client = client();
     let operation = async {
         let response = client
-            .get(parsed)
+            .get(parsed.clone())
             .timeout(timeout)
             .header(
                 reqwest::header::ACCEPT,
@@ -62,6 +92,20 @@ pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutpu
             .await
             .map_err(|e| failure(format!("Fetch failed: {}", e.without_url())))?;
         let status = response.status();
+        if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+            if let Some(location) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+            {
+                let mut target = parsed
+                    .join(location)
+                    .map_err(|e| failure(format!("Invalid redirect URL: {e}")))?;
+                validate_url(target.as_str())?;
+                target.set_fragment(None);
+                return Ok(Hop::Redirect(target.into()));
+            }
+        }
         if !status.is_success() {
             return Err(failure(format!(
                 "HTTP {} {}",
@@ -101,11 +145,11 @@ pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutpu
         } else {
             String::from_utf8(bytes).map_err(|_| failure("Response is not UTF-8 text"))?
         };
-        Ok(ToolOutput {
+        Ok(Hop::Done(ToolOutput {
             title: final_url.clone(),
             output: body,
             metadata: json!({"url":final_url,"contentType":content_type,"format":format,"status":status.as_u16()}),
-        })
+        }))
     };
     tokio::select! {
         result = operation => result,
@@ -127,6 +171,7 @@ fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("process HTTP client")
     })

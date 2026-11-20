@@ -194,18 +194,21 @@ async fn large_shell_and_web_results_save_full_output_and_replay_only_the_previe
             .error_for_status()
             .unwrap();
         let request = provider.request().await;
-        let sent = request.to_string();
-        assert!(request["messages"]
+        let messages = request["messages"].to_string();
+        let replayed = request["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|message| {
-                message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains(path.to_str().unwrap()))
-            }));
-        assert!(!sent.contains("MIDDLE_SENTINEL"));
-        assert!(sent.len() < 65 * 1024);
+            .find(|message| {
+                message["role"] == "tool"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains(path.to_str().unwrap()))
+            })
+            .expect("replayed tool preview");
+        assert!(replayed["content"].as_str().unwrap().len() < 52 * 1024);
+        assert!(!messages.contains("MIDDLE_SENTINEL"));
+        assert!(messages.len() < 65 * 1024);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
@@ -427,4 +430,139 @@ async fn malformed_optional_shell_fields_fail_without_effects_and_remain_visible
             && message["content"]
                 .as_str()
                 .is_some_and(|text| text.contains("boolean"))));
+}
+
+#[tokio::test]
+async fn webfetch_rechecks_permissions_on_redirects() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let secret_hit = Arc::new(AtomicBool::new(false));
+    let gated_hit = Arc::new(AtomicBool::new(false));
+    let hit = secret_hit.clone();
+    let gated = gated_hit.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route(
+            "/to-denied",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/secret") }),
+        )
+        .route(
+            "/to-ask",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/gated") }),
+        )
+        .route(
+            "/to-allowed",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/public#frag") }),
+        )
+        .route(
+            "/secret",
+            axum::routing::get(move || {
+                let hit = hit.clone();
+                async move {
+                    hit.store(true, Ordering::SeqCst);
+                    "TOP_SECRET"
+                }
+            }),
+        )
+        .route(
+            "/gated",
+            axum::routing::get(move || {
+                let gated = gated.clone();
+                async move {
+                    gated.store(true, Ordering::SeqCst);
+                    "GATED_SECRET"
+                }
+            }),
+        )
+        .route("/public", axum::routing::get(|| async { "PUBLIC_OK" }));
+    let web = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "webfetch",
+            json!({"url":format!("{base}/to-denied"),"format":"text"}),
+            "denied_redirect",
+        ),
+        tool_script(
+            "webfetch",
+            json!({"url":format!("{base}/to-ask"),"format":"text"}),
+            "ask_redirect",
+        ),
+        tool_script(
+            "webfetch",
+            json!({"url":format!("{base}/to-allowed"),"format":"text"}),
+            "allowed_redirect",
+        ),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server
+        .session(json!([
+            {"permission":"*","pattern":"*","action":"allow"},
+            {"permission":"webfetch","pattern":"*/secret*","action":"deny"},
+            {"permission":"webfetch","pattern":"*/gated*","action":"ask"}
+        ]))
+        .await;
+    let mut events = server.events().await;
+    server
+        .post(
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_redirect", "Fetch all"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let asked = events.through("permission.asked").await.pop().unwrap();
+    assert_eq!(asked["properties"]["permission"], "webfetch");
+    assert_eq!(
+        asked["properties"]["patterns"],
+        json!([format!("{base}/gated")])
+    );
+    let req_id = asked["properties"]["id"].as_str().unwrap();
+    server
+        .post(
+            &format!("/permission/{req_id}/reply"),
+            &json!({"reply":"reject"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
+    let messages = server.messages(&id).await;
+    let parts: Vec<_> = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .collect();
+    let denied = parts
+        .iter()
+        .find(|p| p["callID"] == "denied_redirect")
+        .unwrap();
+    assert_eq!(denied["state"]["status"], "error", "{denied}");
+    assert!(denied["state"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("Permission 'webfetch' denied"));
+    assert!(!secret_hit.load(Ordering::SeqCst));
+    let rejected = parts
+        .iter()
+        .find(|p| p["callID"] == "ask_redirect")
+        .unwrap();
+    assert_eq!(rejected["state"]["status"], "error", "{rejected}");
+    assert!(rejected["state"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("Permission 'webfetch' denied"));
+    assert!(!gated_hit.load(Ordering::SeqCst));
+    let allowed = parts
+        .iter()
+        .find(|p| p["callID"] == "allowed_redirect")
+        .unwrap();
+    assert_eq!(allowed["state"]["status"], "completed", "{allowed}");
+    assert_eq!(allowed["state"]["output"], "PUBLIC_OK");
+    let _ = provider.request().await;
+    web.abort();
 }

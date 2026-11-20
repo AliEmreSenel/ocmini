@@ -135,11 +135,11 @@ async fn prepare_tool_catalog(
 ) -> Result<(Vec<Value>, Option<DeferredMcpCatalog>), OperationError> {
     let mut defs = tools::tool_defs();
     v2_tool_defs(&mut defs, app.v2.enabled(sid));
-    if catalog.is_none() {
-        defs.retain(|d| d["function"]["name"] != "discover_mcp_tools");
-    }
     let agent = request.agent.as_deref().unwrap_or("build");
     let read_only = ["plan", "explore"].contains(&agent);
+    if catalog.is_none() || read_only || request.deny_unattended_tools {
+        defs.retain(|d| d["function"]["name"] != "discover_mcp_tools");
+    }
     defs.extend(match &mut catalog {
         Some(snapshot) => std::mem::take(&mut snapshot.definitions),
         None => app.mcp().tool_defs(),
@@ -323,6 +323,9 @@ pub async fn inspect_context(
     let mut defs = tools::tool_defs();
     v2_tool_defs(&mut defs, v2);
     let mcp_defs = if deferred_mcp_enabled(&cfg) {
+        if ["plan", "explore"].contains(&agent) || selected.deny_unattended_tools {
+            defs.retain(|def| def["function"]["name"] != "discover_mcp_tools");
+        }
         Vec::new()
     } else {
         defs.retain(|def| def["function"]["name"] != "discover_mcp_tools");
