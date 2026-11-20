@@ -436,13 +436,19 @@ async fn malformed_optional_shell_fields_fail_without_effects_and_remain_visible
 async fn webfetch_rechecks_permissions_on_redirects() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let secret_hit = Arc::new(AtomicBool::new(false));
+    let gated_hit = Arc::new(AtomicBool::new(false));
     let hit = secret_hit.clone();
+    let gated = gated_hit.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = Router::new()
         .route(
             "/to-denied",
             axum::routing::get(|| async { axum::response::Redirect::temporary("/secret") }),
+        )
+        .route(
+            "/to-ask",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/gated") }),
         )
         .route(
             "/to-allowed",
@@ -458,6 +464,16 @@ async fn webfetch_rechecks_permissions_on_redirects() {
                 }
             }),
         )
+        .route(
+            "/gated",
+            axum::routing::get(move || {
+                let gated = gated.clone();
+                async move {
+                    gated.store(true, Ordering::SeqCst);
+                    "GATED_SECRET"
+                }
+            }),
+        )
         .route("/public", axum::routing::get(|| async { "PUBLIC_OK" }));
     let web = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let mut provider = Provider::start(vec![
@@ -465,6 +481,11 @@ async fn webfetch_rechecks_permissions_on_redirects() {
             "webfetch",
             json!({"url":format!("{base}/to-denied"),"format":"text"}),
             "denied_redirect",
+        ),
+        tool_script(
+            "webfetch",
+            json!({"url":format!("{base}/to-ask"),"format":"text"}),
+            "ask_redirect",
         ),
         tool_script(
             "webfetch",
@@ -478,19 +499,39 @@ async fn webfetch_rechecks_permissions_on_redirects() {
     let id = server
         .session(json!([
             {"permission":"*","pattern":"*","action":"allow"},
-            {"permission":"webfetch","pattern":"*/secret*","action":"deny"}
+            {"permission":"webfetch","pattern":"*/secret*","action":"deny"},
+            {"permission":"webfetch","pattern":"*/gated*","action":"ask"}
         ]))
         .await;
+    let mut events = server.events().await;
     server
         .post(
-            &format!("/session/{id}/message"),
-            &prompt("msg_redirect", "Fetch both"),
+            &format!("/session/{id}/prompt_async"),
+            &prompt("msg_redirect", "Fetch all"),
         )
         .send()
         .await
         .unwrap()
         .error_for_status()
         .unwrap();
+    let asked = events.through("permission.asked").await.pop().unwrap();
+    assert_eq!(asked["properties"]["permission"], "webfetch");
+    assert_eq!(
+        asked["properties"]["patterns"],
+        json!([format!("{base}/gated")])
+    );
+    let req_id = asked["properties"]["id"].as_str().unwrap();
+    server
+        .post(
+            &format!("/permission/{req_id}/reply"),
+            &json!({"reply":"reject"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.idle").await;
     let messages = server.messages(&id).await;
     let parts: Vec<_> = messages
         .iter()
@@ -506,6 +547,16 @@ async fn webfetch_rechecks_permissions_on_redirects() {
         .unwrap()
         .contains("Permission 'webfetch' denied"));
     assert!(!secret_hit.load(Ordering::SeqCst));
+    let rejected = parts
+        .iter()
+        .find(|p| p["callID"] == "ask_redirect")
+        .unwrap();
+    assert_eq!(rejected["state"]["status"], "error", "{rejected}");
+    assert!(rejected["state"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("Permission 'webfetch' denied"));
+    assert!(!gated_hit.load(Ordering::SeqCst));
     let allowed = parts
         .iter()
         .find(|p| p["callID"] == "allowed_redirect")

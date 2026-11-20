@@ -237,7 +237,11 @@ impl Effects {
             "webfetch_hop" => {
                 let input: crate::web::Input = crate::decode(&args)?;
                 match crate::web::fetch_hop(&input, cancel).await? {
-                    crate::web::Hop::Done(output) => json!({"done": output}),
+                    crate::web::Hop::Done(output) => {
+                        let output =
+                            crate::output::limit(output, crate::output::directory()).await?;
+                        json!({"done": output})
+                    }
                     crate::web::Hop::Redirect(url) => json!({"redirect": url}),
                 }
             }
