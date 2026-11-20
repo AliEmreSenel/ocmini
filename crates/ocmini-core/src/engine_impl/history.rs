@@ -149,7 +149,9 @@ pub(super) fn project_messages(
                     continue;
                 }
                 match part["type"].as_str() {
-                    Some("text")=>content.push(json!({"type":"text","text":part["text"]})),
+                    Some("text" | "ocmini_skill") => {
+                        content.push(json!({"type":"text","text":part["text"]}))
+                    }
                     Some("file")=>content.push(if part[image_recovery::REJECTED] == true {
                         image_recovery::placeholder()
                     } else {

@@ -21,6 +21,7 @@ pub struct AppState {
     pub engine: Arc<dyn EngineApi>,
     pub shutdown: tokio_util::sync::CancellationToken,
     pub max_request_bytes: usize,
+    pub listen_url: Option<String>,
 }
 
 impl IntoResponse for OperationError {
@@ -900,6 +901,21 @@ async fn access_log(request: Request, next: Next) -> Response {
     response
 }
 
+async fn panic_to_json(request: Request, next: Next) -> Response {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(next.run(request))
+        .catch_unwind()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"_tag":"UnknownError","message":"Internal server error"})),
+        )
+            .into_response(),
+    }
+}
+
 async fn not_found() -> OperationError {
     OperationError::not_found("Route not found")
 }
@@ -951,6 +967,7 @@ pub fn router_with(state: AppState, extra: Router<AppState>) -> Router {
         .route("/skill", get(skills))
         .route("/command", get(commands))
         .fallback(not_found)
+        .layer(middleware::from_fn(panic_to_json))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn(request_site_gate))
         .layer(middleware::from_fn(auth_gate))
@@ -986,23 +1003,22 @@ pub async fn serve_with(
     let listener = tokio::net::TcpListener::bind((hostname.as_str(), port))
         .await
         .map_err(|error| format!("Cannot listen on {hostname}:{port}: {error}"))?;
-    let state = AppState {
-        app,
-        engine: Arc::new(crate::engine_impl::Engine::new()),
-        shutdown: tokio_util::sync::CancellationToken::new(),
-        max_request_bytes,
-    };
-    state.engine.recover(state.app.clone());
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     let announced_host = if address.is_ipv6() {
         format!("[{}]", address.ip())
     } else {
         address.ip().to_string()
     };
-    println!(
-        "opencode server listening on http://{announced_host}:{}",
-        address.port()
-    );
+    let listen_url = format!("http://{announced_host}:{}", address.port());
+    let state = AppState {
+        app,
+        engine: Arc::new(crate::engine_impl::Engine::new()),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        max_request_bytes,
+        listen_url: Some(listen_url.clone()),
+    };
+    state.engine.recover(state.app.clone());
+    println!("opencode server listening on {listen_url}");
     use std::io::Write;
     std::io::stdout()
         .flush()
@@ -1184,5 +1200,23 @@ mod request_site_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn handler_panics_return_typed_unknown_error_json() {
+        async fn boom() -> &'static str {
+            panic!("boom")
+        }
+        let app = Router::new()
+            .route("/api/panic", get(boom))
+            .layer(middleware::from_fn(panic_to_json));
+        let response = app
+            .oneshot(Request::get("/api/panic").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["_tag"], "UnknownError");
     }
 }

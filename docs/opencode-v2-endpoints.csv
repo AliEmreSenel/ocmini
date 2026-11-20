@@ -5,7 +5,7 @@ GET,/auth/connect/{code},server.connect,deferred,,missing,9bbb8ce18c80f099e0e448
 GET,/api/location,location.get,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/location/reload,location.reload,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/agent,agent.list,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/agent/{agentID},agent.get,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/agent/{agentID},agent.get,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/plugin,plugin.list,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/plugin/gui,plugin.gui,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/plugin/check,plugin.check,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
@@ -29,15 +29,15 @@ POST,/api/experimental/session/{sessionID}/skill,experimental.session.skill,defe
 POST,/api/session/{sessionID}/synthetic,session.synthetic,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/session/{sessionID}/shell,session.shell,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/session/{sessionID}/compact,session.compact,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
-POST,/api/experimental/session/{sessionID}/wait,experimental.session.wait,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+POST,/api/experimental/session/{sessionID}/wait,experimental.session.wait,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/session/{sessionID}/revert/stage,session.revert.stage,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 DELETE,/api/session/{sessionID}/revert,session.revert.clear,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/session/{sessionID}/revert/commit,session.revert.commit,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/session/{sessionID}/context,session.context,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/session/{sessionID}/context,session.context,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/session/{sessionID}/diff,session.diff,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/session/{sessionID}/inbox,session.inbox.list,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 DELETE,/api/session/{sessionID}/inbox/{inboxID},session.inbox.cancel,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
-PATCH,/api/session/{sessionID}/inbox/{inboxID},session.inbox.update,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+PATCH,/api/session/{sessionID}/inbox/{inboxID},session.inbox.update,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/experimental/session/{sessionID}/instructions/entries,experimental.session.instructions.entry.list,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 PUT,/api/experimental/session/{sessionID}/instructions/entries/{key},experimental.session.instructions.entry.put,P0-T3,v2/adapter.ts (client.session.instructions.entry.put alias),implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 DELETE,/api/experimental/session/{sessionID}/instructions/entries/{key},experimental.session.instructions.entry.remove,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
@@ -45,7 +45,7 @@ POST,/api/session/{sessionID}/generate,session.generate,deferred,,missing,9bbb8c
 GET,/api/experimental/session/{sessionID}/log,experimental.session.log,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/session/{sessionID}/interrupt,session.interrupt,P0-T3,v2/adapter.ts;v2/textGeneration.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/session/{sessionID}/background,session.background,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/session/{sessionID}/message/{messageID},session.message.get,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/session/{sessionID}/message/{messageID},session.message.get,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/session/{sessionID}/form,session.form.list,P0-T3,v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/session/{sessionID}/form,session.form.create,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/session/{sessionID}/form/{formID},session.form.get,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
@@ -55,7 +55,7 @@ PUT,/api/session/{sessionID}/environment,session.environment,P1-headless,,missin
 POST,/api/session/{sessionID}/view,session.view,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/session/{sessionID}/message,session.message.list,P0-T3,v2/adapter.ts (client.message.list alias),implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/model,model.list,P0-T3,openCode2Catalog.ts;v2/adapter.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/model/default,model.default,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/model/default,model.default,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/experimental/generate/text,experimental.generate.text,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/experimental/generate,experimental.generate.textLegacy,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/experimental/generate/image,experimental.generate.image,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
@@ -63,7 +63,7 @@ POST,/api/experimental/generate/decisions,experimental.generate.decisions,deferr
 GET,/api/experimental/voice/models,experimental.voice.models,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/experimental/voice/session,experimental.voice.session,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/provider,provider.list,P0-T3,openCode2Catalog.ts,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/provider/{providerID},provider.get,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/provider/{providerID},provider.get,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/integration,integration.list,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/integration/{integrationID},integration.get,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/experimental/integration/wellknown,experimental.integration.wellknown.add,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
@@ -76,11 +76,11 @@ POST,/api/integration/{integrationID}/connect/oauth/{attemptID}/complete,integra
 POST,/api/integration/{integrationID}/connect/command,integration.command.connect,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/integration/{integrationID}/connect/command/{attemptID},integration.command.status,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 DELETE,/api/integration/{integrationID}/connect/command/{attemptID},integration.command.cancel,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/mcp,mcp.list,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/mcp,mcp.list,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 PUT,/api/experimental/mcp/{server},experimental.mcp.add,P0-T3,v2/adapter.ts (client.mcp.add alias),implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 DELETE,/api/experimental/mcp/{server},experimental.mcp.remove,P0-T3,v2/adapter.ts (client.mcp.remove alias),implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
-POST,/api/experimental/mcp/{server}/connect,experimental.mcp.connect,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
-POST,/api/experimental/mcp/{server}/disconnect,experimental.mcp.disconnect,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+POST,/api/experimental/mcp/{server}/connect,experimental.mcp.connect,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
+POST,/api/experimental/mcp/{server}/disconnect,experimental.mcp.disconnect,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/mcp/resource,mcp.resource.catalog,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/experimental/client-mcp/token,experimental.mcp.client.token,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/experimental/client-mcp,experimental.mcp.client,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
@@ -92,7 +92,7 @@ POST,/api/credential/{credentialID}/activate,credential.activate,deferred,,missi
 GET,/api/project,project.list,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 PATCH,/api/project/{projectID},project.update,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/form,form.list,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/permission/request,permission.request.list,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/permission/request,permission.request.list,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/permission/saved,permission.saved.list,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 PATCH,/api/permission/saved/{id},permission.saved.update,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 DELETE,/api/permission/saved/{id},permission.saved.remove,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
@@ -165,6 +165,6 @@ GET,/api/experimental/migration/v1,experimental.migration.v1.status,deferred,,mi
 GET,/api/websearch/provider,websearch.providers,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 POST,/api/websearch,websearch.query,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/experimental/usage/limits,experimental.usage.limits,deferred,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
-GET,/api/config,config.get,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
+GET,/api/config,config.get,P1-headless,,implemented,9bbb8ce18c80f099e0e448775f59d965ead40a21
 GET,/api/config/shell,config.shells,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
 PATCH,/api/experimental/config,experimental.config.update,P1-headless,,missing,9bbb8ce18c80f099e0e448775f59d965ead40a21
