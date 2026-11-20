@@ -370,6 +370,12 @@ storage {
     ) -> Result<(i64, i64), OperationError>;
     fn v2_inbox(&self, sid: &str) -> Result<Vec<Value>, OperationError>;
     fn v2_cancel_input(&self, sid: &str, id: &str) -> Result<(), OperationError>;
+    fn v2_update_inbox_delivery(
+        &self,
+        sid: &str,
+        id: &str,
+        delivery: &str,
+    ) -> Result<bool, OperationError>;
     fn has_steering(&self, sid: &str) -> Result<bool, OperationError>;
 
     fn v2_revert(&self, sid: &str, boundary: Option<&str>) -> Result<(), OperationError>;

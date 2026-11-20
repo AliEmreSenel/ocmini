@@ -65,6 +65,26 @@ impl SqliteBackend {
             Ok(())
         })
     }
+    pub fn v2_update_inbox_delivery(
+        &self,
+        sid: &str,
+        id: &str,
+        delivery: &str,
+    ) -> Result<bool, OperationError> {
+        self.transaction(|tx| {
+            let changed = tx.execute(
+                "UPDATE inbox SET request=json_set(request,'$.v2.delivery',?3) WHERE session_id=?1 AND message_id=?2 AND started=0",
+                params![sid, id, delivery],
+            )?;
+            if changed > 0 {
+                tx.execute(
+                    "UPDATE message SET json=json_set(json,'$.ocminiV2Input.delivery',?2) WHERE session_id=?1 AND id=?3",
+                    params![sid, delivery, id],
+                )?;
+            }
+            Ok(changed > 0)
+        })
+    }
     pub fn has_steering(&self, sid: &str) -> Result<bool, OperationError> {
         self.with_read(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE session_id=?1 AND started=0 AND coalesce(json_extract(request,'$.v2.delivery'),'steer')='steer')",[sid],|r|r.get(0)).map_err(Into::into))
     }
@@ -131,9 +151,9 @@ impl SqliteBackend {
         self.with_read(|c| {
             let direction=if descending {"DESC"} else {"ASC"};
             let compare=if descending {"<"} else {">"};
-            let sql=format!("SELECT m.rowid,m.id FROM message m LEFT JOIN inbox i ON i.message_id=m.id AND i.started=0 WHERE m.session_id=?1 AND i.message_id IS NULL AND coalesce(json_extract(m.json,'$.ocminiV2Cancelled'),0)=0 AND (?2 IS NULL OR m.rowid {compare} ?2) ORDER BY m.rowid {direction} LIMIT ?3");
+            let sql=format!("SELECT m.rowid,m.id FROM message m LEFT JOIN inbox i ON i.message_id=m.id AND i.started=0 WHERE m.session_id=?1 AND i.message_id IS NULL AND coalesce(json_extract(m.json,'$.ocminiV2Cancelled'),0)=0 AND coalesce(json_extract(m.json,'$.command'),'')!='__ocmini_compact' AND (?2 IS NULL OR m.rowid {compare} ?2) ORDER BY m.rowid {direction} LIMIT ?3");
             let mut q=c.prepare(&sql)?;
-            let ids=q.query_map(params![sid,after,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+            let ids=q.query_map(params![sid,after,limit.saturating_add(1).min(i64::MAX as usize) as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
             ids.into_iter().map(|(seq,id)|read_message(c,sid,&id)?.map(|m|(seq,m)).ok_or_else(||OperationError::not_found("Message disappeared"))).collect()
         })
     }

@@ -79,11 +79,17 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/info", get(info))
         .route("/api/event", get(events))
+        .route("/api/config", get(config_entries))
         .route("/api/model", get(models))
+        .route("/api/model/default", get(default_model))
         .route("/api/provider", get(providers))
+        .route("/api/provider/{id}", get(provider_get))
         .route("/api/agent", get(agents))
+        .route("/api/agent/{id}", get(agent_get))
         .route("/api/skill", get(skills))
         .route("/api/command", get(commands))
+        .route("/api/mcp", get(mcp_list))
+        .route("/api/permission/request", get(permission_requests))
         .route("/api/session", get(list).post(create))
         .route("/api/session/active", get(active))
         .route(
@@ -98,13 +104,18 @@ pub fn router() -> Router<AppState> {
         .route("/api/session/{sid}/command", post(command))
         .route("/api/session/{sid}/compact", post(compact))
         .route("/api/session/{sid}/interrupt", post(interrupt))
+        .route("/api/session/{sid}/context", get(session_context))
         .route("/api/session/{sid}/message", get(messages))
+        .route("/api/session/{sid}/message/{mid}", get(message_get))
         .route("/api/session/{sid}/fork", post(fork))
         .route("/api/session/{sid}/revert/stage", post(revert_stage))
         .route("/api/session/{sid}/revert/commit", post(revert_commit))
         .route("/api/session/{sid}/revert", delete(revert_clear))
         .route("/api/session/{sid}/inbox", get(inbox))
-        .route("/api/session/{sid}/inbox/{id}", delete(cancel_input))
+        .route(
+            "/api/session/{sid}/inbox/{id}",
+            axum::routing::patch(update_input).delete(cancel_input),
+        )
         .route("/api/session/{sid}/permission", get(permissions))
         .route(
             "/api/session/{sid}/permission/{id}/reply",
@@ -113,6 +124,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/session/{sid}/form", get(forms))
         .route("/api/session/{sid}/form/{id}", delete(form_cancel))
         .route("/api/session/{sid}/form/{id}/reply", post(form_reply))
+        .route("/api/experimental/session/{sid}/wait", post(wait))
         .route(
             "/api/experimental/session/{sid}/instructions/entries",
             get(instructions),
@@ -125,11 +137,22 @@ pub fn router() -> Router<AppState> {
             "/api/experimental/mcp/{name}",
             put(mcp_add).delete(mcp_remove),
         )
+        .route("/api/experimental/mcp/{name}/connect", post(mcp_connect))
+        .route(
+            "/api/experimental/mcp/{name}/disconnect",
+            post(mcp_disconnect),
+        )
 }
-async fn info() -> Json<Value> {
+async fn info(State(st): State<AppState>) -> Json<Value> {
+    let urls: Vec<&str> = st.listen_url.as_deref().into_iter().collect();
     Json(
-        json!({"version":crate::OPENCODE_COMPAT_VERSION,"pid":std::process::id(),"urls":[],"paths":{"tmp":std::env::temp_dir()},"capabilities":{"persistentPty":false}}),
+        json!({"version":crate::OPENCODE_COMPAT_VERSION,"pid":std::process::id(),"urls":urls,"paths":{"tmp":std::env::temp_dir()},"capabilities":{"persistentPty":false}}),
     )
+}
+async fn config_entries(Query(query): Query<HashMap<String, String>>) -> Result<Json<Value>> {
+    let dir = directory(&query)?;
+    let entries = Config::entries_for(&dir).map_err(OperationError::invalid)?;
+    Ok(Json(json!(entries)))
 }
 async fn events(
     State(st): State<AppState>,
@@ -169,29 +192,65 @@ async fn catalog(st: &AppState, dir: &str) -> Result<Config> {
     }
     Ok(config)
 }
+fn connected_models(st: &AppState, cfg: &Config) -> Vec<Value> {
+    let connected = st.app.auth.connected_for(cfg);
+    cfg.catalog()
+        .into_iter()
+        .filter(|m| connected.iter().any(|p| m["providerID"] == p.as_str()))
+        .map(|m| {
+            let variants: Vec<_> = m["variants"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(id, _)| json!({"id":id}))
+                .collect();
+            let mut model = json!({"id":m["modelID"],"modelID":m["modelID"],"providerID":m["providerID"],"name":m["name"],"variants":variants,"time":{"released":m["time"]["released"].as_i64().unwrap_or(0)},"cost":[],"status":"active","enabled":true,"capabilities":{"tools":m["capabilities"]["tools"].as_bool().unwrap_or(true),"input":m["modalities"]["input"].as_array().cloned().unwrap_or_else(||vec![json!("text")]),"output":["text"]},"limit":{"context":m["limit"]["context"].as_i64().unwrap_or(0),"output":m["limit"]["output"].as_i64().unwrap_or(0)}});
+            if let Some(input) = m["limit"].get("input") {
+                model["limit"]["input"] = input.clone();
+            }
+            for key in ["family", "type"] {
+                if let Some(v) = m.get(key) {
+                    model[key] = v.clone();
+                }
+            }
+            model
+        })
+        .collect()
+}
 async fn models(
     State(st): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
     let dir = directory(&query)?;
     let cfg = catalog(&st, &dir).await?;
-    let connected = st.app.auth.connected_for(&cfg);
-    let models:Vec<_>=cfg.catalog().into_iter().filter(|m|connected.iter().any(|p|m["providerID"]==p.as_str())).map(|m|{
-        let variants:Vec<_>=m["variants"].as_object().into_iter().flatten().map(|(id,_)|json!({"id":id})).collect();
-        let mut model=json!({"id":m["modelID"],"modelID":m["modelID"],"providerID":m["providerID"],"name":m["name"],"variants":variants,"time":{"released":m["time"]["released"].as_i64().unwrap_or(0)},"cost":[],"status":"active","enabled":true,"capabilities":{"tools":m["capabilities"]["tools"].as_bool().unwrap_or(true),"input":m["modalities"]["input"].as_array().cloned().unwrap_or_else(||vec![json!("text")]),"output":["text"]},"limit":{"context":m["limit"]["context"].as_i64().unwrap_or(0),"output":m["limit"]["output"].as_i64().unwrap_or(0)}});
-        if let Some(input)=m["limit"].get("input"){model["limit"]["input"]=input.clone();}
-        for key in ["family","type"]{if let Some(v)=m.get(key){model[key]=v.clone();}}
-        model
-    }).collect();
-    Ok(located(&dir, json!(models)))
+    Ok(located(&dir, json!(connected_models(&st, &cfg))))
 }
-async fn providers(
+async fn default_model(
     State(st): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
     let dir = directory(&query)?;
+    let cfg = catalog(&st, &dir).await?;
+    let list = connected_models(&st, &cfg);
+    let selected = ModelRef::parse(&cfg.model)
+        .ok()
+        .and_then(|wanted| {
+            list.iter()
+                .find(|m| {
+                    m["providerID"] == wanted.provider_id.as_str()
+                        && m["id"] == wanted.model_id.as_str()
+                })
+                .cloned()
+        })
+        .or_else(|| list.into_iter().next());
+    match selected {
+        Some(model) => Ok(located(&dir, model)),
+        None => Ok(Json(json!({"location":{"directory":dir}}))),
+    }
+}
+fn provider_list_for(st: &AppState, dir: &str) -> Result<Vec<Value>> {
     // Provider metadata does not depend on remote model enumeration.
-    let mut cfg = Config::load_for(&dir).map_err(OperationError::invalid)?;
+    let mut cfg = Config::load_for(dir).map_err(OperationError::invalid)?;
     for id in st.app.auth.connected_for(&cfg) {
         cfg.provider
             .entry(id.clone())
@@ -200,14 +259,61 @@ async fn providers(
                 ..Default::default()
             });
     }
-    let list:Vec<_>=cfg.provider.iter().filter(|(id,_)|cfg.provider_enabled(id)).map(|(id,p)|json!({"id":id,"name":p.name,"package":p.npm,"env":p.env,"models":{},"enabled":true,"activation":"auto","settings":{},"headers":{},"body":{}})).collect();
-    Ok(located(&dir, json!(list)))
+    Ok(cfg
+        .provider
+        .iter()
+        .filter(|(id, _)| cfg.provider_enabled(id))
+        .map(|(id, p)| json!({"id":id,"name":p.name,"package":p.npm,"env":p.env,"models":{},"enabled":true,"activation":"auto","settings":{},"headers":{},"body":{}}))
+        .collect())
+}
+async fn providers(
+    State(st): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    let dir = directory(&query)?;
+    Ok(located(&dir, json!(provider_list_for(&st, &dir)?)))
+}
+async fn provider_get(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    let dir = directory(&query)?;
+    let provider = provider_list_for(&st, &dir)?
+        .into_iter()
+        .find(|p| p["id"] == id.as_str())
+        .ok_or_else(|| Error {
+            status: StatusCode::NOT_FOUND,
+            value: json!({"_tag":"ProviderNotFoundError","providerID":id,"message":format!("ProviderNotFoundError: {id}")}),
+        })?;
+    Ok(located(&dir, provider))
+}
+fn agent_list_for(dir: &str) -> Result<Vec<Value>> {
+    let cfg = Config::load_for(dir).map_err(OperationError::invalid)?;
+    Ok(crate::inventory::agents_json(&cfg)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|a| json!({"id":a["name"],"name":a["name"],"mode":a["mode"],"hidden":a["hidden"].as_bool().unwrap_or(false),"description":a["description"].as_str().unwrap_or_default(),"request":{"settings":{},"headers":{},"body":{}},"permissions":wire::rules_out(&cfg.agent_permission_rules(a["name"].as_str().unwrap_or_default()))}))
+        .collect())
 }
 async fn agents(Query(query): Query<HashMap<String, String>>) -> Result<Json<Value>> {
     let dir = directory(&query)?;
-    let cfg = Config::load_for(&dir).map_err(OperationError::invalid)?;
-    let list:Vec<_>=crate::inventory::agents_json(&cfg).as_array().into_iter().flatten().map(|a|json!({"id":a["name"],"name":a["name"],"mode":a["mode"],"hidden":a["hidden"].as_bool().unwrap_or(false),"description":a["description"].as_str().unwrap_or_default(),"request":{"settings":{},"headers":{},"body":{}},"permissions":wire::rules_out(&cfg.agent_permission_rules(a["name"].as_str().unwrap_or_default()))})).collect();
-    Ok(located(&dir, json!(list)))
+    Ok(located(&dir, json!(agent_list_for(&dir)?)))
+}
+async fn agent_get(
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    let dir = directory(&query)?;
+    let agent = agent_list_for(&dir)?
+        .into_iter()
+        .find(|a| a["id"] == id.as_str())
+        .ok_or_else(|| Error {
+            status: StatusCode::NOT_FOUND,
+            value: json!({"_tag":"AgentNotFoundError","agentID":id,"message":format!("AgentNotFoundError: {id}")}),
+        })?;
+    Ok(located(&dir, agent))
 }
 async fn skills(Query(query): Query<HashMap<String, String>>) -> Result<Json<Value>> {
     let dir = directory(&query)?;
@@ -311,7 +417,21 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
     } else {
         crate::sessions::directory(body["location"]["directory"].as_str().unwrap_or("."))?
     };
-    let mut s = Session::new(body["title"].as_str().unwrap_or("New session"), &dir);
+    let title = optional(&body, "title")
+        .map(|v| v.as_str().ok_or_else(|| invalid("title must be a string")))
+        .transpose()?;
+    let agent = optional(&body, "agent")
+        .map(|v| v.as_str().ok_or_else(|| invalid("agent must be a string")))
+        .transpose()?;
+    if let Some(agent) = agent {
+        let cfg = Config::load_for(&dir).map_err(OperationError::invalid)?;
+        if !["build", "plan", "general", "explore"].contains(&agent)
+            && !cfg.agent.contains_key(agent)
+        {
+            return Err(invalid("Unknown agent"));
+        }
+    }
+    let mut s = Session::new(title.unwrap_or("New session"), &dir);
     s.parent_id = parent.map(str::to_owned);
     if let Some(id) = optional(&body, "id") {
         let id = id
@@ -324,7 +444,7 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
         }
         s.id = id.into();
     }
-    if optional(&body, "title").is_some() {
+    if title.is_some() {
         s.title_source = Some(TitleSource::Explicit);
     }
     // ocmini extension: choose the root session's sandbox preset at creation.
@@ -345,7 +465,7 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
     }
     let s = crate::sessions::create(&st.app, s, optional(&body, "metadata")).await?;
     st.app.v2.enable(&s.id)?;
-    let mut state = json!({"agent":body["agent"].as_str().unwrap_or("build")});
+    let mut state = json!({"agent": agent.unwrap_or("build")});
     if let Some(model) = optional(&body, "model") {
         state["model"] = model.clone();
     }
@@ -566,7 +686,7 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
             )
             .await
             .map_err(|e| OperationError::from(e.to_string()))?;
-            parts.push(json!({"type":"text","text":content,"synthetic":true}));
+            parts.push(json!({"type":"ocmini_skill","skill":id,"text":content,"synthetic":true}));
         }
     }
     let id = optional(body, "id")
@@ -616,14 +736,22 @@ async fn command(
     Json(body): Json<Value>,
 ) -> Result<StatusCode> {
     let s = required(&st, &sid)?;
+    let state = st.app.store.v2_state(&sid)?;
+    if let Some(boundary) = state["revert"]["messageID"].as_str() {
+        st.app.store.v2_revert(&sid, Some(boundary))?;
+    }
     let cfg = Config::load_for(&s.directory).map_err(OperationError::invalid)?;
     let name = wire::string(&body, "name")?;
+    let text = optional(&body, "text")
+        .map(|v| v.as_str().ok_or_else(|| invalid("text must be a string")))
+        .transpose()?
+        .unwrap_or("");
     let request = crate::commands::prepare(
         &cfg,
         name,
-        wire::string(&body, "text")?,
+        text,
         PromptRequest {
-            v2: Some(input(&body, "user", json!({"text":body["text"]}))?),
+            v2: Some(input(&body, "user", json!({"text": text}))?),
             ..Default::default()
         },
         None,
@@ -697,13 +825,63 @@ async fn relocate(
     .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn interrupt(State(st): State<AppState>, Path(sid): Path<String>) -> Result<Json<Value>> {
+async fn interrupt(
+    State(st): State<AppState>,
+    Path(sid): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    let session = required(&st, &sid)?;
+    let resume = query
+        .get("resume")
+        .map(|v| match v.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(invalid("resume must be true or false")),
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let interrupted = st.engine.interrupt(&sid);
+    if resume {
+        if interrupted {
+            st.engine.wait_idle(&sid).await;
+        }
+        if st.app.store.has_steering(&sid)? {
+            st.engine
+                .resume(st.app.for_directory(&session.directory)?, sid)?;
+        }
+    }
+    Ok(Json(json!({"interrupted":interrupted})))
+}
+async fn wait(State(st): State<AppState>, Path(sid): Path<String>) -> Result<StatusCode> {
     required(&st, &sid)?;
-    Ok(Json(json!({"interrupted":st.engine.interrupt(&sid)})))
+    st.engine.wait_idle(&sid).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn inbox(State(st): State<AppState>, Path(sid): Path<String>) -> Result<Json<Value>> {
     required(&st, &sid)?;
     Ok(data(json!(st.app.store.v2_inbox(&sid)?)))
+}
+async fn update_input(
+    State(st): State<AppState>,
+    Path((sid, id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode> {
+    let session = required(&st, &sid)?;
+    let delivery = wire::string(&body, "delivery")?;
+    if !matches!(delivery, "steer" | "queue") {
+        return Err(invalid("delivery must be steer or queue"));
+    }
+    if !st.app.store.v2_update_inbox_delivery(&sid, &id, delivery)? {
+        return Err(Error {
+            status: StatusCode::CONFLICT,
+            value: json!({"_tag":"ConflictError","message":"Pending inbox item is no longer available"}),
+        });
+    }
+    if delivery == "steer" {
+        st.engine
+            .resume(st.app.for_directory(&session.directory)?, sid)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn cancel_input(
     State(st): State<AppState>,
@@ -725,6 +903,19 @@ struct Cursor {
     after: i64,
     descending: bool,
 }
+const MESSAGE_TYPES: &[&str] = &[
+    "agent-switched",
+    "model-switched",
+    "location-switched",
+    "user",
+    "synthetic",
+    "system",
+    "skill",
+    "shell",
+    "assistant",
+    "compaction",
+    "idle",
+];
 async fn messages(
     State(st): State<AppState>,
     Path(sid): Path<String>,
@@ -733,15 +924,38 @@ async fn messages(
     use base64::Engine;
     required(&st, &sid)?;
     let mut descending = query.get("order").is_some_and(|v| v == "desc");
+    if let Some(order) = query.get("order") {
+        if !matches!(order.as_str(), "asc" | "desc") {
+            return Err(invalid("order must be asc or desc"));
+        }
+    }
+    let filter_type = query
+        .get("type")
+        .map(|kind| {
+            if MESSAGE_TYPES.contains(&kind.as_str()) {
+                Ok(kind.as_str())
+            } else {
+                Err(invalid("Invalid message type filter"))
+            }
+        })
+        .transpose()?;
     let mut after = None;
     if let Some(cursor) = query.get("cursor") {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(cursor)
-            .map_err(|_| invalid("Invalid message cursor"))?;
-        let cursor: Cursor =
-            serde_json::from_slice(&bytes).map_err(|_| invalid("Invalid message cursor"))?;
+            .map_err(|_| Error {
+                status: StatusCode::BAD_REQUEST,
+                value: json!({"_tag":"InvalidCursorError","message":"Invalid message cursor"}),
+            })?;
+        let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| Error {
+            status: StatusCode::BAD_REQUEST,
+            value: json!({"_tag":"InvalidCursorError","message":"Invalid message cursor"}),
+        })?;
         if cursor.session != sid {
-            return Err(invalid("Cursor belongs to another session"));
+            return Err(Error {
+                status: StatusCode::BAD_REQUEST,
+                value: json!({"_tag":"InvalidCursorError","message":"Cursor belongs to another session"}),
+            });
         }
         after = Some(cursor.after);
         descending = cursor.descending;
@@ -756,15 +970,37 @@ async fn messages(
         })
         .transpose()?
         .unwrap_or(50);
-    let rows = st.app.store.v2_page(&sid, after, descending, limit)?;
-    let last = rows.last().map(|r| r.0);
-    let len = rows.len();
-    let values: Vec<_> = rows
-        .into_iter()
-        .filter_map(|(_, m)| wire::message(&m))
-        .collect();
-    let next = if len == limit {
-        last.map(|after| {
+    let mut values = Vec::new();
+    let mut last_seq = None;
+    let mut more = false;
+    let mut scan_after = after;
+    loop {
+        let rows = st.app.store.v2_page(&sid, scan_after, descending, limit)?;
+        let fetched_more = rows.len() > limit;
+        let page_len = rows.len();
+        for (seq, m) in rows {
+            scan_after = Some(seq);
+            let Some(projected) = wire::message(&m) else {
+                continue;
+            };
+            if let Some(kind) = filter_type {
+                if projected["type"].as_str() != Some(kind) {
+                    continue;
+                }
+            }
+            if values.len() == limit {
+                more = true;
+                break;
+            }
+            last_seq = Some(seq);
+            values.push(projected);
+        }
+        if more || !fetched_more || page_len == 0 {
+            break;
+        }
+    }
+    let next = if more {
+        last_seq.map(|after| {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
                 serde_json::to_vec(&Cursor {
                     session: sid,
@@ -783,6 +1019,44 @@ async fn messages(
     }
     Ok(Json(json!({"data":values,"cursor":cursor})))
 }
+async fn message_get(
+    State(st): State<AppState>,
+    Path((sid, mid)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    required(&st, &sid)?;
+    let projected = st
+        .app
+        .store
+        .message(&sid, &mid)?
+        .and_then(|m| wire::message(&m))
+        .ok_or_else(|| missing("MessageNotFoundError", &sid, "messageID", &mid))?;
+    Ok(data(projected))
+}
+async fn session_context(
+    State(st): State<AppState>,
+    Path(sid): Path<String>,
+) -> Result<Json<Value>> {
+    required(&st, &sid)?;
+    let all = st.app.store.messages(&sid)?;
+    let pending: std::collections::HashSet<String> = st
+        .app
+        .store
+        .v2_inbox(&sid)?
+        .into_iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect();
+    let start = all
+        .iter()
+        .rposition(|m| m.info.summary == Some(true) && m.info.time.completed.is_some())
+        .unwrap_or(0);
+    let projected: Vec<_> = all
+        .into_iter()
+        .skip(start)
+        .filter(|m| !pending.contains(&m.info.id))
+        .filter_map(|m| wire::message(&m))
+        .collect();
+    Ok(data(json!(projected)))
+}
 async fn fork(
     State(st): State<AppState>,
     Path(sid): Path<String>,
@@ -790,7 +1064,10 @@ async fn fork(
 ) -> Result<Json<Value>> {
     let s = required(&st, &sid)?;
     let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
-    let mut fork = crate::sessions::fork(&st.app, &s, body["before"].as_str()).await?;
+    let before = optional(&body, "before")
+        .map(|v| v.as_str().ok_or_else(|| invalid("before must be a string")))
+        .transpose()?;
+    let mut fork = crate::sessions::fork(&st.app, &s, before).await?;
     fork.cost = 0.0;
     fork.tokens = Tokens::default();
     st.app.store.update_session(&fork)?;
@@ -800,7 +1077,7 @@ async fn fork(
     state.as_object_mut().unwrap().remove("outcome");
     state.as_object_mut().unwrap().remove("busy");
     state.as_object_mut().unwrap().remove("idle");
-    state["fork"] = json!({"sessionID":sid,"boundary":{"type":if body["before"].is_string(){"before"}else{"through"},"messageID":body["before"].as_str().map(str::to_owned).or(st.app.store.messages_limited(&sid,Some(1))?.last().map(|m|m.info.id.clone())).unwrap_or_default()}});
+    state["fork"] = json!({"sessionID":sid,"boundary":{"type":if before.is_some(){"before"}else{"through"},"messageID":before.map(str::to_owned).or(st.app.store.messages_limited(&sid,Some(1))?.last().map(|m|m.info.id.clone())).unwrap_or_default()}});
     st.app.store.v2_update(&fork.id, &state)?;
     st.app.v2.emit(
         &fork.id,
@@ -872,6 +1149,26 @@ async fn revert_clear(State(st): State<AppState>, Path(sid): Path<String>) -> Re
     st.engine
         .resume(st.app.for_directory(&session.directory)?, sid)?;
     Ok(StatusCode::NO_CONTENT)
+}
+async fn permission_requests(
+    State(st): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    let dir = directory(&query)?;
+    let list: Vec<_> = st
+        .app
+        .perms
+        .list()
+        .into_iter()
+        .filter(|p| {
+            st.app
+                .store
+                .directory_of(&p.session_id)
+                .is_some_and(|session_dir| session_dir == dir)
+        })
+        .map(|p| wire::permission(&p))
+        .collect();
+    Ok(located(&dir, json!(list)))
 }
 async fn permissions(State(st): State<AppState>, Path(sid): Path<String>) -> Result<Json<Value>> {
     required(&st, &sid)?;
@@ -966,6 +1263,7 @@ async fn form_reply(
 async fn form_cancel(
     State(st): State<AppState>,
     Path((sid, id)): Path<(String, String)>,
+    Query(_query): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
     let q = question(&st, &sid, &id)?;
     st.app.questions.reject(&q.id);
@@ -1008,10 +1306,50 @@ async fn instruction_remove(
     st.app.store.v2_instruction(&sid, &key, None)?;
     Ok(StatusCode::NO_CONTENT)
 }
+fn mcp_not_found(name: &str, error: OperationError) -> Error {
+    if error.kind == FailureKind::NotFound {
+        Error {
+            status: StatusCode::NOT_FOUND,
+            value: json!({"_tag":"McpServerNotFoundError","server":name,"message":error.message}),
+        }
+    } else {
+        error.into()
+    }
+}
+fn mcp_status_v2(value: &Value) -> Value {
+    let error = value["error"].as_str();
+    match value["status"].as_str().unwrap_or("disabled") {
+        "connected" => json!({"status":"connected"}),
+        "connecting" => json!({"status":"pending"}),
+        "failed" => json!({"status":"failed","error":error.unwrap_or("MCP connection failed")}),
+        "needs_auth" => {
+            json!({"status":"needs_auth","error":error.unwrap_or("Authentication required")})
+        }
+        _ => json!({"status":"disabled"}),
+    }
+}
 async fn mcp(st: &AppState, query: &HashMap<String, String>) -> Result<App> {
     let app = st.app.for_directory(&directory(query)?)?;
     app.wait_mcp_ready().await;
     Ok(app)
+}
+async fn mcp_list(
+    State(st): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    let dir = directory(&query)?;
+    let app = st.app.for_directory(&dir)?;
+    app.wait_mcp_ready().await;
+    let mut servers: Vec<_> = app
+        .mcp()
+        .status()
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, status)| json!({"name":name,"status":mcp_status_v2(status)}))
+        .collect();
+    servers.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(located(&dir, json!(servers)))
 }
 async fn mcp_add(
     State(st): State<AppState>,
@@ -1042,6 +1380,41 @@ async fn mcp_remove(
     Path(name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
-    mcp(&st, &query).await?.mcp().remove(&name)?;
+    mcp(&st, &query)
+        .await?
+        .mcp()
+        .remove(&name)
+        .map_err(|e| mcp_not_found(&name, e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn mcp_connect(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<StatusCode> {
+    let status = mcp(&st, &query)
+        .await?
+        .mcp()
+        .connect_async(&name)
+        .await
+        .map_err(|e| mcp_not_found(&name, e))?;
+    if status["status"] != "connected" {
+        return Err(OperationError::from(
+            status["error"].as_str().unwrap_or("MCP connection failed"),
+        )
+        .into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn mcp_disconnect(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<StatusCode> {
+    mcp(&st, &query)
+        .await?
+        .mcp()
+        .disconnect(&name)
+        .map_err(|e| mcp_not_found(&name, e))?;
     Ok(StatusCode::NO_CONTENT)
 }
