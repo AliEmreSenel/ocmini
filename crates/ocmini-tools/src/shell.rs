@@ -229,18 +229,198 @@ pub async fn shell_with_env(
 /// started them, so they need an owner: the session that started them ends them
 /// when it is aborted or deleted, and the runtime ends the rest when it exits.
 #[cfg(unix)]
-static BACKGROUND: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+static BACKGROUND: Mutex<Vec<BackgroundJob>> = Mutex::new(Vec::new());
+
+#[cfg(unix)]
+const EXITED_JOB_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[cfg(unix)]
+struct BackgroundJob {
+    session: String,
+    id: String,
+    pid: u32,
+    log: Option<File>,
+    path: std::path::PathBuf,
+    identity: LogIdentity,
+    // None is running; Some(None) is an observed termination without an exit code.
+    exit: Option<Option<i32>>,
+    exited_at: Option<std::time::Instant>,
+}
+
+#[cfg(unix)]
+fn prune_exited(jobs: &mut Vec<BackgroundJob>, now: std::time::Instant, ttl: Duration) {
+    jobs.retain(|job| {
+        job.exited_at
+            .is_none_or(|exited_at| now.saturating_duration_since(exited_at) < ttl)
+    });
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct LogIdentity {
+    dev: u64,
+    ino: u64,
+    created: Option<std::time::SystemTime>,
+}
+
+#[cfg(unix)]
+impl LogIdentity {
+    fn from_metadata(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            created: m.created().ok(),
+        }
+    }
+    fn matches(self, m: &std::fs::Metadata) -> bool {
+        let other = Self::from_metadata(m);
+        m.is_file()
+            && self.dev == other.dev
+            && self.ino == other.ino
+            && self.created == other.created
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct BackgroundReadInput {
+    pub job_id: String,
+    #[serde(default)]
+    pub offset: u64,
+    pub limit: Option<u64>,
+}
+
+pub fn read_background(
+    session: &str,
+    input: &BackgroundReadInput,
+) -> Result<ToolOutput, OperationError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let (id, exit, handle, path, identity) = {
+            let jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+            let job = jobs
+                .iter()
+                .find(|job| job.session == session && job.id == input.job_id)
+                .ok_or_else(|| failure("Background job not found in this session"))?;
+            (
+                job.id.clone(),
+                job.exit,
+                job.log
+                    .as_ref()
+                    .map(File::try_clone)
+                    .transpose()
+                    .map_err(|e| failure(e.to_string()))?,
+                job.path.clone(),
+                job.identity,
+            )
+        };
+        let file = match handle {
+            Some(file) => file,
+            None => {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|e| failure(format!("Cannot reopen background output: {e}")))?;
+                if !identity.matches(&file.metadata().map_err(|e| failure(e.to_string()))?) {
+                    return Err(failure(
+                        "Background output no longer has its original identity",
+                    ));
+                }
+                file
+            }
+        };
+        // Reserve room for the status and for lossy UTF-8 expansion. Never let
+        // the generic output limiter discard bytes covered by nextOffset.
+        let limit = input
+            .limit
+            .map_or(output::MAX_OUTPUT, |value| {
+                usize::try_from(value).unwrap_or(usize::MAX)
+            })
+            .min((output::MAX_OUTPUT - 512) / 3);
+        let requested = limit;
+        let limit = if limit == 0 { 0 } else { limit.max(4) };
+        let mut bytes = vec![0; limit];
+        let mut filled = 0;
+        while filled < limit {
+            let count = file
+                .read_at(
+                    &mut bytes[filled..],
+                    input.offset.saturating_add(filled as u64),
+                )
+                .map_err(|e| failure(format!("Cannot read background output: {e}")))?;
+            if count == 0 {
+                break;
+            }
+            filled += count;
+        }
+        bytes.truncate(filled);
+        if bytes.len() > requested {
+            let mut end = requested;
+            if requested > 0 {
+                if let Err(error) = std::str::from_utf8(&bytes[..requested]) {
+                    if error.error_len().is_none() && error.valid_up_to() == 0 {
+                        while end < bytes.len() && std::str::from_utf8(&bytes[..end]).is_err() {
+                            end += 1;
+                        }
+                    }
+                }
+            }
+            bytes.truncate(end);
+        }
+        // Keep an incomplete suffix for the next page while the process runs.
+        // Invalid complete sequences remain visible as replacement characters.
+        let mut at = 0;
+        while at < bytes.len() {
+            match std::str::from_utf8(&bytes[at..]) {
+                Ok(_) => break,
+                Err(error) => match error.error_len() {
+                    Some(len) => at += error.valid_up_to() + len,
+                    None => {
+                        if exit.is_none() || at + error.valid_up_to() > 0 {
+                            bytes.truncate(at + error.valid_up_to());
+                        }
+                        break;
+                    }
+                },
+            }
+        }
+        let next = input.offset.saturating_add(bytes.len() as u64);
+        Ok(ToolOutput {
+            title: format!("background {}", id),
+            output: format!(
+                "{}\n[background job {}; status: {}; exit: {}; next byte offset: {}]",
+                String::from_utf8_lossy(&bytes),
+                id,
+                if exit.is_some() { "exited" } else { "running" },
+                exit.flatten()
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                next
+            ),
+            metadata: json!({"jobID":id,"offset":input.offset,"nextOffset":next,"status":if exit.is_some() {"exited"} else {"running"},"exit":exit.flatten()}),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session, input);
+        Err(failure(
+            "Background job polling is unavailable on this platform",
+        ))
+    }
+}
 
 #[cfg(unix)]
 use crate::process_group::kill_group;
 
 #[cfg(unix)]
-fn take_jobs(keep: impl Fn(&(String, u32)) -> bool) -> Vec<u32> {
+fn take_jobs(keep: impl Fn(&BackgroundJob) -> bool) -> Vec<u32> {
     let mut jobs = BACKGROUND.lock().unwrap();
     let pids = jobs
         .iter()
         .filter(|job| !keep(job))
-        .map(|(_, pid)| *pid)
+        .filter(|job| job.exit.is_none())
+        .map(|job| job.pid)
         .collect();
     jobs.retain(keep);
     pids
@@ -261,7 +441,7 @@ pub fn cancel_background_jobs(session_id: &str) {
     #[cfg(not(unix))]
     let _ = session_id;
     #[cfg(unix)]
-    for pid in take_jobs(|(session, _)| session != session_id) {
+    for pid in take_jobs(|job| job.session != session_id) {
         kill_group(pid);
     }
 }
@@ -301,6 +481,11 @@ pub async fn shell_background_with_env(
         .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?
         .keep()
         .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
+    #[cfg(unix)]
+    let log_handle = file.try_clone().map_err(|e| failure(e.to_string()))?;
+    #[cfg(unix)]
+    let identity =
+        LogIdentity::from_metadata(&file.metadata().map_err(|e| failure(e.to_string()))?);
     let mut process = shell_command(command, directory);
     for (key, value) in env {
         if let Some(value) = value.as_str() {
@@ -328,34 +513,67 @@ pub async fn shell_background_with_env(
     let pid = child
         .id()
         .ok_or_else(|| failure("Shell has no process id"))?;
+    let job_id = crate::types::hex_id("job_");
     #[cfg(unix)]
-    BACKGROUND
-        .lock()
-        .map_err(|e| failure(e.to_string()))?
-        .push((session_id.to_string(), pid));
+    {
+        let mut jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+        prune_exited(&mut jobs, std::time::Instant::now(), EXITED_JOB_TTL);
+        jobs.push(BackgroundJob {
+            session: session_id.to_string(),
+            id: job_id.clone(),
+            pid,
+            log: Some(log_handle),
+            path: log.clone(),
+            identity,
+            exit: None,
+            exited_at: None,
+        });
+    }
     // Reap the job so an exited command never becomes a zombie.
+    #[cfg(unix)]
+    let waiter_id = job_id.clone();
     tokio::spawn(async move {
-        let _ = child.wait().await;
+        let status = child.wait().await.ok().and_then(|status| status.code());
+        #[cfg(not(unix))]
+        let _ = status;
         #[cfg(unix)]
-        BACKGROUND.lock().unwrap().retain(|(_, job)| *job != pid);
+        if let Some(job) = BACKGROUND
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|job| job.id == waiter_id)
+        {
+            job.log = None;
+            job.exit = Some(status);
+            job.exited_at = Some(std::time::Instant::now());
+        }
     });
+    let polling = if cfg!(unix) {
+        "Use background_read with job_id and offset for progress; "
+    } else {
+        ""
+    };
     Ok(ToolOutput {
         title: format!(
             "background {}",
             command.chars().take(60).collect::<String>()
         ),
         output: format!(
-            "Started in the background as pid {pid}.\nOutput: {}\nRead that file for progress; `kill {pid}` stops it. It keeps running across tool calls and is stopped when ocmini exits.",
+            "Started in the background as job {job_id} (pid {pid}).\nOutput: {}\n{polling}`kill {pid}` stops it. It keeps running across tool calls and is stopped when ocmini exits.",
             log.display()
         ),
-        metadata: json!({"background":true,"pid":pid,"outputPath":log.to_string_lossy()}),
+        metadata: json!({"background":true,"jobID":job_id,"pid":pid,"outputPath":log.to_string_lossy()}),
     })
 }
 
 pub fn tracked_background(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        BACKGROUND.lock().unwrap().iter().any(|(_, p)| *p == pid)
+        BACKGROUND
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|job| job.pid == pid && job.exit.is_none())
     }
     #[cfg(not(unix))]
     {
@@ -651,6 +869,176 @@ mod tests {
         assert!(Path::new(&format!("/proc/{pid}")).exists());
         cancel_background_jobs("ses_owner");
         assert_process_stopped(pid).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_poll_tracks_offsets_status_and_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let result = shell_background_with_env(
+            "printf first; sleep 0.2; printf second; exit 7",
+            root.path(),
+            "poll_owner",
+            root.path(),
+            &serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+        let id = result.metadata["jobID"].as_str().unwrap().to_owned();
+        let input = |offset, limit| BackgroundReadInput {
+            job_id: id.clone(),
+            offset,
+            limit,
+        };
+        assert!(read_background("poll_other", &input(0, None)).is_err());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let first = read_background("poll_owner", &input(0, Some(5))).unwrap();
+        assert!(first.output.starts_with("first\n[background job"));
+        assert_eq!(first.metadata["status"], "running");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let next = read_background("poll_owner", &input(5, None)).unwrap();
+                if next.metadata["status"] == "exited" {
+                    assert!(next.output.starts_with("second\n[background job"));
+                    assert_eq!(next.metadata["nextOffset"], 11);
+                    assert_eq!(next.metadata["exit"], 7);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel_background_jobs("poll_owner");
+        assert!(read_background("poll_owner", &input(0, None)).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn polling_pages_are_bounded_and_reject_replaced_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = format!("{}🙂end", "x".repeat(output::MAX_OUTPUT));
+        std::fs::write(root.path().join("source"), &source).unwrap();
+        let launch = shell_background_with_env(
+            "cat source",
+            root.path(),
+            "page_owner",
+            root.path(),
+            &serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+        let id = launch.metadata["jobID"].as_str().unwrap().to_owned();
+        let input = |offset| BackgroundReadInput {
+            job_id: id.clone(),
+            offset,
+            limit: Some(u64::MAX),
+        };
+        let mut offset = 0;
+        let mut text = String::new();
+        loop {
+            let page = read_background("page_owner", &input(offset)).unwrap();
+            let end = page.metadata["nextOffset"].as_u64().unwrap();
+            assert!(page.output.len() <= output::MAX_OUTPUT);
+            let content = page.output.split("\n[background job ").next().unwrap();
+            text.push_str(content);
+            offset = end;
+            if page.metadata["status"] == "exited" && offset == source.len() as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(text, source);
+        let path = launch.metadata["outputPath"].as_str().unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::write(path, "replacement").unwrap();
+        assert!(read_background("page_owner", &input(0)).is_err());
+        cancel_background_jobs("page_owner");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_poll_survives_grandchild_writes_after_shell_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = shell_background_with_env(
+            "(sleep 0.15; printf late) & printf early; exit 0",
+            root.path(),
+            "grandchild_owner",
+            root.path(),
+            &serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+        let id = launch.metadata["jobID"].as_str().unwrap().to_owned();
+        let input = |offset| BackgroundReadInput {
+            job_id: id.clone(),
+            offset,
+            limit: None,
+        };
+        let mut offset = 0;
+        let mut combined = String::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let page = read_background("grandchild_owner", &input(offset)).unwrap();
+                let content = page.output.split("\n[background job ").next().unwrap();
+                combined.push_str(content);
+                offset = page.metadata["nextOffset"].as_u64().unwrap();
+                if page.metadata["status"] == "exited" && combined == "earlylate" {
+                    assert_eq!(page.metadata["exit"], 0);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel_background_jobs("grandchild_owner");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_exited_reclaims_only_expired_finished_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let log_path = root.path().join("job.txt");
+        std::fs::write(&log_path, "ok").unwrap();
+        let identity = LogIdentity::from_metadata(&std::fs::metadata(&log_path).unwrap());
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(60);
+        let mut jobs = vec![
+            BackgroundJob {
+                session: "s".into(),
+                id: "running".into(),
+                pid: 1,
+                log: None,
+                path: log_path.clone(),
+                identity,
+                exit: None,
+                exited_at: None,
+            },
+            BackgroundJob {
+                session: "s".into(),
+                id: "recent".into(),
+                pid: 2,
+                log: None,
+                path: log_path.clone(),
+                identity,
+                exit: Some(Some(0)),
+                exited_at: Some(now),
+            },
+            BackgroundJob {
+                session: "s".into(),
+                id: "expired".into(),
+                pid: 3,
+                log: None,
+                path: log_path,
+                identity,
+                exit: Some(Some(0)),
+                exited_at: Some(now - Duration::from_secs(120)),
+            },
+        ];
+        prune_exited(&mut jobs, now, ttl);
+        let kept: Vec<_> = jobs.iter().map(|job| job.id.as_str()).collect();
+        assert_eq!(kept, vec!["running", "recent"]);
     }
 
     #[cfg(target_os = "linux")]

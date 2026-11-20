@@ -510,6 +510,8 @@ impl McpHub {
     fn build_catalog(&self, version: u64) -> Catalog {
         let mut used: HashSet<String> = [
             "bash",
+            #[cfg(unix)]
+            "background_read",
             "read",
             "write",
             "edit",

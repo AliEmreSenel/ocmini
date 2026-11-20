@@ -434,6 +434,9 @@ pub(super) fn unattended_tool_denied(name: &str, app: &App, request: &PromptRequ
 }
 
 pub(super) fn tool_enabled(name: &str, agent: &str, cfg: &Config, request: &PromptRequest) -> bool {
+    if name == "background_read" && !tool_enabled("bash", agent, cfg, request) {
+        return false;
+    }
     let legacy = match name {
         "shell" => "bash",
         "subagent" => "task",

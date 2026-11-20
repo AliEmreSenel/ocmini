@@ -391,6 +391,10 @@ impl Registry {
             .get(id)
             .and_then(|e| e.runner.clone())
             .ok_or("Runner is unavailable")?;
+        let mut args = args;
+        if let Some(object) = args.as_object_mut() {
+            object.insert("_ocmini_session".into(), id.into());
+        }
         runner
             .request(method, args, cancel, lease, directory.map(str::to_owned))
             .await
@@ -735,12 +739,17 @@ pub fn runner_main() -> Result<(), String> {
         let effects=Arc::new(ocmini_tools::effects::Effects::default());let directory=spec.directory.to_string_lossy().into_owned();let spill=wire::Spill::new(spec.spill).map_err(|e|e.to_string())?;
         let mut term=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e|e.to_string())?;
         let relay_end=async move{match relay{Some(mut relay)=>relay.wait().await,None=>std::future::pending().await}};
-        tokio::select!{r=wire::serve(socket,spill,move|method,args,requested_directory,cancel|{let effects=effects.clone();let directory=requested_directory.unwrap_or_else(||directory.clone());async move{
+        tokio::select!{r=wire::serve(socket,spill,move|method,mut args,requested_directory,cancel|{let effects=effects.clone();let directory=requested_directory.unwrap_or_else(||directory.clone());async move{
             if method == "check_directory" {
                 std::fs::read_dir(&directory).map_err(|e|format!("Sandbox cannot enter directory {directory}: {e}"))?;
                 return Ok(Value::Null);
             }
-            effects.dispatch(&directory,"runner",&method,args,cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)
+            let session = args
+                .as_object_mut()
+                .and_then(|object| object.remove("_ocmini_session"))
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "runner".into());
+            effects.dispatch(&directory,&session,&method,args,cancel).await.and_then(ocmini_tools::effects::EffectResult::json).map_err(String::from)
         }})=>r.map_err(|e|e.to_string()),r=relay_end=>r.map_err(|e|e.to_string()),_=term.recv()=>Ok(())}
     }))
 }
