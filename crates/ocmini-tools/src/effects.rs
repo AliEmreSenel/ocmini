@@ -245,6 +245,34 @@ impl Effects {
                     crate::web::Hop::Redirect(url) => json!({"redirect": url}),
                 }
             }
+            "instruction_resolve_read" | "instruction_resolve" | "instruction" => {
+                let directory = directory.to_owned();
+                let method_owned = method.to_owned();
+                let args = args.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    instruction_effect(&directory, &method_owned, &args)
+                })
+                .await
+                .map_err(|e| OperationError::from(e.to_string()))??;
+                if method == "instruction" {
+                    let text = result
+                        .json()?
+                        .as_str()
+                        .ok_or("Invalid instruction result")?
+                        .to_owned();
+                    let limited = crate::output::limit(
+                        crate::types::ToolOutput {
+                            output: text,
+                            title: String::new(),
+                            metadata: json!({}),
+                        },
+                        crate::output::directory(),
+                    )
+                    .await?;
+                    return Ok(EffectResult::Json(json!(limited.output)));
+                }
+                return Ok(result);
+            }
             "skill" => {
                 return Ok(EffectResult::Output(crate::skills::load_content(
                     directory,
@@ -257,4 +285,143 @@ impl Effects {
         };
         Ok(EffectResult::Json(value))
     }
+}
+
+// Resolve and open in the effect process, so sandbox mounts apply. The final
+// open walks the authorized canonical path without following replacement links.
+fn instruction_effect(
+    directory: &str,
+    method: &str,
+    args: &Value,
+) -> Result<EffectResult, OperationError> {
+    let root = std::fs::canonicalize(directory).map_err(|e| e.to_string())?;
+    let requested = args["path"].as_str().ok_or("Missing instruction path")?;
+    let path = std::fs::canonicalize(crate::resolve_path(directory, requested))
+        .map_err(|e| e.to_string())?;
+    if !path.starts_with(&root) {
+        if method == "instruction_resolve_read" {
+            return Ok(EffectResult::Json(Value::Null));
+        }
+        return Err("Instruction outside workspace".into());
+    }
+    if method == "instruction_resolve_read" {
+        let root_instruction = std::fs::canonicalize(root.join("AGENTS.md")).ok();
+        return Ok(EffectResult::Json(json!({
+            "root": root,
+            "target": path,
+            "directory": path.is_dir(),
+            "rootInstruction": root_instruction,
+        })));
+    }
+    if method == "instruction_resolve" {
+        return Ok(EffectResult::Json(json!(path)));
+    }
+    if args["expected"].as_str() != path.to_str() {
+        return Err("Instruction target changed".into());
+    }
+    use std::io::Read;
+    let mut file = open_instruction(&root, &path)?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Instruction is not a regular file".into());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|e| e.to_string())?;
+    let display = args["display"].as_str().unwrap_or(requested);
+    Ok(EffectResult::Json(json!(format!(
+        "Instructions from: {display}\n{text}"
+    ))))
+}
+
+#[cfg(unix)]
+fn open_instruction(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::fs::File, OperationError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let mut file = std::fs::File::open(root).map_err(|e| e.to_string())?;
+    let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
+    let components: Vec<_> = relative.components().collect();
+    for (i, component) in components.iter().enumerate() {
+        let name =
+            std::ffi::CString::new(component.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if i + 1 < components.len() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string().into());
+        }
+        file = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_instruction(
+    _root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::fs::File, OperationError> {
+    use std::os::windows::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    };
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFinalPathNameByHandleW(
+            handle: std::os::windows::io::RawHandle,
+            name: *mut u16,
+            capacity: u32,
+            flags: u32,
+        ) -> u32;
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    if file
+        .metadata()
+        .map_err(|e| e.to_string())?
+        .file_attributes()
+        & FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        return Err("Instruction target changed".into());
+    }
+    let expected = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut actual = vec![0; expected.len() + 1];
+    // Verify the opened handle so a replaced junction along the path cannot
+    // redirect the read after authorization.
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            actual.as_mut_ptr(),
+            actual.len() as u32,
+            0,
+        )
+    } as usize;
+    if len != expected.len() || actual.get(..len) != Some(expected.as_slice()) {
+        return Err("Instruction target changed".into());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_instruction(
+    _root: &std::path::Path,
+    _path: &std::path::Path,
+) -> Result<std::fs::File, OperationError> {
+    Err("Instruction discovery requires secure file access".into())
 }

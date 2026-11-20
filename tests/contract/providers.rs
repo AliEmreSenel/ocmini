@@ -556,3 +556,266 @@ async fn disabled_generated_variants_stay_disabled_during_execution() {
     assert_eq!(response.status(), 400);
     assert!(response.text().await.unwrap().contains("disabled"));
 }
+
+#[tokio::test]
+async fn nested_read_instructions_reach_model_once() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "first_read"),
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "second_read"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(
+        server.directory.join("nested/AGENTS.md"),
+        "nested instruction marker",
+    )
+    .unwrap();
+    std::fs::write(server.directory.join("nested/file.txt"), "file content").unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_nested", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let first = provider.request().await.to_string();
+    assert!(first.contains("nested instruction marker"));
+    let suffix = serde_json::to_string(&std::path::Path::new("nested").join("AGENTS.md")).unwrap();
+    assert!(first.contains(suffix.trim_matches('"')));
+    let second = provider.request().await.to_string();
+    assert_eq!(second.matches("nested instruction marker").count(), 1);
+    let v2_messages: Value = server
+        .get(&format!("/api/session/{id}/message"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let visible = v2_messages.to_string();
+    assert!(
+        !visible.contains("nested instruction marker") && !visible.contains("Instructions from:"),
+        "nested instructions must not leak into visible v2 assistant history: {v2_messages}"
+    );
+}
+
+#[tokio::test]
+async fn nested_instruction_read_deny_is_respected() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "read_file"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(
+        server.directory.join("nested/AGENTS.md"),
+        "private instruction marker",
+    )
+    .unwrap();
+    std::fs::write(
+        server.directory.join("nested/file.txt"),
+        "public file marker",
+    )
+    .unwrap();
+    let id = server
+        .session(json!([
+            {"permission":"*","pattern":"*","action":"allow"},
+            {"permission":"read","pattern":"*AGENTS.md","action":"deny"}
+        ]))
+        .await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_denied_instruction", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let model_request = provider.request().await.to_string();
+    assert!(model_request.contains("public file marker"));
+    assert!(!model_request.contains("private instruction marker"));
+}
+
+#[tokio::test]
+async fn parallel_reads_share_nested_instructions() {
+    let calls = ["one.txt", "two.txt"].iter().enumerate().map(|(i, name)| {
+        json!({"index":i,"id":format!("read_{i}"),"type":"function","function":{"name":"read","arguments":json!({"filePath":format!("nested/{name}")}).to_string()}})
+    }).collect::<Vec<_>>();
+    let mut provider = Provider::start(vec![Script::ok(vec![
+        json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()})
+    ]), text_script("Done", "")]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(
+        server.directory.join("nested/AGENTS.md"),
+        "parallel instruction marker",
+    )
+    .unwrap();
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(server.directory.join("nested").join(name), "content").unwrap();
+    }
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_parallel_instructions", "Read both"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert_eq!(request.matches("parallel instruction marker").count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_instruction_symlink_is_not_loaded() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "read_file"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), "external instruction secret").unwrap();
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(server.directory.join("nested/file.txt"), "public content").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret"),
+        server.directory.join("nested/AGENTS.md"),
+    )
+    .unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_external_instruction", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert!(request.contains("public content"));
+    assert!(!request.contains("external instruction secret"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_instruction_symlink_to_root_is_not_duplicated() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "read_file"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(
+        server.directory.join("AGENTS.md"),
+        "root instruction sentinel",
+    )
+    .unwrap();
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(server.directory.join("nested/file.txt"), "public content").unwrap();
+    std::os::unix::fs::symlink(
+        server.directory.join("AGENTS.md"),
+        server.directory.join("nested/AGENTS.md"),
+    )
+    .unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_root_symlink_instruction", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert_eq!(
+        request.matches("root instruction sentinel").count(),
+        1,
+        "{request}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_instruction_canonical_path_under_symlinked_workspace_loads() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let real_workspace = temp.path().join("real-workspace");
+    let link_workspace = temp.path().join("link-workspace");
+    std::fs::create_dir_all(real_workspace.join("nested")).unwrap();
+    std::fs::write(
+        real_workspace.join("nested/AGENTS.md"),
+        "symlinked workspace marker",
+    )
+    .unwrap();
+    let canonical_file = real_workspace.join("nested/file.txt");
+    std::fs::write(&canonical_file, "file via canonical path").unwrap();
+    std::os::unix::fs::symlink(&real_workspace, &link_workspace).unwrap();
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "read",
+            json!({"filePath": canonical_file.to_string_lossy()}),
+            "read_file",
+        ),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let created: Value = server
+        .post(
+            "/api/session",
+            &json!({
+                "location": {"directory": link_workspace.to_string_lossy()},
+                "permissions": [{"action":"*","resource":"*","effect":"allow"}]
+            }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["data"]["id"].as_str().unwrap();
+    let mut events = server.events_at("/api/event").await;
+    server
+        .post(
+            &format!("/api/session/{id}/prompt"),
+            &json!({"text": "Read the canonical file"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.execution.succeeded").await;
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert!(request.contains("file via canonical path"));
+    assert!(request.contains("symlinked workspace marker"), "{request}");
+}
