@@ -139,6 +139,7 @@ pub(super) async fn provider_reply(
 
 pub(super) struct Provider {
     pub(super) url: String,
+    pub(super) scripts: Arc<Mutex<VecDeque<Script>>>,
     pub(super) requests: mpsc::UnboundedReceiver<Value>,
     pub(super) task: tokio::task::JoinHandle<()>,
 }
@@ -149,8 +150,9 @@ impl Provider {
     }
     pub(super) async fn start_with_titles(scripts: Vec<Script>, titles: Vec<Script>) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
+        let scripts = Arc::new(Mutex::new(scripts.into()));
         let state = ProviderState {
-            scripts: Arc::new(Mutex::new(scripts.into())),
+            scripts: scripts.clone(),
             route_titles: !titles.is_empty(),
             title_scripts: Arc::new(Mutex::new(titles.into())),
             requests,
@@ -167,9 +169,14 @@ impl Provider {
         });
         Self {
             url,
+            scripts,
             requests: receiver,
             task,
         }
+    }
+
+    pub(super) async fn push(&self, script: Script) {
+        self.scripts.lock().await.push_back(script);
     }
 
     pub(super) async fn request(&mut self) -> Value {

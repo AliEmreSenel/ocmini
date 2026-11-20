@@ -566,3 +566,167 @@ async fn webfetch_rechecks_permissions_on_redirects() {
     let _ = provider.request().await;
     web.abort();
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn background_read_polls_session_jobs_and_follows_shell_gating() {
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "background_read",
+            json!({"job_id": "job_none", "offset": 0}),
+            "call_plan_blocked",
+        ),
+        text_script("Plan done", ""),
+        text_script("Shell disabled done", ""),
+        tool_script(
+            "bash",
+            json!({"command": "printf first; sleep 0.15; printf second; exit 7", "background": true}),
+            "call_bg_start",
+        ),
+        text_script("Started", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+
+    // 1. Read-only plan agent must not advertise or execute background_read.
+    let mut plan_prompt = prompt("msg_plan_bg", "Inspect background job");
+    plan_prompt["agent"] = json!("plan");
+    server
+        .post(&format!("/session/{id}/message"), &plan_prompt)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let plan_req = provider.request().await;
+    let plan_tools: Vec<_> = plan_req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        !plan_tools.contains(&"background_read"),
+        "plan agent must not advertise background_read: {plan_tools:?}"
+    );
+    let _ = provider.request().await;
+    let messages = server.messages(&id).await;
+    let blocked = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["callID"] == "call_plan_blocked")
+        .unwrap();
+    assert_eq!(blocked["state"]["status"], "error", "{blocked}");
+    assert!(
+        blocked["state"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("disabled for this request"),
+        "{blocked}"
+    );
+
+    // 2. Disabling shell/bash disables background_read too.
+    let mut no_shell = prompt("msg_no_shell_bg", "No shell");
+    no_shell["tools"] = json!({"shell": false});
+    server
+        .post(&format!("/session/{id}/message"), &no_shell)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let no_shell_req = provider.request().await;
+    let no_shell_tools: Vec<_> = no_shell_req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        !no_shell_tools.contains(&"background_read"),
+        "disabling shell must hide background_read: {no_shell_tools:?}"
+    );
+
+    // 3. Normal build turn launches a background job and polls it across offsets.
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_bg_launch", "Launch job"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let build_req = provider.request().await;
+    let build_tools: Vec<_> = build_req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        build_tools.contains(&"background_read"),
+        "build agent should advertise background_read: {build_tools:?}"
+    );
+    let _ = provider.request().await;
+    let messages = server.messages(&id).await;
+    let launched = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["callID"] == "call_bg_start")
+        .unwrap();
+    assert_eq!(launched["state"]["status"], "completed", "{launched}");
+    let job_id = launched["state"]["metadata"]["jobID"]
+        .as_str()
+        .expect("background launch returns jobID")
+        .to_owned();
+
+    // Poll first 5 bytes ("first"), then wait for completion and read the rest ("second").
+    let mut offset = 0u64;
+    let mut collected = String::new();
+    let mut observed_exit = None;
+    for attempt in 0..40 {
+        let call_id = format!("call_bg_poll_{attempt}");
+        let limit = if offset == 0 { json!(5) } else { Value::Null };
+        let mut args = json!({"job_id": job_id, "offset": offset});
+        if !limit.is_null() {
+            args["limit"] = limit;
+        }
+        provider
+            .push(tool_script("background_read", args, &call_id))
+            .await;
+        provider.push(text_script("Polled", "")).await;
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt(&format!("msg_bg_poll_{attempt}"), "Poll job"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let _ = provider.request().await;
+        let _ = provider.request().await;
+        let messages = server.messages(&id).await;
+        let polled = messages
+            .iter()
+            .flat_map(|m| m["parts"].as_array().unwrap())
+            .find(|p| p["callID"] == call_id)
+            .unwrap();
+        assert_eq!(polled["state"]["status"], "completed", "{polled}");
+        let output = polled["state"]["output"].as_str().unwrap();
+        collected.push_str(output.split("\n[background job ").next().unwrap());
+        offset = polled["state"]["metadata"]["nextOffset"].as_u64().unwrap();
+        if polled["state"]["metadata"]["status"] == "exited" && offset == 11 {
+            observed_exit = polled["state"]["metadata"]["exit"].as_i64();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(collected, "firstsecond");
+    assert_eq!(offset, 11);
+    assert_eq!(observed_exit, Some(7));
+}

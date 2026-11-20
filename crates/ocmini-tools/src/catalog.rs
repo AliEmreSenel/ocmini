@@ -43,7 +43,15 @@ macro_rules! builtin_tools {
                 }
             }
             pub fn is_execution(self) -> bool {
-                matches!(self, Self::Bash | Self::Write | Self::Edit | Self::ApplyPatch | Self::Task)
+                matches!(
+                    self,
+                    Self::Bash
+                        | Self::BackgroundRead
+                        | Self::Write
+                        | Self::Edit
+                        | Self::ApplyPatch
+                        | Self::Task
+                )
             }
         }
         pub fn tool_defs() -> Vec<Value> {
