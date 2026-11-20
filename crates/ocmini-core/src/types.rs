@@ -321,6 +321,7 @@ pub fn validate_parts(parts: &[Value], scope: PromptPartScope) -> Result<(), Ope
             Some("text") => part["text"].is_string(),
             Some("file") => part["url"].is_string() && part["mime"].is_string(),
             Some("agent") => scope != PromptPartScope::User && part["name"].is_string(),
+            Some("ocmini_skill") => scope != PromptPartScope::User && part["text"].is_string(),
             Some("compaction") => scope == PromptPartScope::Compaction,
             _ => false,
         };

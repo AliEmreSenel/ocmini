@@ -631,7 +631,7 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
     post(
         &server,
         &format!("/api/session/{sid}/compact"),
-        json!({"id":"msg_compact"}),
+        json!({"id":"msg_compact","ocminiFocus":"Preserve the deployment decision"}),
     )
     .await;
     let compacted = events.through("session.execution.succeeded").await;
@@ -658,7 +658,10 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
     .await;
     events.through("session.execution.succeeded").await;
     provider.request().await;
-    provider.request().await;
+    let compact_request = provider.request().await;
+    assert!(compact_request
+        .to_string()
+        .contains("Preserve the deployment decision"));
     assert!(provider.request().await["messages"]
         .as_array()
         .unwrap()
@@ -666,6 +669,35 @@ async fn v2_compaction_uses_native_shapes_and_saved_instructions_survive() {
         .any(|m| m["content"]
             .as_str()
             .is_some_and(|t| t.contains("Continuation summary"))));
+}
+
+#[tokio::test]
+async fn v2_compaction_hook_replacement_overrides_manual_focus() {
+    let mut provider =
+        Provider::start(vec![text_script("answer", ""), text_script("summary", "")]).await;
+    let code = r#"import json,sys
+json.load(sys.stdin);print('{"set":{"prompt":"HOOK_REPLACEMENT"}}')"#;
+    let server = TestServer::start(&provider, json!({"ocmini":{"hooks":{"version":1,"handlers":[{"id":"replace-compact","on":"compaction.before","command":[PYTHON,"-S","-c",code]}]}}})).await;
+    let sid = session(&server).await;
+    let mut events = server.events_at("/api/event").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"text":"work"}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/compact"),
+        json!({"id":"msg_hook_compact","ocminiFocus":"FOCUS_MUST_BE_REPLACED"}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert!(request.contains("HOOK_REPLACEMENT"), "{request}");
+    assert!(!request.contains("FOCUS_MUST_BE_REPLACED"), "{request}");
 }
 
 #[tokio::test]
@@ -747,6 +779,14 @@ async fn v2_native_configuration_and_shell_permission_rules_reach_the_model() {
         get(&server, &format!("/api/session/{sid}/permission")).await["data"][0]["id"],
         request["id"]
     );
+    let loc = format!(
+        "location[directory]={}",
+        encode_directory(&server.directory)
+    );
+    assert_eq!(
+        get(&server, &format!("/api/permission/request?{loc}")).await["data"][0]["id"],
+        request["id"]
+    );
     post(
         &server,
         &format!(
@@ -782,6 +822,43 @@ async fn v2_mcp_registration_reuses_the_connection_and_removal_stops_tools() {
         assert_eq!(response.status(), 204, "{}", response.text().await.unwrap());
     }
     assert_eq!(super::mcp::mcp_spawns(&server).len(), 1);
+    let loc = format!(
+        "location[directory]={}",
+        encode_directory(&server.directory)
+    );
+    let listed = get(&server, &format!("/api/mcp?{loc}")).await;
+    assert_eq!(
+        listed["data"],
+        json!([{"name":"runtime","status":{"status":"connected"}}])
+    );
+    assert_eq!(
+        server
+            .post(
+                &format!("/api/experimental/mcp/runtime/disconnect?{loc}"),
+                &json!({}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        get(&server, &format!("/api/mcp?{loc}")).await["data"],
+        json!([{"name":"runtime","status":{"status":"disabled"}}])
+    );
+    assert_eq!(
+        server
+            .post(
+                &format!("/api/experimental/mcp/runtime/connect?{loc}"),
+                &json!({}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
     let sid = session(&server).await;
     let mut events = server.events_at("/api/event").await;
     post(
@@ -812,6 +889,66 @@ async fn v2_mcp_registration_reuses_the_connection_and_removal_stops_tools() {
         .await
         .unwrap();
     assert!(!response.status().is_success());
+}
+
+#[tokio::test]
+async fn v2_rejection_settles_only_the_current_step() {
+    let calls = ["one", "two"].into_iter().enumerate().map(|(index, name)|
+        json!({"index":index,"id":format!("call_{name}"),"type":"function","function":{"name":"shell","arguments":json!({"command":format!("touch {name}")}).to_string()}})
+    ).collect::<Vec<_>>();
+    let mut provider = Provider::start(vec![
+        Script::ok(vec![
+            json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":usage()}),
+        ]),
+        tool_script("shell", json!({"command":"touch later"}), "call_later"),
+        text_script("Done", ""),
+    ]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sid = session(&server).await;
+    server
+        .client
+        .patch(format!("{}/api/session/{sid}", server.url))
+        .json(&json!({"permissions":[{"action":"shell","resource":"*","effect":"ask"}]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut events = server.events_at("/api/event").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"text":"Run commands"}),
+    )
+    .await;
+    events.through("permission.asked").await;
+    events.through("permission.asked").await;
+    let pending = get(&server, &format!("/api/session/{sid}/permission")).await;
+    let requests = pending["data"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    let id = requests[0]["id"].as_str().unwrap();
+    post(
+        &server,
+        &format!("/api/session/{sid}/permission/{id}/reply"),
+        json!({"decision":"reject"}),
+    )
+    .await;
+    let observed = events.through("permission.asked").await;
+    let later = observed.last().unwrap()["data"]["id"].as_str().unwrap();
+    post(
+        &server,
+        &format!("/api/session/{sid}/permission/{later}/reply"),
+        json!({"decision":"once"}),
+    )
+    .await;
+    events.through("session.execution.succeeded").await;
+    for _ in 0..3 {
+        provider.request().await;
+    }
+    assert!(!server.directory.join("one").exists());
+    assert!(!server.directory.join("two").exists());
+    assert!(server.directory.join("later").exists());
 }
 
 #[tokio::test]
@@ -1142,4 +1279,291 @@ async fn v2_archive_filters_and_native_update_events_survive_restart() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn v2_catalog_mcp_config_and_validation_endpoints() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let loc = format!(
+        "location[directory]={}",
+        encode_directory(&server.directory)
+    );
+
+    let info = get(&server, "/api/info").await;
+    assert_eq!(info["urls"], json!([server.url]));
+
+    let config = get(&server, &format!("/api/config?{loc}")).await;
+    let entries = config.as_array().unwrap();
+    assert!(!entries.is_empty());
+    assert!(entries
+        .iter()
+        .all(|entry| entry["type"] == "document" && entry["info"].is_object()));
+
+    let default_model = get(&server, &format!("/api/model/default?{loc}")).await;
+    assert_eq!(default_model["data"]["providerID"], "mock");
+    assert_eq!(default_model["data"]["id"], "test-model");
+
+    let prov = get(&server, &format!("/api/provider/mock?{loc}")).await;
+    assert_eq!(prov["data"]["id"], "mock");
+    let missing_prov = server
+        .get(&format!("/api/provider/missing?{loc}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_prov.status(), 404);
+    assert_eq!(
+        missing_prov.json::<Value>().await.unwrap()["_tag"],
+        "ProviderNotFoundError"
+    );
+
+    let agent = get(&server, &format!("/api/agent/reviewer?{loc}")).await;
+    assert_eq!(agent["data"]["id"], "reviewer");
+    let missing_agent = server
+        .get(&format!("/api/agent/missing?{loc}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_agent.status(), 404);
+    assert_eq!(
+        missing_agent.json::<Value>().await.unwrap()["_tag"],
+        "AgentNotFoundError"
+    );
+
+    let mcp_list = get(&server, &format!("/api/mcp?{loc}")).await;
+    assert_eq!(mcp_list["data"], json!([]));
+    for op in ["connect", "disconnect"] {
+        let resp = server
+            .post(
+                &format!("/api/experimental/mcp/missing/{op}?{loc}"),
+                &json!({}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(
+            resp.json::<Value>().await.unwrap()["_tag"],
+            "McpServerNotFoundError"
+        );
+    }
+
+    for invalid_body in [
+        json!({"agent": "no-such-agent"}),
+        json!({"title": 123}),
+        json!({"model": {"providerID": "mock", "id": "test-model", "variant": ""}}),
+        json!({"model": {"providerID": "mock", "id": "test-model", "variant": 42}}),
+    ] {
+        assert_eq!(
+            server
+                .post("/api/session", &invalid_body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400,
+            "{invalid_body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v2_message_pagination_get_context_inbox_skills_command_and_form_events() {
+    let mut provider = Provider::start(vec![
+        text_script("First reply", ""),
+        tool_script(
+            "question",
+            json!({"questions":[
+                {"header":"Pick one","question":"Single?","options":[{"label":"A","description":"Option A"},{"label":"B","description":"Option B"}]},
+                {"header":"Pick many","question":"Multi?","multiple":true,"options":[{"label":"X","description":"Option X"},{"label":"Y","description":"Option Y"}]}
+            ]}),
+            "ask_both",
+        ),
+        text_script("After form", ""),
+        text_script("Command reply", ""),
+        text_script("Woken reply", ""),
+    ])
+    .await;
+    let server = TestServer::start(
+        &provider,
+        json!({
+            "command": {"ping": {"description": "Zero-arg command", "template": "PING_TEMPLATE $ARGUMENTS"}}
+        }),
+    )
+    .await;
+    std::fs::create_dir_all(server.directory.join(".opencode/skills/demo")).unwrap();
+    std::fs::write(
+        server.directory.join(".opencode/skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Demo skill\n---\nSKILL_SECRET_BODY",
+    )
+    .unwrap();
+    let sid = session(&server).await;
+
+    // 1. Prompt with explicit skill: skill content reaches model without polluting user text in v2 history.
+    let admitted = post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"id":"msg_skill","text":"Hello","skills":[{"id":"demo"}]}),
+    )
+    .await;
+    assert_eq!(admitted["data"]["id"], "msg_skill");
+    server
+        .post(&format!("/api/experimental/session/{sid}/wait"), &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let req = provider.request().await.to_string();
+    assert!(req.contains("SKILL_SECRET_BODY"), "{req}");
+
+    let single = get(&server, &format!("/api/session/{sid}/message/msg_skill")).await;
+    assert_eq!(single["data"]["text"], "Hello");
+    assert!(
+        !single["data"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("SKILL_SECRET_BODY"),
+        "{single}"
+    );
+    let missing_msg = server
+        .get(&format!("/api/session/{sid}/message/msg_missing"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_msg.status(), 404);
+    assert_eq!(
+        missing_msg.json::<Value>().await.unwrap()["_tag"],
+        "MessageNotFoundError"
+    );
+
+    // 2. Exact boundary pagination must NOT emit a spurious cursor.next, and ?type= filters cleanly.
+    let all = get(&server, &format!("/api/session/{sid}/message?limit=50")).await;
+    let total = all["data"].as_array().unwrap().len();
+    assert!(total >= 2);
+    let exact = get(
+        &server,
+        &format!("/api/session/{sid}/message?limit={total}"),
+    )
+    .await;
+    assert_eq!(exact["data"].as_array().unwrap().len(), total);
+    assert!(
+        exact["cursor"].get("next").is_none(),
+        "exact boundary must not emit empty next cursor: {exact}"
+    );
+    let only_assistant = get(
+        &server,
+        &format!("/api/session/{sid}/message?type=assistant&limit=10"),
+    )
+    .await;
+    assert_eq!(only_assistant["data"].as_array().unwrap().len(), 1);
+    assert_eq!(only_assistant["data"][0]["type"], "assistant");
+    assert!(only_assistant["cursor"].get("next").is_none());
+
+    // 3. Context endpoint returns active messages.
+    let context = get(&server, &format!("/api/session/{sid}/context")).await;
+    assert_eq!(context["data"].as_array().unwrap().len(), total);
+
+    // 4. form.replied SSE event emits string for single-select and array for multiselect.
+    let mut events = server.events_at("/api/event").await;
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"id":"msg_form","text":"Ask me"}),
+    )
+    .await;
+    let created_form = events.through("form.created").await.pop().unwrap();
+    let form_id = created_form["data"]["form"]["id"].as_str().unwrap();
+    server
+        .post(
+            &format!("/api/session/{sid}/form/{form_id}/reply"),
+            &json!({"answer":{"0":"A","1":["X","Y"]}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let replied = events.through("form.replied").await.pop().unwrap();
+    assert_eq!(replied["data"]["answer"]["0"], json!("A"));
+    assert_eq!(replied["data"]["answer"]["1"], json!(["X", "Y"]));
+    events.through("session.execution.succeeded").await;
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+
+    // 5. Command with omitted text works and commits any staged revert first.
+    post(
+        &server,
+        &format!("/api/session/{sid}/revert/stage"),
+        json!({"messageID":"msg_form","files":false}),
+    )
+    .await;
+    server
+        .post(
+            &format!("/api/session/{sid}/command"),
+            &json!({"name":"ping"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    server
+        .post(&format!("/api/experimental/session/{sid}/wait"), &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let cmd_req = provider.request().await.to_string();
+    assert!(cmd_req.contains("PING_TEMPLATE"));
+    assert_eq!(
+        server
+            .get(&format!("/api/session/{sid}/message/msg_form"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "staged revert must be committed before running a command"
+    );
+
+    // 6. PATCH /api/session/{sid}/inbox/{id} updates delivery to steer and wakes execution.
+    post(
+        &server,
+        &format!("/api/session/{sid}/prompt"),
+        json!({"id":"msg_parked","text":"Wake me","delivery":"queue","resume":false}),
+    )
+    .await;
+    assert_eq!(
+        get(&server, &format!("/api/session/{sid}/inbox")).await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    server
+        .client
+        .patch(format!("{}/api/session/{sid}/inbox/msg_parked", server.url))
+        .json(&json!({"delivery":"steer"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    server
+        .post(&format!("/api/experimental/session/{sid}/wait"), &json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let woken = provider.request().await.to_string();
+    assert!(woken.contains("Wake me"));
+    assert!(
+        get(&server, &format!("/api/session/{sid}/inbox")).await["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }

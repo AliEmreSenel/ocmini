@@ -142,9 +142,12 @@ impl AuthStore {
             .ok_or("OpenCode auth must be a JSON object")?;
         let mut entries = HashMap::new();
         for (id, value) in object {
-            let entry: AuthEntry = serde_json::from_value(value.clone())
-                .map_err(|e| format!("invalid credential for provider {id}: {e}"))?;
-            entries.insert(id.trim_end_matches('/').to_string(), entry);
+            match serde_json::from_value(value.clone()) {
+                Ok(entry) => {
+                    entries.insert(id.trim_end_matches('/').to_string(), entry);
+                }
+                Err(_) => eprintln!("ocmini: skipped invalid credential for provider {id}"),
+            }
         }
         Ok(Self {
             entries: Arc::new(entries),
@@ -475,6 +478,19 @@ mod tests {
             matches!(store.entries.get("openai"), Some(AuthEntry::Oauth { account_id: Some(id), .. }) if id == "account")
         );
     }
+    #[tokio::test]
+    async fn invalid_legacy_entry_does_not_hide_other_credentials() {
+        let store = AuthStore::from_json(
+            r#"{"bad":{"type":"unknown"},"good":{"type":"api","key":"fixture"}}"#,
+        )
+        .unwrap();
+        assert_eq!(store.connected(), ["good"]);
+        assert!(
+            matches!(store.credential("good").await.unwrap(), Some(AuthEntry::Api { key }) if key == "fixture")
+        );
+        assert!(store.credential("bad").await.unwrap().is_none());
+    }
+
     #[test]
     fn jwt_account_is_read_without_authenticating_the_token() {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD

@@ -284,7 +284,19 @@ impl Config {
         Self::load_uncached(directory)
     }
 
+    /// Returns configuration documents discovered for `directory`, ordered from
+    /// lowest to highest priority, matching OpenCode v2 `GET /api/config`.
+    pub fn entries_for(directory: &str) -> Result<Vec<Value>, String> {
+        let mut entries = Vec::new();
+        let _ = Self::load_raw(directory, Some(&mut entries))?;
+        Ok(entries)
+    }
+
     fn load_uncached(directory: &str) -> Result<Config, String> {
+        Self::load_raw(directory, None)
+    }
+
+    fn load_raw(directory: &str, mut entries: Option<&mut Vec<Value>>) -> Result<Config, String> {
         let directory = absolute_path(
             Path::new(directory),
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -301,6 +313,7 @@ impl Config {
                 &mut seen,
                 &mut hook_sources,
                 true,
+                entries.as_deref_mut(),
             )?;
         }
         load_markdown(&mut value, &global, "agent", "prompt")?;
@@ -314,6 +327,7 @@ impl Config {
                     &mut seen,
                     &mut hook_sources,
                     true,
+                    entries.as_deref_mut(),
                 )?;
             }
         }
@@ -332,6 +346,7 @@ impl Config {
                         &mut seen,
                         &mut hook_sources,
                         false,
+                        entries.as_deref_mut(),
                     )?;
                 }
                 let root = base.join(".opencode");
@@ -344,6 +359,7 @@ impl Config {
                             &mut seen,
                             &mut hook_sources,
                             false,
+                            entries.as_deref_mut(),
                         )?;
                     }
                     load_markdown(&mut value, &root, "agent", "prompt")?;
@@ -362,6 +378,7 @@ impl Config {
                         &mut seen,
                         &mut hook_sources,
                         true,
+                        entries.as_deref_mut(),
                     )?;
                 }
                 load_markdown(&mut value, &root, "agent", "prompt")?;
@@ -378,6 +395,9 @@ impl Config {
                     true,
                     &mut hook_sources,
                 );
+                if let Some(entries) = entries {
+                    entries.push(json!({"type":"document","info":overlay}));
+                }
                 deep_merge(&mut value, overlay);
             }
         }
@@ -550,6 +570,7 @@ fn merge_file(
     seen: &mut HashMap<PathBuf, bool>,
     hook_sources: &mut Vec<HookConfigSource>,
     trusted: bool,
+    entries: Option<&mut Vec<Value>>,
 ) -> Result<(), String> {
     let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let previously_read = seen.get(&key).copied();
@@ -595,6 +616,9 @@ fn merge_file(
         }
     }
     collect_hook_source(&overlay, &source, directory, trusted, hook_sources);
+    if let Some(entries) = entries {
+        entries.push(json!({"type":"document","path":source,"info":overlay}));
+    }
     deep_merge(base, overlay);
     Ok(())
 }
@@ -983,8 +1007,26 @@ mod tests {
         let mut value = json!({});
         let mut seen = HashMap::new();
         let mut sources = Vec::new();
-        merge_file(&mut value, &global, true, &mut seen, &mut sources, true).unwrap();
-        merge_file(&mut value, &project, true, &mut seen, &mut sources, false).unwrap();
+        merge_file(
+            &mut value,
+            &global,
+            true,
+            &mut seen,
+            &mut sources,
+            true,
+            None,
+        )
+        .unwrap();
+        merge_file(
+            &mut value,
+            &project,
+            true,
+            &mut seen,
+            &mut sources,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(value["ocmini"]["hooks"]["handlers"]
             .as_array()
             .unwrap()
@@ -1010,6 +1052,7 @@ mod tests {
             &mut seen,
             &mut sources,
             true,
+            None,
         )
         .unwrap();
         assert!(sources[1].trusted);

@@ -32,6 +32,7 @@ struct State {
     steps: HashSet<String>,
     ordinals: HashMap<String, usize>,
     compactions: HashMap<String, &'static str>,
+    form_multi: HashMap<String, Vec<bool>>,
 }
 #[derive(Default)]
 struct Sequence {
@@ -564,6 +565,12 @@ impl Events {
             "question.asked" => {
                 let request: QuestionRequest = serde_json::from_value(p.clone())
                     .map_err(|e| OperationError::from(e.to_string()))?;
+                let multi = request
+                    .questions
+                    .iter()
+                    .map(|q| q["multiple"] == true)
+                    .collect();
+                state.form_multi.insert(request.id.clone(), multi);
                 self.send(
                     session,
                     sid,
@@ -574,6 +581,7 @@ impl Events {
             }
             "question.replied" | "question.rejected" => {
                 let id = p["requestID"].as_str().unwrap_or_default();
+                let multi = state.form_multi.remove(id);
                 let mut data =
                     json!({"id":format!("frm_{}",id.trim_start_matches("que_")),"sessionID":sid});
                 if kind == "question.replied" {
@@ -582,7 +590,22 @@ impl Events {
                         .into_iter()
                         .flatten()
                         .enumerate()
-                        .map(|(n, a)| (n.to_string(), a.clone()))
+                        .map(|(n, a)| {
+                            let value = if multi
+                                .as_ref()
+                                .and_then(|flags| flags.get(n))
+                                .copied()
+                                .unwrap_or(false)
+                            {
+                                a.clone()
+                            } else if let Some(first) = a.as_array().and_then(|items| items.first())
+                            {
+                                first.clone()
+                            } else {
+                                a.clone()
+                            };
+                            (n.to_string(), value)
+                        })
                         .collect::<serde_json::Map<_, _>>();
                     data["answer"] = json!(answers);
                 }

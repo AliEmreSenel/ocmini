@@ -19,16 +19,25 @@ const MAX_PROMPT_CHARS: usize = 2000;
 /// Models to try, in order: `title_model`, `small_model`, the session's model.
 /// An unset `title_model` means deterministic titles only; `small` starts at
 /// the small model.
-fn chain(cfg: &Config, session_model: &ModelRef) -> Vec<ModelRef> {
+fn chain(cfg: &Config, session_model: &ModelRef) -> Vec<(ModelRef, Option<String>)> {
+    let parse = |spec: &str| {
+        let (model, variant) = spec
+            .split_once('#')
+            .map_or((spec, None), |(m, v)| (m, Some(v)));
+        if variant.is_some_and(|v| v.is_empty() || v.contains('#')) {
+            return None;
+        }
+        Some((ModelRef::parse(model).ok()?, variant.map(str::to_owned)))
+    };
     let wanted = match cfg.title_model.trim() {
         "" => return Vec::new(),
         "small" => None,
-        spec => ModelRef::parse(spec).ok(),
+        spec => parse(spec),
     };
     let mut chain = wanted.into_iter().collect::<Vec<_>>();
-    for model in ModelRef::parse(&cfg.small_model)
+    for model in parse(&cfg.small_model)
         .into_iter()
-        .chain([session_model.clone()])
+        .chain([(session_model.clone(), None)])
     {
         if !chain.contains(&model) {
             chain.push(model);
@@ -75,13 +84,13 @@ pub fn launch(app: App, sid: String, parts: &[Value], session_model: &ModelRef) 
             &app.session_context(&sid, json!({})),
         );
         let mut generated = None;
-        for model in chain {
+        for (model, variant) in chain {
             let cfg = app.config.as_ref().clone();
             if !cfg.model_available(&model.provider_id, &model.model_id) {
                 eprintln!("ocmini: title model {model} is unavailable, trying the next");
                 continue;
             }
-            match request(&app, &sid, &cfg, &model, &prompt).await {
+            match request(&app, &sid, &cfg, &model, variant.as_deref(), &prompt).await {
                 Ok(reply) => {
                     generated = sessions::title_from_reply(&reply);
                     if generated.is_some() {
@@ -131,14 +140,13 @@ fn apply(app: &App, result: Result<Option<Session>, crate::types::OperationError
     }
 }
 
-/// One tool-free title request. `variant` stays `None` on purpose: the
-/// session's variant belongs to its model, and leaking it to the title model
-/// is a 400 (upstream's effort-leak failure).
+/// A tool-free title request uses only the title model's own configured variant.
 async fn request(
     app: &App,
     sid: &str,
     cfg: &Config,
     model: &ModelRef,
+    variant: Option<&str>,
     prompt: &str,
 ) -> Result<String, String> {
     let adapter = provider::build(
@@ -158,6 +166,7 @@ async fn request(
     );
     let mut chat = ChatRequest {
         model: model.model_id.clone(),
+        variant: variant.map(str::to_owned),
         system: TITLE_PROMPT.into(),
         messages: vec![json!({"role": "user", "content": prompt})],
         session_id: Some(sid.into()),
@@ -198,30 +207,48 @@ mod tests {
     }
 
     #[test]
+    fn small_model_inline_variant_is_used_for_title_requests() {
+        let session = ModelRef::parse("other/model").unwrap();
+        assert_eq!(
+            chain(&cfg("small", "anthropic/haiku#low"), &session)[0],
+            (
+                ModelRef::parse("anthropic/haiku").unwrap(),
+                Some("low".into())
+            )
+        );
+    }
+
+    #[test]
     fn chain_orders_title_small_and_session_models() {
         let session = ModelRef::parse("anthropic/opus").unwrap();
         assert_eq!(
             chain(&cfg("openai/gpt-mini", "anthropic/haiku"), &session),
             [
-                ModelRef::parse("openai/gpt-mini").unwrap(),
-                ModelRef::parse("anthropic/haiku").unwrap(),
-                session.clone()
+                (ModelRef::parse("openai/gpt-mini").unwrap(), None),
+                (ModelRef::parse("anthropic/haiku").unwrap(), None),
+                (session.clone(), None)
             ]
         );
         // "small" starts at the small model; duplicates appear once, and the
         // session model is always the last stop.
         assert_eq!(
             chain(&cfg("small", "anthropic/haiku"), &session),
-            [ModelRef::parse("anthropic/haiku").unwrap(), session.clone()]
+            [
+                (ModelRef::parse("anthropic/haiku").unwrap(), None),
+                (session.clone(), None)
+            ]
         );
         assert_eq!(
             chain(&cfg("anthropic/opus", ""), &session),
-            std::slice::from_ref(&session)
+            [(session.clone(), None)]
         );
         // A malformed model name falls through to the rest of the chain.
         assert_eq!(
             chain(&cfg("broken", "anthropic/haiku"), &session),
-            [ModelRef::parse("anthropic/haiku").unwrap(), session.clone()]
+            [
+                (ModelRef::parse("anthropic/haiku").unwrap(), None),
+                (session.clone(), None)
+            ]
         );
     }
 }

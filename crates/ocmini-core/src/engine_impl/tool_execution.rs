@@ -2,6 +2,9 @@ use super::*;
 use crate::events as event;
 use tokio_util::sync::CancellationToken;
 
+pub(super) type DeferredMcpTool = (usize, Value, crate::mcp::McpToolRoute);
+type McpActivation<'a> = (&'a [DeferredMcpTool], &'a mut Vec<String>);
+
 /// Tool calls admitted in one model step are independent. Argument hooks and
 /// doom-loop signatures run in part order, then preparation and execution run
 /// concurrently. A same-file edit can wait for its predecessor's transaction
@@ -13,7 +16,8 @@ pub(super) async fn run_tools(
     allowed: &HashSet<String>,
     tool_parts: &mut [Value],
     recent_calls: &mut VecDeque<String>,
-) -> Result<(), String> {
+    deferred: &[DeferredMcpTool],
+) -> Result<Vec<String>, String> {
     let agent = request.agent.as_deref().unwrap_or("build");
     let mut running = Vec::new();
     for (index, part) in tool_parts.iter_mut().enumerate() {
@@ -26,8 +30,17 @@ pub(super) async fn run_tools(
         let mut ctx = base.clone();
         ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
         ctx.part_id = part["id"].as_str().unwrap_or_default().into();
-        let prepared =
-            prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await;
+        let stale = deferred
+            .iter()
+            .find(|(_, def, _)| def["function"]["name"] == name)
+            .is_some_and(|(_, _, route)| !base.app.mcp().route_is_current(&name, route));
+        let prepared = if stale {
+            Err(OperationError::from(
+                "MCP tool catalog changed. Run discover_mcp_tools again.",
+            ))
+        } else {
+            prepare_effective_args(&ctx, &name, original_input.clone(), cfg, request).await
+        };
         let visible_input = match &prepared {
             Ok(input) => input.clone(),
             Err(_) => original_input.clone(),
@@ -51,19 +64,259 @@ pub(super) async fn run_tools(
             cfg,
             request,
             allowed,
+            deferred,
         ));
     }
     let mut first_error = None;
-    for (index, part, error) in futures::future::join_all(running).await {
+    let mut activated = Vec::new();
+    for (index, part, error, selected) in futures::future::join_all(running).await {
         tool_parts[index] = part;
+        activated.extend(selected);
         if let Some(error) = error.filter(|_| first_error.is_none()) {
             first_error = Some(error);
         }
     }
+    if first_error.is_none()
+        && tool_parts.iter().any(|part| {
+            part["tool"] == "read"
+                && part["state"]["status"] == "completed"
+                && part["state"]["input"]["filePath"].as_str().is_some()
+        })
+    {
+        discover_read_instructions(base, cfg, request, tool_parts).await?;
+    }
     match first_error {
-        None => Ok(()),
+        None => Ok(activated),
         Some(error) => Err(error),
     }
+}
+
+async fn discover_read_instructions(
+    base: &ToolCtx,
+    cfg: &Config,
+    request: &PromptRequest,
+    parts: &[Value],
+) -> Result<(), String> {
+    // Resolve paths in the effect domain, including when a sandbox is active
+    // or the workspace directory is accessed through a symlink.
+    let root = tools::resolve_path(&base.dir, ".");
+    let reads: Vec<_> = parts
+        .iter()
+        .filter_map(|part| {
+            if part["tool"] != "read" || part["state"]["status"] != "completed" {
+                return None;
+            }
+            let path = tools::resolve_path(&base.dir, part["state"]["input"]["filePath"].as_str()?);
+            if path == root {
+                return None;
+            }
+            Some((part, path))
+        })
+        .collect();
+    if reads.is_empty() || base.cancel.is_cancelled() {
+        return Ok(());
+    }
+    let mut pending = Vec::new();
+    for (part, path) in reads {
+        if base.cancel.is_cancelled() {
+            return Ok(());
+        }
+        // The successful read's input may refer to a directory; probing it is
+        // delegated to the same effect domain as the read itself.
+        let Ok(resolved) = tools::host::Host::effect(
+            &base.app,
+            base,
+            "instruction_resolve_read",
+            json!({"path":path}),
+        )
+        .await
+        else {
+            continue;
+        };
+        let Ok(resolved) = resolved.json() else {
+            continue;
+        };
+        let Some(target) = resolved["target"].as_str() else {
+            continue;
+        };
+        let Some(canonical_root) = resolved["root"].as_str() else {
+            continue;
+        };
+        let root_instruction = resolved["rootInstruction"].as_str().map(PathBuf::from);
+        let target = Path::new(target);
+        let canonical_root = Path::new(canonical_root);
+        if !target.starts_with(canonical_root) {
+            continue;
+        }
+        let mut dir = if resolved["directory"] == true {
+            Some(target)
+        } else {
+            target.parent()
+        };
+        let mut candidates = Vec::new();
+        while let Some(current) = dir {
+            if current == canonical_root || !current.starts_with(canonical_root) {
+                break;
+            }
+            candidates.push(current.join("AGENTS.md"));
+            dir = current.parent();
+        }
+        candidates.reverse();
+        if !candidates.is_empty() {
+            pending.push((
+                part,
+                target.to_path_buf(),
+                canonical_root.to_path_buf(),
+                root_instruction,
+                candidates,
+            ));
+        }
+    }
+    if pending.is_empty() || base.cancel.is_cancelled() {
+        return Ok(());
+    }
+    let store = base.app.store.clone();
+    let sid = base.session_id.clone();
+    let mid = base.message_id.clone();
+    let history = tokio::task::spawn_blocking(move || store.context_messages(&sid, &mid))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.message)?;
+    let start = history
+        .iter()
+        .rposition(|m| {
+            m.info.summary == Some(true)
+                && m.info.time.completed.is_some()
+                && m.info.error.is_none()
+                && m.parts.iter().any(|p| {
+                    p["type"] == "text" && p["text"].as_str().is_some_and(|s| !s.trim().is_empty())
+                })
+        })
+        .map_or(0, |i| i + 1);
+    let mut seen = HashSet::new();
+    for message in history.into_iter().skip(start) {
+        for part in message.parts {
+            if let Some(path) = part["ocminiInstructionPath"].as_str() {
+                seen.insert(path.to_owned());
+            }
+            // Recognize provenance written by the previous implementation until it is pruned.
+            if !part["state"]["time"]["compacted"].is_number() {
+                if let Some(paths) = part["state"]["metadata"]["instructionPaths"].as_array() {
+                    seen.extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            }
+        }
+    }
+    for (part, target, canonical_root, root_instruction, candidates) in pending {
+        if base.cancel.is_cancelled() {
+            return Ok(());
+        }
+        let mut ctx = base.clone();
+        ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
+        ctx.part_id = part["id"].as_str().unwrap_or_default().into();
+        let root_agents = canonical_root.join("AGENTS.md");
+        for candidate in candidates {
+            if ctx.cancel.is_cancelled() {
+                return Ok(());
+            }
+            if seen.contains(candidate.to_string_lossy().as_ref()) {
+                continue;
+            }
+            let Ok(result) = tools::host::Host::effect(
+                &ctx.app,
+                &ctx,
+                "instruction_resolve",
+                json!({"path":candidate}),
+            )
+            .await
+            else {
+                continue;
+            };
+            let Ok(value) = result.json() else {
+                continue;
+            };
+            let Some(canonical) = value.as_str() else {
+                continue;
+            };
+            let canonical = Path::new(canonical);
+            if !canonical.starts_with(&canonical_root)
+                || canonical == target.as_path()
+                || canonical == root_agents.as_path()
+                || root_instruction
+                    .as_deref()
+                    .is_some_and(|root_file| canonical == root_file)
+            {
+                continue;
+            }
+            let key = canonical.to_string_lossy().into_owned();
+            if seen.contains(&key) {
+                continue;
+            }
+            let rules = current_permission_rules(&ctx, cfg, request).map_err(|e| e.message)?;
+            let candidate_str = candidate.to_string_lossy();
+            let permission_input = json!({"filePath": candidate_str});
+            if check_permission(
+                &ctx,
+                &rules,
+                "read",
+                &candidate_str,
+                "read",
+                &permission_input,
+            )
+            .await
+            .is_err()
+            {
+                if ctx.cancel.is_cancelled() {
+                    return Ok(());
+                }
+                continue;
+            }
+            if canonical != candidate
+                && check_permission(&ctx, &rules, "read", &key, "read", &permission_input)
+                    .await
+                    .is_err()
+            {
+                if ctx.cancel.is_cancelled() {
+                    return Ok(());
+                }
+                continue;
+            }
+            ctx.app
+                .store
+                .check_ownership(&ctx.session_id)
+                .map_err(|e| e.message)?;
+            let Ok(result) = tools::host::Host::effect(
+                &ctx.app,
+                &ctx,
+                "instruction",
+                json!({"path":candidate, "expected":canonical, "display":candidate_str}),
+            )
+            .await
+            else {
+                continue;
+            };
+            let Ok(value) = result.json() else {
+                continue;
+            };
+            let Some(content) = value.as_str() else {
+                continue;
+            };
+            // Store under a dedicated internal part type so v2/TUI transcript views
+            // never render injected AGENTS.md content as visible assistant text.
+            let context = json!({
+                "id": hex_id("prt_"),
+                "sessionID": base.session_id,
+                "messageID": base.message_id,
+                "type": "ocmini_instruction",
+                "synthetic": true,
+                "ocminiInstructionPath": key,
+                "text": content,
+            });
+            crate::messages::update_part(&base.app, &context).map_err(|e| e.message)?;
+            seen.insert(key);
+        }
+    }
+    Ok(())
 }
 
 /// Run one prepared tool call to its terminal part state. The part is owned
@@ -82,7 +335,8 @@ async fn execute_part(
     cfg: &Config,
     request: &PromptRequest,
     allowed: &HashSet<String>,
-) -> (usize, Value, Option<String>) {
+    deferred: &[DeferredMcpTool],
+) -> (usize, Value, Option<String>, Vec<String>) {
     let prepared = match prepared {
         Ok(_)
             if !allowed.contains(&name) && !allowed.contains(crate::v2::wire::tool_name(&name)) =>
@@ -104,11 +358,23 @@ async fn execute_part(
     }
     part["state"] = json!({"status":"running","input":&visible_input,"time":{"start":start}});
     if let Err(error) = crate::messages::update_part(&ctx.app, &part) {
-        return (index, part, Some(error.message));
+        return (index, part, Some(error.message), Vec::new());
     }
+    let mut selected = Vec::new();
     let output: Result<_, OperationError> = match &prepared {
         Err(error) => Err(error.clone()),
-        Ok(input) => execute_tool(&ctx, &name, input, cfg, request, repeated).await,
+        Ok(input) => {
+            execute_tool(
+                &ctx,
+                &name,
+                input,
+                cfg,
+                request,
+                repeated,
+                Some((deferred, &mut selected)),
+            )
+            .await
+        }
     };
     // Task/question tools may publish metadata while blocked. Preserve it.
     let existing = ctx
@@ -131,6 +397,9 @@ async fn execute_part(
     };
     let update = crate::messages::update_part(&ctx.app, &part);
     let completed = part["state"]["status"] == "completed";
+    if !completed {
+        selected.clear();
+    }
     let error_value = part["state"]["error"].clone();
     let event = if completed {
         event::Tool::Completed {
@@ -152,7 +421,7 @@ async fn execute_part(
         Ok(()) => None,
         Err(error) => Some(error.message),
     };
-    (index, part, failure)
+    (index, part, failure, selected)
 }
 
 pub(super) fn execution_tool(name: &str) -> bool {
@@ -314,8 +583,9 @@ pub(super) async fn execute_tool(
     cfg: &Config,
     request: &PromptRequest,
     repeated: bool,
+    selection: Option<McpActivation<'_>>,
 ) -> Result<ToolOutput, OperationError> {
-    let result = execute_authorized_tool(ctx, name, input, cfg, request, repeated).await;
+    let result = execute_authorized_tool(ctx, name, input, cfg, request, repeated, selection).await;
     let mut context = tools::hook_context(ctx, name);
     context["outcome"] = json!(if result.is_ok() { "completed" } else { "error" });
     if !ctx
@@ -378,6 +648,7 @@ async fn execute_authorized_tool(
     cfg: &Config,
     request: &PromptRequest,
     repeated: bool,
+    selection: Option<McpActivation<'_>>,
 ) -> Result<ToolOutput, OperationError> {
     if repeated || input.file_paths().is_none() {
         let rules = current_permission_rules(ctx, cfg, request)?;
@@ -411,6 +682,15 @@ async fn execute_authorized_tool(
             }
         }
     }
+    let route = selection.as_ref().and_then(|(deferred, _)| {
+        deferred
+            .iter()
+            .find(|(_, def, _)| def["function"]["name"] == name)
+            .map(|(_, _, route)| route)
+    });
+    if route.is_some_and(|route| !ctx.app.mcp().route_is_current(name, route)) {
+        return Err("MCP tool catalog changed. Run discover_mcp_tools again.".into());
+    }
     // Approval hooks and user input can outlive the lease that authorized them.
     ctx.app.store.check_ownership(&ctx.session_id)?;
     ctx.app.hooks.emit(
@@ -422,7 +702,52 @@ async fn execute_authorized_tool(
         },
         &tools::hook_context(ctx, name),
     );
-    tools::run_tool(ctx, name, input).await.map_err(Into::into)
+    if name == "discover_mcp_tools" {
+        let (deferred, selected) = selection.ok_or("Discovery unavailable")?;
+        let query = input.args()["query"]
+            .as_str()
+            .ok_or("query must be a string")?
+            .to_lowercase();
+        for (_, def, route) in deferred {
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            let description = def["function"]["description"].as_str().unwrap_or_default();
+            if ctx.app.mcp().route_is_current(name, route)
+                && format!("{name} {description}")
+                    .to_lowercase()
+                    .contains(&query)
+            {
+                selected.push(name.to_owned());
+            }
+        }
+        return tools::limit_output(
+            ToolOutput {
+                output: format!("Activated MCP tools: {}", selected.join(", ")),
+                title: "Discover MCP tools".into(),
+                metadata: json!({"activated":selected}),
+            },
+            ctx.app.tool_output_directory(&ctx.session_id),
+        )
+        .await
+        .map_err(Into::into);
+    }
+    if let Some(route) = route {
+        let output = ctx
+            .app
+            .mcp()
+            .call_discovered(route, input.args().clone(), ctx.cancel.clone())
+            .await?;
+        return ocmini_tools::output::limit(output, ctx.app.tool_output_directory(&ctx.session_id))
+            .await
+            .map_err(Into::into);
+    }
+    tools::run_tool(ctx, name, input, |next, hop_args| async move {
+        let rules = current_permission_rules(ctx, cfg, request)?;
+        check_permission(ctx, &rules, "webfetch", &next, "webfetch", &hop_args).await?;
+        ctx.app.store.check_ownership(&ctx.session_id)?;
+        Ok(())
+    })
+    .await
+    .map_err(Into::into)
 }
 
 async fn check_permission(
@@ -553,7 +878,7 @@ pub(super) async fn expand_shell_templates(
             let input = prepare_effective_input(&ctx, "bash", input, cfg, request)
                 .await
                 .map_err(|e| e.message)?;
-            let output = execute_tool(&ctx, "bash", &input, cfg, request, false)
+            let output = execute_tool(&ctx, "bash", &input, cfg, request, false, None)
                 .await
                 .map_err(|e| e.message)?;
             replaced.push_str(&original[offset..matched.start()]);

@@ -22,6 +22,39 @@ pub struct Cursor {
     pub id: String,
     pub previous: bool,
 }
+
+/// SQLite LIKE only folds ASCII. Expand single-character case forms into GLOB
+/// classes while preserving LIKE's wildcards and treating GLOB syntax literally.
+pub(crate) fn title_pattern(search: &str) -> String {
+    let mut pattern = String::from("*");
+    for ch in search.chars() {
+        match ch {
+            '%' => pattern.push('*'),
+            '_' => pattern.push('?'),
+            '[' => pattern.push_str("[[]"),
+            '*' => pattern.push_str("[*]"),
+            '?' => pattern.push_str("[?]"),
+            _ => {
+                let mut lower = ch.to_lowercase();
+                let mut upper = ch.to_uppercase();
+                let lower = lower.next().filter(|form| lower.len() == 0 && *form != ch);
+                let upper = upper.next().filter(|form| upper.len() == 0 && *form != ch);
+                if lower.is_some() || upper.is_some() {
+                    pattern.push('[');
+                    pattern.push(ch);
+                    pattern.extend(lower);
+                    pattern.extend(upper.filter(|form| Some(*form) != lower));
+                    pattern.push(']');
+                } else {
+                    pattern.push(ch);
+                }
+            }
+        }
+    }
+    pattern.push('*');
+    pattern
+}
+
 impl Cursor {
     pub fn decode(value: &str) -> Result<Self, OperationError> {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD

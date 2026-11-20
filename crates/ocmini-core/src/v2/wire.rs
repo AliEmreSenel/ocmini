@@ -7,6 +7,11 @@ pub fn model_in(value: &Value) -> Result<ModelRef, OperationError> {
         model_id: string(value, "id")?.into(),
     };
     model.validate().map_err(OperationError::invalid)?;
+    if let Some(variant) = value.get("variant").filter(|v| !v.is_null()) {
+        if variant.as_str().is_none_or(str::is_empty) {
+            return Err(OperationError::invalid("variant must be a nonempty string"));
+        }
+    }
     Ok(model)
 }
 pub fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, OperationError> {

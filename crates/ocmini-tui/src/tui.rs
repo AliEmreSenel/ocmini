@@ -1,4 +1,5 @@
 // Terminal transcript and input over the shared session engine.
+use crate::commands::{Command, LocalAction, Registry, LOCAL_COMMANDS};
 use crate::config::ScrollMode;
 use crate::engine::{self, App, EngineApi};
 use crate::engine_impl::Engine;
@@ -13,6 +14,7 @@ use crossterm::{
 use futures::{poll, StreamExt};
 use serde_json::Value;
 mod clipboard;
+mod completion;
 mod input;
 mod markdown;
 mod render;
@@ -21,6 +23,7 @@ use crate::client::{parse_answer, shutdown_signal, TextState};
 #[cfg(test)]
 use clipboard::image_attachment;
 use clipboard::{file_attachment, paste_clipboard, pasted_image_path};
+use completion::Completion;
 pub(crate) use input::Motion;
 use input::{
     clean_input, input_prefix, page_move, terminal_width, Display, Draft, History, KillRing,
@@ -188,6 +191,7 @@ struct Ui {
     tool_done: std::collections::HashSet<String>,
     // Prompt interaction routed from the terminal: lines when idle, keys while a request is pending.
     prompt: Option<PendingPrompt>,
+    completion: Completion,
     /// Live transcript toggles, mirrored into the display on every change.
     visibility: Visibility,
     /// The answer's `assistant` label is already on screen. A turn runs one
@@ -228,6 +232,19 @@ fn prompt_header(model: &str, visibility: Visibility) -> String {
 
 /// Local help is shown only on request, never sent to the model.
 fn help_text(fullscreen: bool) -> String {
+    let mut commands = String::new();
+    for command in LOCAL_COMMANDS {
+        let mut invocation = format!("/{}", command.name);
+        if let Some(arguments) = command.arguments {
+            invocation.push(' ');
+            invocation.push_str(arguments);
+        }
+        if let Some(shortcut) = command.shortcut {
+            invocation.push_str(" or ");
+            invocation.push_str(shortcut);
+        }
+        commands.push_str(&format!("  {invocation:<25} {}\n", command.description));
+    }
     let tools = if fullscreen {
         "Cycle tools: grouped / brief / full"
     } else {
@@ -239,9 +256,8 @@ fn help_text(fullscreen: bool) -> String {
         "  PgUp/PgDn              Move through draft\n  Mouse wheel            Terminal scrollback\n"
     };
     format!(
-        "\n{BOLD}Help{RESET}\n\
-  /help or F1            Show this help\n\
-  /quit or Ctrl+D        Quit\n\
+        "\n{BOLD}Help{RESET}\n{commands}\
+  /                      Show commands (Up/Down select, Tab completes, Esc hides)\n\
   Enter                  Send\n\
   Alt+Enter              Insert newline\n\
   Up/Down                History on empty draft; move in text\n\
@@ -708,6 +724,11 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     display.draw(&ui, &draft, terminal_width(), &model_display);
                     continue;
                 }
+                if ui.prompt.is_none() && ui.completion.key(&key, &mut draft) {
+                    ui.completion.update(&draft, Registry::new(&app.config));
+                    display.draw(&ui, &draft, terminal_width(), &model_display);
+                    continue;
+                }
                 match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
@@ -773,6 +794,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                                         ui.text = TextState::default();
                                         ui.tool_done.clear();
                                         ui.prompt = None;
+                                        ui.completion = Completion::default();
                                         model_display = display_model(selected.model.as_ref(), &app.config.model);
                                         draft = Draft::default();
                                         prompt_history.load(session_prompts(&history));
@@ -806,15 +828,57 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                         }
                     }
                     Key::Enter if pending_permission => {},
-                    Key::Enter if draft.text.trim() == "/help" => {
-                        // Keep attachments: asking for help must not discard them.
-                        draft.clear_text();
-                        display.finish_line();
-                        display.output(&help_text(fullscreen), terminal_width());
-                        display.scroll_bottom();
-                    }
                     Key::Enter => {
                         display.finish_line();
+                        let command = Registry::new(&app.config).resolve_terminal(&draft.text);
+                        let configured = match command {
+                            Some((Command::Local(command), arguments)) => {
+                                // Local actions leave attachments in the draft.
+                                match command.action {
+                                    LocalAction::Help => {
+                                        draft.clear_text();
+                                        display.output(&help_text(fullscreen), terminal_width());
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Context => {
+                                        draft.clear_text();
+                                        match crate::engine_impl::inspect_context(&app, &session, &selected).await {
+                                            Ok(report) => display.output(&format!("\n{report}"), terminal_width()),
+                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Compact => {
+                                        let mut part = serde_json::json!({"type":"compaction","auto":false});
+                                        if !arguments.is_empty() {
+                                            part["ocminiFocus"] = Value::String(arguments.to_owned());
+                                        }
+                                        display.user_prompt(draft.text.trim(), terminal_width());
+                                        draft.clear_text();
+                                        let request = PromptRequest {
+                                            message_id: Some(crate::types::hex_id("msg_")),
+                                            parts: vec![part],
+                                            command: Some("__ocmini_compact".into()),
+                                            ..selected.clone()
+                                        };
+                                        if let Err(error) = engine.admit(app.clone(), session.id.clone(), request).await {
+                                            display.output(&format!("{RED}error:{RESET} {error}\n"), terminal_width());
+                                        }
+                                    }
+                                    LocalAction::Quit => {
+                                        display.user_prompt(&draft.text, terminal_width());
+                                        break;
+                                    }
+                                }
+                                ui.completion.update(&draft, Registry::new(&app.config));
+                                display.draw(&ui, &draft, terminal_width(), &model_display);
+                                continue;
+                            }
+                            Some((Command::Configured { name, .. }, arguments)) => {
+                                Some((name, arguments.to_owned()))
+                            }
+                            None => None,
+                        };
                         let (text, files) = draft.take();
                         display.user_prompt(&text, terminal_width());
                         for file in &files {
@@ -826,7 +890,6 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                                 terminal_width(),
                             );
                         }
-                        if text.trim() == "/quit" { break; }
                         prompt_history.remember(text.clone());
                         let mut parts: Vec<Value> = Vec::new();
                         if !text.trim().is_empty() {
@@ -836,12 +899,27 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                             parts.push(attachment.part());
                         }
                         if !parts.is_empty() {
-                            let request = PromptRequest {
-                                message_id: Some(crate::types::hex_id("msg_")),
-                                parts,
-                                ..selected.clone()
+                            let request = match configured {
+                                Some((name, arguments)) => prepare_configured_command(
+                                    &app.config,
+                                    name,
+                                    &arguments,
+                                    parts,
+                                    &selected,
+                                    model_override.as_ref(),
+                                )
+                                .map_err(crate::types::OperationError::invalid),
+                                None => Ok(PromptRequest {
+                                    message_id: Some(crate::types::hex_id("msg_")),
+                                    parts,
+                                    ..selected.clone()
+                                }),
                             };
-                            if let Err(error) = engine.admit(app.clone(), session.id.clone(), request).await {
+                            let result = match request {
+                                Ok(request) => engine.admit(app.clone(), session.id.clone(), request).await.map(drop),
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = result {
                                 display.output(
                                     &format!("{RED}error:{RESET} {error}\n"),
                                     terminal_width(),
@@ -919,6 +997,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     }
                     _ => {}
                 }
+                ui.completion.update(&draft, Registry::new(&app.config));
                 display.draw(&ui, &draft, terminal_width(), &model_display);
             }
             event = events.recv() => {
@@ -932,6 +1011,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let history = app.store.messages(&session.id)?;
                         ui = Ui { visibility: ui.visibility, ..Default::default() };
+                        ui.completion.update(&draft, Registry::new(&app.config));
                         display.clear_screen();
                         display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), terminal_width());
                         render_history(&mut display, &mut ui, &history);
@@ -950,6 +1030,35 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
     display.leave_screen();
     engine.abort_and_wait(&session.id).await;
     Ok(())
+}
+
+fn prepare_configured_command(
+    config: &crate::config::Config,
+    name: &str,
+    arguments: &str,
+    parts: Vec<Value>,
+    selected: &PromptRequest,
+    model_override: Option<&crate::types::ModelRef>,
+) -> Result<PromptRequest, String> {
+    let base = PromptRequest {
+        message_id: Some(crate::types::hex_id("msg_")),
+        model: model_override.cloned(),
+        parts,
+        ..Default::default()
+    };
+    let mut request = crate::commands::prepare(config, name, arguments, base, None)?;
+    if request.agent.is_none() {
+        request.agent = selected.agent.clone();
+    }
+    if request.model.is_none() {
+        request.model = selected.model.clone();
+        if request.variant.is_none() {
+            request.variant = selected.variant.clone();
+        }
+    } else if request.variant.is_none() && request.model == selected.model {
+        request.variant = selected.variant.clone();
+    }
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -1756,5 +1865,65 @@ mod tests {
         };
         assert!(!confirm);
         assert_eq!(drafts[0].text, "1");
+    }
+
+    #[test]
+    fn configured_commands_keep_resumed_selection_unless_overridden() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "command": {
+                "plain": "Review $ARGUMENTS",
+                "custom": {
+                    "template": "Audit $ARGUMENTS",
+                    "agent": "explore",
+                    "model": "other/fast"
+                }
+            }
+        }))
+        .unwrap();
+        let resumed = super::PromptRequest {
+            model: Some(crate::types::ModelRef {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+            }),
+            agent: Some("plan".into()),
+            variant: Some("high".into()),
+            ..Default::default()
+        };
+        let plain =
+            super::prepare_configured_command(&cfg, "plain", "diff", vec![], &resumed, None)
+                .unwrap();
+        assert_eq!(plain.model, resumed.model);
+        assert_eq!(plain.agent.as_deref(), Some("plan"));
+        assert_eq!(plain.variant.as_deref(), Some("high"));
+
+        let custom =
+            super::prepare_configured_command(&cfg, "custom", "diff", vec![], &resumed, None)
+                .unwrap();
+        assert_eq!(
+            custom.model,
+            Some(crate::types::ModelRef {
+                provider_id: "other".into(),
+                model_id: "fast".into(),
+            })
+        );
+        assert_eq!(custom.agent.as_deref(), Some("explore"));
+        assert!(custom.variant.is_none());
+
+        let cli_model = crate::types::ModelRef {
+            provider_id: "cli".into(),
+            model_id: "override".into(),
+        };
+        let overridden = super::prepare_configured_command(
+            &cfg,
+            "custom",
+            "diff",
+            vec![],
+            &resumed,
+            Some(&cli_model),
+        )
+        .unwrap();
+        assert_eq!(overridden.model.as_ref(), Some(&cli_model));
+        assert_eq!(overridden.agent.as_deref(), Some("explore"));
+        assert!(overridden.variant.is_none());
     }
 }

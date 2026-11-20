@@ -21,6 +21,7 @@ pub struct AppState {
     pub engine: Arc<dyn EngineApi>,
     pub shutdown: tokio_util::sync::CancellationToken,
     pub max_request_bytes: usize,
+    pub listen_url: Option<String>,
 }
 
 impl IntoResponse for OperationError {
@@ -81,6 +82,55 @@ async fn auth_gate(req: Request, next: Next) -> Response {
                     Json(if req.uri().path().starts_with("/api/") {json!({"_tag":"UnauthorizedError","message":"Authentication required"})} else {json!({"name": "UnauthorizedError", "data": {"message": "Authentication required"}})}),
                 ).into_response();
             }
+        }
+    }
+    next.run(req).await
+}
+
+async fn request_site_gate(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let api = path == "/api"
+        || path.starts_with("/api/")
+        || path.starts_with("/web/api/")
+        || matches!(
+            path.split('/').nth(1),
+            Some(
+                "global"
+                    | "session"
+                    | "event"
+                    | "permission"
+                    | "question"
+                    | "mcp"
+                    | "provider"
+                    | "agent"
+                    | "skill"
+                    | "command"
+            )
+        );
+    let headers = req.headers();
+    let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    if api && matches!(site, Some("cross-site" | "same-site")) {
+        let navigate = headers
+            .get("sec-fetch-mode")
+            .is_some_and(|v| v == "navigate");
+        let disallowed_origin = headers.get(header::ORIGIN).is_some_and(|origin| {
+            let origin = origin
+                .to_str()
+                .ok()
+                .and_then(|v| reqwest::Url::parse(v).ok());
+            let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+            !origin.as_ref().zip(host).is_some_and(|(origin, host)| {
+                origin.host_str().is_some_and(|name| {
+                    let authority = match origin.port() {
+                        Some(port) => format!("{name}:{port}"),
+                        None => name.to_owned(),
+                    };
+                    authority.eq_ignore_ascii_case(host)
+                })
+            })
+        });
+        if navigate || disallowed_origin {
+            return (StatusCode::FORBIDDEN, Json(json!({"_tag":"ForbiddenError","message":"Cross-site requests to the API are not allowed"}))).into_response();
         }
     }
     next.run(req).await
@@ -851,6 +901,21 @@ async fn access_log(request: Request, next: Next) -> Response {
     response
 }
 
+async fn panic_to_json(request: Request, next: Next) -> Response {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(next.run(request))
+        .catch_unwind()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"_tag":"UnknownError","message":"Internal server error"})),
+        )
+            .into_response(),
+    }
+}
+
 async fn not_found() -> OperationError {
     OperationError::not_found("Route not found")
 }
@@ -902,7 +967,9 @@ pub fn router_with(state: AppState, extra: Router<AppState>) -> Router {
         .route("/skill", get(skills))
         .route("/command", get(commands))
         .fallback(not_found)
+        .layer(middleware::from_fn(panic_to_json))
         .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn(request_site_gate))
         .layer(middleware::from_fn(auth_gate))
         .layer(middleware::from_fn(access_log))
         .with_state(state)
@@ -936,23 +1003,22 @@ pub async fn serve_with(
     let listener = tokio::net::TcpListener::bind((hostname.as_str(), port))
         .await
         .map_err(|error| format!("Cannot listen on {hostname}:{port}: {error}"))?;
-    let state = AppState {
-        app,
-        engine: Arc::new(crate::engine_impl::Engine::new()),
-        shutdown: tokio_util::sync::CancellationToken::new(),
-        max_request_bytes,
-    };
-    state.engine.recover(state.app.clone());
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     let announced_host = if address.is_ipv6() {
         format!("[{}]", address.ip())
     } else {
         address.ip().to_string()
     };
-    println!(
-        "opencode server listening on http://{announced_host}:{}",
-        address.port()
-    );
+    let listen_url = format!("http://{announced_host}:{}", address.port());
+    let state = AppState {
+        app,
+        engine: Arc::new(crate::engine_impl::Engine::new()),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        max_request_bytes,
+        listen_url: Some(listen_url.clone()),
+    };
+    state.engine.recover(state.app.clone());
+    println!("opencode server listening on {listen_url}");
     use std::io::Write;
     std::io::stdout()
         .flush()
@@ -1046,5 +1112,111 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+}
+
+#[cfg(test)]
+mod request_site_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn browser_site_gate_preserves_native_and_same_origin_requests() {
+        let app = Router::new()
+            .route("/", get(|| async { "page" }))
+            .route("/api/test", get(|| async { "ok" }))
+            .route("/web/api/test", get(|| async { "ok" }))
+            .route("/session", get(|| async { "ok" }))
+            .route("/mcp", get(|| async { "ok" }))
+            .layer(middleware::from_fn(request_site_gate));
+        for (path, site, mode, origin, status) in [
+            ("/", "cross-site", "navigate", "", StatusCode::OK),
+            ("/api/test", "", "", "", StatusCode::OK),
+            (
+                "/api/test",
+                "same-origin",
+                "cors",
+                "https://example.test",
+                StatusCode::OK,
+            ),
+            (
+                "/api/test",
+                "same-site",
+                "cors",
+                "https://proxy.test:8443",
+                StatusCode::OK,
+            ),
+            (
+                "/api/test",
+                "cross-site",
+                "cors",
+                "https://evil.test",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/test",
+                "same-site",
+                "navigate",
+                "https://proxy.test:8443",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/web/api/test",
+                "cross-site",
+                "navigate",
+                "",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/session",
+                "cross-site",
+                "cors",
+                "https://evil.test",
+                StatusCode::FORBIDDEN,
+            ),
+            ("/mcp", "cross-site", "navigate", "", StatusCode::FORBIDDEN),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("host", "proxy.test:8443")
+                        .header("sec-fetch-site", site)
+                        .header("sec-fetch-mode", mode)
+                        .header("origin", origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path} {site} {mode} {origin}");
+            if status == StatusCode::FORBIDDEN {
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap()["_tag"],
+                    "ForbiddenError"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_panics_return_typed_unknown_error_json() {
+        async fn boom() -> &'static str {
+            panic!("boom")
+        }
+        let app = Router::new()
+            .route("/api/panic", get(boom))
+            .layer(middleware::from_fn(panic_to_json));
+        let response = app
+            .oneshot(Request::get("/api/panic").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["_tag"], "UnknownError");
     }
 }

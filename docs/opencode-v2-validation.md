@@ -66,3 +66,7 @@ Total RSS is approximately 4 MiB higher in this build. Mapping inspection attrib
 With 20,001 saved v2 sessions, two additional startup samples took 0.068–0.075 s before and 0.068–0.075 s after. The event cache no longer loads those saved IDs, but total startup RSS was still about 1–1.4 MiB higher due to the executable mapping difference. The structural cache improvement should not be described as a measured reduction in total RSS.
 
 These focused checks validate the changed paths. They are not a mandatory benchmark framework, a whole-system 500 MB test or certification of embedded-device performance.
+
+### Nested instruction discovery limits
+
+Successful reads can add nested AGENTS.md content as synthetic context, once per canonical path in the visible history. Revert follows the visible history; after a completed compaction summary, a later read can load the instructions again. The existing tool-output limit applies to each instruction, with larger output saved by the normal output mechanism. Discovery only follows targets inside the workspace, uses the active effect domain, and skips files that cannot be authorized or securely opened. Parallel same-directory reads, denied instructions, and external instruction symlinks have local provider contract coverage; sandbox-specific discovery and concurrent filesystem replacement have not been independently exercised by those fixtures.

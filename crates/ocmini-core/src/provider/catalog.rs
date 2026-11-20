@@ -39,6 +39,9 @@ pub async fn discover_models(config: &Config, auth: &AuthStore) -> (Config, Vec<
     }
     // A model explicitly selected in config is a declared capability, even if its provider cannot enumerate models.
     for selected in [&config.model, &config.small_model] {
+        let selected = selected
+            .split_once('#')
+            .map_or(selected.as_str(), |(model, _)| model);
         if let Some((provider, model)) = selected.split_once('/') {
             if !provider.is_empty() && !model.is_empty() && config.provider_enabled(provider) {
                 result

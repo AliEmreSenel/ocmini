@@ -65,6 +65,26 @@ impl SqliteBackend {
             Ok(())
         })
     }
+    pub fn v2_update_inbox_delivery(
+        &self,
+        sid: &str,
+        id: &str,
+        delivery: &str,
+    ) -> Result<bool, OperationError> {
+        self.transaction(|tx| {
+            let changed = tx.execute(
+                "UPDATE inbox SET request=json_set(request,'$.v2.delivery',?3) WHERE session_id=?1 AND message_id=?2 AND started=0",
+                params![sid, id, delivery],
+            )?;
+            if changed > 0 {
+                tx.execute(
+                    "UPDATE message SET json=json_set(json,'$.ocminiV2Input.delivery',?2) WHERE session_id=?1 AND id=?3",
+                    params![sid, delivery, id],
+                )?;
+            }
+            Ok(changed > 0)
+        })
+    }
     pub fn has_steering(&self, sid: &str) -> Result<bool, OperationError> {
         self.with_read(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE session_id=?1 AND started=0 AND coalesce(json_extract(request,'$.v2.delivery'),'steer')='steer')",[sid],|r|r.get(0)).map_err(Into::into))
     }
@@ -131,9 +151,9 @@ impl SqliteBackend {
         self.with_read(|c| {
             let direction=if descending {"DESC"} else {"ASC"};
             let compare=if descending {"<"} else {">"};
-            let sql=format!("SELECT m.rowid,m.id FROM message m LEFT JOIN inbox i ON i.message_id=m.id AND i.started=0 WHERE m.session_id=?1 AND i.message_id IS NULL AND coalesce(json_extract(m.json,'$.ocminiV2Cancelled'),0)=0 AND (?2 IS NULL OR m.rowid {compare} ?2) ORDER BY m.rowid {direction} LIMIT ?3");
+            let sql=format!("SELECT m.rowid,m.id FROM message m LEFT JOIN inbox i ON i.message_id=m.id AND i.started=0 WHERE m.session_id=?1 AND i.message_id IS NULL AND coalesce(json_extract(m.json,'$.ocminiV2Cancelled'),0)=0 AND coalesce(json_extract(m.json,'$.command'),'')!='__ocmini_compact' AND (?2 IS NULL OR m.rowid {compare} ?2) ORDER BY m.rowid {direction} LIMIT ?3");
             let mut q=c.prepare(&sql)?;
-            let ids=q.query_map(params![sid,after,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+            let ids=q.query_map(params![sid,after,limit.saturating_add(1).min(i64::MAX as usize) as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
             ids.into_iter().map(|(seq,id)|read_message(c,sid,&id)?.map(|m|(seq,m)).ok_or_else(||OperationError::not_found("Message disappeared"))).collect()
         })
     }
@@ -183,9 +203,10 @@ impl SqliteBackend {
         self.with_read(|c| {
             let ascending=filter.ascending ^ cursor.is_some_and(|c| c.previous);
             let (order,compare)=if ascending { ("ASC",">") } else { ("DESC","<") };
-            let sql=format!("SELECT s.json,coalesce(v.json,'{{}}') FROM session s LEFT JOIN v2_state v ON v.session_id=s.id WHERE (?1 IS NULL OR s.directory=?1) AND (?2 IS NULL OR s.json->>'$.projectID'=?2) AND (?3 IS NULL OR s.json->>'$.title' LIKE '%'||?3||'%') AND (?4 IS NULL OR CASE WHEN ?4='null' THEN s.parent_id IS NULL ELSE s.parent_id=?4 END) AND (?5 IS NULL OR (s.json->>'$.time.archived' IS NOT NULL)=?5) AND (?6 IS NULL OR s.time_updated {compare} ?6 OR (s.time_updated=?6 AND s.id {compare} ?7)) ORDER BY s.time_updated {order},s.id {order} LIMIT ?8");
+            let search=filter.search.as_deref().map(crate::v2::list::title_pattern);
+            let sql=format!("SELECT s.json,coalesce(v.json,'{{}}') FROM session s LEFT JOIN v2_state v ON v.session_id=s.id WHERE (?1 IS NULL OR s.directory=?1) AND (?2 IS NULL OR s.json->>'$.projectID'=?2) AND (?3 IS NULL OR s.json->>'$.title' GLOB ?3) AND (?4 IS NULL OR CASE WHEN ?4='null' THEN s.parent_id IS NULL ELSE s.parent_id=?4 END) AND (?5 IS NULL OR (s.json->>'$.time.archived' IS NOT NULL)=?5) AND (?6 IS NULL OR s.time_updated {compare} ?6 OR (s.time_updated=?6 AND s.id {compare} ?7)) ORDER BY s.time_updated {order},s.id {order} LIMIT ?8");
             let mut stmt=c.prepare(&sql)?;
-            let rows=stmt.query_map(params![filter.directory,filter.project,filter.search,filter.parent,filter.archived,cursor.map(|c|c.time),cursor.map(|c|c.id.as_str()),limit.saturating_add(1).min(i64::MAX as usize) as i64], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
+            let rows=stmt.query_map(params![filter.directory,filter.project,search,filter.parent,filter.archived,cursor.map(|c|c.time),cursor.map(|c|c.id.as_str()),limit.saturating_add(1).min(i64::MAX as usize) as i64], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
             rows.map(|row| { let (session,state)=row?; Ok((serde_json::from_str(&session).map_err(data_error)?,serde_json::from_str(&state).map_err(data_error)?)) }).collect()
         })
     }
@@ -217,6 +238,40 @@ fn update_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_title_search_folds_unicode_and_preserves_wildcards() {
+        let store = SqliteBackend::open(Path::new(":memory:"), "search").unwrap();
+        let cyrillic = Session::new("Тестова сесия", "/tmp");
+        let accented = Session::new("CAFÉ [Draft]", "/tmp");
+        for session in [&cyrillic, &accented] {
+            store.create_session(session).unwrap();
+        }
+        for (search, expected) in [
+            ("тест%сия", cyrillic.id.as_str()),
+            ("caf_", accented.id.as_str()),
+            ("café [draft]", accented.id.as_str()),
+        ] {
+            let filter = crate::v2::list::Filter {
+                search: Some(search.into()),
+                ..Default::default()
+            };
+            let rows = store.v2_sessions_page(&filter, None, 10).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0.id, expected);
+        }
+        for search in ["*", "?"] {
+            let filter = crate::v2::list::Filter {
+                search: Some(search.into()),
+                ..Default::default()
+            };
+            assert!(store
+                .v2_sessions_page(&filter, None, 10)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
     #[test]
     fn sequence_ranges_reuse_reads_and_recover_after_sibling_writes_and_restart() {
         let root = tempfile::tempdir().unwrap();

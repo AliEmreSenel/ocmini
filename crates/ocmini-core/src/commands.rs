@@ -1,6 +1,142 @@
 use crate::config::Config;
 use crate::types::{ModelRef, PromptRequest};
-use serde_json::json;
+use serde_json::{json, Value};
+
+#[derive(Clone, Copy)]
+pub enum LocalAction {
+    Compact,
+    Context,
+    Help,
+    Quit,
+}
+
+pub struct LocalCommand {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub arguments: Option<&'static str>,
+    pub shortcut: Option<&'static str>,
+    pub action: LocalAction,
+}
+
+pub const LOCAL_COMMANDS: &[LocalCommand] = &[
+    LocalCommand {
+        name: "compact",
+        description: "Summarize context with optional focus",
+        arguments: Some("[instructions]"),
+        shortcut: None,
+        action: LocalAction::Compact,
+    },
+    LocalCommand {
+        name: "context",
+        description: "Inspect approximate context usage",
+        arguments: None,
+        shortcut: None,
+        action: LocalAction::Context,
+    },
+    LocalCommand {
+        name: "help",
+        description: "Show this help",
+        arguments: None,
+        shortcut: Some("F1"),
+        action: LocalAction::Help,
+    },
+    LocalCommand {
+        name: "quit",
+        description: "Quit",
+        arguments: None,
+        shortcut: Some("Ctrl+D"),
+        action: LocalAction::Quit,
+    },
+];
+
+pub enum Command<'a> {
+    Local(&'static LocalCommand),
+    Configured {
+        name: &'a str,
+        definition: &'a Value,
+    },
+}
+
+impl Command<'_> {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Local(command) => command.name,
+            Self::Configured { name, .. } => name,
+        }
+    }
+
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Local(command) => command.description,
+            Self::Configured { definition, .. } => {
+                definition["description"].as_str().unwrap_or_default()
+            }
+        }
+    }
+}
+
+pub struct Registry<'a> {
+    config: &'a Config,
+}
+
+impl<'a> Registry<'a> {
+    pub fn new(config: &'a Config) -> Self {
+        Self { config }
+    }
+
+    /// Prompt templates are also callable through the HTTP command endpoint.
+    pub fn configured(&self) -> impl Iterator<Item = (&'a str, &'a Value)> {
+        self.config
+            .command
+            .iter()
+            .filter(|(_, definition)| template(definition).is_some())
+            .map(|(name, definition)| (name.as_str(), definition))
+    }
+
+    pub fn terminal(&self) -> impl Iterator<Item = Command<'a>> {
+        LOCAL_COMMANDS.iter().map(Command::Local).chain(
+            self.configured()
+                .filter(|(name, _)| valid_slash_name(name) && local_command(name).is_none())
+                .map(|(name, definition)| Command::Configured { name, definition }),
+        )
+    }
+
+    pub fn resolve_terminal<'text>(&self, text: &'text str) -> Option<(Command<'a>, &'text str)> {
+        let (name, rest) = split_slash(text)?;
+        let arguments = rest.trim();
+        if let Some(command) = local_command(name) {
+            return (arguments.is_empty() || command.arguments.is_some())
+                .then_some((Command::Local(command), arguments));
+        }
+        if !valid_slash_name(name) {
+            return None;
+        }
+        let (name, definition) = self.config.command.get_key_value(name)?;
+        template(definition)?;
+        Some((Command::Configured { name, definition }, arguments))
+    }
+}
+
+fn local_command(name: &str) -> Option<&'static LocalCommand> {
+    LOCAL_COMMANDS.iter().find(|command| command.name == name)
+}
+
+fn valid_slash_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(|ch: char| ch.is_whitespace() || ch.is_control())
+}
+
+/// The command name and its untouched suffix, including the separator.
+pub fn split_slash(text: &str) -> Option<(&str, &str)> {
+    let slash = text.trim_start().strip_prefix('/')?;
+    Some(slash.split_at(slash.find(char::is_whitespace).unwrap_or(slash.len())))
+}
+
+fn template(definition: &Value) -> Option<&str> {
+    definition
+        .get("template")
+        .and_then(Value::as_str)
+        .or_else(|| definition.as_str())
+}
 
 /// Construct the same command prompt for terminal and HTTP clients.
 /// Structured CLI arguments preserve shell grouping; other clients supply raw text.
@@ -15,11 +151,7 @@ pub fn prepare(
         .command
         .get(name)
         .ok_or_else(|| format!("Command {name} is not configured"))?;
-    let template = command
-        .get("template")
-        .and_then(|value| value.as_str())
-        .or_else(|| command.as_str())
-        .ok_or_else(|| format!("Command {name} has no template"))?;
+    let template = template(command).ok_or_else(|| format!("Command {name} has no template"))?;
     if request.model.is_none() {
         if request.variant.is_none() {
             request.variant = command["variant"].as_str().map(str::to_owned);
@@ -110,6 +242,49 @@ fn expand_with(template: &str, arguments: &str, argv: Option<&[String]>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_uses_the_same_configured_commands_for_listing_and_dispatch() {
+        let cfg: Config = serde_json::from_value(json!({
+            "command": {
+                "help": {"template": "Configured help", "description": "HTTP help"},
+                "nested/review": "Review $ARGUMENTS",
+                "invalid": {"description": "Missing template"}
+            }
+        }))
+        .unwrap();
+        let registry = Registry::new(&cfg);
+        assert_eq!(registry.terminal().count(), LOCAL_COMMANDS.len() + 1);
+        assert!(matches!(
+            registry.resolve_terminal(" /help "),
+            Some((
+                Command::Local(LocalCommand {
+                    action: LocalAction::Help,
+                    ..
+                }),
+                ""
+            ))
+        ));
+        assert!(matches!(
+            registry.resolve_terminal("/nested/review\t\"two words\" more "),
+            Some((
+                Command::Configured {
+                    name: "nested/review",
+                    ..
+                },
+                "\"two words\" more"
+            ))
+        ));
+        assert!(registry.resolve_terminal("/invalid").is_none());
+        assert!(registry.resolve_terminal("Please /help").is_none());
+        assert_eq!(
+            crate::inventory::commands_json(&cfg),
+            json!([
+                {"name":"help","template":"Configured help","description":"HTTP help","source":"command","hints":[]},
+                {"name":"nested/review","template":"Review $ARGUMENTS","source":"command","hints":["$ARGUMENTS"]}
+            ])
+        );
+    }
 
     #[test]
     fn prepared_commands_preserve_raw_arguments_for_admission_hooks() {

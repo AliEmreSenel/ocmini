@@ -725,6 +725,9 @@ impl Boot {
                 if mount.ensure {
                     let bytes = mount.target.as_bytes();
                     let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+                    if bytes.len() >= path.len() {
+                        self.fail(2);
+                    }
                     for (index, byte) in bytes.iter().enumerate() {
                         if *byte == b'/' && index > 0 {
                             self.check(

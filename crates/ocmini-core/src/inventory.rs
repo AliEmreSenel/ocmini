@@ -107,12 +107,8 @@ pub fn commands_json(config: &Config) -> Value {
     static PLACEHOLDER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let placeholder = PLACEHOLDER
         .get_or_init(|| regex::Regex::new(r"\$ARGUMENTS|\$\d+").expect("constant regex"));
-    let commands: BTreeMap<_, _> = config
-        .command
-        .iter()
-        .filter(|(_, entry)| {
-            entry.is_string() || entry.get("template").is_some_and(Value::is_string)
-        })
+    let commands: BTreeMap<_, _> = crate::commands::Registry::new(config)
+        .configured()
         .map(|(name, entry)| {
             let mut entry = if entry.is_string() {
                 json!({"template": entry})
@@ -135,7 +131,7 @@ pub fn commands_json(config: &Config) -> Value {
                 }
             }
             entry["hints"] = json!(hints);
-            (name.clone(), entry)
+            (name, entry)
         })
         .collect();
     json!(commands.into_values().collect::<Vec<_>>())
