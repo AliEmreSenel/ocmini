@@ -81,8 +81,8 @@ async fn discover_read_instructions(
     request: &PromptRequest,
     parts: &[Value],
 ) -> Result<(), String> {
-    // Resolve paths in the effect domain, including when a sandbox is active.
-    // No filesystem probes are made until a successful, lexically in-scope read.
+    // Resolve paths in the effect domain, including when a sandbox is active
+    // or the workspace directory is accessed through a symlink.
     let root = tools::resolve_path(&base.dir, ".");
     let reads: Vec<_> = parts
         .iter()
@@ -91,17 +91,20 @@ async fn discover_read_instructions(
                 return None;
             }
             let path = tools::resolve_path(&base.dir, part["state"]["input"]["filePath"].as_str()?);
-            if !path.starts_with(&root) || path == root {
+            if path == root {
                 return None;
             }
             Some((part, path))
         })
         .collect();
-    if reads.is_empty() {
+    if reads.is_empty() || base.cancel.is_cancelled() {
         return Ok(());
     }
     let mut pending = Vec::new();
     for (part, path) in reads {
+        if base.cancel.is_cancelled() {
+            return Ok(());
+        }
         // The successful read's input may refer to a directory; probing it is
         // delegated to the same effect domain as the read itself.
         let Ok(resolved) = tools::host::Host::effect(
@@ -123,6 +126,7 @@ async fn discover_read_instructions(
         let Some(canonical_root) = resolved["root"].as_str() else {
             continue;
         };
+        let root_instruction = resolved["rootInstruction"].as_str().map(PathBuf::from);
         let target = Path::new(target);
         let canonical_root = Path::new(canonical_root);
         if !target.starts_with(canonical_root) {
@@ -147,11 +151,12 @@ async fn discover_read_instructions(
                 part,
                 target.to_path_buf(),
                 canonical_root.to_path_buf(),
+                root_instruction,
                 candidates,
             ));
         }
     }
-    if pending.is_empty() {
+    if pending.is_empty() || base.cancel.is_cancelled() {
         return Ok(());
     }
     let store = base.app.store.clone();
@@ -186,11 +191,18 @@ async fn discover_read_instructions(
             }
         }
     }
-    for (part, target, canonical_root, candidates) in pending {
+    for (part, target, canonical_root, root_instruction, candidates) in pending {
+        if base.cancel.is_cancelled() {
+            return Ok(());
+        }
         let mut ctx = base.clone();
         ctx.call_id = part["callID"].as_str().unwrap_or_default().into();
         ctx.part_id = part["id"].as_str().unwrap_or_default().into();
+        let root_agents = canonical_root.join("AGENTS.md");
         for candidate in candidates {
+            if ctx.cancel.is_cancelled() {
+                return Ok(());
+            }
             if seen.contains(candidate.to_string_lossy().as_ref()) {
                 continue;
             }
@@ -211,44 +223,57 @@ async fn discover_read_instructions(
                 continue;
             };
             let canonical = Path::new(canonical);
-            if !canonical.starts_with(&canonical_root) || canonical == target.as_path() {
+            if !canonical.starts_with(&canonical_root)
+                || canonical == target.as_path()
+                || canonical == root_agents.as_path()
+                || root_instruction
+                    .as_deref()
+                    .is_some_and(|root_file| canonical == root_file)
+            {
                 continue;
             }
             let key = canonical.to_string_lossy().into_owned();
             if seen.contains(&key) {
                 continue;
             }
-            let Ok(rules) = current_permission_rules(&ctx, cfg, request) else {
-                continue;
-            };
+            let rules = current_permission_rules(&ctx, cfg, request).map_err(|e| e.message)?;
+            let candidate_str = candidate.to_string_lossy();
+            let permission_input = json!({"filePath": candidate_str});
             if check_permission(
                 &ctx,
                 &rules,
                 "read",
-                &candidate.to_string_lossy(),
+                &candidate_str,
                 "read",
-                &part["state"]["input"],
+                &permission_input,
             )
             .await
             .is_err()
             {
+                if ctx.cancel.is_cancelled() {
+                    return Ok(());
+                }
                 continue;
             }
             if canonical != candidate
-                && check_permission(&ctx, &rules, "read", &key, "read", &part["state"]["input"])
+                && check_permission(&ctx, &rules, "read", &key, "read", &permission_input)
                     .await
                     .is_err()
             {
+                if ctx.cancel.is_cancelled() {
+                    return Ok(());
+                }
                 continue;
             }
-            if ctx.app.store.check_ownership(&ctx.session_id).is_err() {
-                continue;
-            }
+            ctx.app
+                .store
+                .check_ownership(&ctx.session_id)
+                .map_err(|e| e.message)?;
             let Ok(result) = tools::host::Host::effect(
                 &ctx.app,
                 &ctx,
                 "instruction",
-                json!({"path":candidate, "expected":canonical}),
+                json!({"path":candidate, "expected":canonical, "display":candidate_str}),
             )
             .await
             else {
@@ -260,16 +285,17 @@ async fn discover_read_instructions(
             let Some(content) = value.as_str() else {
                 continue;
             };
-            let output = ToolOutput {
-                output: format!("Instructions from: {}\n{}", candidate.display(), content),
-                title: String::new(),
-                metadata: json!({}),
-            };
-            let output =
-                tools::limit_output(output, ctx.app.tool_output_directory(&ctx.session_id))
-                    .await
-                    .map_err(|e| e.message)?;
-            let context = json!({"id":hex_id("prt_"),"sessionID":base.session_id,"messageID":base.message_id,"type":"text","synthetic":true,"ocminiInstructionPath":key,"text":output.output});
+            // Store under a dedicated internal part type so v2/TUI transcript views
+            // never render injected AGENTS.md content as visible assistant text.
+            let context = json!({
+                "id": hex_id("prt_"),
+                "sessionID": base.session_id,
+                "messageID": base.message_id,
+                "type": "ocmini_instruction",
+                "synthetic": true,
+                "ocminiInstructionPath": key,
+                "text": content,
+            });
             crate::messages::update_part(&base.app, &context).map_err(|e| e.message)?;
             seen.insert(key);
         }

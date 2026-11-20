@@ -591,6 +591,21 @@ async fn nested_read_instructions_reach_model_once() {
     assert!(first.contains(suffix.trim_matches('"')));
     let second = provider.request().await.to_string();
     assert_eq!(second.matches("nested instruction marker").count(), 1);
+    let v2_messages: Value = server
+        .get(&format!("/api/session/{id}/message"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let visible = v2_messages.to_string();
+    assert!(
+        !visible.contains("nested instruction marker") && !visible.contains("Instructions from:"),
+        "nested instructions must not leak into visible v2 assistant history: {v2_messages}"
+    );
 }
 
 #[tokio::test]
@@ -702,4 +717,105 @@ async fn external_instruction_symlink_is_not_loaded() {
     let request = provider.request().await.to_string();
     assert!(request.contains("public content"));
     assert!(!request.contains("external instruction secret"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_instruction_symlink_to_root_is_not_duplicated() {
+    let mut provider = Provider::start(vec![
+        tool_script("read", json!({"filePath":"nested/file.txt"}), "read_file"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(
+        server.directory.join("AGENTS.md"),
+        "root instruction sentinel",
+    )
+    .unwrap();
+    std::fs::create_dir_all(server.directory.join("nested")).unwrap();
+    std::fs::write(server.directory.join("nested/file.txt"), "public content").unwrap();
+    std::os::unix::fs::symlink(
+        server.directory.join("AGENTS.md"),
+        server.directory.join("nested/AGENTS.md"),
+    )
+    .unwrap();
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_root_symlink_instruction", "Read the file"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert_eq!(
+        request.matches("root instruction sentinel").count(),
+        1,
+        "{request}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_instruction_canonical_path_under_symlinked_workspace_loads() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let real_workspace = temp.path().join("real-workspace");
+    let link_workspace = temp.path().join("link-workspace");
+    std::fs::create_dir_all(real_workspace.join("nested")).unwrap();
+    std::fs::write(
+        real_workspace.join("nested/AGENTS.md"),
+        "symlinked workspace marker",
+    )
+    .unwrap();
+    let canonical_file = real_workspace.join("nested/file.txt");
+    std::fs::write(&canonical_file, "file via canonical path").unwrap();
+    std::os::unix::fs::symlink(&real_workspace, &link_workspace).unwrap();
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "read",
+            json!({"filePath": canonical_file.to_string_lossy()}),
+            "read_file",
+        ),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let created: Value = server
+        .post(
+            "/api/session",
+            &json!({
+                "location": {"directory": link_workspace.to_string_lossy()},
+                "permissions": [{"action":"*","resource":"*","effect":"allow"}]
+            }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["data"]["id"].as_str().unwrap();
+    let mut events = server.events_at("/api/event").await;
+    server
+        .post(
+            &format!("/api/session/{id}/prompt"),
+            &json!({"text": "Read the canonical file"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    events.through("session.execution.succeeded").await;
+    provider.request().await;
+    let request = provider.request().await.to_string();
+    assert!(request.contains("file via canonical path"));
+    assert!(request.contains("symlinked workspace marker"), "{request}");
 }

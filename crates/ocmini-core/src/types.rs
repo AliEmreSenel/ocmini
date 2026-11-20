@@ -336,7 +336,7 @@ pub fn validate_parts(parts: &[Value], scope: PromptPartScope) -> Result<(), Ope
 pub fn text_parts(parts: &[Value]) -> impl Iterator<Item = &str> {
     parts
         .iter()
-        .filter(|part| part["type"] == "text" && !part["ocminiInstructionPath"].is_string())
+        .filter(|part| part["type"] == "text")
         .filter_map(|part| part["text"].as_str())
 }
 

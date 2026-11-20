@@ -236,13 +236,31 @@ impl Effects {
             }
             "instruction_resolve_read" | "instruction_resolve" | "instruction" => {
                 let directory = directory.to_owned();
-                let method = method.to_owned();
+                let method_owned = method.to_owned();
                 let args = args.clone();
-                return tokio::task::spawn_blocking(move || {
-                    instruction_effect(&directory, &method, &args)
+                let result = tokio::task::spawn_blocking(move || {
+                    instruction_effect(&directory, &method_owned, &args)
                 })
                 .await
-                .map_err(|e| OperationError::from(e.to_string()))?;
+                .map_err(|e| OperationError::from(e.to_string()))??;
+                if method == "instruction" {
+                    let text = result
+                        .json()?
+                        .as_str()
+                        .ok_or("Invalid instruction result")?
+                        .to_owned();
+                    let limited = crate::output::limit(
+                        crate::types::ToolOutput {
+                            output: text,
+                            title: String::new(),
+                            metadata: json!({}),
+                        },
+                        crate::output::directory(),
+                    )
+                    .await?;
+                    return Ok(EffectResult::Json(json!(limited.output)));
+                }
+                return Ok(result);
             }
             "skill" => {
                 return Ok(EffectResult::Output(crate::skills::load_content(
@@ -270,12 +288,19 @@ fn instruction_effect(
     let path = std::fs::canonicalize(crate::resolve_path(directory, requested))
         .map_err(|e| e.to_string())?;
     if !path.starts_with(&root) {
+        if method == "instruction_resolve_read" {
+            return Ok(EffectResult::Json(Value::Null));
+        }
         return Err("Instruction outside workspace".into());
     }
     if method == "instruction_resolve_read" {
-        return Ok(EffectResult::Json(
-            json!({"root":root,"target":path,"directory":path.is_dir()}),
-        ));
+        let root_instruction = std::fs::canonicalize(root.join("AGENTS.md")).ok();
+        return Ok(EffectResult::Json(json!({
+            "root": root,
+            "target": path,
+            "directory": path.is_dir(),
+            "rootInstruction": root_instruction,
+        })));
     }
     if method == "instruction_resolve" {
         return Ok(EffectResult::Json(json!(path)));
@@ -290,7 +315,10 @@ fn instruction_effect(
     }
     let mut text = String::new();
     file.read_to_string(&mut text).map_err(|e| e.to_string())?;
-    Ok(EffectResult::Json(json!(text)))
+    let display = args["display"].as_str().unwrap_or(requested);
+    Ok(EffectResult::Json(json!(format!(
+        "Instructions from: {display}\n{text}"
+    ))))
 }
 
 #[cfg(unix)]
