@@ -181,10 +181,13 @@ impl Decoder for MessageState {
                     "thinking_delta" => Some("thinking"),
                     "signature_delta" => Some("signature"),
                     "input_json_delta" => {
-                        let args = self.arguments.entry(index).or_default();
-                        args.push_str(delta["partial_json"].as_str().unwrap_or_default());
-                        if args.len() > 16 * 1024 * 1024 {
-                            return Err("Anthropic tool arguments exceed 16 MiB".into());
+                        let partial = delta["partial_json"].as_str().unwrap_or_default();
+                        if !partial.is_empty() {
+                            let args = self.arguments.entry(index).or_default();
+                            args.push_str(partial);
+                            if args.len() > 16 * 1024 * 1024 {
+                                return Err("Anthropic tool arguments exceed 16 MiB".into());
+                            }
                         }
                         None
                     }
@@ -363,6 +366,23 @@ mod tests {
         );
         assert!(
             matches!(&events[1], ProviderEvent::Metadata(value) if value["content"][0]["signature"] == "opaque")
+        );
+    }
+    #[test]
+    fn ignores_empty_input_json_delta_for_zero_arg_tool_calls() {
+        let mut state = MessageState::default();
+        for event in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_empty","name":"ping","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ] {
+            state.consume(&event).unwrap();
+        }
+        let events = state.finish("model").unwrap();
+        assert!(
+            matches!(&events[0], ProviderEvent::ToolCallStart { call_id, name, args } if call_id == "call_empty" && name == "ping" && args == "{}")
         );
     }
     #[test]

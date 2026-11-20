@@ -71,6 +71,15 @@ pub fn read(
             return Err(failure("ranges must contain valid one-based inclusive spans and cannot be combined with offset or limit"));
         }
         ranges.sort_by_key(|r| r.start);
+        let mut merged: Vec<LineRange> = Vec::with_capacity(ranges.len());
+        for range in ranges.drain(..) {
+            if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        *ranges = merged;
     }
     let path = resolve_path(directory, &input.file_path);
     let metadata = std::fs::metadata(&path).map_err(|error| {
@@ -91,8 +100,8 @@ pub fn read(
             failure(format!("Cannot read {}: {error}", path.display()))
         }
     })?;
-    let offset = input.offset.unwrap_or(1).max(1) as usize;
-    let limit = input.limit.unwrap_or(2000) as usize;
+    let offset = usize::try_from(input.offset.unwrap_or(1).max(1)).unwrap_or(usize::MAX);
+    let limit = usize::try_from(input.limit.unwrap_or(2000)).unwrap_or(usize::MAX);
     if metadata.is_dir() {
         if ranges.is_some() {
             return Err(failure("ranges are only supported for text files"));
@@ -674,6 +683,22 @@ mod tests {
             &CancellationToken::new()
         )
         .is_err());
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let overlapped = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"ranges.txt", "ranges":[{"start":1,"end":10},{"start":5,"end":15},{"start":20,"end":22}]}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            overlapped.output.lines().take(3).collect::<Vec<_>>(),
+            ["1: a", "2: b", "3: c"]
+        );
+        assert_eq!(
+            overlapped.metadata["missingRanges"],
+            json!([{"start":4,"end":15},{"start":20,"end":22}])
+        );
     }
 
     #[test]

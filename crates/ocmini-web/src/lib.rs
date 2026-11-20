@@ -283,7 +283,7 @@ async fn read(headers: HeaderMap, Query(query): Query<PathQuery>) -> Result<Resp
         )
             .into_response());
     }
-    let mut prefix = vec![0; SNIFF.min(meta.len() as usize)];
+    let mut prefix = vec![0; SNIFF.min(usize::try_from(meta.len()).unwrap_or(SNIFF))];
     let mut filled = 0;
     while filled < prefix.len() {
         match file.read(&mut prefix[filled..]).await {

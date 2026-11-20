@@ -234,6 +234,13 @@ impl Effects {
                     crate::run_effect(directory, session, name, &args["args"], cancel).await?,
                 ))
             }
+            "webfetch_hop" => {
+                let input: crate::web::Input = crate::decode(&args)?;
+                match crate::web::fetch_hop(&input, cancel).await? {
+                    crate::web::Hop::Done(output) => json!({"done": output}),
+                    crate::web::Hop::Redirect(url) => json!({"redirect": url}),
+                }
+            }
             "skill" => {
                 return Ok(EffectResult::Output(crate::skills::load_content(
                     directory,

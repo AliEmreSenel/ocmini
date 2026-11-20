@@ -503,7 +503,92 @@ async fn execute_authorized_tool(
             .await
             .map_err(Into::into);
     }
+    if name == "webfetch" {
+        return run_webfetch(ctx, input, cfg, request).await;
+    }
     tools::run_tool(ctx, name, input).await.map_err(Into::into)
+}
+
+async fn run_webfetch(
+    ctx: &ToolCtx,
+    input: &PreparedTool,
+    cfg: &Config,
+    request: &PromptRequest,
+) -> Result<ToolOutput, OperationError> {
+    let mut hop_args = input.args().clone();
+    for step in 0..=tools::web::MAX_REDIRECTS {
+        let value = tools::host::Host::effect(&ctx.app, ctx, "webfetch_hop", hop_args.clone())
+            .await?
+            .json()?;
+        if let Some(done) = value.get("done") {
+            let output: ToolOutput = serde_json::from_value(done.clone())
+                .map_err(|error| OperationError::from(error.to_string()))?;
+            return tools::limit_output(output, ctx.app.tool_output_directory(&ctx.session_id))
+                .await
+                .map_err(Into::into);
+        }
+        let next = value["redirect"]
+            .as_str()
+            .ok_or_else(|| OperationError::from("Invalid webfetch redirect response"))?;
+        if step == tools::web::MAX_REDIRECTS {
+            return Err(OperationError::from(format!(
+                "Too many redirects (more than {})",
+                tools::web::MAX_REDIRECTS
+            )));
+        }
+        let rules = current_permission_rules(ctx, cfg, request)?;
+        assert_not_denied(ctx, &rules, "webfetch", next, "webfetch").await?;
+        ctx.app.store.check_ownership(&ctx.session_id)?;
+        hop_args["url"] = json!(next);
+    }
+    Err(OperationError::from(format!(
+        "Too many redirects (more than {})",
+        tools::web::MAX_REDIRECTS
+    )))
+}
+
+async fn assert_not_denied(
+    ctx: &ToolCtx,
+    rules: &[PermissionRule],
+    permission: &str,
+    pattern: &str,
+    tool: &str,
+) -> Result<(), OperationError> {
+    let original = crate::permission::decide(rules, permission, pattern);
+    let mut decision = original;
+    let mut context = ctx.hook_context.clone();
+    context["tool"] = json!(tool);
+    context["messageID"] = json!(ctx.message_id);
+    context["callID"] = json!(ctx.call_id);
+    context["requestKind"] = json!("primary");
+    if ctx.app.hooks.has(crate::permission::PERMISSION_DECIDE) {
+        let result = ctx
+            .app
+            .hooks
+            .run(
+                crate::permission::PERMISSION_DECIDE,
+                &context,
+                json!({"permission":permission,"pattern":pattern,"decision":decision}),
+                Some(&ctx.cancel),
+            )
+            .await?;
+        decision = serde_json::from_value(result.input["decision"].clone())
+            .map_err(|e| OperationError::from(format!("Invalid permission decision: {e}")))?;
+    }
+    ctx.app.hooks.emit(
+        event::Permission::Decided {
+            permission,
+            pattern,
+            decision,
+        },
+        &context,
+    );
+    if decision == PermissionAction::Deny {
+        return Err(OperationError::from(format!(
+            "Permission '{permission}' denied for {pattern}"
+        )));
+    }
+    Ok(())
 }
 
 async fn check_permission(

@@ -676,7 +676,7 @@ async fn compact(
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>> {
     let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
-    if body.get("ocminiFocus").is_some_and(|v| !v.is_string()) {
+    if optional(&body, "ocminiFocus").is_some_and(|v| !v.is_string()) {
         return Err(invalid("ocminiFocus must be a string"));
     }
     control(&st, &sid, &body, "compaction", json!({})).await

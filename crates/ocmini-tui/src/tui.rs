@@ -899,20 +899,21 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                             parts.push(attachment.part());
                         }
                         if !parts.is_empty() {
-                            let selection = if configured.is_some() {
-                                PromptRequest { model: model_override.clone(), ..Default::default() }
-                            } else {
-                                selected.clone()
-                            };
-                            let request = PromptRequest {
-                                message_id: Some(crate::types::hex_id("msg_")),
-                                parts,
-                                ..selection
-                            };
                             let request = match configured {
-                                Some((name, arguments)) => crate::commands::prepare(&app.config, name, &arguments, request, None)
-                                    .map_err(crate::types::OperationError::invalid),
-                                None => Ok(request),
+                                Some((name, arguments)) => prepare_configured_command(
+                                    &app.config,
+                                    name,
+                                    &arguments,
+                                    parts,
+                                    &selected,
+                                    model_override.as_ref(),
+                                )
+                                .map_err(crate::types::OperationError::invalid),
+                                None => Ok(PromptRequest {
+                                    message_id: Some(crate::types::hex_id("msg_")),
+                                    parts,
+                                    ..selected.clone()
+                                }),
                             };
                             let result = match request {
                                 Ok(request) => engine.admit(app.clone(), session.id.clone(), request).await.map(drop),
@@ -1029,6 +1030,35 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
     display.leave_screen();
     engine.abort_and_wait(&session.id).await;
     Ok(())
+}
+
+fn prepare_configured_command(
+    config: &crate::config::Config,
+    name: &str,
+    arguments: &str,
+    parts: Vec<Value>,
+    selected: &PromptRequest,
+    model_override: Option<&crate::types::ModelRef>,
+) -> Result<PromptRequest, String> {
+    let base = PromptRequest {
+        message_id: Some(crate::types::hex_id("msg_")),
+        model: model_override.cloned(),
+        parts,
+        ..Default::default()
+    };
+    let mut request = crate::commands::prepare(config, name, arguments, base, None)?;
+    if request.agent.is_none() {
+        request.agent = selected.agent.clone();
+    }
+    if request.model.is_none() {
+        request.model = selected.model.clone();
+        if request.variant.is_none() {
+            request.variant = selected.variant.clone();
+        }
+    } else if request.variant.is_none() && request.model == selected.model {
+        request.variant = selected.variant.clone();
+    }
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -1835,5 +1865,65 @@ mod tests {
         };
         assert!(!confirm);
         assert_eq!(drafts[0].text, "1");
+    }
+
+    #[test]
+    fn configured_commands_keep_resumed_selection_unless_overridden() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "command": {
+                "plain": "Review $ARGUMENTS",
+                "custom": {
+                    "template": "Audit $ARGUMENTS",
+                    "agent": "explore",
+                    "model": "other/fast"
+                }
+            }
+        }))
+        .unwrap();
+        let resumed = super::PromptRequest {
+            model: Some(crate::types::ModelRef {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+            }),
+            agent: Some("plan".into()),
+            variant: Some("high".into()),
+            ..Default::default()
+        };
+        let plain =
+            super::prepare_configured_command(&cfg, "plain", "diff", vec![], &resumed, None)
+                .unwrap();
+        assert_eq!(plain.model, resumed.model);
+        assert_eq!(plain.agent.as_deref(), Some("plan"));
+        assert_eq!(plain.variant.as_deref(), Some("high"));
+
+        let custom =
+            super::prepare_configured_command(&cfg, "custom", "diff", vec![], &resumed, None)
+                .unwrap();
+        assert_eq!(
+            custom.model,
+            Some(crate::types::ModelRef {
+                provider_id: "other".into(),
+                model_id: "fast".into(),
+            })
+        );
+        assert_eq!(custom.agent.as_deref(), Some("explore"));
+        assert!(custom.variant.is_none());
+
+        let cli_model = crate::types::ModelRef {
+            provider_id: "cli".into(),
+            model_id: "override".into(),
+        };
+        let overridden = super::prepare_configured_command(
+            &cfg,
+            "custom",
+            "diff",
+            vec![],
+            &resumed,
+            Some(&cli_model),
+        )
+        .unwrap();
+        assert_eq!(overridden.model.as_ref(), Some(&cli_model));
+        assert_eq!(overridden.agent.as_deref(), Some("explore"));
+        assert!(overridden.variant.is_none());
     }
 }
