@@ -107,8 +107,21 @@ pub async fn run_effect(
                 _ = cancel.cancelled() => Err(failure("Background read cancelled")),
             }
         }
+        "background_list" => {
+            let _: shell::BackgroundListInput = decode(args)?;
+            let session = session.to_owned();
+            let task = tokio::task::spawn_blocking(move || shell::list_background(&session));
+            tokio::select! {
+                result = task => result.map_err(|e| failure(e.to_string()))?,
+                _ = cancel.cancelled() => Err(failure("Background list cancelled")),
+            }
+        }
+        "background_stop" => {
+            let input: shell::BackgroundStopInput = decode(args)?;
+            shell::stop_background(session, &input, cancel.clone()).await
+        }
         "read" => {
-            let input = decode(args)?;
+            let input = decode(&alias(args, "filePath", "path"))?;
             let dir = directory.to_owned();
             let token = cancel.clone();
             tokio::task::spawn_blocking(move || files::read(&dir, &input, &token))
@@ -152,8 +165,9 @@ pub async fn run_effect(
                 .cloned()
                 .unwrap_or_default();
             if args["background"] == true {
-                shell::shell_background_with_env(
+                shell::shell_background_with_description(
                     command,
+                    args["description"].as_str(),
                     &path,
                     session,
                     &output::directory(),

@@ -48,7 +48,11 @@ pub fn run(
     };
     check()?;
     match name {
-        "read" => read(directory, &super::decode(input)?, cancel),
+        "read" => read(
+            directory,
+            &super::decode(&super::alias(input, "filePath", "path"))?,
+            cancel,
+        ),
         "write" | "edit" => {
             super::changes::prepare_sync(directory, name, input, cancel)?.commit(cancel)
         }
@@ -56,13 +60,14 @@ pub fn run(
     }
 }
 
-pub fn read(
-    directory: &str,
-    input: &ReadInput,
-    cancel: &CancellationToken,
-) -> Result<ToolOutput, OperationError> {
-    let mut ranges = input.ranges.clone();
-    if let Some(ranges) = &mut ranges {
+pub fn validate_read(input: &ReadInput) -> Result<(), OperationError> {
+    if input.offset == Some(0) {
+        return Err(failure("offset must be a positive integer (1-based)"));
+    }
+    if input.limit == Some(0) {
+        return Err(failure("limit must be a positive integer"));
+    }
+    if let Some(ranges) = &input.ranges {
         if input.offset.is_some()
             || input.limit.is_some()
             || ranges.is_empty()
@@ -70,6 +75,18 @@ pub fn read(
         {
             return Err(failure("ranges must contain valid one-based inclusive spans and cannot be combined with offset or limit"));
         }
+    }
+    Ok(())
+}
+
+pub fn read(
+    directory: &str,
+    input: &ReadInput,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, OperationError> {
+    validate_read(input)?;
+    let mut ranges = input.ranges.clone();
+    if let Some(ranges) = &mut ranges {
         ranges.sort_by_key(|r| r.start);
         let mut merged: Vec<LineRange> = Vec::with_capacity(ranges.len());
         for range in ranges.drain(..) {
@@ -110,12 +127,23 @@ pub fn read(
             .map_err(|e| failure(format!("Cannot list {}: {e}", path.display())))?
             .map(|entry| {
                 entry.map(|entry| {
-                    let suffix = if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                        "/"
+                    let file_type = entry.file_type().ok();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if file_type.is_some_and(|t| t.is_symlink()) {
+                        let target_is_dir =
+                            std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir());
+                        match std::fs::read_link(entry.path()) {
+                            Ok(target) => {
+                                let dir_mark = if target_is_dir { "/" } else { "" };
+                                format!("{name}@ -> {}{dir_mark}", target.display())
+                            }
+                            Err(_) => format!("{name}@"),
+                        }
+                    } else if file_type.is_some_and(|t| t.is_dir()) {
+                        format!("{name}/")
                     } else {
-                        ""
-                    };
-                    format!("{}{suffix}", entry.file_name().to_string_lossy())
+                        name
+                    }
                 })
             })
             .collect::<Result<Vec<_>, _>>()
@@ -839,14 +867,20 @@ mod tests {
         )
         .unwrap();
         assert!(next.output.starts_with("18: "));
-        let empty = run(
+        assert!(run(
             directory.dir(),
             "read",
-            &json!({"filePath":"page.txt","offset":0,"limit":0}),
+            &json!({"filePath":"page.txt","offset":0}),
             &CancellationToken::new(),
         )
-        .unwrap();
-        assert!(empty.output.contains("continue with offset 1"));
+        .is_err());
+        assert!(run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"page.txt","limit":0}),
+            &CancellationToken::new(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1133,5 +1167,50 @@ mod tests {
         assert!(out.output.contains("15: line-15"));
         assert!(!out.output.contains("4: line-4"));
         assert_eq!(out.metadata["totalLines"], 20);
+    }
+
+    #[test]
+    fn read_accepts_path_alias_for_file_path() {
+        let directory = Directory::new();
+        std::fs::write(directory.0.path().join("alias.txt"), "hello\nworld\n").unwrap();
+        let result = run(
+            directory.dir(),
+            "read",
+            &json!({"path": "alias.txt", "offset": 2, "limit": 1}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(result.output, "2: world\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_distinguishes_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = Directory::new();
+        std::fs::write(directory.0.path().join("file.txt"), "hi").unwrap();
+        std::fs::create_dir(directory.0.path().join("sub")).unwrap();
+        symlink("file.txt", directory.0.path().join("link_file")).unwrap();
+        symlink("sub", directory.0.path().join("link_dir")).unwrap();
+        symlink("missing", directory.0.path().join("link_broken")).unwrap();
+
+        let result = run(
+            directory.dir(),
+            "read",
+            &json!({"path": "."}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let lines: Vec<_> = result.output.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "file.txt",
+                "link_broken@ -> missing",
+                "link_dir@ -> sub/",
+                "link_file@ -> file.txt",
+                "sub/",
+            ]
+        );
     }
 }

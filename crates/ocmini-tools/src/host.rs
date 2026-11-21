@@ -101,6 +101,7 @@ pub trait Host: Clone + Send + Sync + 'static {
         ctx: &crate::ToolCtx<Self>,
         questions: Value,
     ) -> Result<Vec<Vec<String>>, OperationError>;
+    fn todos(&self, session: &str) -> Result<Value, OperationError>;
     fn set_todos(&self, session: &str, todos: &Value) -> Result<(), OperationError>;
     fn skill_paths(&self) -> Vec<String>;
     fn mcp_route(&self, name: &str) -> Option<(String, String)>;

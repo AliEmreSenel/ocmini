@@ -292,6 +292,7 @@ storage {
     fn pending_sessions(&self) -> Result<Vec<String>, OperationError>;
     fn has_waiting(&self, sid: &str) -> Result<bool, OperationError>;
     fn is_pending_message(&self, id: &str) -> Result<bool, OperationError>;
+    fn todos(&self, sid: &str) -> Result<Value, OperationError>;
     fn set_todos(&self, sid: &str, todos: &Value) -> Result<(), OperationError>;
 
     fn interrupted_turns(&self) -> Result<Vec<InterruptedTurn>, OperationError>;

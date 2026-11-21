@@ -47,6 +47,8 @@ macro_rules! builtin_tools {
                     self,
                     Self::Bash
                         | Self::BackgroundRead
+                        | Self::BackgroundList
+                        | Self::BackgroundStop
                         | Self::Write
                         | Self::Edit
                         | Self::ApplyPatch
@@ -56,7 +58,18 @@ macro_rules! builtin_tools {
         }
         pub fn tool_defs() -> Vec<Value> {
             static DEFINITIONS: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
-            DEFINITIONS.get_or_init(|| vec![$(definition::<$parameters>($name, $description)),+]).iter().filter(|def| cfg!(unix) || def["function"]["name"] != "background_read").cloned().collect()
+            DEFINITIONS
+                .get_or_init(|| vec![$(definition::<$parameters>($name, $description)),+])
+                .iter()
+                .filter(|def| {
+                    cfg!(unix)
+                        || !matches!(
+                            def["function"]["name"].as_str(),
+                            Some("background_read" | "background_list" | "background_stop")
+                        )
+                })
+                .cloned()
+                .collect()
         }
     };
 }
@@ -64,13 +77,16 @@ builtin_tools! {
     DiscoverMcpTools => "discover_mcp_tools", "Find and activate available MCP tools for later steps by name or description.", DiscoverInput;
     Bash => "bash", "Run a shell command. workdir is relative to the session directory; timeout is milliseconds (default 120000). Commands are cancelled with the turn and their process group is stopped when the command exits, so pass background:true for work that must outlive the call: it returns a pid and log path at once and keeps running across tool calls, ending when its session is aborted or deleted, or when ocmini exits. A timed-out command completes with the output captured before the limit and a shell_metadata timeout notice.", ShellInput;
     BackgroundRead => "background_read", "Read incremental output from a background shell job owned by this session. Use job_id from the launch and nextOffset as the next byte offset; status and observed exit code are returned in metadata.", crate::shell::BackgroundReadInput;
-    Read => "read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Relative paths use the session directory; offset starts at 1.", files::ReadInput;
+    BackgroundList => "background_list", "List background shell jobs owned by this session, including pid, job_id, command/description, status, exit code, log path, and elapsed time.", crate::shell::BackgroundListInput;
+    BackgroundStop => "background_stop", "Stop a running background shell job owned by this session by pid, terminating its entire process group.", crate::shell::BackgroundStopInput;
+    Read => "read", "Read a UTF-8 file with line numbers, an image/PDF attachment, or a directory listing. Accepts filePath (or path alias). Relative paths use the session directory; offset starts at 1.", files::ReadInput;
     Write => "write", "Atomically write a UTF-8 file, creating parent directories and preserving existing file permissions.", changes::WriteInput;
     Edit => "edit", "Replace an exact, nonempty string in a file. Match must be unique unless replaceAll is true. Preserves CRLF files.", changes::EditInput;
     ApplyPatch => "apply_patch", "Apply a patch using *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, optional *** Move to:, @@ context hunks, and *** End Patch. All files are validated before any are changed.", changes::PatchInput;
-    Glob => "glob", "Find files using ripgrep and glob patterns (including ** and {a,b}), honoring gitignore. Returns up to 100 files. Relative path uses the session directory.", search::Input;
-    Grep => "grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines with paths and line numbers; include filters file names or relative paths by glob; context adds surrounding lines, filesOnly returns paths, literal disables regex, and caseSensitive controls case matching.", search::GrepInput;
+    Glob => "glob", "Find files using ripgrep and glob patterns (including ** and {a,b}), including hidden files while honoring gitignore and skipping .git. Returns up to 100 files in deterministic sorted order. Relative path uses the session directory.", search::Input;
+    Grep => "grep", "Search UTF-8 files by regex, honoring gitignore. Returns up to 100 matching lines in deterministic path order; include and exclude filter by glob, offset paginates results, multiline enables multi-line matching, context adds surrounding lines, filesOnly returns paths, literal disables regex, and caseSensitive controls case matching.", search::GrepInput;
     WebFetch => "webfetch", "Fetch an HTTP(S) text resource up to 5 MiB. HTML is converted to readable Markdown-style text or plain text according to format. timeout is seconds (default 30, maximum 120).", web::Input;
+    TodoRead => "todoread", "Read the current session's persisted todo list.", todo::ReadInput;
     TodoWrite => "todowrite", "Replace and persist the session's todo list.", todo::Input;
     Question => "question", "Ask one or more questions, with options, and wait for the user's answers.", question::Input;
     Task => "task", "Delegate to a subagent session. subagent_type selects an available subagent; task_id resumes a child from this session. Returns the child's session ID and result.", task::Input;
@@ -108,6 +124,7 @@ enum Tool {
         _lease: FileLease,
     },
     Task(Box<task::Plan>),
+    TodoRead,
     Todo(todo::Input),
     Question(question::Input),
     Skill(skills::Input),
@@ -159,6 +176,14 @@ impl PreparedTool {
                 Some(Builtin::BackgroundRead) => (
                     "background_read",
                     vec![self.args["job_id"].as_str().unwrap_or_default().into()],
+                ),
+                Some(Builtin::BackgroundList) => ("background_list", vec!["*".into()]),
+                Some(Builtin::BackgroundStop) => (
+                    "background_stop",
+                    vec![self.args["pid"]
+                        .as_u64()
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_default()],
                 ),
                 Some(Builtin::Read) => (
                     "read",
@@ -332,6 +357,10 @@ where
             args = effective;
             Tool::Task(Box::new(plan))
         }
+        Some(Builtin::TodoRead) => {
+            let _: todo::ReadInput = decode(&args)?;
+            Tool::TodoRead
+        }
         Some(Builtin::TodoWrite) => Tool::Todo(todo::parse(&args)?),
         Some(Builtin::Question) => Tool::Question(question::parse(&args)?),
         Some(Builtin::Skill) => Tool::Skill(decode(&alias(&args, "name", "id"))?),
@@ -341,22 +370,41 @@ where
                     let _: DiscoverInput = decode(&args)?;
                 }
                 Builtin::Bash => {
-                    let _: ShellInput = decode(&alias(&args, "workdir", "cwd"))?;
+                    let input: ShellInput = decode(&alias(&args, "workdir", "cwd"))?;
+                    if input.timeout == Some(0) {
+                        return Err(failure(
+                            "timeout must be a positive integer in milliseconds",
+                        ));
+                    }
                 }
                 Builtin::BackgroundRead => {
                     let _: crate::shell::BackgroundReadInput = decode(&args)?;
                 }
+                Builtin::BackgroundList => {
+                    let _: crate::shell::BackgroundListInput = decode(&args)?;
+                }
+                Builtin::BackgroundStop => {
+                    let input: crate::shell::BackgroundStopInput = decode(&args)?;
+                    if input.pid == 0 {
+                        return Err(failure("pid must be a positive integer"));
+                    }
+                }
                 Builtin::Read => {
-                    let _: files::ReadInput = decode(&args)?;
+                    let input: files::ReadInput = decode(&alias(&args, "filePath", "path"))?;
+                    files::validate_read(&input)?;
                 }
                 Builtin::Glob => {
                     let _: search::Input = decode(&args)?;
                 }
                 Builtin::Grep => {
-                    let _: search::GrepInput = decode(&args)?;
+                    let input: search::GrepInput = decode(&args)?;
+                    if input.search.pattern.is_empty() {
+                        return Err(failure("pattern is required"));
+                    }
                 }
                 Builtin::WebFetch => {
-                    let _: web::Input = decode(&args)?;
+                    let input: web::Input = decode(&args)?;
+                    web::validate(&input)?;
                 }
                 _ => {}
             }
@@ -452,6 +500,15 @@ where
             value.output()
         }
         Tool::Task(plan) => task::run(ctx, plan).await,
+        Tool::TodoRead => {
+            let todos = ctx.app.todos(&ctx.session_id)?;
+            let count = todos.as_array().map_or(0, Vec::len);
+            Ok(ToolOutput {
+                output: serde_json::to_string_pretty(&todos).map_err(|e| failure(e.to_string()))?,
+                title: format!("{count} todos"),
+                metadata: json!({"todos":todos}),
+            })
+        }
         Tool::Todo(input) => {
             let todos = json!(input.todos);
             ctx.app.set_todos(&ctx.session_id, &todos)?;

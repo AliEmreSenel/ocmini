@@ -243,12 +243,17 @@ struct BackgroundJob {
     session: String,
     id: String,
     pid: u32,
+    command: String,
+    description: Option<String>,
+    started_at: std::time::Instant,
+    started_ms: i64,
     log: Option<File>,
     path: std::path::PathBuf,
     identity: LogIdentity,
     // None is running; Some(None) is an observed termination without an exit code.
     exit: Option<Option<i32>>,
     exited_at: Option<std::time::Instant>,
+    done: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[cfg(unix)]
@@ -292,6 +297,240 @@ pub struct BackgroundReadInput {
     #[serde(default)]
     pub offset: u64,
     pub limit: Option<u64>,
+}
+
+#[derive(Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct BackgroundListInput {}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct BackgroundStopInput {
+    #[schemars(range(min = 1))]
+    pub pid: u32,
+}
+
+pub fn list_background(session: &str) -> Result<ToolOutput, OperationError> {
+    #[cfg(unix)]
+    {
+        let now = std::time::Instant::now();
+        let mut jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+        prune_exited(&mut jobs, now, EXITED_JOB_TTL);
+        let mut entries = Vec::new();
+        let mut lines = Vec::new();
+        for job in jobs.iter().filter(|job| job.session == session) {
+            let status = if job.exit.is_some() {
+                "exited"
+            } else {
+                "running"
+            };
+            let exit = job.exit.flatten();
+            let elapsed_ms = job
+                .exited_at
+                .unwrap_or(now)
+                .saturating_duration_since(job.started_at)
+                .as_millis() as u64;
+            let log_path = job.path.to_string_lossy().into_owned();
+            let summary = job
+                .description
+                .as_deref()
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or(job.command.as_str());
+            let exit_note = match job.exit {
+                None => String::new(),
+                Some(Some(code)) => format!(" exit={code}"),
+                Some(None) => " exit=signal".into(),
+            };
+            lines.push(format!(
+                "{} (pid {}) [{}{}] elapsed={}ms: {}\n  log: {}",
+                job.id, job.pid, status, exit_note, elapsed_ms, summary, log_path
+            ));
+            let mut item = json!({
+                "jobID": job.id,
+                "pid": job.pid,
+                "command": job.command,
+                "status": status,
+                "exit": exit,
+                "logPath": log_path,
+                "startedAt": job.started_ms,
+                "elapsedMs": elapsed_ms,
+            });
+            if let Some(description) = &job.description {
+                item["description"] = json!(description);
+            }
+            entries.push(item);
+        }
+        let count = entries.len();
+        let output = if lines.is_empty() {
+            "No background jobs in this session.".into()
+        } else {
+            lines.join("\n")
+        };
+        Ok(ToolOutput {
+            title: format!(
+                "{count} background job{}",
+                if count == 1 { "" } else { "s" }
+            ),
+            output,
+            metadata: json!({"jobs": entries, "count": count}),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        Err(failure(
+            "Background job management is unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: libc::c_int) -> Result<(), std::io::Error> {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process group id",
+        ));
+    }
+    let result = unsafe { libc::kill(-(pid as i32), signal) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub async fn stop_background(
+    session: &str,
+    input: &BackgroundStopInput,
+    cancel: CancellationToken,
+) -> Result<ToolOutput, OperationError> {
+    if input.pid == 0 {
+        return Err(failure("pid must be a positive integer"));
+    }
+    #[cfg(unix)]
+    {
+        let (id, pid, already_exited, initial_exit, done) = {
+            let now = std::time::Instant::now();
+            let mut jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+            prune_exited(&mut jobs, now, EXITED_JOB_TTL);
+            let job = jobs
+                .iter()
+                .rev()
+                .find(|job| job.session == session && job.pid == input.pid)
+                .ok_or_else(|| {
+                    failure(format!(
+                        "Background job with pid {} not found in this session",
+                        input.pid
+                    ))
+                })?;
+            let already_exited = job.exit.is_some();
+            if !already_exited {
+                // Send SIGTERM to the entire process group while holding the lock
+                // so the reaper cannot race to mark the leader exited first.
+                let _ = signal_group(job.pid, libc::SIGTERM);
+            }
+            (
+                job.id.clone(),
+                job.pid,
+                already_exited,
+                job.exit,
+                job.done.clone(),
+            )
+        };
+        if already_exited {
+            let exit = initial_exit.flatten();
+            let exit_str = exit.map_or_else(|| "unknown".into(), |c| c.to_string());
+            return Ok(ToolOutput {
+                title: format!("background pid {pid}"),
+                output: format!(
+                    "Background job {id} (pid {pid}) had already exited (exit: {exit_str})."
+                ),
+                metadata: json!({
+                    "jobID": id,
+                    "pid": pid,
+                    "status": "exited",
+                    "stopped": false,
+                    "alreadyExited": true,
+                    "exit": exit,
+                }),
+            });
+        }
+
+        // Wait briefly for graceful SIGTERM exit, then escalate to SIGKILL on the
+        // process group if the leader or any descendant process remains alive.
+        let wait_grace = async {
+            let notified = done.notified();
+            let exited = {
+                let jobs = BACKGROUND.lock().unwrap();
+                jobs.iter()
+                    .find(|job| job.id == id)
+                    .is_none_or(|job| job.exit.is_some())
+            };
+            if !exited {
+                notified.await;
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_millis(250), wait_grace) => {}
+            _ = cancel.cancelled() => {
+                kill_group(pid);
+                return Err(failure("Background stop cancelled"));
+            }
+        }
+
+        let group_still_alive = match signal_group(pid, 0) {
+            Ok(()) => true,
+            Err(err) => err.raw_os_error() != Some(libc::ESRCH),
+        };
+        let leader_still_running = {
+            let jobs = BACKGROUND.lock().unwrap();
+            jobs.iter()
+                .find(|job| job.id == id)
+                .is_some_and(|job| job.exit.is_none())
+        };
+        if leader_still_running || group_still_alive {
+            kill_group(pid);
+            let wait_kill = async {
+                let notified = done.notified();
+                let exited = {
+                    let jobs = BACKGROUND.lock().unwrap();
+                    jobs.iter()
+                        .find(|job| job.id == id)
+                        .is_none_or(|job| job.exit.is_some())
+                };
+                if !exited {
+                    notified.await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(1), wait_kill).await;
+        }
+
+        let exit = {
+            let jobs = BACKGROUND.lock().unwrap();
+            jobs.iter()
+                .find(|job| job.id == id)
+                .and_then(|job| job.exit)
+                .flatten()
+        };
+        Ok(ToolOutput {
+            title: format!("stopped background pid {pid}"),
+            output: format!("Stopped background job {id} (pid {pid}) and its process group."),
+            metadata: json!({
+                "jobID": id,
+                "pid": pid,
+                "status": "exited",
+                "stopped": true,
+                "alreadyExited": false,
+                "exit": exit,
+            }),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session, input, cancel);
+        Err(failure(
+            "Background job management is unavailable on this platform",
+        ))
+    }
 }
 
 pub fn read_background(
@@ -474,8 +713,20 @@ pub async fn shell_background_with_env(
     output_directory: &Path,
     env: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<ToolOutput, OperationError> {
+    shell_background_with_description(command, None, directory, session_id, output_directory, env)
+        .await
+}
+
+pub async fn shell_background_with_description(
+    command: &str,
+    description: Option<&str>,
+    directory: &Path,
+    session_id: &str,
+    output_directory: &Path,
+    env: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ToolOutput, OperationError> {
     #[cfg(not(unix))]
-    let _ = session_id;
+    let _ = (session_id, description);
     let capture_dir = output_directory.to_owned();
     #[cfg(unix)]
     let (file, child_stdout, log, log_handle, identity) = tokio::task::spawn_blocking(move || {
@@ -538,18 +789,28 @@ pub async fn shell_background_with_env(
         .ok_or_else(|| failure("Shell has no process id"))?;
     let job_id = crate::types::hex_id("job_");
     #[cfg(unix)]
+    let done = std::sync::Arc::new(tokio::sync::Notify::new());
+    #[cfg(unix)]
     {
+        let now = std::time::Instant::now();
         let mut jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
-        prune_exited(&mut jobs, std::time::Instant::now(), EXITED_JOB_TTL);
+        prune_exited(&mut jobs, now, EXITED_JOB_TTL);
         jobs.push(BackgroundJob {
             session: session_id.to_string(),
             id: job_id.clone(),
             pid,
+            command: command.to_owned(),
+            description: description.map(str::to_owned),
+            started_at: now,
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64),
             log: Some(log_handle),
             path: log.clone(),
             identity,
             exit: None,
             exited_at: None,
+            done: done.clone(),
         });
     }
     // Reap the job so an exited command never becomes a zombie.
@@ -560,19 +821,22 @@ pub async fn shell_background_with_env(
         #[cfg(not(unix))]
         let _ = status;
         #[cfg(unix)]
-        if let Some(job) = BACKGROUND
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .find(|job| job.id == waiter_id)
         {
-            job.log = None;
-            job.exit = Some(status);
-            job.exited_at = Some(std::time::Instant::now());
+            if let Some(job) = BACKGROUND
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|job| job.id == waiter_id)
+            {
+                job.log = None;
+                job.exit = Some(status);
+                job.exited_at = Some(std::time::Instant::now());
+            }
+            done.notify_waiters();
         }
     });
     let polling = if cfg!(unix) {
-        "Use background_read with job_id and offset for progress; "
+        "Use background_read with job_id and offset for progress, background_list to inspect jobs, or background_stop with pid to stop it; "
     } else {
         ""
     };
@@ -1032,31 +1296,46 @@ mod tests {
                 session: "s".into(),
                 id: "running".into(),
                 pid: 1,
+                command: "sleep 10".into(),
+                description: None,
+                started_at: now,
+                started_ms: 0,
                 log: None,
                 path: log_path.clone(),
                 identity,
                 exit: None,
                 exited_at: None,
+                done: std::sync::Arc::new(tokio::sync::Notify::new()),
             },
             BackgroundJob {
                 session: "s".into(),
                 id: "recent".into(),
                 pid: 2,
+                command: "true".into(),
+                description: None,
+                started_at: now,
+                started_ms: 0,
                 log: None,
                 path: log_path.clone(),
                 identity,
                 exit: Some(Some(0)),
                 exited_at: Some(now),
+                done: std::sync::Arc::new(tokio::sync::Notify::new()),
             },
             BackgroundJob {
                 session: "s".into(),
                 id: "expired".into(),
                 pid: 3,
+                command: "true".into(),
+                description: None,
+                started_at: now - Duration::from_secs(120),
+                started_ms: 0,
                 log: None,
                 path: log_path,
                 identity,
                 exit: Some(Some(0)),
                 exited_at: Some(now - Duration::from_secs(120)),
+                done: std::sync::Arc::new(tokio::sync::Notify::new()),
             },
         ];
         prune_exited(&mut jobs, now, ttl);
@@ -1118,5 +1397,98 @@ mod tests {
         assert_eq!(first.unwrap().output.trim_end(), "private value");
         assert_eq!(second.unwrap().output.trim_end(), "unset");
         assert!(std::env::var_os(key).is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn background_list_and_stop_manage_session_jobs_and_kill_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        let pidfile = root.path().join("child.pid");
+        let cmd = format!(
+            "trap '' TERM; sleep 30 & echo $! > '{}'; wait",
+            pidfile.display()
+        );
+        let launched = shell_background_with_description(
+            &cmd,
+            Some("stubborn worker"),
+            root.path(),
+            "bg_mgmt_owner",
+            root.path(),
+            &serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+        let pid = launched.metadata["pid"].as_u64().unwrap() as u32;
+        let job_id = launched.metadata["jobID"].as_str().unwrap().to_owned();
+        for _ in 0..100 {
+            if pidfile.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Owner sees the job; another session does not.
+        let other_list = list_background("bg_mgmt_other").unwrap();
+        assert_eq!(other_list.metadata["count"], 0);
+        let list = list_background("bg_mgmt_owner").unwrap();
+        assert_eq!(list.metadata["count"], 1);
+        let item = &list.metadata["jobs"][0];
+        assert_eq!(item["jobID"], job_id);
+        assert_eq!(item["pid"], pid);
+        assert_eq!(item["description"], "stubborn worker");
+        assert_eq!(item["command"], cmd);
+        assert_eq!(item["status"], "running");
+        assert!(item["logPath"].as_str().is_some_and(|p| !p.is_empty()));
+        assert!(item["startedAt"].as_i64().is_some());
+        assert!(item["elapsedMs"].as_u64().is_some());
+
+        // Another session cannot stop the job; invalid pid 0 is rejected.
+        assert!(stop_background(
+            "bg_mgmt_other",
+            &BackgroundStopInput { pid },
+            CancellationToken::new()
+        )
+        .await
+        .is_err());
+        assert!(stop_background(
+            "bg_mgmt_owner",
+            &BackgroundStopInput { pid: 0 },
+            CancellationToken::new()
+        )
+        .await
+        .is_err());
+
+        // Owner stops the job; both leader (trapping TERM) and child die via process group.
+        let stopped = stop_background(
+            "bg_mgmt_owner",
+            &BackgroundStopInput { pid },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped.metadata["stopped"], true);
+        assert_eq!(stopped.metadata["alreadyExited"], false);
+        assert_eq!(stopped.metadata["status"], "exited");
+        assert_process_stopped(pid as i32).await;
+        assert_process_stopped(child_pid).await;
+
+        // Listing now shows exited, and stopping again reports alreadyExited cleanly.
+        let after = list_background("bg_mgmt_owner").unwrap();
+        assert_eq!(after.metadata["jobs"][0]["status"], "exited");
+        let again = stop_background(
+            "bg_mgmt_owner",
+            &BackgroundStopInput { pid },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.metadata["stopped"], false);
+        assert_eq!(again.metadata["alreadyExited"], true);
+        cancel_background_jobs("bg_mgmt_owner");
     }
 }

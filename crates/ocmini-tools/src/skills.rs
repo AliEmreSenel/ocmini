@@ -133,13 +133,30 @@ pub fn load_content(
     let base = Path::new(location)
         .parent()
         .ok_or_else(|| failure("Skill has no resource directory"))?;
-    let resources = std::fs::read_dir(base)
-        .map_err(|error| failure(format!("Cannot read skill resources: {error}")))?
-        .flatten()
-        .filter(|entry| entry.file_name() != "SKILL.md")
-        .map(|entry| entry.path().display().to_string())
-        .take(100)
-        .collect::<Vec<_>>();
+    let _ = std::fs::read_dir(base)
+        .map_err(|error| failure(format!("Cannot read skill resources: {error}")))?;
+    let mut resources = Vec::new();
+    for entry in walkdir::WalkDir::new(base)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+        })
+    {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.depth() == 0 || entry.file_type().is_dir() {
+            continue;
+        }
+        if entry.depth() == 1 && entry.file_name() == "SKILL.md" {
+            continue;
+        }
+        resources.push(entry.path().display().to_string());
+    }
+    resources.sort();
+    resources.truncate(100);
     Ok(ToolOutput {
         title: format!("Loaded skill {name}"),
         output: skill["content"].as_str().unwrap_or_default().into(),
@@ -239,5 +256,52 @@ mod tests {
         let skill = path.join("SKILL.md");
         std::fs::write(&skill, "---\nname: deep-skill\n---\nInstructions").unwrap();
         assert!(discover(root.path()).contains(&skill));
+    }
+
+    #[test]
+    fn skill_resources_are_discovered_recursively_in_sorted_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("skills/nested-res");
+        std::fs::create_dir_all(root.join("scripts/sub")).unwrap();
+        std::fs::create_dir_all(root.join("references")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: nested-res\n---\nInstructions",
+        )
+        .unwrap();
+        std::fs::write(root.join("z_top.txt"), "top").unwrap();
+        std::fs::write(root.join("scripts/b.sh"), "b").unwrap();
+        std::fs::write(root.join("scripts/a.sh"), "a").unwrap();
+        std::fs::write(root.join("scripts/sub/deep.py"), "deep").unwrap();
+        std::fs::write(root.join("references/guide.md"), "guide").unwrap();
+        std::fs::write(root.join(".hidden/secret.txt"), "hidden").unwrap();
+
+        let out = load(
+            temporary.path().to_str().unwrap(),
+            &["skills".into()],
+            "nested-res",
+        )
+        .unwrap();
+        let base = root.canonicalize().unwrap();
+        let resources: Vec<&str> = out.metadata["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let expected: Vec<String> = [
+            "references/guide.md",
+            "scripts/a.sh",
+            "scripts/b.sh",
+            "scripts/sub/deep.py",
+            "z_top.txt",
+        ]
+        .iter()
+        .map(|rel| base.join(rel).display().to_string())
+        .collect();
+        assert_eq!(resources, expected);
+        assert!(out.output.contains("scripts/sub/deep.py"));
+        assert!(!out.output.contains("secret.txt"));
     }
 }

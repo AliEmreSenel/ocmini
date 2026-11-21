@@ -1,6 +1,9 @@
 use crate::{decode, types::OperationError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+pub struct ReadInput {}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct Input {
     pub todos: Vec<Todo>,

@@ -208,7 +208,15 @@ fn prepare_plan(
             });
         }
     };
-    let output = file_output(kind, &path, after.len(), count);
+    let diff = (kind == Kind::Edit).then(|| {
+        let before_str = before
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or_default();
+        let after_str = std::str::from_utf8(&after).unwrap_or_default();
+        unified_diff(&path, before_str, after_str)
+    });
+    let output = file_output(kind, &path, after.len(), count, diff);
     let permissions = std::fs::metadata(&canonical).ok().map(|m| m.permissions());
     Ok(Plan {
         changes: vec![Change {
@@ -222,7 +230,13 @@ fn prepare_plan(
     })
 }
 
-fn file_output(kind: Kind, path: &Path, bytes: usize, count: usize) -> ToolOutput {
+fn file_output(
+    kind: Kind,
+    path: &Path,
+    bytes: usize,
+    count: usize,
+    diff: Option<String>,
+) -> ToolOutput {
     ToolOutput {
         title: path.display().to_string(),
         output: if kind == Kind::Write {
@@ -237,9 +251,226 @@ fn file_output(kind: Kind, path: &Path, bytes: usize, count: usize) -> ToolOutpu
         metadata: if kind == Kind::Write {
             json!({"filepath":path,"bytes":bytes})
         } else {
-            json!({"filepath":path,"replacements":count})
+            json!({"filepath":path,"replacements":count,"diff":diff.unwrap_or_default()})
         },
     }
+}
+
+#[derive(Clone, Copy)]
+enum DiffOp {
+    Equal(usize),
+    Delete(usize),
+    Insert(usize),
+}
+
+/// Produce a standard unified diff with 3 lines of context, without external crates.
+fn unified_diff(path: &Path, before: &str, after: &str) -> String {
+    if before == after {
+        return String::new();
+    }
+    let old_lines: Vec<&str> = before.lines().collect();
+    let new_lines: Vec<&str> = after.lines().collect();
+
+    let mut prefix = 0;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_lines.len() - prefix
+        && suffix < new_lines.len() - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_mid = &old_lines[prefix..old_lines.len() - suffix];
+    let new_mid = &new_lines[prefix..new_lines.len() - suffix];
+
+    let mut ops = Vec::with_capacity(old_lines.len() + new_lines.len());
+    for i in 0..prefix {
+        ops.push(DiffOp::Equal(i));
+    }
+    ops.extend(diff_middle(old_mid, new_mid, prefix));
+    let old_tail = old_lines.len() - suffix;
+    for i in 0..suffix {
+        ops.push(DiffOp::Equal(old_tail + i));
+    }
+
+    let mut change_indices: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, op)| (!matches!(op, DiffOp::Equal(_))).then_some(idx))
+        .collect();
+    if change_indices.is_empty() {
+        // Only line-ending or trailing-newline formatting changed.
+        if let Some(last) = ops.len().checked_sub(1) {
+            change_indices.push(last);
+        } else {
+            return String::new();
+        }
+    }
+
+    const CONTEXT: usize = 3;
+    let mut out = format!("--- a/{0}\n+++ b/{0}\n", path.display());
+    let mut group_start = 0;
+    while group_start < change_indices.len() {
+        let mut group_end = group_start;
+        while group_end + 1 < change_indices.len()
+            && change_indices[group_end + 1] <= change_indices[group_end] + CONTEXT * 2 + 1
+        {
+            group_end += 1;
+        }
+        let start = change_indices[group_start].saturating_sub(CONTEXT);
+        let end = (change_indices[group_end] + CONTEXT + 1).min(ops.len());
+
+        let mut old_pos = 0usize;
+        let mut new_pos = 0usize;
+        for op in &ops[..start] {
+            match op {
+                DiffOp::Equal(_) => {
+                    old_pos += 1;
+                    new_pos += 1;
+                }
+                DiffOp::Delete(_) => old_pos += 1,
+                DiffOp::Insert(_) => new_pos += 1,
+            }
+        }
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        for op in &ops[start..end] {
+            match op {
+                DiffOp::Equal(_) => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                DiffOp::Delete(_) => old_count += 1,
+                DiffOp::Insert(_) => new_count += 1,
+            }
+        }
+        let old_start = if old_count == 0 { old_pos } else { old_pos + 1 };
+        let new_start = if new_count == 0 { new_pos } else { new_pos + 1 };
+        out.push_str(&format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+        ));
+        for op in &ops[start..end] {
+            match *op {
+                DiffOp::Equal(o) => {
+                    out.push(' ');
+                    out.push_str(old_lines[o]);
+                    out.push('\n');
+                }
+                DiffOp::Delete(o) => {
+                    out.push('-');
+                    out.push_str(old_lines[o]);
+                    out.push('\n');
+                }
+                DiffOp::Insert(n) => {
+                    out.push('+');
+                    out.push_str(new_lines[n]);
+                    out.push('\n');
+                }
+            }
+        }
+        group_start = group_end + 1;
+    }
+    out
+}
+
+fn diff_middle(old_mid: &[&str], new_mid: &[&str], base: usize) -> Vec<DiffOp> {
+    let n = old_mid.len();
+    let m = new_mid.len();
+    if n == 0 {
+        return (0..m).map(|j| DiffOp::Insert(base + j)).collect();
+    }
+    if m == 0 {
+        return (0..n).map(|i| DiffOp::Delete(base + i)).collect();
+    }
+    const MAX_D: usize = 512;
+    let max_d = (n + m).min(MAX_D);
+    let offset = max_d as isize;
+    let mut v = vec![0isize; 2 * max_d + 1];
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut found = false;
+
+    'outer: for d in 0..=max_d {
+        let d_i = d as isize;
+        let mut k = -d_i;
+        while k <= d_i {
+            let idx = (k + offset) as usize;
+            let mut x = if k == -d_i
+                || (k != d_i && v[(k - 1 + offset) as usize] < v[(k + 1 + offset) as usize])
+            {
+                v[(k + 1 + offset) as usize]
+            } else {
+                v[(k - 1 + offset) as usize] + 1
+            };
+            let mut y = x - k;
+            while (x as usize) < n && (y as usize) < m && old_mid[x as usize] == new_mid[y as usize]
+            {
+                x += 1;
+                y += 1;
+            }
+            v[idx] = x;
+            if x as usize >= n && y as usize >= m {
+                trace.push(v.clone());
+                found = true;
+                break 'outer;
+            }
+            k += 2;
+        }
+        trace.push(v.clone());
+    }
+
+    if !found {
+        let mut fallback = Vec::with_capacity(n + m);
+        for i in 0..n {
+            fallback.push(DiffOp::Delete(base + i));
+        }
+        for j in 0..m {
+            fallback.push(DiffOp::Insert(base + j));
+        }
+        return fallback;
+    }
+
+    let mut ops = Vec::with_capacity(n + m);
+    let mut x = n as isize;
+    let mut y = m as isize;
+    for d in (1..trace.len()).rev() {
+        let v_prev = &trace[d - 1];
+        let d_i = d as isize;
+        let k = x - y;
+        let prev_k = if k == -d_i
+            || (k != d_i && v_prev[(k - 1 + offset) as usize] < v_prev[(k + 1 + offset) as usize])
+        {
+            k + 1
+        } else {
+            k - 1
+        };
+        let prev_x = v_prev[(prev_k + offset) as usize];
+        let prev_y = prev_x - prev_k;
+        while x > prev_x && y > prev_y {
+            x -= 1;
+            y -= 1;
+            ops.push(DiffOp::Equal(base + x as usize));
+        }
+        if x == prev_x {
+            y -= 1;
+            ops.push(DiffOp::Insert(base + y as usize));
+        } else {
+            x -= 1;
+            ops.push(DiffOp::Delete(base + x as usize));
+        }
+    }
+    while x > 0 && y > 0 {
+        x -= 1;
+        y -= 1;
+        ops.push(DiffOp::Equal(base + x as usize));
+    }
+    ops.reverse();
+    ops
 }
 
 fn transformed_changes(
@@ -559,7 +790,17 @@ impl Plan {
         .map_err(|e| failure(e.to_string()))??;
         if kind != Kind::Patch {
             let c = &changes[0];
-            self.output = file_output(kind, &c.path, c.after.as_ref().unwrap().len(), 1);
+            let after = c.after.as_ref().unwrap();
+            let diff = (kind == Kind::Edit).then(|| {
+                let before_str = c
+                    .before
+                    .as_deref()
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or_default();
+                let after_str = std::str::from_utf8(after).unwrap_or_default();
+                unified_diff(&c.path, before_str, after_str)
+            });
+            self.output = file_output(kind, &c.path, after.len(), 1, diff);
         }
         self.changes = changes;
         Ok(())
@@ -844,5 +1085,54 @@ mod tests {
             .contains("changed since preparation"));
         assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(alias).unwrap(), "updated");
+    }
+
+    #[test]
+    fn edit_emits_unified_diff_in_metadata() {
+        let root = crate::test_tempdir().unwrap();
+        let file = root.path().join("sample.txt");
+        std::fs::write(
+            &file,
+            "line1\nline2\nline3\nold_a\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nold_b\nline13\n",
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let result = prepare_sync(
+            root.path().to_str().unwrap(),
+            "edit",
+            &json!({"filePath": "sample.txt", "oldString": "old_a", "newString": "new_a\nextra_a"}),
+            &cancel,
+        )
+        .unwrap()
+        .commit(&cancel)
+        .unwrap();
+        let diff = result.metadata["diff"].as_str().unwrap();
+        assert!(diff.contains("--- a/"), "{diff}");
+        assert!(diff.contains("+++ b/"), "{diff}");
+        assert!(diff.contains("@@ -1,7 +1,8 @@"), "{diff}");
+        assert!(diff.contains("-old_a\n+new_a\n+extra_a\n"), "{diff}");
+        assert!(diff.contains(" line1\n"), "{diff}");
+        assert!(!diff.contains("line10"), "{diff}");
+
+        // Multi-hunk replaceAll emits separate hunks for distant changes.
+        let file2 = root.path().join("multi.txt");
+        let mut content = String::from("target\n");
+        for i in 0..12 {
+            content.push_str(&format!("mid{i}\n"));
+        }
+        content.push_str("target\n");
+        std::fs::write(&file2, content).unwrap();
+        let result2 = prepare_sync(
+            root.path().to_str().unwrap(),
+            "edit",
+            &json!({"filePath": "multi.txt", "oldString": "target", "newString": "replaced", "replaceAll": true}),
+            &cancel,
+        )
+        .unwrap()
+        .commit(&cancel)
+        .unwrap();
+        let diff2 = result2.metadata["diff"].as_str().unwrap();
+        assert_eq!(diff2.matches("@@ ").count(), 2, "{diff2}");
+        assert!(diff2.contains("-target\n+replaced\n"), "{diff2}");
     }
 }
