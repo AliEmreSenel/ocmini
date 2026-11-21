@@ -21,13 +21,22 @@
     models: [],
     agents: [],
     commands: [],
+    skills: [],
     attachments: [],
+    selectedSkills: [],
     selection: null,
     files: [],
     active: null,
     tree: null,
     treeSelected: null,
     scope: "all",
+    showArchived: false,
+    showThinking: true,
+    toolView: "brief",
+    theme: "system",
+    promptHistory: [],
+    historyIndex: -1,
+    historyDraft: "",
     sandbox: null,
     sandboxChoices: null,
     sandboxPick: "",
@@ -55,10 +64,23 @@
   const esc = (text) =>
     String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-  function toast(message, error = false) {
-    const node = h("div", { class: "toast" + (error ? " error" : ""), role: error ? "alert" : "status", text: message });
+  function toast(message, error = false, onClick = null) {
+    const props = {
+      class: "toast" + (error ? " error" : "") + (onClick ? " clickable" : ""),
+      role: onClick ? "button" : error ? "alert" : "status",
+      text: onClick ? message + " — click to open" : message,
+    };
+    if (onClick) {
+      props.tabindex = 0;
+      const activateToast = () => { node.remove(); onClick(); };
+      props.onclick = activateToast;
+      props.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activateToast(); }
+      };
+    }
+    const node = h("div", props);
     $("#toasts").append(node);
-    setTimeout(() => node.remove(), error ? 8000 : 3500);
+    setTimeout(() => node.remove(), error ? 8000 : onClick ? 8000 : 3500);
   }
   const fail = (error) => {
     console.error(error);
@@ -220,7 +242,13 @@
     const search = $("#session-search").value.trim();
     const params = append && state.sessionCursor
       ? { cursor: state.sessionCursor }
-      : { directory: state.scope === "project" ? state.dir : null, parentID: "null", archived: "false", limit: 50, search };
+      : {
+          directory: state.scope === "project" ? state.dir : null,
+          parentID: "null",
+          archived: state.showArchived ? "true" : "false",
+          limit: 50,
+          search,
+        };
     const result = await api("GET", "/api/session?" + q(params));
     state.sessions = append ? state.sessions.concat(result.data) : result.data;
     state.sessionCursor = result.cursor && result.cursor.next;
@@ -238,7 +266,16 @@
   };
   const sessionDir = (s) => (s.location && s.location.directory) || "";
   function renderSessions() {
-    document.querySelectorAll(".scope button").forEach((b) => b.classList.toggle("active", b.dataset.scope === state.scope));
+    document.querySelectorAll(".scope button[data-scope]").forEach((b) => {
+      const active = b.dataset.scope === state.scope;
+      b.classList.toggle("active", active);
+      b.setAttribute("aria-checked", String(active));
+    });
+    const archivedBtn = $("#archived-toggle");
+    if (archivedBtn) {
+      archivedBtn.setAttribute("aria-pressed", String(state.showArchived));
+      archivedBtn.classList.toggle("active", state.showArchived);
+    }
     const list = $("#sessions");
     const rows = [];
     // Sessions arrive newest first, so projects are ordered by their latest activity.
@@ -258,10 +295,13 @@
       rows.push(...sessions.map(sessionRow));
     }
     list.replaceChildren(...rows);
-    if (!state.sessions.length) list.append(h("li", { class: "muted", text: "No sessions yet" }));
+    if (!state.sessions.length) {
+      list.append(h("li", { class: "muted", text: state.showArchived ? "No archived sessions" : "No sessions yet" }));
+    }
     $("#more-sessions").hidden = !state.sessionCursor;
   }
   function sessionRow(s) {
+    const isArchived = !!(state.showArchived || (s.time && s.time.archived));
     return (
         h("li", { class: s.id === state.sid ? "active" : "", tabindex: 0, title: s.title, onclick: () => openSession(s.id),
           onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); } },
@@ -271,8 +311,11 @@
           h("span", { class: "tools" },
             h("button", { type: "button", title: "Rename", "aria-label": "Rename", text: "✎",
               onclick: (e) => { e.stopPropagation(); renameSession(s); } }),
-            h("button", { type: "button", title: "Archive", "aria-label": "Archive", text: "⌫",
-              onclick: (e) => { e.stopPropagation(); archiveSession(s); } }),
+            isArchived
+              ? h("button", { type: "button", title: "Unarchive", "aria-label": "Unarchive", text: "↩",
+                  onclick: (e) => { e.stopPropagation(); unarchiveSession(s); } })
+              : h("button", { type: "button", title: "Archive", "aria-label": "Archive", text: "⌫",
+                  onclick: (e) => { e.stopPropagation(); archiveSession(s); } }),
             h("button", { type: "button", title: "Delete", "aria-label": "Delete", text: "✕",
               onclick: (e) => { e.stopPropagation(); deleteSession(s); } }))));
   }
@@ -287,6 +330,11 @@
   async function archiveSession(s) {
     await api("PATCH", sessionPath(s.id), { archived: true }).catch(fail);
     if (s.id === state.sid) clearSession();
+    reloadSessions();
+  }
+  async function unarchiveSession(s) {
+    await api("PATCH", sessionPath(s.id), { archived: false }).catch(fail);
+    toast("Unarchived " + (s.title || s.id));
     reloadSessions();
   }
   async function deleteSession(s) {
@@ -350,6 +398,7 @@
       state.messages = [];
       state.byId.clear();
       for (const m of page.data.slice().reverse()) addMessage(m);
+      syncPromptHistory();
       state.olderCursor = page.cursor && page.cursor.next;
       state.pending.clear();
       for (const item of inbox.data) state.pending.set(item.id, item);
@@ -410,16 +459,28 @@
 
   // ---------- catalogs ----------
   async function loadCatalogs() {
-    const [models, agents, commands] = await Promise.allSettled([
+    const [models, agents, commands, skills] = await Promise.allSettled([
       api("GET", "/api/model?" + located()),
       api("GET", "/api/agent?" + located()),
       api("GET", "/api/command?" + located()),
+      api("GET", "/api/skill?" + located()),
     ]);
     state.models = models.status === "fulfilled" ? models.value.data : [];
     if (models.status === "rejected") toast("Models: " + models.reason.message, true);
     state.agents = agents.status === "fulfilled" ? agents.value.data.filter((a) => a.mode !== "subagent" && !a.hidden) : [];
     state.commands = commands.status === "fulfilled" ? commands.value.data : [];
+    state.skills = skills.status === "fulfilled" ? skills.value.data : [];
     renderSelectors();
+    renderSkillPicker();
+  }
+  function renderSkillPicker() {
+    const pick = $("#skill-pick");
+    if (!pick) return;
+    pick.hidden = !state.skills.length;
+    pick.replaceChildren(
+      h("option", { value: "", text: "+ Skill" }),
+      ...state.skills.map((s) => h("option", { value: s.id, text: s.name || s.id, title: s.description || "" })));
+    pick.value = "";
   }
   const modelKey = (m) => m ? m.providerID + "/" + m.id : "";
   // An existing session without a selection runs on the configured default.
@@ -498,6 +559,7 @@
     renderHeader();
     renderSessions();
     renderSelectors();
+    renderDisplayControls();
     renderMessages();
     renderRequests();
     renderStatus();
@@ -506,11 +568,66 @@
   function renderHeader() {
     $("#session-title").textContent = state.session ? state.session.title || state.session.id : "New session";
     $("#usage").textContent = state.session ? usage(state.session.tokens, state.session.cost) : "";
-    $("#compact").disabled = $("#fork").disabled = !state.sid;
+    const busy = !!(state.sid && state.busy.has(state.sid));
+    $("#compact").disabled = $("#fork").disabled = $("#instructions").disabled = !state.sid;
+    $("#move-session").disabled = !state.sid || busy;
+    const parentBtn = $("#parent-session");
+    if (parentBtn) parentBtn.hidden = !(state.session && state.session.parentID);
     $("#project").textContent = ltr(state.dir);
     $("#project").title = "Project: " + state.dir + " (click to change)";
     $("#empty-dir").textContent = state.dir;
     document.title = (state.session ? state.session.title + " · " : "") + "ocmini";
+  }
+  function renderDisplayControls() {
+    $("#chat").classList.toggle("hide-thinking", !state.showThinking);
+    const thinkBtn = $("#toggle-thinking");
+    if (thinkBtn) {
+      thinkBtn.textContent = "Thinking: " + (state.showThinking ? "on" : "off");
+      thinkBtn.setAttribute("aria-pressed", String(state.showThinking));
+    }
+    const toolsBtn = $("#toggle-tools");
+    if (toolsBtn) toolsBtn.textContent = "Tools: " + state.toolView;
+  }
+  function toggleThinking() {
+    state.showThinking = !state.showThinking;
+    store.set("thinking", state.showThinking ? "on" : "off");
+    renderDisplayControls();
+  }
+  function cycleToolView() {
+    const order = ["brief", "full", "grouped"];
+    state.toolView = order[(order.indexOf(state.toolView) + 1) % order.length];
+    store.set("toolView", state.toolView);
+    renderDisplayControls();
+    renderMessages();
+  }
+  function applyTheme(theme) {
+    state.theme = ["system", "light", "dark"].includes(theme) ? theme : "system";
+    if (state.theme === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", state.theme);
+    const btn = $("#theme-toggle");
+    if (btn) {
+      const icon = { system: "◐", light: "☀", dark: "☾" }[state.theme];
+      btn.textContent = icon;
+      btn.title = "Theme: " + state.theme + " (click to switch)";
+      btn.setAttribute("aria-label", "Theme: " + state.theme);
+    }
+  }
+  function cycleTheme() {
+    const order = ["system", "light", "dark"];
+    const next = order[(order.indexOf(state.theme) + 1) % order.length];
+    store.set("theme", next);
+    applyTheme(next);
+  }
+  function syncPromptHistory() {
+    state.promptHistory = [];
+    for (const m of state.messages) {
+      if (m.type === "user" && m.text && m.text.trim()) {
+        const text = m.text.trim();
+        if (state.promptHistory[state.promptHistory.length - 1] !== text) state.promptHistory.push(text);
+      }
+    }
+    state.historyIndex = -1;
+    state.historyDraft = "";
   }
   function renderMessages() {
     const box = $("#messages");
@@ -522,9 +639,13 @@
     const box = $("#pending");
     box.replaceChildren(...[...state.pending.values()].filter((item) => item.type !== "compaction" && item.type !== "move").map((item) => {
       const payload = item.payload || {};
+      const nextDelivery = item.delivery === "queue" ? "steer" : "queue";
       return h("div", { class: "msg user pending" },
-        h("div", { class: "role" }, (item.delivery === "queue" ? "Queued" : "You") + " · ",
+        h("div", { class: "role" }, (item.delivery === "queue" ? "Queued" : "Steer") + " · ",
           h("span", { class: "tools shown" },
+            h("button", { type: "button", class: "link",
+              text: nextDelivery === "steer" ? "Switch to steer" : "Switch to queue",
+              onclick: () => toggleInboxDelivery(item.id, nextDelivery) }),
             h("button", { type: "button", class: "link", text: "Cancel", onclick: () => cancelInput(item.id) }))),
         h("div", { class: "bubble", text: payload.text || "" }),
         fileChips(payload.files));
@@ -558,13 +679,42 @@
         node.append(h("div", { class: "role", text: [m.agent, m.model && m.model.id].filter(Boolean).join(" · ") }));
         const body = h("div", { class: "content" });
         m.content = m.content || [];
-        m.content.forEach((block) => block && body.append(renderBlock(block)));
+        if (state.toolView === "grouped") {
+          let run = [];
+          const flushTools = () => {
+            if (!run.length) return;
+            body.append(renderToolGroup(run));
+            run = [];
+          };
+          for (const block of m.content) {
+            if (!block) continue;
+            if (block.type === "tool") run.push(block);
+            else { flushTools(); body.append(renderBlock(block)); }
+          }
+          flushTools();
+        } else {
+          m.content.forEach((block) => block && body.append(renderBlock(block)));
+        }
         node.append(body);
         if (m.error) node.append(h("div", { class: "error", text: m.error.message || "Failed" }));
         const footer = m.time && m.time.completed ? usage(m.tokens, m.cost) : "";
         if (footer) node.append(h("div", { class: "footer", text: footer }));
         break;
       }
+      case "info-card":
+        node = h("div", { class: "info-card" },
+          h("div", { class: "info-head" },
+            h("h3", { text: m.title || "" }),
+            h("button", { type: "button", class: "icon", "aria-label": "Dismiss", text: "✕",
+              onclick: () => {
+                const idx = state.messages.indexOf(m);
+                if (idx !== -1) state.messages.splice(idx, 1);
+                state.byId.delete(m.id);
+                node.remove();
+                $("#empty").hidden = !!(state.messages.length || state.pending.size);
+              } })),
+          m.bodyNode ? m.bodyNode.cloneNode(true) : h("div", { class: "md", html: markdown(m.text || "") }));
+        break;
       case "compaction":
         node = h("div", { class: "notice" },
           m.status === "failed" ? h("span", { class: "error", text: "Compaction failed: " + ((m.error && m.error.message) || "") })
@@ -608,25 +758,61 @@
     const todos = Array.isArray(input.todos) && input.todos.length + " items";
     return input.command || input.pattern || input.url || input.description || input.query || question || todos || "";
   }
+  function renderToolGroup(blocks) {
+    const counts = new Map();
+    let running = 0;
+    let failed = 0;
+    for (const b of blocks) {
+      counts.set(b.name, (counts.get(b.name) || 0) + 1);
+      const st = b.state && b.state.status;
+      if (st === "running" || st === "streaming") running++;
+      else if (st === "error") failed++;
+    }
+    const parts = [...counts].map(([name, n]) => name + " × " + n).join(", ");
+    const tail = [];
+    if (running) tail.push(running + " running");
+    if (failed) tail.push(failed + " failed");
+    const mark = failed ? "✕" : "▸";
+    const summaryText = `${mark} ${blocks.length} tool call${blocks.length === 1 ? "" : "s"} · ${parts}${tail.length ? " · " + tail.join(" · ") : ""}`;
+    return h("details", { class: "tool-group" },
+      h("summary", { text: summaryText }),
+      h("div", { class: "group-items" }, ...blocks.map((b) => renderTool(b))));
+  }
   function renderTool(block) {
     const s = block.state || {};
     const status = s.status || "streaming";
     let input = s.input;
     if (typeof input === "string") { try { input = JSON.parse(input); } catch { /* still streaming */ } }
     const icon = { streaming: "…", running: "●", completed: "✓", error: "✕" }[status] || "•";
-    const node = h("details", { class: "tool " + status, open: !!block.open, ontoggle: (e) => { block.open = e.target.open; } });
+    const isOpen = block.open != null ? !!block.open : state.toolView === "full";
+    const node = h("details", { class: "tool " + status, open: isOpen, ontoggle: (e) => { block.open = e.target.open; } });
     const arg = toolArg(block.name, input);
     const path = input && (input.filePath || input.path);
-    node.append(h("summary", {},
+    const childSid = s.metadata && (s.metadata.sessionID || s.metadata.sessionId);
+    const summary = h("summary", {},
       h("span", { class: "state", text: icon }),
       h("span", { class: "name", text: block.name }),
-      h("span", { class: "arg", text: arg, title: arg })));
+      h("span", { class: "arg", text: arg, title: arg }));
+    if (childSid && (block.name === "subagent" || block.name === "task")) {
+      summary.append(h("button", {
+        type: "button", class: "link", text: "Open subagent ↗",
+        title: "Open child session " + childSid,
+        onclick: (e) => { e.preventDefault(); e.stopPropagation(); openSession(childSid); },
+      }));
+    }
+    node.append(summary);
     // Building the body lazily keeps long transcripts cheap.
     const fill = () => {
       if (node.querySelector(".body")) return;
       const body = h("div", { class: "body" });
+      if (childSid && (block.name === "subagent" || block.name === "task")) {
+        body.append(h("div", {}, h("button", {
+          type: "button", class: "filelink", text: "Open subagent transcript (" + childSid + ") ↗",
+          onclick: () => openSession(childSid),
+        })));
+      }
       if (path && typeof path === "string") {
-        body.append(h("div", {}, h("span", { class: "filelink", text: "Open " + relative(path), onclick: () => openFile(resolve(path)) })));
+        body.append(h("div", {}, h("button", { type: "button", class: "filelink", text: "Open " + relative(path), onclick: () => openFile(resolve(path)) })));
       }
       if (input && typeof input === "object" && typeof input.oldString === "string" && typeof input.newString === "string") {
         body.append(h("div", { class: "label", text: "Change" }), diff(input.oldString, input.newString));
@@ -643,7 +829,7 @@
       if (s.error) body.append(h("div", { class: "error", text: s.error.message || "Tool failed" }));
       node.append(body);
     };
-    if (block.open) fill();
+    if (isOpen) fill();
     node.addEventListener("toggle", () => node.open && fill());
     return node;
   }
@@ -681,7 +867,7 @@
     frame = 0;
     stick = nearBottom();
     for (const item of dirty) {
-      if (item.type === "assistant" || item.type === "notice" || item.type === "user" || item.type === "synthetic" || item.type === "compaction") {
+      if (item.type === "assistant" || item.type === "notice" || item.type === "info-card" || item.type === "user" || item.type === "synthetic" || item.type === "compaction") {
         const old = item.node;
         const fresh = renderMessage(item);
         if (old && old.isConnected && fresh) old.replaceWith(fresh);
@@ -864,10 +1050,93 @@
   setInterval(() => { if (started) renderStatus(); }, 1000);
 
   function renderAttachments() {
-    $("#attachments").replaceChildren(...state.attachments.map((a, i) =>
+    const fileNodes = state.attachments.map((a, i) =>
       h("span", { class: "chip" }, "📎 " + a.name,
         h("button", { type: "button", "aria-label": "Remove " + a.name, text: "✕",
-          onclick: () => { state.attachments.splice(i, 1); renderAttachments(); } }))));
+          onclick: () => { state.attachments.splice(i, 1); renderAttachments(); } })));
+    const skillNodes = state.selectedSkills.map((id, i) =>
+      h("span", { class: "chip skill" }, "✦ " + id,
+        h("button", { type: "button", "aria-label": "Remove skill " + id, text: "✕",
+          onclick: () => { state.selectedSkills.splice(i, 1); renderAttachments(); } })));
+    $("#attachments").replaceChildren(...skillNodes, ...fileNodes);
+  }
+  function addInfoCard(title, bodyNode) {
+    const card = addMessage({ id: "info_" + Date.now() + "_" + Math.random().toString(36).slice(2), type: "info-card", title, bodyNode });
+    touch(card);
+    stick = true;
+    scrollToBottom(true);
+  }
+  function showHelpCard() {
+    const rows = [
+      ["/help", "Show this commands & shortcuts card"],
+      ["/context", "Inspect approximate context usage for the active session"],
+      ["/compact [focus]", "Summarize older context with optional focus instructions"],
+      ...state.commands.map((c) => ["/" + c.name, c.description || c.template || ""]),
+      ["Enter / Shift+Enter", "Send prompt / insert newline"],
+      ["Up / Down", "Recall prompt history when at the start of the composer"],
+      ["Ctrl+T", "Toggle thinking blocks visibility"],
+      ["Ctrl+O", "Cycle tool display (brief / full / grouped)"],
+      ["Ctrl+P", "Quick open file in workspace"],
+      ["Ctrl+S", "Save active editor file"],
+      ["Esc", "Close suggestions or stop an active turn"],
+    ];
+    const dl = h("dl", {});
+    for (const [term, desc] of rows) {
+      dl.append(h("dt", { text: term }), h("dd", { text: desc }));
+    }
+    addInfoCard("Commands & Shortcuts", dl);
+  }
+  async function showContextCard() {
+    if (!state.sid) {
+      toast("Start or open a session first to inspect context", true);
+      return;
+    }
+    const res = await api("GET", sessionPath(state.sid, "/context"));
+    const items = res.data || [];
+    let userCount = 0, assistantCount = 0, toolCount = 0, textChars = 0, reasoningChars = 0, toolChars = 0;
+    for (const m of items) {
+      if (m.type === "user" || m.type === "synthetic") {
+        userCount++;
+        textChars += (m.text || "").length;
+      } else if (m.type === "assistant") {
+        assistantCount++;
+        for (const b of m.content || []) {
+          if (!b) continue;
+          if (b.type === "text") textChars += (b.text || "").length;
+          else if (b.type === "reasoning") reasoningChars += (b.text || "").length;
+          else if (b.type === "tool") {
+            toolCount++;
+            toolChars += JSON.stringify(b.state || {}).length;
+          }
+        }
+      } else if (m.type === "compaction") {
+        textChars += (m.summary || "").length;
+      }
+    }
+    const est = (chars) => Math.ceil(chars / 4);
+    const estTotal = est(textChars) + est(reasoningChars) + est(toolChars);
+    const current = currentModel();
+    const modelInfo = current && state.models.find((m) => modelKey(m) === modelKey(current));
+    const ctxWindow = modelInfo && modelInfo.limit && modelInfo.limit.context ? compact(modelInfo.limit.context) + " tokens" : "unknown";
+    const observed = state.session ? usage(state.session.tokens, state.session.cost) || "none yet" : "none yet";
+    const dl = h("dl", {},
+      h("dt", { text: "Active messages" }), h("dd", { text: `${items.length} (${userCount} user, ${assistantCount} assistant, ${toolCount} tool calls)` }),
+      h("dt", { text: "Est. conversation" }), h("dd", { text: `~${compact(est(textChars))} tokens (4 bytes/tok)` }),
+      h("dt", { text: "Est. reasoning" }), h("dd", { text: `~${compact(est(reasoningChars))} tokens` }),
+      h("dt", { text: "Est. tool payloads" }), h("dd", { text: `~${compact(est(toolChars))} tokens` }),
+      h("dt", { text: "Est. subtotal" }), h("dd", { text: `~${compact(estTotal)} tokens (excludes system prompt & tool schemas)` }),
+      h("dt", { text: "Session usage" }), h("dd", { text: observed }),
+      h("dt", { text: "Model window" }), h("dd", { text: ctxWindow }));
+    addInfoCard("Context breakdown", dl);
+  }
+  async function toggleInboxDelivery(id, delivery) {
+    if (!state.sid) return;
+    try {
+      await api("PATCH", sessionPath(state.sid, "/inbox/" + encodeURIComponent(id)), { delivery });
+      const item = state.pending.get(id);
+      if (item) item.delivery = delivery;
+      renderPending();
+    } catch (error) { fail(error); }
   }
   function readFileAsDataUrl(file) {
     return new Promise((resolve, reject) => {
@@ -890,32 +1159,55 @@
     if (e) e.preventDefault();
     const input = $("#input");
     const text = input.value;
-    if (!text.trim() && !state.attachments.length) return;
+    if (!text.trim() && !state.attachments.length && !state.selectedSkills.length) return;
+    hideSuggest();
+    const slash = text.trim().match(/^\/(\S+)(?:\s+([\s\S]*))?$/);
+    if (slash && slash[1] === "help") {
+      input.value = "";
+      autosize();
+      store.set("draft", "");
+      showHelpCard();
+      input.focus();
+      return;
+    }
+    if (slash && slash[1] === "context") {
+      input.value = "";
+      autosize();
+      store.set("draft", "");
+      try { await showContextCard(); } catch (error) { fail(error); }
+      input.focus();
+      return;
+    }
     if (state.remote) {
       return toast("Another ocmini process is running this session. You can send once it finishes; your draft is kept.", true);
     }
-    hideSuggest();
     const send = $("#send");
     send.disabled = true;
     try {
       const sid = await ensureSession();
       const delivery = $("#delivery").value;
-      const slash = text.match(/^\/(\S+)\s*([\s\S]*)$/);
       if (slash && slash[1] === "compact") {
         await api("POST", sessionPath(sid, "/compact"), slash[2] ? { ocminiFocus: slash[2] } : {});
       } else if (slash && state.commands.some((c) => c.name === slash[1])) {
-        await api("POST", sessionPath(sid, "/command"), { name: slash[1], text: slash[2], delivery });
+        await api("POST", sessionPath(sid, "/command"), { name: slash[1], text: slash[2] || "", delivery });
       } else {
         const body = { text, delivery };
         if (state.attachments.length) body.files = state.attachments.map((a) => ({ uri: a.uri, name: a.name }));
+        if (state.selectedSkills.length) body.skills = state.selectedSkills.map((id) => ({ id }));
         const receipt = await api("POST", sessionPath(sid, "/prompt"), body);
         const item = receipt.data;
         if (item && !state.byId.has(item.id) && sid === state.sid && !delivered.has(item.id)) {
           state.pending.set(item.id, item);
         }
       }
+      if (text.trim() && state.promptHistory[state.promptHistory.length - 1] !== text.trim()) {
+        state.promptHistory.push(text.trim());
+      }
+      state.historyIndex = -1;
+      state.historyDraft = "";
       input.value = "";
       state.attachments = [];
+      state.selectedSkills = [];
       renderAttachments();
       autosize();
       store.set("draft", "");
@@ -977,22 +1269,42 @@
     const text = $("#input").value;
     const m = text.match(/^\/(\S*)$/);
     if (!m) return [];
-    const all = [{ name: "compact", description: "Summarize older context" }].concat(state.commands);
+    const builtins = [
+      { name: "compact", description: "Summarize older context" },
+      { name: "context", description: "Inspect approximate context usage" },
+      { name: "help", description: "Show commands and keyboard shortcuts" },
+    ];
+    const all = builtins.concat(state.commands.filter((c) => !builtins.some((b) => b.name === c.name)));
     return all.filter((c) => c.name.startsWith(m[1]));
   }
   function renderSuggest() {
     const list = suggestions();
     const box = $("#suggest");
+    const input = $("#input");
     if (!list.length) return hideSuggest();
     suggestIndex = Math.min(suggestIndex, list.length - 1);
-    box.replaceChildren(...list.map((c, i) => h("li", { class: i === suggestIndex ? "active" : "",
-      onmousedown: (e) => { e.preventDefault(); pickSuggest(c); } },
-      h("b", { text: "/" + c.name }), h("small", { text: c.description || c.template || "" }))));
+    box.replaceChildren(...list.map((c, i) => {
+      const active = i === suggestIndex;
+      const optId = "suggest-opt-" + i;
+      return h("li", {
+        id: optId,
+        role: "option",
+        "aria-selected": String(active),
+        class: active ? "active" : "",
+        onmousedown: (e) => { e.preventDefault(); pickSuggest(c); },
+      },
+      h("b", { text: "/" + c.name }), h("small", { text: c.description || c.template || "" }));
+    }));
+    input.setAttribute("aria-activedescendant", "suggest-opt-" + suggestIndex);
     box.hidden = false;
   }
-  function hideSuggest() { $("#suggest").hidden = true; suggestIndex = 0; }
+  function hideSuggest() {
+    $("#suggest").hidden = true;
+    $("#input").removeAttribute("aria-activedescendant");
+    suggestIndex = 0;
+  }
   function pickSuggest(c) {
-    $("#input").value = "/" + c.name + " ";
+    $("#input").value = "/" + c.name + (c.name === "help" || c.name === "context" ? "" : " ");
     hideSuggest();
     $("#input").focus();
   }
@@ -1063,7 +1375,12 @@
       case "session.created":
       case "session.forked":
       case "session.deleted":
+      case "session.archived":
+      case "session.unarchived":
         if (type === "session.deleted" && sid === state.sid) clearSession();
+        return reloadSessions();
+      case "session.location.changed":
+        if (sid === state.sid) openSession(sid);
         return reloadSessions();
       case "session.renamed": {
         const s = state.sessions.find((x) => x.id === sid);
@@ -1113,7 +1430,7 @@
       case "permission.asked":
         state.permissions.set(data.id, data);
         if (sid === state.sid) renderRequests();
-        else toast("A session is waiting for permission");
+        else toast("A session is waiting for permission", false, sid ? () => openSession(sid) : null);
         return;
       case "permission.replied":
         state.permissions.delete(data.requestID);
@@ -1121,7 +1438,7 @@
       case "form.created":
         state.forms.set(data.form.id, data.form);
         if (data.form.sessionID === state.sid) renderRequests();
-        else toast("A session asked a question");
+        else toast("A session asked a question", false, data.form.sessionID ? () => openSession(data.form.sessionID) : null);
         return;
       case "form.replied":
       case "form.cancelled":
@@ -1200,7 +1517,7 @@
         const status = { "session.tool.called": "running", "session.tool.progress": "running",
           "session.tool.success": "completed", "session.tool.failed": "error" }[type];
         block.state = { status, input: data.input, metadata: data.metadata, content: data.content, error: data.error };
-        touch(m, block.node ? block : null);
+        touch(m, state.toolView === "grouped" ? null : (block.node ? block : null));
         if (type === "session.tool.success" && MUTATING_TOOLS.has(data.name)) {
           refreshOpenFiles();
           refreshTree();
@@ -1631,6 +1948,155 @@
     if (!dialog.open) dialog.showModal();
   }
 
+  // ---------- MCP panel ----------
+  async function openMcpModal() {
+    let list;
+    try {
+      const res = await api("GET", "/api/mcp?" + located());
+      list = res.data || [];
+    } catch (error) { return fail(error); }
+    const rows = list.length ? list.map((srv) => {
+      const st = (srv.status && srv.status.status) || "disabled";
+      const err = srv.status && srv.status.error;
+      const connected = st === "connected";
+      const act = async () => {
+        const op = connected ? "disconnect" : "connect";
+        try {
+          await api("POST", "/api/experimental/mcp/" + encodeURIComponent(srv.name) + "/" + op + "?" + located());
+          toast((connected ? "Disconnected " : "Connected ") + srv.name);
+          openMcpModal();
+        } catch (error) { fail(error); openMcpModal(); }
+      };
+      return h("div", { class: "modal-row" },
+        h("div", {},
+          h("b", { text: srv.name }), " ",
+          h("span", { class: "badge " + st, text: st }),
+          err ? h("div", { class: "note", text: err }) : null),
+        h("button", { type: "button", text: connected ? "Disconnect" : "Connect", onclick: act }));
+    }) : [h("p", { class: "note", text: "No MCP servers configured for this directory. Add them under \"mcp\" in opencode.json." })];
+    modal("MCP servers", h("div", {},
+      ...rows,
+      h("div", { class: "buttons" }, h("button", { type: "button", text: "Refresh", onclick: openMcpModal }))));
+  }
+
+  // ---------- session keyed instructions ----------
+  async function openInstructionsModal() {
+    if (!state.sid) return;
+    let entries;
+    try {
+      const res = await api("GET", "/api/experimental/session/" + encodeURIComponent(state.sid) + "/instructions/entries");
+      entries = res.data || [];
+    } catch (error) { return fail(error); }
+    const keyInput = h("input", { type: "text", placeholder: "e.g. style.guide", "aria-label": "Instruction key", spellcheck: "false" });
+    const valInput = h("textarea", { rows: 4, placeholder: "Instruction text or JSON value", "aria-label": "Instruction value" });
+    const saveEntry = async (e) => {
+      if (e) e.preventDefault();
+      const key = keyInput.value.trim();
+      const raw = valInput.value;
+      if (!key) return toast("Key is required", true);
+      try {
+        await api("PUT", "/api/experimental/session/" + encodeURIComponent(state.sid) + "/instructions/entries/" + encodeURIComponent(key), { value: raw });
+        toast("Saved instruction: " + key);
+        openInstructionsModal();
+      } catch (error) { fail(error); }
+    };
+    const removeEntry = async (key) => {
+      try {
+        await api("DELETE", "/api/experimental/session/" + encodeURIComponent(state.sid) + "/instructions/entries/" + encodeURIComponent(key));
+        toast("Removed instruction: " + key);
+        openInstructionsModal();
+      } catch (error) { fail(error); }
+    };
+    const listNodes = entries.length ? entries.map((entry) => {
+      const text = typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value, null, 2);
+      return h("div", { class: "modal-row" },
+        h("div", { style: "min-width:0;flex:1;" },
+          h("code", { text: entry.key }),
+          h("div", { class: "note", text: text.length > 160 ? text.slice(0, 160) + "…" : text })),
+        h("div", { style: "display:flex;gap:4px;" },
+          h("button", { type: "button", text: "Edit", onclick: () => { keyInput.value = entry.key; valInput.value = text; valInput.focus(); } }),
+          h("button", { type: "button", text: "Delete", onclick: () => removeEntry(entry.key) })));
+    }) : [h("p", { class: "note", text: "No session instructions set yet." })];
+    modal("Session instructions", h("div", {},
+      ...listNodes,
+      h("h3", { text: "Add or update instruction" }),
+      h("form", { onsubmit: saveEntry },
+        h("div", { class: "field" }, h("label", { text: "Key" }), keyInput,
+          h("div", { class: "hint", text: "Lowercase letters, digits, dots, underscores, or hyphens." })),
+        h("div", { class: "field" }, h("label", { text: "Value" }), valInput),
+        h("div", { class: "buttons" }, h("button", { type: "submit", class: "primary", text: "Save instruction" })))));
+  }
+
+  // ---------- move session directory ----------
+  function moveSessionModal() {
+    if (!state.sid) return;
+    if (state.busy.has(state.sid)) return toast("Stop the session before moving it", true);
+    const known = [...new Set([state.dir].concat(state.sessions.map(sessionDir), recentProjects()))].filter(Boolean);
+    const input = h("input", { type: "text", value: state.dir, "aria-label": "Target directory", spellcheck: "false" });
+    const go = async (dir) => {
+      if (!dir || !dir.trim()) return;
+      try {
+        await api("POST", sessionPath(state.sid, "/move"), { directory: dir.trim() });
+        $("#modal").close();
+        toast("Session moved to " + dir.trim());
+        await openSession(state.sid);
+        reloadSessions();
+      } catch (error) { fail(error); }
+    };
+    modal("Move session", h("div", {},
+      h("form", { class: "field", onsubmit: (e) => { e.preventDefault(); go(input.value); } },
+        h("label", { text: "Directory" }), input,
+        h("div", { class: "hint", text: "Move this session to another absolute directory on the server." })),
+      h("div", { class: "buttons" }, h("button", { type: "button", class: "primary", text: "Move", onclick: () => go(input.value) })),
+      h("h3", { text: "Known projects" }),
+      h("ul", { class: "projects" }, ...known.map((dir) =>
+        h("li", { class: dir === state.dir ? "current" : "", tabindex: 0, text: dir,
+          onclick: () => go(dir), onkeydown: (e) => { if (e.key === "Enter") go(dir); } })))));
+    input.select();
+  }
+
+  // ---------- quick open (Ctrl+P) ----------
+  function openQuickOpen() {
+    let results = [];
+    let selected = 0;
+    let timer = 0;
+    const input = h("input", { type: "search", placeholder: "Type a file name or path…", "aria-label": "Quick open file", spellcheck: "false" });
+    const list = h("ul", { class: "modal-list", role: "listbox", "aria-label": "Matching files" });
+    const renderList = () => {
+      if (!results.length) {
+        list.replaceChildren(h("li", { class: "muted", text: "No matching files" }));
+        return;
+      }
+      selected = Math.min(selected, results.length - 1);
+      list.replaceChildren(...results.map((item, i) =>
+        h("li", {
+          role: "option",
+          "aria-selected": String(i === selected),
+          class: i === selected ? "active" : "",
+          text: item.relative,
+          title: item.path,
+          onclick: () => { $("#modal").close(); openFile(item.path); },
+        })));
+    };
+    const search = async () => {
+      try {
+        const res = await api("GET", "/web/api/fs/find?" + q({ root: state.dir, query: input.value.trim(), limit: 80 }));
+        results = res.entries || [];
+        selected = 0;
+        renderList();
+      } catch (error) { fail(error); }
+    };
+    input.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(search, 120); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); if (results.length) { selected = (selected + 1) % results.length; renderList(); } }
+      else if (e.key === "ArrowUp") { e.preventDefault(); if (results.length) { selected = (selected + results.length - 1) % results.length; renderList(); } }
+      else if (e.key === "Enter" && results[selected]) { e.preventDefault(); $("#modal").close(); openFile(results[selected].path); }
+    });
+    modal("Quick open", h("div", {}, h("div", { class: "row", style: "padding:0 0 8px;" }, input), list));
+    input.focus();
+    search();
+  }
+
   // ---------- sandbox ----------
   async function loadSandboxChoices() {
     try {
@@ -1774,13 +2240,33 @@
     const app = $("#app");
     app.classList.toggle("view-chat", view === "chat");
     app.classList.toggle("view-editor", view === "editor");
-    document.querySelectorAll(".views button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+    document.querySelectorAll(".views button").forEach((b) => {
+      const active = b.dataset.view === view;
+      b.classList.toggle("active", active);
+      b.setAttribute("aria-selected", String(active));
+    });
   }
   function showTab(tab) {
-    document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    document.querySelectorAll(".tabs button").forEach((b) => {
+      const active = b.dataset.tab === tab;
+      b.classList.toggle("active", active);
+      b.setAttribute("aria-selected", String(active));
+    });
     $("#tab-sessions").hidden = tab !== "sessions";
     $("#tab-files").hidden = tab !== "files";
     store.set("tab", tab);
+  }
+  function bindArrowNav(selector, activateBtn) {
+    const buttons = [...document.querySelectorAll(selector)];
+    buttons.forEach((btn, idx) => {
+      btn.addEventListener("keydown", (e) => {
+        if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+        e.preventDefault();
+        const next = buttons[(idx + (e.key === "ArrowRight" ? 1 : buttons.length - 1)) % buttons.length];
+        next.focus();
+        activateBtn(next);
+      });
+    });
   }
   function resizer() {
     const divider = $("#divider");
@@ -1812,20 +2298,40 @@
     };
     document.querySelectorAll(".tabs button").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
     document.querySelectorAll(".views button").forEach((b) => (b.onclick = () => showView(b.dataset.view)));
+    bindArrowNav(".tabs button", (b) => showTab(b.dataset.tab));
+    bindArrowNav(".views button", (b) => showView(b.dataset.view));
+    bindArrowNav(".scope button[data-scope]", (b) => {
+      state.scope = b.dataset.scope;
+      store.set("scope", state.scope);
+      loadSessions().catch(fail);
+    });
     $("#project").onclick = changeDirectory;
     $("#settings").onclick = () => openSettings();
+    $("#mcp-btn").onclick = openMcpModal;
+    $("#theme-toggle").onclick = cycleTheme;
+    $("#quick-open").onclick = openQuickOpen;
+    $("#quick-open-top").onclick = openQuickOpen;
     $("#sandbox").onchange = selectSandbox;
     document.querySelectorAll(".scope button[data-scope]").forEach((b) => (b.onclick = () => {
       state.scope = b.dataset.scope;
       store.set("scope", state.scope);
       loadSessions().catch(fail);
     }));
+    $("#archived-toggle").onclick = () => {
+      state.showArchived = !state.showArchived;
+      loadSessions().catch(fail);
+    };
     $("#new-session").onclick = () => { clearSession(); showView("chat"); $("#input").focus(); if (narrow()) $("#app").classList.remove("sidebar-open"); };
     let searchTimer = 0;
     $("#session-search").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => loadSessions().catch(fail), 250); };
     $("#more-sessions").onclick = () => loadSessions(true).catch(fail);
     $("#older").onclick = () => loadOlder().catch(fail);
+    $("#parent-session").onclick = () => state.session && state.session.parentID && openSession(state.session.parentID);
     $("#session-title").onclick = () => state.session && renameSession(state.session);
+    $("#toggle-thinking").onclick = toggleThinking;
+    $("#toggle-tools").onclick = cycleToolView;
+    $("#instructions").onclick = openInstructionsModal;
+    $("#move-session").onclick = moveSessionModal;
     $("#compact").onclick = compactSession;
     $("#fork").onclick = () => forkSession();
     $("#model").onchange = () => { $("#variant").value = ""; selectModel(); };
@@ -1834,9 +2340,24 @@
     $("#delivery").onchange = renderStatus;
     $("#composer").onsubmit = submit;
     $("#stop").onclick = interrupt;
+    $("#attach-btn").onclick = () => $("#attach").click();
     $("#attach").onchange = (e) => { attachFiles([...e.target.files]); e.target.value = ""; };
+    $("#skill-pick").onchange = (e) => {
+      const id = e.target.value;
+      if (id && !state.selectedSkills.includes(id)) {
+        state.selectedSkills.push(id);
+        renderAttachments();
+      }
+      e.target.value = "";
+      $("#input").focus();
+    };
     const input = $("#input");
-    input.addEventListener("input", () => { autosize(); renderSuggest(); store.set("draft", input.value); });
+    input.addEventListener("input", () => {
+      state.historyIndex = -1;
+      autosize();
+      renderSuggest();
+      store.set("draft", input.value);
+    });
     input.addEventListener("keydown", (e) => {
       const open = !$("#suggest").hidden;
       if (open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
@@ -1850,6 +2371,38 @@
         return pickSuggest(suggestions()[suggestIndex]);
       }
       if (open && e.key === "Escape") return hideSuggest();
+      if (!open && e.key === "ArrowUp" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const onFirstLine = !input.value.slice(0, input.selectionStart).includes("\n");
+        if (onFirstLine && state.promptHistory.length && (input.value === "" || state.historyIndex !== -1)) {
+          e.preventDefault();
+          if (state.historyIndex === -1) {
+            state.historyDraft = input.value;
+            state.historyIndex = state.promptHistory.length - 1;
+          } else if (state.historyIndex > 0) {
+            state.historyIndex--;
+          }
+          input.value = state.promptHistory[state.historyIndex];
+          input.setSelectionRange(input.value.length, input.value.length);
+          autosize();
+          return;
+        }
+      }
+      if (!open && e.key === "ArrowDown" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const onLastLine = !input.value.slice(input.selectionEnd).includes("\n");
+        if (onLastLine && state.historyIndex !== -1) {
+          e.preventDefault();
+          if (state.historyIndex < state.promptHistory.length - 1) {
+            state.historyIndex++;
+            input.value = state.promptHistory[state.historyIndex];
+          } else {
+            state.historyIndex = -1;
+            input.value = state.historyDraft;
+          }
+          input.setSelectionRange(input.value.length, input.value.length);
+          autosize();
+          return;
+        }
+      }
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         submit();
@@ -1897,6 +2450,9 @@
     };
     document.addEventListener("keydown", (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s" && state.active) { e.preventDefault(); save(); }
+      else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "p") { e.preventDefault(); openQuickOpen(); }
+      else if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "t") { e.preventDefault(); toggleThinking(); }
+      else if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); cycleToolView(); }
     });
     addEventListener("beforeunload", (e) => {
       stash();
@@ -1912,6 +2468,11 @@
 
   async function start() {
     bind();
+    applyTheme(store.get("theme") || "system");
+    state.showThinking = store.get("thinking") !== "off";
+    const savedToolView = store.get("toolView");
+    if (["brief", "full", "grouped"].includes(savedToolView)) state.toolView = savedToolView;
+    renderDisplayControls();
     showTab(store.get("tab") || "sessions");
     state.scope = store.get("scope") === "project" ? "project" : "all";
     try { state.selection = JSON.parse(store.get("model") || "null"); } catch { state.selection = null; }

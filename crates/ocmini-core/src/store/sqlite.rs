@@ -1004,7 +1004,6 @@ impl SqliteBackend {
         })
     }
 
-    #[cfg(test)]
     pub fn todos(&self, sid: &str) -> Result<Value, OperationError> {
         let raw: Option<String> = self.with_read(|c| {
             c.query_row(

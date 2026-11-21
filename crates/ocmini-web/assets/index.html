@@ -16,20 +16,25 @@
     <button id="project" class="project" type="button" title="Change project directory"></button>
     <span class="spacer"></span>
     <div class="views" role="tablist" aria-label="View">
-      <button type="button" data-view="chat" class="active">Chat</button>
-      <button type="button" data-view="editor">Editor</button>
+      <button type="button" role="tab" aria-selected="true" data-view="chat" class="active">Chat</button>
+      <button type="button" role="tab" aria-selected="false" data-view="editor">Editor</button>
     </div>
-    <select id="agent" title="Agent" aria-label="Agent"></select>
-    <select id="model" title="Model" aria-label="Model"></select>
-    <select id="variant" title="Model variant" aria-label="Model variant" hidden></select>
+    <div class="selectors">
+      <select id="agent" title="Agent" aria-label="Agent"></select>
+      <select id="model" title="Model" aria-label="Model"></select>
+      <select id="variant" title="Model variant" aria-label="Model variant" hidden></select>
+    </div>
+    <button id="quick-open-top" class="icon" type="button" title="Quick open file (Ctrl+P)" aria-label="Quick open file">⌕</button>
+    <button id="mcp-btn" type="button" title="MCP servers" aria-label="MCP servers">MCP</button>
+    <button id="theme-toggle" class="icon" type="button" title="Theme: system" aria-label="Theme: system">◐</button>
     <button id="settings" class="icon" type="button" title="Settings" aria-label="Settings">⚙</button>
     <span id="conn" class="conn" title="Connecting to event stream" aria-live="polite"></span>
   </header>
 
   <aside id="sidebar">
-    <nav class="tabs" role="tablist">
-      <button type="button" data-tab="sessions" class="active">Sessions</button>
-      <button type="button" data-tab="files">Files</button>
+    <nav class="tabs" role="tablist" aria-label="Sidebar">
+      <button type="button" role="tab" aria-selected="true" data-tab="sessions" class="active">Sessions</button>
+      <button type="button" role="tab" aria-selected="false" data-tab="files">Files</button>
     </nav>
     <section id="tab-sessions" class="tab">
       <div class="row">
@@ -37,8 +42,9 @@
         <input id="session-search" type="search" placeholder="Search" aria-label="Search sessions">
       </div>
       <div class="row scope" role="radiogroup" aria-label="Show sessions from">
-        <button type="button" data-scope="all">All projects</button>
-        <button type="button" data-scope="project">This project</button>
+        <button type="button" role="radio" aria-checked="true" data-scope="all">All projects</button>
+        <button type="button" role="radio" aria-checked="false" data-scope="project">This project</button>
+        <button id="archived-toggle" type="button" aria-pressed="false" title="Show archived sessions">Archived</button>
       </div>
       <ul id="sessions" class="list"></ul>
       <button id="more-sessions" type="button" class="more" hidden>Load more</button>
@@ -47,8 +53,9 @@
       <div class="row">
         <button id="new-file" type="button" title="New file in the selected folder">New file</button>
         <button id="new-folder" type="button" title="New folder in the selected folder">New folder</button>
+        <button id="quick-open" type="button" title="Quick open file (Ctrl+P)">Find</button>
         <span class="spacer"></span>
-        <button id="refresh-files" type="button" class="icon" title="Refresh">⟳</button>
+        <button id="refresh-files" type="button" class="icon" title="Refresh" aria-label="Refresh files">⟳</button>
       </div>
       <div id="tree" class="tree" role="tree"></div>
     </section>
@@ -57,10 +64,15 @@
   <main>
     <section id="chat" class="pane">
       <div class="pane-head">
+        <button id="parent-session" type="button" class="link" hidden title="Return to parent session">← Parent</button>
         <button id="session-title" type="button" class="title" title="Rename session">New session</button>
         <span class="spacer"></span>
         <span id="usage" class="muted"></span>
         <select id="sandbox" title="Sandbox for this session" aria-label="Sandbox" hidden></select>
+        <button id="toggle-thinking" type="button" aria-pressed="true" title="Toggle thinking blocks (Ctrl+T)">Thinking: on</button>
+        <button id="toggle-tools" type="button" title="Cycle tool display: brief / full / grouped (Ctrl+O)">Tools: brief</button>
+        <button id="instructions" type="button" title="Session keyed instructions">Instructions</button>
+        <button id="move-session" type="button" title="Move session to another directory">Move</button>
         <button id="compact" type="button" title="Summarize older context">Compact</button>
         <button id="fork" type="button" title="Copy this session into a new one">Fork</button>
       </div>
@@ -75,11 +87,13 @@
       </div>
       <div id="requests"></div>
       <form id="composer" autocomplete="off">
-        <ul id="suggest" class="suggest" hidden></ul>
+        <ul id="suggest" class="suggest" role="listbox" aria-label="Command suggestions" hidden></ul>
         <div id="attachments"></div>
-        <textarea id="input" rows="3" placeholder="Ask anything…  Enter sends, Shift+Enter adds a line, / lists commands" aria-label="Prompt"></textarea>
+        <textarea id="input" rows="3" placeholder="Ask anything…  Enter sends, Shift+Enter adds a line, / lists commands" aria-label="Prompt" aria-autocomplete="list" aria-controls="suggest"></textarea>
         <div class="actions">
-          <label class="button" title="Attach files">Attach<input id="attach" type="file" multiple hidden></label>
+          <button id="attach-btn" type="button" title="Attach files">Attach</button>
+          <input id="attach" type="file" multiple class="sr-only" tabindex="-1" aria-hidden="true">
+          <select id="skill-pick" title="Attach a skill to the next prompt" aria-label="Attach skill" hidden></select>
           <select id="delivery" title="While the agent is working: steer joins the current turn, queue waits for it to finish" aria-label="Delivery">
             <option value="steer">Steer</option>
             <option value="queue">Queue</option>
@@ -98,7 +112,7 @@
       <div id="editor-tabs" class="pane-head tabs-strip"></div>
       <div id="editor-empty" class="empty">
         <h1>No file open</h1>
-        <p>Pick a file in the <b>Files</b> tab. <kbd>Ctrl</kbd>+<kbd>S</kbd> saves.</p>
+        <p>Pick a file in the <b>Files</b> tab or press <kbd>Ctrl</kbd>+<kbd>P</kbd>. <kbd>Ctrl</kbd>+<kbd>S</kbd> saves.</p>
       </div>
       <div id="editor-body" hidden>
         <pre id="gutter" aria-hidden="true"></pre>

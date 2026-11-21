@@ -72,6 +72,18 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Inspect configured MCP servers
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// Inspect effective configuration
+    Config {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, alias = "dir", value_name = "DIR")]
+        directory: Option<String>,
+    },
     /// Inspect runtime resources
     Debug {
         #[command(subcommand)]
@@ -112,12 +124,50 @@ enum DebugCommand {
 }
 
 #[derive(Subcommand)]
+enum McpCommand {
+    /// List configured MCP servers
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, alias = "dir", value_name = "DIR")]
+        directory: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SessionCommand {
     /// List saved sessions, newest first
     List {
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, alias = "dir", value_name = "DIR")]
         directory: Option<String>,
+        /// Emit JSON array instead of tab-separated lines
+        #[arg(long)]
+        json: bool,
+        /// Limit the number of sessions listed
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Show only top-level (root) sessions
+        #[arg(long)]
+        roots: bool,
     },
+    /// Show a session and its messages
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a session and its child sessions
+    Delete { id: String },
+    /// Rename a session
+    Rename { id: String, title: String },
+    /// Fork a session into a new session
+    Fork {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a session, its messages, and todos as JSON
+    Export { id: String },
 }
 
 fn parse_hostname(value: &str) -> Result<String, String> {
@@ -163,13 +213,263 @@ async fn run(cli: Cli) -> Result<(), String> {
     }) {
         Command::Tui { args, .. } => with_app(create_app()?, |app| tui::run(app, args)).await,
         Command::Run { args, .. } => with_app(create_app()?, |app| run::run(app, args)).await,
-        Command::Session {
-            command: SessionCommand::List { directory },
+        Command::Session { command } => match command {
+            SessionCommand::List {
+                directory,
+                json,
+                limit,
+                roots,
+            } => {
+                let directory = directory.as_deref().map(sessions::directory).transpose()?;
+                let store = store::Store::open(&config::store_path(), &types::hex_id("ocm_"))?;
+                let mut sessions = store.list_sessions(directory.as_deref())?;
+                if roots {
+                    sessions.retain(|s| s.parent_id.is_none());
+                }
+                if let Some(limit) = limit {
+                    sessions.truncate(limit);
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&sessions).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    for session in sessions {
+                        println!("{}\t{}\t{}", session.id, session.title, session.directory);
+                    }
+                }
+                Ok(())
+            }
+            SessionCommand::Show { id, json } => {
+                let store = store::Store::open(&config::store_path(), &types::hex_id("ocm_"))?;
+                let session = store
+                    .get_session(&id)?
+                    .ok_or_else(|| format!("Session not found: {id}"))?;
+                let messages = store.messages(&id)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "session": session,
+                            "messages": messages,
+                        }))
+                        .map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!("id:        {}", session.id);
+                    println!("title:     {}", session.title);
+                    println!("directory: {}", session.directory);
+                    if let Some(parent) = &session.parent_id {
+                        println!("parent:    {parent}");
+                    }
+                    let total_tokens = session.tokens.input
+                        + session.tokens.output
+                        + session.tokens.reasoning
+                        + session.tokens.cache.read
+                        + session.tokens.cache.write;
+                    println!("usage:     {} tokens (${:.4})", total_tokens, session.cost);
+                    println!("messages:  {}", messages.len());
+                    for message in &messages {
+                        let preview = message
+                            .parts
+                            .iter()
+                            .find(|p| p["type"].as_str() == Some("text"))
+                            .and_then(|p| p["text"].as_str())
+                            .unwrap_or("")
+                            .lines()
+                            .next()
+                            .unwrap_or("");
+                        println!("  [{}] {}: {}", message.info.id, message.info.role, preview);
+                    }
+                }
+                Ok(())
+            }
+            SessionCommand::Delete { id } => {
+                with_app(create_app()?, move |app| async move {
+                    let session = app
+                        .store
+                        .get_session(&id)?
+                        .ok_or_else(|| format!("Session not found: {id}"))?;
+                    sessions::delete(&app, &session).await?;
+                    println!("deleted {id}");
+                    Ok(())
+                })
+                .await
+            }
+            SessionCommand::Rename { id, title } => {
+                with_app(create_app()?, move |app| async move {
+                    let session = app
+                        .store
+                        .get_session(&id)?
+                        .ok_or_else(|| format!("Session not found: {id}"))?;
+                    let updated =
+                        sessions::update(&app, &session, serde_json::json!({"title": title}))
+                            .await?;
+                    println!("{}\t{}", updated.id, updated.title);
+                    Ok(())
+                })
+                .await
+            }
+            SessionCommand::Fork { id, json } => {
+                with_app(create_app()?, move |app| async move {
+                    let session = app
+                        .store
+                        .get_session(&id)?
+                        .ok_or_else(|| format!("Session not found: {id}"))?;
+                    let forked = sessions::fork(&app, &session, None).await?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&forked).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!("{}\t{}\t{}", forked.id, forked.title, forked.directory);
+                    }
+                    Ok(())
+                })
+                .await
+            }
+            SessionCommand::Export { id } => {
+                let store = store::Store::open(&config::store_path(), &types::hex_id("ocm_"))?;
+                let session = store
+                    .get_session(&id)?
+                    .ok_or_else(|| format!("Session not found: {id}"))?;
+                let messages = store.messages(&id)?;
+                let todos = store.backend().todos(&id)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "session": session,
+                        "messages": messages,
+                        "todos": todos,
+                    }))
+                    .map_err(|e| e.to_string())?
+                );
+                Ok(())
+            }
+        },
+        Command::Mcp {
+            command: McpCommand::List { json, directory },
         } => {
-            let directory = directory.as_deref().map(sessions::directory).transpose()?;
-            let store = store::Store::open(&config::store_path(), &types::hex_id("ocm_"))?;
-            for session in store.list_sessions(directory.as_deref())? {
-                println!("{}\t{}\t{}", session.id, session.title, session.directory);
+            let dir = match directory.as_deref() {
+                Some(d) => sessions::directory(d)?,
+                None => std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            let cfg = config::Config::load_for(&dir)?;
+            let mut entries: Vec<_> = cfg.mcp.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            if json {
+                let list: Vec<_> = entries
+                    .into_iter()
+                    .map(|(name, server)| {
+                        serde_json::json!({
+                            "name": name,
+                            "type": if server.r#type.is_empty() {
+                                if server.url.is_empty() { "local" } else { "remote" }
+                            } else {
+                                server.r#type.as_str()
+                            },
+                            "enabled": server.enabled.unwrap_or(true),
+                            "command": server.command,
+                            "url": server.url,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?
+                );
+            } else if entries.is_empty() {
+                println!("No MCP servers configured.");
+            } else {
+                for (name, server) in entries {
+                    let kind = if server.r#type.is_empty() {
+                        if server.url.is_empty() {
+                            "local"
+                        } else {
+                            "remote"
+                        }
+                    } else {
+                        server.r#type.as_str()
+                    };
+                    let state = if server.enabled.unwrap_or(true) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    let target = if !server.url.is_empty() {
+                        server.url.clone()
+                    } else {
+                        server.command.join(" ")
+                    };
+                    println!("{name}\t{kind}\t{state}\t{target}");
+                }
+            }
+            Ok(())
+        }
+        Command::Config { json, directory } => {
+            let dir = match directory.as_deref() {
+                Some(d) => sessions::directory(d)?,
+                None => std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            let cfg = config::Config::load_for(&dir)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("directory:    {dir}");
+                println!(
+                    "model:        {}",
+                    if cfg.model.is_empty() {
+                        "(unset)"
+                    } else {
+                        &cfg.model
+                    }
+                );
+                if !cfg.small_model.is_empty() {
+                    println!("small_model:  {}", cfg.small_model);
+                }
+                if !cfg.title_model.is_empty() {
+                    println!("title_model:  {}", cfg.title_model);
+                }
+                if let Some(sandbox) = cfg.extra.get("sandbox") {
+                    println!("sandbox:      {sandbox}");
+                }
+                println!("scroll_mode:  {:?}", cfg.ui.scroll_mode);
+                println!(
+                    "compaction:   auto={}, prune={}",
+                    cfg.compaction.auto.unwrap_or(true),
+                    cfg.compaction.prune.unwrap_or(false)
+                );
+                let mut providers: Vec<&str> = cfg.provider.keys().map(String::as_str).collect();
+                providers.sort_unstable();
+                println!(
+                    "providers:    {}",
+                    if providers.is_empty() {
+                        "(none)".into()
+                    } else {
+                        providers.join(", ")
+                    }
+                );
+                let mut mcp: Vec<&str> = cfg.mcp.keys().map(String::as_str).collect();
+                mcp.sort_unstable();
+                println!(
+                    "mcp:          {}",
+                    if mcp.is_empty() {
+                        "(none)".into()
+                    } else {
+                        mcp.join(", ")
+                    }
+                );
             }
             Ok(())
         }

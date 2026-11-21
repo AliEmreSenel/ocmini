@@ -2,12 +2,23 @@ use crate::config::Config;
 use crate::types::{ModelRef, PromptRequest};
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalAction {
+    Agent,
+    Attach,
     Compact,
     Context,
+    Copy,
+    Fork,
     Help,
+    Mcp,
+    Model,
+    New,
     Quit,
+    Rename,
+    Revert,
+    Sandbox,
+    Variant,
 }
 
 pub struct LocalCommand {
@@ -19,6 +30,20 @@ pub struct LocalCommand {
 }
 
 pub const LOCAL_COMMANDS: &[LocalCommand] = &[
+    LocalCommand {
+        name: "agent",
+        description: "Show or switch agent",
+        arguments: Some("[name]"),
+        shortcut: None,
+        action: LocalAction::Agent,
+    },
+    LocalCommand {
+        name: "attach",
+        description: "Attach a file to the next prompt",
+        arguments: Some("<path>"),
+        shortcut: None,
+        action: LocalAction::Attach,
+    },
     LocalCommand {
         name: "compact",
         description: "Summarize context with optional focus",
@@ -34,6 +59,27 @@ pub const LOCAL_COMMANDS: &[LocalCommand] = &[
         action: LocalAction::Context,
     },
     LocalCommand {
+        name: "copy",
+        description: "Copy last assistant reply to clipboard",
+        arguments: None,
+        shortcut: None,
+        action: LocalAction::Copy,
+    },
+    LocalCommand {
+        name: "exit",
+        description: "Quit",
+        arguments: None,
+        shortcut: None,
+        action: LocalAction::Quit,
+    },
+    LocalCommand {
+        name: "fork",
+        description: "Fork the current session",
+        arguments: None,
+        shortcut: None,
+        action: LocalAction::Fork,
+    },
+    LocalCommand {
         name: "help",
         description: "Show this help",
         arguments: None,
@@ -41,11 +87,60 @@ pub const LOCAL_COMMANDS: &[LocalCommand] = &[
         action: LocalAction::Help,
     },
     LocalCommand {
+        name: "mcp",
+        description: "Show MCP server status",
+        arguments: Some("[connect|disconnect <name>]"),
+        shortcut: None,
+        action: LocalAction::Mcp,
+    },
+    LocalCommand {
+        name: "model",
+        description: "Show or switch model",
+        arguments: Some("[provider/model[#variant]]"),
+        shortcut: None,
+        action: LocalAction::Model,
+    },
+    LocalCommand {
+        name: "new",
+        description: "Start a new session",
+        arguments: None,
+        shortcut: None,
+        action: LocalAction::New,
+    },
+    LocalCommand {
         name: "quit",
         description: "Quit",
         arguments: None,
         shortcut: Some("Ctrl+D"),
         action: LocalAction::Quit,
+    },
+    LocalCommand {
+        name: "rename",
+        description: "Rename the current session",
+        arguments: Some("<title>"),
+        shortcut: None,
+        action: LocalAction::Rename,
+    },
+    LocalCommand {
+        name: "revert",
+        description: "Revert the last turn",
+        arguments: None,
+        shortcut: None,
+        action: LocalAction::Revert,
+    },
+    LocalCommand {
+        name: "sandbox",
+        description: "Show or switch sandbox preset",
+        arguments: Some("[preset]"),
+        shortcut: None,
+        action: LocalAction::Sandbox,
+    },
+    LocalCommand {
+        name: "variant",
+        description: "Show or switch model variant",
+        arguments: Some("[name]"),
+        shortcut: None,
+        action: LocalAction::Variant,
     },
 ];
 

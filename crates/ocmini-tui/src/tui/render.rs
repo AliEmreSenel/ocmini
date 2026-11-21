@@ -177,7 +177,7 @@ fn render_interaction(ui: &mut Ui, event: &crate::types::BusEvent) -> String {
         event::EventKind::Permission(event::PermissionKind::Asked) => {
             let id = properties["id"].as_str().unwrap_or_default().to_string();
             let text = format!(
-                "\n{YELLOW}⚠ permission{}: {}{RESET} {DIM}[o]nce [a]lways [r]eject{RESET}",
+                "\n{YELLOW}⚠ permission{}: {}{RESET} {DIM}[y/o]nce [a]lways [n/r]eject{RESET}",
                 properties["permission"]
                     .as_str()
                     .map(|p| format!(" {p}"))

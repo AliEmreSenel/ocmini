@@ -26,7 +26,12 @@ enum Pending {
     },
 }
 pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
-    let existing = if args.session.is_some() || args.continue_last {
+    if args.fork && args.session.is_none() && !args.continue_last && !args.resume {
+        return Err("--fork requires --session, --continue, or --resume".into());
+    }
+    let existing = if args.resume {
+        Some(tui::pick_session(&app, args.dir.as_deref()).await?)
+    } else if args.session.is_some() || args.continue_last {
         Some(
             sessions::open_for_app(
                 &app,
@@ -147,12 +152,23 @@ pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
         if !args.interactive {
             return Ok(());
         }
-        // Follow-up prompts reuse the same turn and cleanup path.
+        if tty && !json {
+            drop(lines);
+            drop(events);
+            let selected = PromptRequest {
+                model: selection.0.clone(),
+                agent: selection.1.clone(),
+                variant: selection.2.clone(),
+                ..Default::default()
+            };
+            return tui::run_session(app, session, selected, args.model, Vec::new()).await;
+        }
+        // Non-TTY / JSON fallback: keep prompting via line loop.
         let line = loop {
             let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? else {
                 return Ok(());
             };
-            if line.trim() == "/exit" {
+            if matches!(line.trim(), "/exit" | "/quit") {
                 return Ok(());
             }
             if !line.trim().is_empty() {

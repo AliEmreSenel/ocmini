@@ -206,6 +206,152 @@ pub(super) async fn clipboard_image() -> Result<Option<Attachment>, String> {
     Ok(bytes.and_then(image_attachment))
 }
 
+/// Resolve a user-supplied file path (supporting quotes, `file://`, `\ `, `~/`,
+/// and relative paths against `base_dir`).
+pub(super) fn resolve_user_path(raw: &str, base_dir: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Path cannot be empty".into());
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .unwrap_or(trimmed);
+    let path = if unquoted.starts_with("file:") {
+        reqwest::Url::parse(unquoted)
+            .map_err(|e| format!("Invalid file URL: {e}"))?
+            .to_file_path()
+            .map_err(|_| "Invalid local file URL".to_string())?
+    } else {
+        PathBuf::from(unquoted.replace("\\ ", " "))
+    };
+    let expanded = match path.to_str().and_then(|s| s.strip_prefix("~/")) {
+        Some(rest) => std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .ok_or_else(|| "HOME is not set".to_string())?,
+        None => path,
+    };
+    Ok(if expanded.is_absolute() {
+        expanded
+    } else {
+        Path::new(base_dir).join(expanded)
+    })
+}
+
+/// Copy plain text to the desktop clipboard.
+#[cfg(target_os = "linux")]
+pub(super) async fn copy_text(text: &str) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    if !wayland && !x11 {
+        return Err(
+            "No desktop clipboard is available (requires wl-copy on Wayland or xclip/xsel on X11)."
+                .into(),
+        );
+    }
+    let candidates: &[(&str, &[&str], bool)] = &[
+        ("wl-copy", &[], wayland),
+        ("xclip", &["-selection", "clipboard", "-in"], x11),
+        ("xsel", &["--clipboard", "--input"], x11),
+    ];
+    let mut last_error: Option<String> = None;
+    for &(program, args, enabled) in candidates {
+        if !enabled {
+            continue;
+        }
+        let mut child = match Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                last_error = Some(format!("Cannot run {program}: {error}"));
+                continue;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes()).await;
+        }
+        match child.wait_with_output().await {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => {
+                last_error = Some(format!(
+                    "{program} exited with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Err(error) => last_error = Some(format!("Cannot run {program}: {error}")),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        "Clipboard copy needs wl-copy (Wayland) or xclip/xsel (X11); none could be started.".into()
+    }))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn copy_text(text: &str) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    let mut child = Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Cannot run pbcopy: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pbcopy exited with {status}"))
+    }
+}
+
+#[cfg(windows)]
+pub(super) async fn copy_text(text: &str) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    let mut child = Command::new("clip")
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Cannot run clip: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("clip exited with {status}"))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(super) async fn copy_text(_text: &str) -> Result<(), String> {
+    Err("Clipboard copy is not supported on this platform".into())
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(super) async fn clipboard_image() -> Result<Option<Attachment>, String> {
     Err("Image paste is not supported on this platform".into())
