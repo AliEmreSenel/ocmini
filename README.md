@@ -113,7 +113,7 @@ ocmini run --auto -m provider/model "…"      # allow tools without asking
 ## What stays
 
 - **Coding loop:** streaming replies and reasoning, file attachments, cancellation, steering, permissions and questions.
-- **Tools:** `bash`, `read`, `write`, `edit`, `apply_patch`, `glob`, `grep`, `webfetch`, `todowrite`, `question`, `task` and `skill`.
+- **Tools:** `bash`, `background_read`, `background_list`, `background_stop`, `read`, `write`, `edit`, `apply_patch`, `glob`, `grep`, `webfetch`, `todoread`, `todowrite`, `question`, `task` and `skill`.
 - **Sessions:** SQLite history, resume, forks, child tasks, context compaction and recovery after interruption.
 - **Providers:** OpenAI Chat Completions, OpenAI Responses and Anthropic Messages, including compatible endpoints.
 - **Project setup:** OpenCode JSON/JSONC configuration, agents, commands, skills and `AGENTS.md` instructions.
@@ -126,7 +126,7 @@ If a provider explicitly rejects an image as truncated or undecodable, ocmini re
 
 Tool text over 50 KiB is saved under `$XDG_DATA_HOME/ocmini/tool-output` (default `~/.local/share/ocmini/tool-output`). The conversation keeps a preview of the beginning and end plus the saved path, so omitted content can be read or searched later. Large shell output is captured to disk with bounded memory. Edits and patches also apply the read policy before inspecting file contents. Existing file-read/search paging and media limits still apply. Full output files are retained by default so resumed sessions can still read them. Set `OCMINI_TOOL_OUTPUT_RETENTION_DAYS` to a positive integer to remove expired output files at startup; unset or `0` retains them. These files use disk space separately from session history.
 
-A normal `bash` call ends its whole process group when the command exits, so `cmd &` and `nohup cmd &` do not survive it. For work that must outlive the call, pass `background: true`: the command starts in its own session, the tool returns its pid and log path at once, the job keeps running across tool calls, and `kill <pid>` stops it. A background job belongs to the session that started it: aborting the turn, deleting the session, or stopping ocmini ends it. Its log is not size-bounded and expires with `OCMINI_TOOL_OUTPUT_RETENTION_DAYS` like other output files. A command that reaches its `timeout` completes with the output it printed before the limit plus a `shell_metadata` notice, so a cancelled build still shows its work; aborting a turn discards the result.
+A normal `bash` call ends its whole process group when the command exits, so `cmd &` and `nohup cmd &` do not survive it. For work that must outlive the call, pass `background: true`: the command starts in its own session, the tool returns its job ID, pid and log path at once, and the job keeps running across tool calls. On Unix, `background_read` polls incremental output by byte offset, `background_list` lists the session's background jobs, and `background_stop` terminates a session-owned job's entire process group by `pid`. A background job belongs to the session that started it: aborting the turn, deleting the session, or stopping ocmini ends it. Its log is not size-bounded and expires with `OCMINI_TOOL_OUTPUT_RETENTION_DAYS` like other output files. A command that reaches its `timeout` completes with the output it printed before the limit plus a `shell_metadata` notice, so a cancelled build still shows its work; aborting a turn discards the result.
 
 Launching a subagent with `task` also accepts `background: true`: the child session starts and the tool returns its id at once; when the child finishes, its result is injected into the parent as a synthetic user message and wakes it for a follow-up turn (steered into the live turn while the parent is busy, a fresh turn when it is idle). Aborting the child's session cancels it and drops its result silently. Background tasks are process-local and do not survive a restart.
 
@@ -134,7 +134,7 @@ In the terminal, `/context` estimates the current projected instructions, tool s
 
 Compaction can be requested manually, runs automatically with room reserved for model output, and recovers from provider context-overflow errors. It can repeat throughout a task, including within one model step while each checkpoint reduces the overflowing request. Recovery stops when compaction fails or no longer reduces that request. Subsequent requests use the latest valid summary, recent messages kept verbatim, and newer messages; the original history remains saved. The default recent-message budget is roughly a quarter of usable context, between 2,000 and 15,000 tokens. Complete tool call/result groups are retained when they fit, with the latest user message taking priority. Budgets use approximate token estimates. Unknown context windows rely on manual compaction or provider overflow recovery.
 
-`grep` and `glob` stream ripgrep results, return up to 100 matches, and use ripgrep's ignore and glob rules. Explicit globs can override ignore rules. Search has no additional candidate-file ceiling. Text reads accept files of any size and default to 2,000 lines; `offset` and `limit` page through them without a separate 20,000-line ceiling. Each line is capped at 2,000 characters and each file page at 50 KiB of text. Reads validate UTF-8 and binary content while retaining a bounded line preview. Media attachment limits still apply.
+`grep` and `glob` stream ripgrep results in deterministic path order (`--sort=path`), include hidden files while honoring `.gitignore` and skipping `.git`, return up to 100 matches, and use ripgrep's native glob rules. `grep` also supports `offset` pagination, `exclude` glob pattern(s), and `multiline` (`-U`), and gracefully summarizes overly long (>64 KiB) or non-UTF-8 matching lines without aborting the search. Explicit globs can override ignore rules. Search has no additional candidate-file ceiling. Text reads accept `filePath` (or `path`), support files of any size, default to 2,000 lines, distinguish symlinks in directory listings, and page via `offset`/`limit` or disjoint `ranges`. Each line is capped at 2,000 characters and each file page at 50 KiB of text. `edit` emits a unified diff in `metadata.diff`. `todoread` reads the session's persisted todo list alongside `todowrite`. Media attachment limits still apply.
 
 ## What gets cut
 
@@ -415,8 +415,10 @@ read-only folders stay read-only even below the writable temporary filesystem.
 
 `workspace-write` and `read-all-net` provide mediated networking and publish development servers
 on a per-runner `127.80.x.x` address. Preview URLs are printed as listeners appear.
-Inbound firewall rules remain authoritative. Localhost-only IPv4 servers work;
-servers bound exclusively to IPv6 `::1` are not published.
+Inbound firewall rules remain authoritative and support both IPv4 and explicit IPv6 TCP/UDP rules;
+when inbound allow rules restrict sources exclusively to loopback (`127.0.0.1` / `::1`), the host
+listener binds loopback rather than a wildcard address. Localhost-only IPv4 servers work with
+automatic previews; servers bound exclusively to IPv6 `::1` are not auto-published.
 
 `unix_sockets` accepts `off`, `abstract`, or `deny`. Independently, `io_uring: false`
 disables io_uring. With io_uring enabled, `IORING_OP_SOCKET` can bypass the seccomp

@@ -115,6 +115,21 @@ pub struct Direction {
     #[serde(default)]
     pub deny: Vec<Rule>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboundBinding {
+    pub bind: std::net::SocketAddr,
+    /// True when the IPv6 listener was added implicitly by a source-less rule
+    /// and may be skipped if the host kernel lacks IPv6 support.
+    pub optional: bool,
+}
+
+fn is_loopback_cidr(ip: IpAddr, prefix: u8) -> bool {
+    match ip {
+        IpAddr::V4(v4) => prefix >= 8 && v4.octets()[0] == 127,
+        IpAddr::V6(v6) => prefix == 128 && v6.is_loopback(),
+    }
+}
+
 impl Direction {
     pub fn new(default: Action) -> Self {
         Self {
@@ -122,6 +137,92 @@ impl Direction {
             allow: vec![],
             deny: vec![],
         }
+    }
+    pub fn inbound_bindings(&self, protocol: Protocol) -> Vec<InboundBinding> {
+        #[derive(Default)]
+        struct Family {
+            explicit: bool,
+            implicit: bool,
+            non_loopback: bool,
+            exact_loopback: Option<Option<IpAddr>>,
+        }
+        impl Family {
+            fn record_loopback(&mut self, ip: Option<IpAddr>) {
+                match (self.exact_loopback, ip) {
+                    (None, Some(addr)) => self.exact_loopback = Some(Some(addr)),
+                    (Some(Some(existing)), Some(addr)) if existing == addr => {}
+                    _ => self.exact_loopback = Some(None),
+                }
+            }
+        }
+        let mut ports: BTreeMap<u16, (Family, Family)> = BTreeMap::new();
+        for rule in &self.allow {
+            if rule.protocol != Protocol::Any && rule.protocol != protocol {
+                continue;
+            }
+            let Some(port) = rule.port else {
+                continue;
+            };
+            let (v4, v6) = ports.entry(port).or_default();
+            match rule.source.as_deref() {
+                None => {
+                    v4.implicit = true;
+                    v4.non_loopback = true;
+                    v6.implicit = true;
+                    v6.non_loopback = true;
+                }
+                Some(source) => {
+                    if let Ok((ip, prefix)) = parse_cidr(source) {
+                        match ip {
+                            IpAddr::V4(_) => {
+                                v4.explicit = true;
+                                if is_loopback_cidr(ip, prefix) {
+                                    v4.record_loopback((prefix == 32).then_some(ip));
+                                } else {
+                                    v4.non_loopback = true;
+                                }
+                            }
+                            IpAddr::V6(_) => {
+                                v6.explicit = true;
+                                if is_loopback_cidr(ip, prefix) {
+                                    v6.record_loopback(Some(ip));
+                                } else {
+                                    v6.non_loopback = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut bindings = Vec::new();
+        for (port, (v4, v6)) in ports {
+            if v4.explicit || v4.implicit {
+                let ip = if self.default == Action::Deny && !v4.non_loopback {
+                    v4.exact_loopback
+                        .flatten()
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+                } else {
+                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                };
+                bindings.push(InboundBinding {
+                    bind: std::net::SocketAddr::new(ip, port),
+                    optional: false,
+                });
+            }
+            if v6.explicit || v6.implicit {
+                let ip = if self.default == Action::Deny && !v6.non_loopback {
+                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                } else {
+                    IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                };
+                bindings.push(InboundBinding {
+                    bind: std::net::SocketAddr::new(ip, port),
+                    optional: !v6.explicit,
+                });
+            }
+        }
+        bindings
     }
     pub fn permits(
         &self,
@@ -1092,5 +1193,120 @@ mod tests {
             .environment(std::iter::empty())
             .unwrap_err()
             .contains("Invalid sandbox executable PATH"));
+    }
+
+    #[test]
+    fn inbound_bindings_handle_ipv6_and_loopback_restrictions() {
+        let mut loopback_v4 = Direction::new(Action::Deny);
+        loopback_v4.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: Some("127.0.0.1".into()),
+            destination: None,
+            port: Some(8080),
+            ..Default::default()
+        });
+        assert_eq!(
+            loopback_v4.inbound_bindings(Protocol::Tcp),
+            vec![InboundBinding {
+                bind: "127.0.0.1:8080".parse().unwrap(),
+                optional: false,
+            }]
+        );
+        assert!(loopback_v4.inbound_bindings(Protocol::Udp).is_empty());
+
+        let mut loopback_v6 = Direction::new(Action::Deny);
+        loopback_v6.allow.push(Rule {
+            protocol: Protocol::Any,
+            source: Some("::1".into()),
+            destination: None,
+            port: Some(9090),
+            ..Default::default()
+        });
+        for proto in [Protocol::Tcp, Protocol::Udp] {
+            assert_eq!(
+                loopback_v6.inbound_bindings(proto),
+                vec![InboundBinding {
+                    bind: "[::1]:9090".parse().unwrap(),
+                    optional: false,
+                }]
+            );
+        }
+
+        let mut explicit_v6 = Direction::new(Action::Deny);
+        explicit_v6.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: Some("2001:db8::/32".into()),
+            destination: None,
+            port: Some(8443),
+            ..Default::default()
+        });
+        assert_eq!(
+            explicit_v6.inbound_bindings(Protocol::Tcp),
+            vec![InboundBinding {
+                bind: "[::]:8443".parse().unwrap(),
+                optional: false,
+            }]
+        );
+
+        let mut mixed_v4 = Direction::new(Action::Deny);
+        mixed_v4.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: Some("127.0.0.1".into()),
+            destination: None,
+            port: Some(8080),
+            ..Default::default()
+        });
+        mixed_v4.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: Some("10.0.0.0/8".into()),
+            destination: None,
+            port: Some(8080),
+            ..Default::default()
+        });
+        assert_eq!(
+            mixed_v4.inbound_bindings(Protocol::Tcp),
+            vec![InboundBinding {
+                bind: "0.0.0.0:8080".parse().unwrap(),
+                optional: false,
+            }]
+        );
+
+        let mut wildcard = Direction::new(Action::Deny);
+        wildcard.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: None,
+            destination: None,
+            port: Some(7000),
+            ..Default::default()
+        });
+        assert_eq!(
+            wildcard.inbound_bindings(Protocol::Tcp),
+            vec![
+                InboundBinding {
+                    bind: "0.0.0.0:7000".parse().unwrap(),
+                    optional: false,
+                },
+                InboundBinding {
+                    bind: "[::]:7000".parse().unwrap(),
+                    optional: true,
+                },
+            ]
+        );
+
+        let mut default_allow = Direction::new(Action::Allow);
+        default_allow.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: Some("127.0.0.1".into()),
+            destination: None,
+            port: Some(8081),
+            ..Default::default()
+        });
+        assert_eq!(
+            default_allow.inbound_bindings(Protocol::Tcp),
+            vec![InboundBinding {
+                bind: "0.0.0.0:8081".parse().unwrap(),
+                optional: false,
+            }]
+        );
     }
 }

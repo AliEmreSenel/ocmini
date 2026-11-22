@@ -27,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 const PACKET_POOL: usize = 64;
 pub const GUEST4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 pub const PEER4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
+pub const GUEST6: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd00, 0x6f63, 0x6d69, 0, 0, 0, 0, 1);
 const PEER6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xfd00, 0x6f63, 0x6d69, 0, 0, 0, 0, 2);
 #[derive(Default)]
 struct PacketDevice {
@@ -517,7 +519,15 @@ pub async fn run(
             datagram=udp_ingress.receive()=>{
                 let(host,peer,destination,bytes)=datagram?;
                 if !policy.network.inbound.permits(Protocol::Udp,peer.ip(),destination.port(),None){continue;}
-                let source=if peer.ip().is_loopback(){SocketAddr::new(PEER4.into(),peer.port())}else{peer};
+                let source = if peer.ip().is_loopback() {
+                    if destination.is_ipv4() {
+                        SocketAddr::new(PEER4.into(), peer.port())
+                    } else {
+                        SocketAddr::new(PEER6.into(), peer.port())
+                    }
+                } else {
+                    peer
+                };
                 let key=Tuple{guest:destination,remote:source};
                 if let std::collections::hash_map::Entry::Vacant(e) = udp_listeners.entry(source) {let ring=policy.buffers.udp_ring;let capacity=ring.checked_mul(wire::MTU).ok_or_else(||io::Error::other("UDP buffer overflow"))?.max(65535);let mut sock=udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]),udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]));sock.bind(endpoint(source)).map_err(io::Error::other)?;let handle=sockets.add(sock);e.insert(UdpListener{touched:Instant::now(),handle,address:source});}
                 let handle=udp_listeners[&source].handle;let _=sockets.get_mut::<udp::Socket>(handle).send_slice(bytes,endpoint(destination));

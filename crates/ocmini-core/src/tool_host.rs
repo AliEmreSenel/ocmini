@@ -304,6 +304,9 @@ impl Host for App {
         );
         tokio::select! {reply=rx=>reply.map_err(|_|OperationError::from("Question cancelled"))?.ok_or_else(||OperationError::from("User dismissed the question")),_=ctx.cancel.cancelled()=>Err("Question cancelled".into())}
     }
+    fn todos(&self, id: &str) -> Result<Value, OperationError> {
+        self.store.todos(id).map_err(Into::into)
+    }
     fn set_todos(&self, id: &str, todos: &Value) -> Result<(), OperationError> {
         self.store.set_todos(id, todos).map_err(Into::into)
     }

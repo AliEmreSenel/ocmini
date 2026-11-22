@@ -55,6 +55,12 @@ fn validate_url(url: &str) -> Result<reqwest::Url, OperationError> {
     Ok(parsed)
 }
 
+pub fn validate(input: &Input) -> Result<(), OperationError> {
+    validate_url(&input.url)?;
+    request_timeout(input.timeout)?;
+    Ok(())
+}
+
 pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutput, OperationError> {
     let mut hop = input.clone();
     for step in 0..=MAX_REDIRECTS {
@@ -172,6 +178,7 @@ fn client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .user_agent(concat!("ocmini/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -239,5 +246,43 @@ mod tests {
         )
         .await
         .is_err());
+        let bad_timeout: Input =
+            crate::tools::decode(&json!({"url":"https://example.com","timeout":0})).unwrap();
+        assert!(validate(&bad_timeout).is_err());
+        let bad_scheme: Input = crate::tools::decode(&json!({"url":"ftp://example.com"})).unwrap();
+        assert!(validate(&bad_scheme).is_err());
+    }
+
+    #[tokio::test]
+    async fn webfetch_sends_default_user_agent_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let result = fetch(
+            &json!({"url": format!("http://{addr}/hello")}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.output, "ok");
+        let request = server.await.unwrap().to_ascii_lowercase();
+        let expected = format!("user-agent: ocmini/{}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            request.contains(&expected),
+            "expected {expected:?} in request:\n{request}"
+        );
     }
 }

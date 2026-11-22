@@ -534,3 +534,200 @@ async fn tools_cannot_inspect_trusted_runner_descriptors() {
         "{result}"
     );
 }
+
+#[tokio::test]
+async fn background_list_and_stop_work_inside_sandbox_and_respect_session_ownership() {
+    use std::time::Duration;
+    let mut jail = Jail::new(json!({"mode":"isolated"}), json!({})).await;
+    let launched = jail
+        .request(
+            "run",
+            json!({
+                "_ocmini_session": "bg-owner",
+                "name": "bash",
+                "args": {
+                    "command": "sleep 30 & echo $! > child.pid; wait",
+                    "description": "sandboxed sleeper",
+                    "background": true
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let pid = launched["metadata"]["pid"].as_u64().unwrap();
+    let job_id = launched["metadata"]["jobID"].as_str().unwrap().to_owned();
+    for _ in 0..100 {
+        if jail.project.join("child.pid").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let child_pid: u64 = std::fs::read_to_string(jail.project.join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Sibling session cannot list or stop owner's job.
+    let sibling_list = jail
+        .request(
+            "run",
+            json!({"_ocmini_session": "bg-sibling", "name": "background_list", "args": {}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sibling_list["metadata"]["count"], 0);
+    assert!(jail
+        .request(
+            "run",
+            json!({"_ocmini_session": "bg-sibling", "name": "background_stop", "args": {"pid": pid}})
+        )
+        .await
+        .is_err());
+
+    // Owner sees the running job with metadata.
+    let owner_list = jail
+        .request(
+            "run",
+            json!({"_ocmini_session": "bg-owner", "name": "background_list", "args": {}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_list["metadata"]["count"], 1);
+    assert_eq!(owner_list["metadata"]["jobs"][0]["jobID"], job_id);
+    assert_eq!(owner_list["metadata"]["jobs"][0]["pid"], pid);
+    assert_eq!(owner_list["metadata"]["jobs"][0]["status"], "running");
+    assert_eq!(
+        owner_list["metadata"]["jobs"][0]["description"],
+        "sandboxed sleeper"
+    );
+
+    // Owner stops it; both leader and spawned child exit inside the sandbox.
+    let stopped = jail
+        .request(
+            "run",
+            json!({"_ocmini_session": "bg-owner", "name": "background_stop", "args": {"pid": pid}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stopped["metadata"]["stopped"], true);
+    assert_eq!(stopped["metadata"]["status"], "exited");
+    let check = jail
+        .bash(format!(
+            "kill -0 {pid} 2>/dev/null && echo LEADER_ALIVE || echo LEADER_GONE; kill -0 {child_pid} 2>/dev/null && echo CHILD_ALIVE || echo CHILD_GONE"
+        ))
+        .await;
+    let text = check["output"].as_str().unwrap();
+    assert!(text.contains("LEADER_GONE"), "{text}");
+    assert!(text.contains("CHILD_GONE"), "{text}");
+
+    let after_list = jail
+        .request(
+            "run",
+            json!({"_ocmini_session": "bg-owner", "name": "background_list", "args": {}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_list["metadata"]["jobs"][0]["status"], "exited");
+}
+
+#[tokio::test]
+async fn explicit_ipv6_tcp_and_udp_inbound_forward_over_loopback() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let reserve_tcp = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let tcp_port = reserve_tcp.local_addr().unwrap().port();
+    drop(reserve_tcp);
+    let reserve_udp = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let udp_port = reserve_udp.local_addr().unwrap().port();
+    drop(reserve_udp);
+
+    let mut jail = Jail::new(
+        json!({
+            "mode": "firewall",
+            "preview": {"mode": "off"},
+            "inbound": {
+                "default": "deny",
+                "allow": [
+                    {"protocol": "tcp", "source": "::1", "port": tcp_port},
+                    {"protocol": "udp", "source": "::1", "port": udp_port}
+                ]
+            },
+            "outbound": {"default": "deny"}
+        }),
+        json!({}),
+    )
+    .await;
+
+    // Confirm IPv4 loopback is NOT bound for these IPv6-only loopback rules.
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", tcp_port)).is_err(),
+        "IPv6-only inbound rule must not bind IPv4"
+    );
+
+    // Start IPv6 TCP and UDP echo servers inside the sandbox bound to ::.
+    jail.request(
+        "run",
+        json!({
+            "name": "bash",
+            "args": {
+                "command": format!(
+                    "python3 -c 'import socket; s=socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"::\", {tcp_port})); s.listen(1); open(\"tcp_ready\", \"w\").close(); c, _ = s.accept(); d = c.recv(16); c.sendall(d + b\":v6\"); c.close(); s.close()'"
+                ),
+                "background": true
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    jail.request(
+        "run",
+        json!({
+            "name": "bash",
+            "args": {
+                "command": format!(
+                    "python3 -c 'import socket; s=socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind((\"::\", {udp_port})); open(\"udp_ready\", \"w\").close(); p, a = s.recvfrom(65535); s.sendto(p + b\":v6\", a); s.close()'"
+                ),
+                "background": true
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..80 {
+        if jail.project.join("tcp_ready").exists() && jail.project.join("udp_ready").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(jail.project.join("tcp_ready").exists());
+    assert!(jail.project.join("udp_ready").exists());
+
+    // TCP over IPv6 loopback
+    let mut stream = tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, tcp_port))
+        .await
+        .unwrap();
+    stream.write_all(b"HELLO").await.unwrap();
+    let mut reply = [0u8; 16];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&reply[..n], b"HELLO:v6");
+
+    // UDP over IPv6 loopback
+    let socket = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    socket
+        .send_to(b"PING", (std::net::Ipv6Addr::LOCALHOST, udp_port))
+        .await
+        .unwrap();
+    let mut bytes = [0u8; 32];
+    let (n, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        socket.recv_from(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&bytes[..n], b"PING:v6");
+}

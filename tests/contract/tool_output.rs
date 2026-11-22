@@ -730,3 +730,388 @@ async fn background_read_polls_session_jobs_and_follows_shell_gating() {
     assert_eq!(offset, 11);
     assert_eq!(observed_exit, Some(7));
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn background_list_and_stop_follow_shell_gating_and_manage_session_jobs() {
+    let mut provider = Provider::start(vec![
+        tool_script("background_list", json!({}), "call_plan_list"),
+        text_script("Plan done", ""),
+        text_script("No shell done", ""),
+        tool_script(
+            "bash",
+            json!({"command": "sleep 30", "description": "long sleeper", "background": true}),
+            "call_bg_launch",
+        ),
+        tool_script("background_list", json!({}), "call_bg_list_running"),
+        text_script("Listed", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+
+    // 1. Read-only plan agent does not advertise or execute background_list/background_stop.
+    let mut plan_prompt = prompt("msg_plan_bg_mgmt", "List jobs");
+    plan_prompt["agent"] = json!("plan");
+    server
+        .post(&format!("/session/{id}/message"), &plan_prompt)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let plan_req = provider.request().await;
+    let plan_tools: Vec<_> = plan_req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(!plan_tools.contains(&"background_list"), "{plan_tools:?}");
+    assert!(!plan_tools.contains(&"background_stop"), "{plan_tools:?}");
+    let _ = provider.request().await;
+    let messages = server.messages(&id).await;
+    let blocked = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["callID"] == "call_plan_list")
+        .unwrap();
+    assert_eq!(blocked["state"]["status"], "error", "{blocked}");
+
+    // 2. Disabling shell/bash hides background_list and background_stop.
+    let mut no_shell = prompt("msg_no_shell_bg_mgmt", "No shell");
+    no_shell["tools"] = json!({"bash": false});
+    server
+        .post(&format!("/session/{id}/message"), &no_shell)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let no_shell_req = provider.request().await;
+    let no_shell_tools: Vec<_> = no_shell_req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        !no_shell_tools.contains(&"background_list"),
+        "{no_shell_tools:?}"
+    );
+    assert!(
+        !no_shell_tools.contains(&"background_stop"),
+        "{no_shell_tools:?}"
+    );
+
+    // 3. Build agent launches a background job, lists it, and stops it via background_stop.
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_bg_launch_mgmt", "Start and list"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let build_req = provider.request().await;
+    let build_tools: Vec<_> = build_req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(build_tools.contains(&"background_list"), "{build_tools:?}");
+    assert!(build_tools.contains(&"background_stop"), "{build_tools:?}");
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+    let messages = server.messages(&id).await;
+    let listed = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["callID"] == "call_bg_list_running")
+        .unwrap();
+    assert_eq!(listed["state"]["status"], "completed", "{listed}");
+    assert_eq!(listed["state"]["metadata"]["count"], 1, "{listed}");
+    let pid = listed["state"]["metadata"]["jobs"][0]["pid"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(listed["state"]["metadata"]["jobs"][0]["status"], "running");
+    assert_eq!(
+        listed["state"]["metadata"]["jobs"][0]["description"],
+        "long sleeper"
+    );
+
+    provider
+        .push(tool_script(
+            "background_stop",
+            json!({"pid": pid}),
+            "call_bg_stop",
+        ))
+        .await;
+    provider
+        .push(tool_script(
+            "background_list",
+            json!({}),
+            "call_bg_list_after",
+        ))
+        .await;
+    provider.push(text_script("Stopped", "")).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_bg_stop_mgmt", "Stop job"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+    let messages = server.messages(&id).await;
+    let stopped = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["callID"] == "call_bg_stop")
+        .unwrap();
+    assert_eq!(stopped["state"]["status"], "completed", "{stopped}");
+    assert_eq!(stopped["state"]["metadata"]["stopped"], true, "{stopped}");
+    let after = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .find(|p| p["callID"] == "call_bg_list_after")
+        .unwrap();
+    assert_eq!(
+        after["state"]["metadata"]["jobs"][0]["status"], "exited",
+        "{after}"
+    );
+}
+
+#[tokio::test]
+async fn todoread_reads_persisted_todos_across_turns_and_in_plan_agent() {
+    let todos = json!([
+        {"id": "t1", "content": "Ship v2 tools", "status": "in_progress", "priority": "high"},
+        {"id": "t2", "content": "Verify tests", "status": "pending", "priority": "medium"}
+    ]);
+    let mut provider = Provider::start(vec![
+        tool_script("todoread", json!({}), "call_todo_empty"),
+        tool_script("todowrite", json!({"todos": todos}), "call_todo_write"),
+        text_script("Saved todos", ""),
+        text_script("Compaction summary", ""),
+        tool_script("todoread", json!({}), "call_todo_plan"),
+        text_script("Read todos in plan mode", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let id = server.session(allow()).await;
+
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_todo_1", "Check and save todos"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+
+    // Compact history and verify todoread still returns the persisted todos.
+    server
+        .post(
+            &format!("/session/{id}/summarize"),
+            &json!({"providerID": "mock", "modelID": "mock-model"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let _ = provider.request().await;
+
+    let mut plan_prompt = prompt("msg_todo_2", "Read todos in plan agent");
+    plan_prompt["agent"] = json!("plan");
+    server
+        .post(&format!("/session/{id}/message"), &plan_prompt)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let plan_req = provider.request().await;
+    let plan_tools: Vec<_> = plan_req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(plan_tools.contains(&"todoread"), "{plan_tools:?}");
+    let _ = provider.request().await;
+
+    let messages = server.messages(&id).await;
+    let find_part = |call_id: &str| {
+        messages
+            .iter()
+            .flat_map(|m| m["parts"].as_array().unwrap())
+            .find(|p| p["callID"] == call_id)
+            .unwrap()
+            .clone()
+    };
+    let empty = find_part("call_todo_empty");
+    assert_eq!(empty["state"]["status"], "completed", "{empty}");
+    assert_eq!(empty["state"]["metadata"]["todos"], json!([]));
+    assert_eq!(empty["state"]["output"], "[]");
+
+    let read_back = find_part("call_todo_plan");
+    assert_eq!(read_back["state"]["status"], "completed", "{read_back}");
+    assert_eq!(read_back["state"]["metadata"]["todos"], todos);
+    assert!(read_back["state"]["output"]
+        .as_str()
+        .unwrap()
+        .contains("Ship v2 tools"));
+}
+
+#[tokio::test]
+async fn edit_diff_metadata_and_read_path_alias_work_end_to_end() {
+    let mut provider = Provider::start(vec![
+        tool_script(
+            "edit",
+            json!({"filePath": "sub/demo.txt", "oldString": "before", "newString": "after"}),
+            "call_edit_diff",
+        ),
+        tool_script("read", json!({"path": "sub/demo.txt"}), "call_read_alias"),
+        text_script("Done", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let sub = std::path::Path::new(&server.directory).join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("demo.txt"), "top\nbefore\nbottom\n").unwrap();
+    std::fs::write(sub.join("AGENTS.md"), "NESTED_ALIAS_RULE").unwrap();
+
+    let id = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{id}/message"),
+            &prompt("msg_edit_read", "Edit and read via path alias"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+    let _ = provider.request().await;
+
+    let messages = server.messages(&id).await;
+    let parts: Vec<_> = messages
+        .iter()
+        .flat_map(|m| m["parts"].as_array().unwrap())
+        .collect();
+    let edited = parts
+        .iter()
+        .find(|p| p["callID"] == "call_edit_diff")
+        .unwrap();
+    assert_eq!(edited["state"]["status"], "completed", "{edited}");
+    let diff = edited["state"]["metadata"]["diff"].as_str().unwrap();
+    assert!(diff.contains("-before\n+after\n"), "{diff}");
+    assert!(diff.contains("@@ "), "{diff}");
+
+    let read = parts
+        .iter()
+        .find(|p| p["callID"] == "call_read_alias")
+        .unwrap();
+    assert_eq!(read["state"]["status"], "completed", "{read}");
+    assert!(read["state"]["output"]
+        .as_str()
+        .unwrap()
+        .contains("2: after"));
+    assert!(
+        parts.iter().any(|p| p["type"] == "ocmini_instruction"
+            && p["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("NESTED_ALIAS_RULE"))),
+        "read with path alias should trigger nested AGENTS.md discovery: {parts:?}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_fail_before_prompting_for_permission() {
+    let provider = Provider::start(vec![
+        tool_script("bash", json!({"command": "echo hi", "timeout": 0}), "call_bad_bash"),
+        tool_script(
+            "webfetch",
+            json!({"url": "https://example.com", "timeout": 0}),
+            "call_bad_webfetch",
+        ),
+        tool_script(
+            "read",
+            json!({"filePath": "a.txt", "offset": 0}),
+            "call_bad_read_offset",
+        ),
+        tool_script(
+            "read",
+            json!({"filePath": "a.txt", "ranges": [{"start": 3, "end": 1}]}),
+            "call_bad_read_ranges",
+        ),
+        tool_script(
+            "question",
+            json!({"questions": [{"header": "Pick", "question": "Which?", "custom": false, "options": []}]}),
+            "call_bad_question",
+        ),
+        text_script("All rejected before permission", ""),
+    ])
+    .await;
+    let server = TestServer::start(&provider, json!({})).await;
+    // Set every tool permission to "ask": if validation ran after permission,
+    // the request would block waiting for a user reply instead of finishing.
+    let id = server
+        .session(json!([
+            {"permission": "*", "pattern": "*", "action": "ask"}
+        ]))
+        .await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        server
+            .post(
+                &format!("/session/{id}/message"),
+                &prompt("msg_pre_perm", "Send invalid tool inputs"),
+            )
+            .send(),
+    )
+    .await
+    .expect("invalid inputs must fail immediately without blocking on permission")
+    .unwrap();
+    response.error_for_status().unwrap();
+    let pending_perms: Value = server
+        .get("/permission")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending_perms, json!([]));
+    let messages = server.messages(&id).await;
+    for call_id in [
+        "call_bad_bash",
+        "call_bad_webfetch",
+        "call_bad_read_offset",
+        "call_bad_read_ranges",
+        "call_bad_question",
+    ] {
+        let part = messages
+            .iter()
+            .flat_map(|m| m["parts"].as_array().unwrap())
+            .find(|p| p["callID"] == call_id)
+            .unwrap();
+        assert_eq!(part["state"]["status"], "error", "{part}");
+    }
+}

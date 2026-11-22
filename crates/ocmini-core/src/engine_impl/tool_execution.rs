@@ -80,7 +80,10 @@ pub(super) async fn run_tools(
         && tool_parts.iter().any(|part| {
             part["tool"] == "read"
                 && part["state"]["status"] == "completed"
-                && part["state"]["input"]["filePath"].as_str().is_some()
+                && part["state"]["input"]["filePath"]
+                    .as_str()
+                    .or(part["state"]["input"]["path"].as_str())
+                    .is_some()
         })
     {
         discover_read_instructions(base, cfg, request, tool_parts).await?;
@@ -106,7 +109,12 @@ async fn discover_read_instructions(
             if part["tool"] != "read" || part["state"]["status"] != "completed" {
                 return None;
             }
-            let path = tools::resolve_path(&base.dir, part["state"]["input"]["filePath"].as_str()?);
+            let path = tools::resolve_path(
+                &base.dir,
+                part["state"]["input"]["filePath"]
+                    .as_str()
+                    .or(part["state"]["input"]["path"].as_str())?,
+            );
             if path == root {
                 return None;
             }
@@ -432,7 +440,11 @@ pub(super) fn unattended_tool_denied(name: &str, app: &App, request: &PromptRequ
 }
 
 pub(super) fn tool_enabled(name: &str, agent: &str, cfg: &Config, request: &PromptRequest) -> bool {
-    if name == "background_read" && !tool_enabled("bash", agent, cfg, request) {
+    if matches!(
+        name,
+        "background_read" | "background_list" | "background_stop"
+    ) && !tool_enabled("bash", agent, cfg, request)
+    {
         return false;
     }
     let legacy = match name {

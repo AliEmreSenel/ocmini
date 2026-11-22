@@ -11,6 +11,22 @@ const MAX_RECORD: usize = 64 * 1024;
 const MAX_ERROR: usize = 8 * 1024;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum GlobPatterns {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl GlobPatterns {
+    pub fn patterns(&self) -> Vec<&str> {
+        match self {
+            Self::One(pattern) => vec![pattern.as_str()],
+            Self::Many(patterns) => patterns.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct Input {
     pub pattern: String,
     pub path: Option<String>,
@@ -21,6 +37,8 @@ pub struct GrepInput {
     #[serde(flatten)]
     pub search: Input,
     pub include: Option<String>,
+    /// Glob pattern or list of glob patterns to exclude from search.
+    pub exclude: Option<GlobPatterns>,
     /// Number of lines of context before and after each match.
     pub context: Option<usize>,
     /// Return only paths containing matches.
@@ -31,6 +49,10 @@ pub struct GrepInput {
     /// Whether matching is case sensitive (defaults to true).
     #[serde(rename = "caseSensitive")]
     pub case_sensitive: Option<bool>,
+    /// Enable multiline matching (`rg -U`) so patterns can span multiple lines.
+    pub multiline: Option<bool>,
+    /// Number of matching results to skip before returning up to 100 results.
+    pub offset: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,10 +88,10 @@ pub async fn run(
             .ok_or_else(|| failure("Search path has no parent"))?
     };
     let mut command = tokio::process::Command::new("rg");
-    command.arg("--no-config");
+    command.args(["--no-config", "--sort=path"]);
     if glob {
         command
-            .args(["--files", "--null"])
+            .args(["--files", "--hidden", "--null"])
             .arg(format!("--glob={pattern}"));
     } else {
         command.args(["--hidden", "--no-messages"]);
@@ -82,11 +104,26 @@ pub async fn run(
             if let Some(include) = &options.include {
                 command.arg(format!("--glob={include}"));
             }
+            if let Some(exclude) = &options.exclude {
+                for pattern in exclude.patterns() {
+                    if pattern.is_empty() {
+                        continue;
+                    }
+                    if pattern.starts_with('!') {
+                        command.arg(format!("--glob={pattern}"));
+                    } else {
+                        command.arg(format!("--glob=!{pattern}"));
+                    }
+                }
+            }
             if options.literal == Some(true) {
                 command.arg("--fixed-strings");
             }
             if options.case_sensitive == Some(false) {
                 command.arg("--ignore-case");
+            }
+            if options.multiline == Some(true) {
+                command.arg("--multiline");
             }
             if options.files_only != Some(true) {
                 if let Some(context) = options.context {
@@ -95,7 +132,7 @@ pub async fn run(
             }
         }
     }
-    command.arg("--glob=!**/.git/**").arg("--");
+    command.args(["--glob=!**/.git/**", "--glob=!**/.git", "--"]);
     if !glob {
         command.arg(pattern);
     }
@@ -135,30 +172,62 @@ pub async fn run(
         .stderr
         .take()
         .ok_or_else(|| failure("ripgrep stderr unavailable"))?;
+    let offset = match mode {
+        Mode::Glob => 0,
+        Mode::Grep(options) => options.offset.unwrap_or(0),
+    };
+    let delimiter = if paths_only { 0 } else { b'\n' };
     let operation = async {
         let output = async {
             let mut reader = BufReader::new(stdout);
             let mut record = Vec::new();
             let mut lines: Vec<(String, bool)> = Vec::new();
+            let mut skipped = 0usize;
             let mut truncated = false;
             let mut stopped = false;
             loop {
                 record.clear();
                 let bytes = (&mut reader)
                     .take(MAX_RECORD as u64 + 1)
-                    .read_until(if paths_only { 0 } else { b'\n' }, &mut record)
+                    .read_until(delimiter, &mut record)
                     .await
                     .map_err(|error| failure(format!("Cannot read ripgrep output: {error}")))?;
                 if bytes == 0 {
                     break;
                 }
-                if record.len() > MAX_RECORD {
-                    return Err(failure(format!("Ripgrep record exceeds {MAX_RECORD} bytes; narrow the pattern or search path")));
-                }
-                let (line, is_match) = if paths_only {
+                let (line, is_match) = if record.len() > MAX_RECORD {
+                    let mut total_bytes = record.len();
+                    if record.last() != Some(&delimiter) {
+                        let extra = drain_until(&mut reader, delimiter).await.map_err(|error| {
+                            failure(format!("Cannot read ripgrep output: {error}"))
+                        })?;
+                        total_bytes = total_bytes.saturating_add(extra);
+                    }
+                    if paths_only {
+                        continue;
+                    }
+                    let Some(event_type) = extract_json_type(&record) else {
+                        continue;
+                    };
+                    if event_type != "match" {
+                        continue;
+                    }
+                    let display_path = extract_json_path(&record)
+                        .map(|path| {
+                            cwd.join(path.trim_start_matches("./"))
+                                .display()
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "<unknown>".into());
+                    (
+                        format!(
+                            "{display_path}: [match on long line ({total_bytes} bytes omitted)]"
+                        ),
+                        true,
+                    )
+                } else if paths_only {
                     record.pop();
-                    let path = std::str::from_utf8(&record)
-                        .map_err(|_| failure("ripgrep returned a non-UTF-8 path"))?;
+                    let path = String::from_utf8_lossy(&record);
                     (
                         cwd.join(path.trim_start_matches("./"))
                             .display()
@@ -173,12 +242,10 @@ pub async fn run(
                         continue;
                     }
                     let data = &event["data"];
-                    let path = data["path"]["text"]
-                        .as_str()
-                        .ok_or_else(|| failure("ripgrep returned a non-UTF-8 path"))?;
-                    let text = data["lines"]["text"]
-                        .as_str()
-                        .ok_or_else(|| failure("ripgrep returned non-UTF-8 matching text"))?;
+                    let path = decode_rg_path(&data["path"])
+                        .ok_or_else(|| failure("ripgrep returned a missing path"))?;
+                    let text = decode_rg_line(&data["lines"])
+                        .ok_or_else(|| failure("ripgrep returned missing matching text"))?;
                     let text = text.trim_end_matches(['\r', '\n']);
                     let mut preview: String = text.chars().take(2_000).collect();
                     if preview.len() < text.len() {
@@ -193,6 +260,10 @@ pub async fn run(
                         is_match,
                     )
                 };
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
                 if lines.len() == MAX_RESULTS {
                     truncated = true;
                     if is_match {
@@ -260,16 +331,104 @@ pub async fn run(
         }));
     }
     if truncated {
-        output.push_str("\n[Results truncated at 100; narrow the path or pattern]\n");
+        if glob {
+            output.push_str("\n[Results truncated at 100; narrow the path or pattern]\n");
+        } else {
+            output.push_str(&format!(
+                "\n[Results truncated at 100; narrow the path or pattern, or pass offset {}]\n",
+                offset + count
+            ));
+        }
     }
     if !errors.is_empty() {
         output.push_str(&format!("\n[ripgrep: {errors}]\n"));
     }
+    let mut metadata = json!({"matches":count,"count":count,"truncated":truncated,"path":base,"partial":!errors.is_empty()});
+    if !glob {
+        metadata["offset"] = json!(offset);
+        if truncated {
+            metadata["nextOffset"] = json!(offset + count);
+        }
+    }
     Ok(ToolOutput {
         title: format!("{count} matches"),
         output,
-        metadata: json!({"matches":count,"count":count,"truncated":truncated,"path":base,"partial":!errors.is_empty()}),
+        metadata,
     })
+}
+
+async fn drain_until<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    delimiter: u8,
+) -> std::io::Result<usize> {
+    let mut drained = 0usize;
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(drained);
+        }
+        if let Some(pos) = buf.iter().position(|&b| b == delimiter) {
+            let consumed = pos + 1;
+            reader.consume(consumed);
+            return Ok(drained.saturating_add(consumed));
+        }
+        let len = buf.len();
+        reader.consume(len);
+        drained = drained.saturating_add(len);
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn extract_json_type(prefix: &[u8]) -> Option<String> {
+    let key = b"\"type\":";
+    let start = find_bytes(prefix, key)? + key.len();
+    let value = serde_json::Deserializer::from_slice(&prefix[start..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    value.as_str().map(str::to_owned)
+}
+
+fn extract_json_path(prefix: &[u8]) -> Option<String> {
+    let key = b"\"path\":";
+    let start = find_bytes(prefix, key)? + key.len();
+    let value = serde_json::Deserializer::from_slice(&prefix[start..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    decode_rg_path(&value)
+}
+
+fn decode_rg_path(field: &Value) -> Option<String> {
+    if let Some(text) = field["text"].as_str() {
+        return Some(text.to_owned());
+    }
+    if let Some(b64) = field["bytes"].as_str() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    None
+}
+
+fn decode_rg_line(field: &Value) -> Option<String> {
+    if let Some(text) = field["text"].as_str() {
+        return Some(text.to_owned());
+    }
+    if let Some(b64) = field["bytes"].as_str() {
+        use base64::Engine;
+        return match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(bytes) if bytes.contains(&0) => Some("[non-UTF-8/binary line omitted]".into()),
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(_) => Some("[non-UTF-8 line omitted]".into()),
+        };
+    }
+    None
 }
 
 #[cfg(test)]
@@ -513,5 +672,207 @@ mod tests {
         .unwrap();
         assert_eq!(result.metadata["matches"], 1);
         assert!(result.output.contains("file39.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_includes_hidden_files_while_respecting_gitignore_and_skipping_git() {
+        let directory = Directory::new();
+        std::fs::create_dir_all(directory.0.path().join(".git/objects")).unwrap();
+        std::fs::write(directory.0.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::create_dir_all(directory.0.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            directory.0.path().join(".github/workflows/ci.yml"),
+            "name: ci\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(directory.0.path().join("ignored_dir")).unwrap();
+        std::fs::write(
+            directory.0.path().join("ignored_dir/ignored.yml"),
+            "name: ignored\n",
+        )
+        .unwrap();
+        std::fs::write(directory.0.path().join(".eslintrc"), "{}\n").unwrap();
+        std::fs::write(directory.0.path().join(".gitignore"), "ignored_dir/\n").unwrap();
+
+        let workflows = run(
+            directory.dir(),
+            "glob",
+            &json!({"pattern": "*.yml"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(workflows.output.contains("ci.yml"), "{}", workflows.output);
+        assert!(
+            !workflows.output.contains("ignored.yml"),
+            "{}",
+            workflows.output
+        );
+
+        let all = run(
+            directory.dir(),
+            "glob",
+            &json!({"pattern": "*"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(all.output.contains(".eslintrc"), "{}", all.output);
+        assert!(all.output.contains("ci.yml"), "{}", all.output);
+        assert!(!all.output.contains(".git/HEAD"), "{}", all.output);
+    }
+
+    #[tokio::test]
+    async fn glob_and_grep_ordering_is_deterministic_when_truncated() {
+        let directory = Directory::new();
+        for i in 0..130 {
+            let name = format!("file_{i:03}.txt");
+            std::fs::write(directory.0.path().join(name), format!("needle {i}\n")).unwrap();
+        }
+        let g1 = run(
+            directory.dir(),
+            "glob",
+            &json!({"pattern": "*.txt"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let g2 = run(
+            directory.dir(),
+            "glob",
+            &json!({"pattern": "*.txt"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(g1.output, g2.output);
+        assert_eq!(g1.metadata["truncated"], true);
+        let glob_lines: Vec<_> = g1.output.lines().filter(|l| l.ends_with(".txt")).collect();
+        assert_eq!(glob_lines.len(), 100);
+        assert!(glob_lines[0].ends_with("file_000.txt"));
+        assert!(glob_lines[99].ends_with("file_099.txt"));
+
+        let s1 = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern": "needle"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let s2 = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern": "needle"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s1.output, s2.output);
+        assert_eq!(s1.metadata["nextOffset"], 100);
+        let page2 = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern": "needle", "offset": 100}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page2.metadata["count"], 30);
+        assert_eq!(page2.metadata["truncated"], false);
+        assert_eq!(page2.metadata["offset"], 100);
+        assert!(page2.output.contains("file_100.txt:1:needle 100"));
+        assert!(page2.output.contains("file_129.txt:1:needle 129"));
+        assert!(!page2.output.contains("file_099.txt"));
+    }
+
+    #[tokio::test]
+    async fn grep_supports_exclude_and_multiline() {
+        let directory = Directory::new();
+        std::fs::create_dir_all(directory.0.path().join("dist")).unwrap();
+        std::fs::write(
+            directory.0.path().join("src.rs"),
+            "fn hello(\n    arg: i32\n) {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.0.path().join("bundle.min.js"),
+            "fn hello(\n    arg: i32\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.0.path().join("dist/out.rs"),
+            "fn hello(\n    arg: i32\n)\n",
+        )
+        .unwrap();
+
+        let excluded_one = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern": "fn hello", "exclude": "*.min.js"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(excluded_one.output.contains("src.rs"));
+        assert!(excluded_one.output.contains("out.rs"));
+        assert!(!excluded_one.output.contains("bundle.min.js"));
+
+        let excluded_many = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern": "fn hello\\(\\s+arg: i32", "exclude": ["*.min.js", "dist/**"], "multiline": true}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            excluded_many.metadata["count"], 1,
+            "{}",
+            excluded_many.output
+        );
+        assert!(excluded_many.output.contains("src.rs:1:fn hello("));
+        assert!(!excluded_many.output.contains("bundle.min.js"));
+        assert!(!excluded_many.output.contains("out.rs"));
+    }
+
+    #[tokio::test]
+    async fn grep_handles_overly_long_and_non_utf8_lines_without_aborting() {
+        let directory = Directory::new();
+        // 1. Overly long (>64 KiB) minified line matching pattern
+        let mut long_line = "a".repeat(80_000);
+        long_line.push_str("NEEDLE");
+        long_line.push_str(&"b".repeat(20_000));
+        long_line.push('\n');
+        std::fs::write(directory.0.path().join("a_minified.js"), long_line).unwrap();
+        // 2. Non-UTF-8 line matching pattern
+        std::fs::write(directory.0.path().join("b_latin1.txt"), b"caf\xe9 NEEDLE\n").unwrap();
+        // 3. Ordinary UTF-8 line matching pattern
+        std::fs::write(directory.0.path().join("c_normal.txt"), "ordinary NEEDLE\n").unwrap();
+
+        let result = run(
+            directory.dir(),
+            "grep",
+            &json!({"pattern": "NEEDLE"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.metadata["count"], 3, "{}", result.output);
+        assert!(
+            result.output.contains("a_minified.js") && result.output.contains("match on long line"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("b_latin1.txt:1:caf\u{fffd} NEEDLE"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("c_normal.txt:1:ordinary NEEDLE"),
+            "{}",
+            result.output
+        );
     }
 }

@@ -512,6 +512,10 @@ impl McpHub {
             "bash",
             #[cfg(unix)]
             "background_read",
+            #[cfg(unix)]
+            "background_list",
+            #[cfg(unix)]
+            "background_stop",
             "read",
             "write",
             "edit",
@@ -520,6 +524,7 @@ impl McpHub {
             "glob",
             "grep",
             "webfetch",
+            "todoread",
             "todowrite",
             "question",
             "task",

@@ -33,6 +33,127 @@ impl Lease {
         ))
     }
 }
+fn ipv6_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+    )
+}
+
+fn guest_destination(bind: SocketAddr) -> SocketAddr {
+    let ip = if bind.is_ipv4() {
+        IpAddr::V4(super::GUEST4)
+    } else {
+        IpAddr::V6(super::GUEST6)
+    };
+    SocketAddr::new(ip, bind.port())
+}
+
+fn bind_tcp(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    match addr {
+        SocketAddr::V4(_) => std::net::TcpListener::bind(addr),
+        SocketAddr::V6(v6) => {
+            use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+            let fd =
+                unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+            let one: libc::c_int = 1;
+            if unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut raw: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            raw.sin6_port = v6.port().to_be();
+            raw.sin6_flowinfo = v6.flowinfo();
+            raw.sin6_addr.s6_addr = v6.ip().octets();
+            raw.sin6_scope_id = v6.scope_id();
+            if unsafe {
+                libc::bind(
+                    fd,
+                    (&raw as *const libc::sockaddr_in6).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { libc::listen(fd, 128) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) })
+        }
+    }
+}
+
+fn bind_udp(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    match addr {
+        SocketAddr::V4(_) => std::net::UdpSocket::bind(addr),
+        SocketAddr::V6(v6) => {
+            use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+            let fd =
+                unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+            let one: libc::c_int = 1;
+            if unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut raw: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            raw.sin6_port = v6.port().to_be();
+            raw.sin6_flowinfo = v6.flowinfo();
+            raw.sin6_addr.s6_addr = v6.ip().octets();
+            raw.sin6_scope_id = v6.scope_id();
+            if unsafe {
+                libc::bind(
+                    fd,
+                    (&raw as *const libc::sockaddr_in6).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) })
+        }
+    }
+}
+
 pub struct Publisher {
     pid: i32,
     lease: Option<Lease>,
@@ -49,17 +170,16 @@ impl Publisher {
             None
         };
         let mut explicit = HashMap::new();
-        for rule in &policy.network.inbound.allow {
-            if matches!(rule.protocol, Protocol::Tcp | Protocol::Any) {
-                if let Some(port) = rule.port {
-                    let guest = SocketAddr::new(super::GUEST4.into(), port);
-                    if let std::collections::hash_map::Entry::Vacant(entry) = explicit.entry(guest)
-                    {
-                        let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
-                        listener.set_nonblocking(true)?;
-                        entry.insert(Arc::new(TcpListener::from_std(listener)?));
-                    }
-                }
+        for binding in policy.network.inbound.inbound_bindings(Protocol::Tcp) {
+            let guest = guest_destination(binding.bind);
+            if let std::collections::hash_map::Entry::Vacant(entry) = explicit.entry(guest) {
+                let listener = match bind_tcp(binding.bind) {
+                    Ok(listener) => listener,
+                    Err(err) if binding.optional && ipv6_unavailable(&err) => continue,
+                    Err(err) => return Err(err),
+                };
+                listener.set_nonblocking(true)?;
+                entry.insert(Arc::new(TcpListener::from_std(listener)?));
             }
         }
         Ok(Self {
@@ -107,7 +227,7 @@ impl Publisher {
                         continue;
                     }
                     IpAddr::V6(if ip.is_unspecified() {
-                        Ipv6Addr::new(0xfd00, 0x6f63, 0x6d69, 0, 0, 0, 0, 1)
+                        super::GUEST6
                     } else {
                         ip
                     })
@@ -192,22 +312,23 @@ fn ipv6_address(hex: &str) -> Option<Ipv6Addr> {
     Some(Ipv6Addr::from(bytes))
 }
 pub struct UdpIngress {
-    listeners: Vec<(u16, Arc<tokio::net::UdpSocket>)>,
+    listeners: Vec<(SocketAddr, Arc<tokio::net::UdpSocket>)>,
     buf: Vec<u8>,
 }
 impl UdpIngress {
     pub fn new(policy: &Policy) -> io::Result<Self> {
         let mut listeners = Vec::new();
-        let mut ports = HashSet::new();
-        for rule in &policy.network.inbound.allow {
-            if matches!(rule.protocol, Protocol::Udp | Protocol::Any) {
-                if let Some(port) = rule.port {
-                    if ports.insert(port) {
-                        let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))?;
-                        socket.set_nonblocking(true)?;
-                        listeners.push((port, Arc::new(tokio::net::UdpSocket::from_std(socket)?)));
-                    }
-                }
+        let mut seen = HashSet::new();
+        for binding in policy.network.inbound.inbound_bindings(Protocol::Udp) {
+            let guest = guest_destination(binding.bind);
+            if seen.insert(guest) {
+                let socket = match bind_udp(binding.bind) {
+                    Ok(socket) => socket,
+                    Err(err) if binding.optional && ipv6_unavailable(&err) => continue,
+                    Err(err) => return Err(err),
+                };
+                socket.set_nonblocking(true)?;
+                listeners.push((guest, Arc::new(tokio::net::UdpSocket::from_std(socket)?)));
             }
         }
         let buf = if listeners.is_empty() {
@@ -233,15 +354,10 @@ impl UdpIngress {
                 });
             }
             let index = ready.next().await.unwrap()?;
-            let (port, socket) = &self.listeners[index];
+            let (destination, socket) = &self.listeners[index];
             match socket.try_recv_from(&mut self.buf) {
                 Ok((n, peer)) => {
-                    return Ok((
-                        socket.clone(),
-                        peer,
-                        SocketAddr::new(super::GUEST4.into(), *port),
-                        &self.buf[..n],
-                    ));
+                    return Ok((socket.clone(), peer, *destination, &self.buf[..n]));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
@@ -253,6 +369,44 @@ impl UdpIngress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Action, Buffers, Direction, Env, Fs, NetMode, Network, Preview, Rule};
+
+    fn test_policy(inbound: Direction) -> Policy {
+        Policy {
+            name: "test".into(),
+            fs: Fs::default(),
+            tmp: false,
+            process_isolation: crate::config::ProcessIsolation::None,
+            unix_sockets: crate::config::UnixSockets::Off,
+            io_uring: true,
+            env: Env {
+                clear: true,
+                allow: vec![],
+                deny: vec![],
+            },
+            network: Network {
+                mode: NetMode::Firewall,
+                ech: crate::config::Ech::Allow,
+                preview: Preview {
+                    mode: PreviewMode::Off,
+                },
+                inbound,
+                outbound: Direction::new(Action::Deny),
+            },
+            buffers: Buffers::default(),
+        }
+    }
+
+    fn free_tcp_port(ip: IpAddr) -> u16 {
+        let listener = bind_tcp(SocketAddr::new(ip, 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn free_udp_port(ip: IpAddr) -> u16 {
+        let socket = bind_udp(SocketAddr::new(ip, 0)).unwrap();
+        socket.local_addr().unwrap().port()
+    }
+
     #[test]
     fn leases_are_exclusive_and_reusable() {
         let a = Lease::acquire().unwrap();
@@ -262,5 +416,88 @@ mod tests {
         drop(a);
         let c = Lease::acquire().unwrap();
         assert_eq!(addr, c.address);
+    }
+
+    #[tokio::test]
+    async fn loopback_inbound_rules_bind_loopback_not_wildcard_for_ipv4_and_ipv6() {
+        let port4 = free_tcp_port(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut inbound4 = Direction::new(Action::Deny);
+        inbound4.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: Some("127.0.0.1".into()),
+            destination: None,
+            port: Some(port4),
+            ..Default::default()
+        });
+        let pub4 = Publisher::new(0, &test_policy(inbound4)).unwrap();
+        assert_eq!(pub4.explicit.len(), 1);
+        let guest4 = SocketAddr::new(super::super::GUEST4.into(), port4);
+        assert_eq!(
+            pub4.explicit[&guest4].local_addr().unwrap(),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port4)
+        );
+
+        let port6 = free_tcp_port(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let mut inbound6 = Direction::new(Action::Deny);
+        inbound6.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: Some("::1".into()),
+            destination: None,
+            port: Some(port6),
+            ..Default::default()
+        });
+        let pub6 = Publisher::new(0, &test_policy(inbound6)).unwrap();
+        assert_eq!(pub6.explicit.len(), 1);
+        let guest6 = SocketAddr::new(super::super::GUEST6.into(), port6);
+        assert_eq!(
+            pub6.explicit[&guest6].local_addr().unwrap(),
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port6)
+        );
+
+        let udp_port6 = free_udp_port(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let mut udp_inbound6 = Direction::new(Action::Deny);
+        udp_inbound6.allow.push(Rule {
+            protocol: Protocol::Udp,
+            source: Some("::1".into()),
+            destination: None,
+            port: Some(udp_port6),
+            ..Default::default()
+        });
+        let udp6 = UdpIngress::new(&test_policy(udp_inbound6)).unwrap();
+        assert_eq!(udp6.listeners.len(), 1);
+        assert_eq!(
+            udp6.listeners[0].0,
+            SocketAddr::new(super::super::GUEST6.into(), udp_port6)
+        );
+        assert_eq!(
+            udp6.listeners[0].1.local_addr().unwrap(),
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), udp_port6)
+        );
+    }
+
+    #[tokio::test]
+    async fn wildcard_inbound_binds_both_ipv4_and_ipv6_v6only_without_conflict() {
+        let port = free_tcp_port(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let mut inbound = Direction::new(Action::Deny);
+        inbound.allow.push(Rule {
+            protocol: Protocol::Tcp,
+            source: None,
+            destination: None,
+            port: Some(port),
+            ..Default::default()
+        });
+        let publisher = Publisher::new(0, &test_policy(inbound)).unwrap();
+        let guest4 = SocketAddr::new(super::super::GUEST4.into(), port);
+        let guest6 = SocketAddr::new(super::super::GUEST6.into(), port);
+        assert_eq!(
+            publisher.explicit[&guest4].local_addr().unwrap(),
+            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)
+        );
+        if let Some(listener6) = publisher.explicit.get(&guest6) {
+            assert_eq!(
+                listener6.local_addr().unwrap(),
+                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)
+            );
+        }
     }
 }
