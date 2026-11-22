@@ -101,6 +101,11 @@ pub async fn relimit(
     Ok(out)
 }
 
+fn is_spill_file(name: &str) -> bool {
+    (name.starts_with("tool_") && name.ends_with(".txt"))
+        || (name.starts_with("wire-") && name.ends_with(".json"))
+}
+
 pub fn cleanup(directory: &Path, retention: Duration) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -113,7 +118,7 @@ pub fn cleanup(directory: &Path, retention: Duration) {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("tool_") || !name.ends_with(".txt") {
+        if !is_spill_file(&name) {
             continue;
         }
         let expired = entry.metadata().is_ok_and(|metadata| {
@@ -142,13 +147,22 @@ fn cleanup_session(path: &Path, retention: Duration) {
     else {
         return;
     };
+    let dir_expired = dir.metadata().is_ok_and(|m| {
+        m.modified()
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age > retention)
+    });
     let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else {
         return;
     };
+    let mut remaining = 0usize;
+    let mut unlinked = false;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let text = name.to_string_lossy();
-        if !text.starts_with("tool_") || !text.ends_with(".txt") {
+        if !is_spill_file(&text) {
+            remaining += 1;
             continue;
         }
         if entry.metadata().is_ok_and(|m| {
@@ -160,11 +174,18 @@ fn cleanup_session(path: &Path, retention: Duration) {
         }) {
             use std::os::unix::ffi::OsStrExt;
             if let Ok(name) = std::ffi::CString::new(name.as_bytes()) {
-                unsafe {
-                    libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
+                let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+                if rc == 0 {
+                    unlinked = true;
+                    continue;
                 }
             }
         }
+        remaining += 1;
+    }
+    drop(dir);
+    if remaining == 0 && (dir_expired || unlinked) {
+        let _ = std::fs::remove_dir(path);
     }
 }
 

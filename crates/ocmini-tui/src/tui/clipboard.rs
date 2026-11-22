@@ -25,6 +25,32 @@ pub(super) fn image_attachment(bytes: Vec<u8>) -> Option<Attachment> {
     })
 }
 
+fn unescape_shell_path(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            } else {
+                out.push('\\');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn expand_home(path: PathBuf) -> Option<PathBuf> {
+    match path.to_str()?.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| PathBuf::from(home).join(rest)),
+        None => Some(path),
+    }
+}
+
 /// A paste that is only a quoted, file: or ~/ path to an image file. Many
 /// terminals paste dragged or copied files as paths, so those become
 /// attachments; anything else stays plain text.
@@ -33,30 +59,51 @@ pub(super) fn pasted_image_path(text: &str) -> Option<PathBuf> {
     if trimmed.contains(['\n', '\r']) {
         return None;
     }
-    let unquoted = trimmed
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-        })
-        .unwrap_or(trimmed);
-    let path = if unquoted.starts_with("file:") {
-        reqwest::Url::parse(unquoted).ok()?.to_file_path().ok()?
-    } else {
-        PathBuf::from(unquoted.replace("\\ ", " "))
-    };
-    let expanded = match path.to_str()?.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))?,
-        None => path,
-    };
-    is_image_file(&expanded).then_some(expanded)
+    let (unquoted, quoted) =
+        if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            (inner, true)
+        } else if let Some(inner) = trimmed
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+        {
+            (inner, true)
+        } else {
+            (trimmed, false)
+        };
+    if unquoted
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        let path = reqwest::Url::parse(unquoted).ok()?.to_file_path().ok()?;
+        let expanded = expand_home(path)?;
+        return is_image_file(&expanded).then_some(expanded);
+    }
+    if let Some(raw) = expand_home(PathBuf::from(unquoted)) {
+        if is_image_file(&raw) {
+            return Some(raw);
+        }
+    }
+    if !quoted {
+        let candidate = if cfg!(unix) {
+            unescape_shell_path(unquoted)
+        } else {
+            unquoted.replace("\\ ", " ")
+        };
+        if let Some(unescaped) = expand_home(PathBuf::from(candidate)) {
+            if is_image_file(&unescaped) {
+                return Some(unescaped);
+            }
+        }
+    }
+    None
 }
 
 // Sniff only the header: pasting a path to a huge file must not read it all.
 pub(super) fn is_image_file(path: &Path) -> bool {
     use std::io::Read;
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -88,7 +135,7 @@ pub(super) fn apply_clipboard(
         Ok(Err(message)) => message,
         Err(_) => "Clipboard read timed out. Paste an image file path to attach it.".into(),
     };
-    display.output(&format!("\n{YELLOW}{message}{RESET}\n"), width);
+    display.output_literal(&format!("\n{YELLOW}{message}{RESET}\n"), width);
 }
 
 #[cfg(target_os = "linux")]
@@ -156,13 +203,20 @@ pub(super) async fn clipboard_image() -> Result<Option<Attachment>, String> {
             Ok(out) if out.status.success() => {
                 if mime == "text/uri-list" {
                     if let Ok(text) = std::str::from_utf8(&out.stdout) {
-                        let paths: Vec<_> = text
+                        let uris: Vec<_> = text
                             .lines()
-                            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty() && !line.starts_with('#'))
                             .collect();
-                        if let [path] = paths.as_slice() {
-                            if let Some(path) = pasted_image_path(path) {
-                                return file_attachment(&path).map(Some);
+                        if let [uri] = uris.as_slice() {
+                            if let Ok(url) = reqwest::Url::parse(uri) {
+                                if url.scheme().eq_ignore_ascii_case("file") {
+                                    if let Ok(path) = url.to_file_path() {
+                                        if is_image_file(&path) {
+                                            return file_attachment(&path).map(Some);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -191,15 +245,32 @@ pub(super) async fn clipboard_image() -> Result<Option<Attachment>, String> {
     let out = Command::new("osascript")
         .args([
             "-e",
-            &format!(
-                "set f to open for access POSIX file \"{}\" with write permission",
-                file.display()
-            ),
+            "on run argv",
+            "-e",
+            "set f to open for access POSIX file (item 1 of argv) with write permission",
+            "-e",
+            "try",
             "-e",
             "write (the clipboard as «class PNGf») to f starting at 1",
             "-e",
             "close access f",
+            "-e",
+            "on error errMsg",
+            "-e",
+            "try",
+            "-e",
+            "close access f",
+            "-e",
+            "end try",
+            "-e",
+            "error errMsg",
+            "-e",
+            "end try",
+            "-e",
+            "end run",
+            "--",
         ])
+        .arg(&file)
         .kill_on_drop(true)
         .output()
         .await
@@ -217,12 +288,10 @@ pub(super) async fn clipboard_image() -> Result<Option<Attachment>, String> {
     use tokio::process::Command;
     let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
     let file = directory.path().join("clipboard.png");
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; if ($i = [System.Windows.Forms.Clipboard]::GetImage()) {{ $i.Save('{}') }}",
-        file.display()
-    );
+    let script = "Add-Type -AssemblyName System.Windows.Forms; if ($i = [System.Windows.Forms.Clipboard]::GetImage()) { $i.Save($env:OCMINI_CLIPBOARD_FILE) }";
     let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
+        .env("OCMINI_CLIPBOARD_FILE", &file)
+        .args(["-NoProfile", "-Command", script])
         .kill_on_drop(true)
         .output()
         .await

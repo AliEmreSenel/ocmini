@@ -510,11 +510,17 @@ impl EngineApi for Engine {
         sid: String,
         model: Option<ModelRef>,
     ) -> Result<oneshot::Receiver<TurnResult>, OperationError> {
+        let v2 = app.v2.enabled(&sid).then(|| crate::v2::Input {
+            kind: "compaction".into(),
+            delivery: "queue".into(),
+            ..Default::default()
+        });
         self.start_turn(
             app,
             sid,
             PromptRequest {
                 model,
+                v2,
                 parts: vec![json!({"type":"compaction","auto":false})],
                 command: Some("__ocmini_compact".into()),
                 ..Default::default()
@@ -588,12 +594,12 @@ fn normalize_request(
                 .get("model")
                 .map(crate::v2::wire::model_in)
                 .transpose()?;
+            if request.variant.is_none() {
+                request.variant = state["model"]["variant"].as_str().map(str::to_owned);
+            }
         }
         if request.agent.is_none() {
             request.agent = state["agent"].as_str().map(str::to_owned);
-        }
-        if request.variant.is_none() {
-            request.variant = state["model"]["variant"].as_str().map(str::to_owned);
         }
     }
     let agent = request

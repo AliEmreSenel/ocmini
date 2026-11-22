@@ -55,7 +55,8 @@ pub(super) fn prepare_fork(source: &Session, history: Vec<MessageWithParts>) -> 
                 part["compactionPending"] = json!(ids.get(pending));
             }
             // A copied task cannot point at a live child owned by the source thread.
-            if part["type"] == "tool" && part["tool"] == "task" {
+            if part["type"] == "tool" && matches!(part["tool"].as_str(), Some("task" | "subagent"))
+            {
                 if let Some(meta) = part["state"]["metadata"].as_object_mut() {
                     meta.remove("sessionId");
                     meta.remove("sessionID");

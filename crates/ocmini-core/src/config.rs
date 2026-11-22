@@ -285,19 +285,34 @@ impl Config {
         Self::load_uncached(directory)
     }
 
+    /// Reads configuration from disk while substituting `override_text` for
+    /// `override_path` in memory, allowing callers to validate edits before
+    /// writing to disk.
+    pub fn load_with_override(
+        directory: &str,
+        override_path: &Path,
+        override_text: &str,
+    ) -> Result<Config, String> {
+        Self::load_raw(directory, None, Some((override_path, override_text)))
+    }
+
     /// Returns configuration documents discovered for `directory`, ordered from
     /// lowest to highest priority, matching OpenCode v2 `GET /api/config`.
     pub fn entries_for(directory: &str) -> Result<Vec<Value>, String> {
         let mut entries = Vec::new();
-        let _ = Self::load_raw(directory, Some(&mut entries))?;
+        let _ = Self::load_raw(directory, Some(&mut entries), None)?;
         Ok(entries)
     }
 
     fn load_uncached(directory: &str) -> Result<Config, String> {
-        Self::load_raw(directory, None)
+        Self::load_raw(directory, None, None)
     }
 
-    fn load_raw(directory: &str, mut entries: Option<&mut Vec<Value>>) -> Result<Config, String> {
+    fn load_raw(
+        directory: &str,
+        mut entries: Option<&mut Vec<Value>>,
+        file_override: Option<(&Path, &str)>,
+    ) -> Result<Config, String> {
         let directory = absolute_path(
             Path::new(directory),
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -315,6 +330,7 @@ impl Config {
                 &mut hook_sources,
                 true,
                 entries.as_deref_mut(),
+                file_override,
             )?;
         }
         load_markdown(&mut value, &global, "agent", "prompt")?;
@@ -329,6 +345,7 @@ impl Config {
                     &mut hook_sources,
                     true,
                     entries.as_deref_mut(),
+                    file_override,
                 )?;
             }
         }
@@ -348,6 +365,7 @@ impl Config {
                         &mut hook_sources,
                         false,
                         entries.as_deref_mut(),
+                        file_override,
                     )?;
                 }
                 let root = base.join(".opencode");
@@ -361,6 +379,7 @@ impl Config {
                             &mut hook_sources,
                             false,
                             entries.as_deref_mut(),
+                            file_override,
                         )?;
                     }
                     load_markdown(&mut value, &root, "agent", "prompt")?;
@@ -380,6 +399,7 @@ impl Config {
                         &mut hook_sources,
                         true,
                         entries.as_deref_mut(),
+                        file_override,
                     )?;
                 }
                 load_markdown(&mut value, &root, "agent", "prompt")?;
@@ -564,6 +584,19 @@ fn parse_permission_rules(value: &Value) -> Result<Vec<PermissionRule>, String> 
     Ok(rules)
 }
 
+fn canonical_file_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            return canonical_parent.join(name);
+        }
+    }
+    normalize_path(path)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn merge_file(
     base: &mut Value,
     path: &Path,
@@ -572,17 +605,14 @@ fn merge_file(
     hook_sources: &mut Vec<HookConfigSource>,
     trusted: bool,
     entries: Option<&mut Vec<Value>>,
+    file_override: Option<(&Path, &str)>,
 ) -> Result<(), String> {
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let key = canonical_file_key(path);
     let previously_read = seen.get(&key).copied();
     if let Some(mcp_loaded) = previously_read {
         if trusted {
             for source in hook_sources.iter_mut() {
-                if Path::new(&source.source)
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(&source.source))
-                    == key
-                {
+                if canonical_file_key(Path::new(&source.source)) == key {
                     source.trusted = true;
                 }
             }
@@ -591,10 +621,28 @@ fn merge_file(
             return Ok(());
         }
     }
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
+    let text = if let Some((override_path, override_text)) = file_override {
+        if canonical_file_key(override_path) == key {
+            override_text.to_owned()
+        } else {
+            match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(())
+                }
+                Err(error) => {
+                    return Err(format!("cannot read config {}: {error}", path.display()))
+                }
+            }
+        }
+    } else {
+        match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(())
+            }
+            Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
+        }
     };
     let source = path.display().to_string();
     let directory = path.parent().unwrap_or(Path::new("."));
@@ -795,16 +843,20 @@ fn load_markdown(value: &mut Value, root: &Path, kind: &str, body_key: &str) -> 
 
 pub use ocmini_tools::frontmatter::markdown_frontmatter;
 
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 pub fn config_home() -> String {
-    std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", home()))
+    env_non_empty("XDG_CONFIG_HOME").unwrap_or_else(|| format!("{}/.config", home()))
 }
 fn home() -> String {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into())
+    env_non_empty("HOME")
+        .or_else(|| env_non_empty("USERPROFILE"))
+        .unwrap_or_else(|| ".".into())
 }
 pub fn data_home() -> String {
-    std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home()))
+    env_non_empty("XDG_DATA_HOME").unwrap_or_else(|| format!("{}/.local/share", home()))
 }
 pub fn store_path() -> PathBuf {
     Path::new(&data_home()).join("ocmini").join("ocmini.db")
@@ -1016,6 +1068,7 @@ mod tests {
             &mut sources,
             true,
             None,
+            None,
         )
         .unwrap();
         merge_file(
@@ -1025,6 +1078,7 @@ mod tests {
             &mut seen,
             &mut sources,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1053,6 +1107,7 @@ mod tests {
             &mut seen,
             &mut sources,
             true,
+            None,
             None,
         )
         .unwrap();

@@ -804,22 +804,52 @@ impl Settings {
         url: &str,
         protocol: Protocol,
     ) -> reqwest::RequestBuilder {
-        let mut request = client()
-            .request(method, url)
-            .header("accept", "text/event-stream, application/json")
-            .header("user-agent", "ocmini");
-        if !self.token.is_empty() {
-            request = if protocol == Protocol::Anthropic && !self.bearer {
-                request.header("x-api-key", &self.token)
-            } else {
-                request.bearer_auth(&self.token)
-            };
-        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream, application/json"),
+        );
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("ocmini"),
+        );
         if protocol == Protocol::Anthropic {
-            request = request.header("anthropic-version", "2023-06-01");
+            headers.insert(
+                reqwest::header::HeaderName::from_static("anthropic-version"),
+                reqwest::header::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        let mut invalid = Vec::new();
+        if !self.token.is_empty() {
+            let (name, value) = if protocol == Protocol::Anthropic && !self.bearer {
+                ("x-api-key", self.token.clone())
+            } else {
+                ("authorization", format!("Bearer {}", self.token))
+            };
+            match (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&value),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    headers.insert(name, value);
+                }
+                _ => invalid.push((name.to_owned(), value)),
+            }
         }
         for (name, value) in &self.headers {
-            request = request.header(name.as_str(), value.as_str());
+            match (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    headers.insert(name, value);
+                }
+                _ => invalid.push((name.clone(), value.clone())),
+            }
+        }
+        let mut request = client().request(method, url).headers(headers);
+        for (name, value) in invalid {
+            request = request.header(name, value);
         }
         if let Some(timeout) = self.total_timeout {
             request = request.timeout(timeout);

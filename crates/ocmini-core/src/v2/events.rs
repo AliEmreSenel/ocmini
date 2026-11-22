@@ -28,8 +28,10 @@ pub type Frame = Result<Arc<EncodedEvent>, Arc<str>>;
 struct State {
     active: HashSet<String>,
     failures: HashMap<String, Value>,
-    parts: HashMap<String, (usize, String, String)>,
+    parts: HashMap<String, (usize, String, String, bool)>,
     steps: HashSet<String>,
+    ended_steps: HashSet<String>,
+    last_step: Option<String>,
     ordinals: HashMap<String, usize>,
     compactions: HashMap<String, &'static str>,
     form_multi: HashMap<String, Vec<bool>>,
@@ -195,6 +197,9 @@ impl Events {
                     | "session.idle"
                     | "message.updated"
                     | "message.part.updated"
+                    | "question.asked"
+                    | "question.replied"
+                    | "question.rejected"
                     | "ocmini.compaction.started"
                     | "ocmini.compaction.failed"
             )
@@ -317,11 +322,14 @@ impl Events {
                     let amid = p["messageID"]
                         .as_str()
                         .map(str::to_owned)
+                        .or_else(|| state.last_step.clone())
                         .or_else(|| {
-                            store
-                                .messages_limited(sid, Some(1))
-                                .ok()
-                                .and_then(|m| m.last().map(|m| m.info.id.clone()))
+                            store.messages(sid).ok().and_then(|msgs| {
+                                msgs.into_iter()
+                                    .rev()
+                                    .find(|m| m.info.role == "assistant")
+                                    .map(|m| m.info.id)
+                            })
                         })
                         .unwrap_or_default();
                     self.send(session, sid,"session.retry.scheduled",json!({"sessionID":sid,"assistantMessageID":amid,"attempt":p["status"]["attempt"],"at":p["status"]["next"],"error":wire::error(p["status"]["message"].as_str().unwrap_or("Retrying"))}),true);
@@ -368,10 +376,14 @@ impl Events {
                         true,
                     );
                     // Only retain live part/step indexes; persisted history is authoritative.
-                    state.parts.retain(|_, (_, _, owner)| owner != sid);
+                    state.parts.retain(|_, (_, _, owner, _)| owner != sid);
                     state
                         .steps
                         .retain(|key| !key.starts_with(&format!("{sid}/")));
+                    state
+                        .ended_steps
+                        .retain(|key| !key.starts_with(&format!("{sid}/")));
+                    state.last_step = None;
                     state
                         .ordinals
                         .retain(|key, _| !key.starts_with(&format!("{sid}/")));
@@ -405,13 +417,14 @@ impl Events {
                         .message(sid, mid)?
                         .ok_or("Compaction message missing")?;
                     self.send(session, sid,"session.compaction.ended",json!({"sessionID":sid,"reason":reason,"text":text_parts(&m.parts).collect::<Vec<_>>().join("\n"),"model":{"providerID":info["providerID"],"id":info["modelID"]},"cost":info["cost"].as_f64().unwrap_or(0.0),"tokens":info["tokens"],"metadata":{}}),true);
-                } else if state.steps.insert(key) {
+                } else if state.steps.insert(key.clone()) {
+                    state.last_step = Some(mid.to_owned());
                     let mut model = json!({"id":info["modelID"],"providerID":info["providerID"]});
                     if let Some(variant) = info.get("variant") {
                         model["variant"] = variant.clone();
                     }
                     self.send(session, sid,"session.step.started",json!({"sessionID":sid,"assistantMessageID":mid,"agent":info["agent"].as_str().unwrap_or("build"),"model":model,"started":info["time"]["created"]}),true);
-                } else if info["time"]["completed"].is_number() {
+                } else if info["time"]["completed"].is_number() && state.ended_steps.insert(key) {
                     let mut data = json!({"sessionID":sid,"assistantMessageID":mid,"finish":info["finish"].as_str().unwrap_or("stop"),"cost":info["cost"].as_f64().unwrap_or(0.0),"tokens":info["tokens"].as_object().map(|_|info["tokens"].clone()).unwrap_or_else(||json!(Tokens::default()))});
                     let failed = info.get("error").is_some_and(|e| !e.is_null());
                     if failed {
@@ -467,11 +480,16 @@ impl Events {
                     let ordinal = state.ordinals.entry(format!("{sid}/{mid}")).or_default();
                     state
                         .parts
-                        .insert(id.into(), (*ordinal, name.into(), sid.into()));
+                        .insert(id.into(), (*ordinal, name.into(), sid.into(), false));
                     *ordinal += 1;
                 }
                 let ordinal = state.parts[id].0;
                 if !self.listening() {
+                    if name != "tool" && part["time"]["end"].is_number() {
+                        if let Some(entry) = state.parts.get_mut(id) {
+                            entry.3 = true;
+                        }
+                    }
                     return Ok(());
                 }
                 if name == "tool" {
@@ -535,13 +553,20 @@ impl Events {
                         );
                     }
                     if part["time"]["end"].is_number() {
-                        data["text"] = part["text"].clone();
-                        self.send(session, sid, &format!("session.{name}.ended"), data, true);
+                        let already_ended = state
+                            .parts
+                            .get_mut(id)
+                            .map(|entry| std::mem::replace(&mut entry.3, true))
+                            .unwrap_or(false);
+                        if !already_ended {
+                            data["text"] = part["text"].clone();
+                            self.send(session, sid, &format!("session.{name}.ended"), data, true);
+                        }
                     }
                 }
             }
             "message.part.delta" => {
-                if let Some((ordinal, name, _)) =
+                if let Some((ordinal, name, _, _)) =
                     p["partID"].as_str().and_then(|id| state.parts.get(id))
                 {
                     self.send(session, sid,&format!("session.{name}.delta"),json!({"sessionID":sid,"assistantMessageID":p["messageID"],"ordinal":ordinal,"delta":p["delta"]}),false);
@@ -582,8 +607,10 @@ impl Events {
             "question.replied" | "question.rejected" => {
                 let id = p["requestID"].as_str().unwrap_or_default();
                 let multi = state.form_multi.remove(id);
-                let mut data =
-                    json!({"id":format!("frm_{}",id.trim_start_matches("que_")),"sessionID":sid});
+                let mut data = json!({
+                    "id": format!("frm_{}", id.strip_prefix("que_").unwrap_or(id)),
+                    "sessionID": sid
+                });
                 if kind == "question.replied" {
                     let answers = p["answers"]
                         .as_array()

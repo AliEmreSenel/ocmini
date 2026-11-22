@@ -226,7 +226,9 @@ pub async fn run(
                         true,
                     )
                 } else if paths_only {
-                    record.pop();
+                    if record.last() == Some(&0) {
+                        record.pop();
+                    }
                     let path = String::from_utf8_lossy(&record);
                     (
                         cwd.join(path.trim_start_matches("./"))
@@ -280,13 +282,14 @@ pub async fn run(
                 }
                 lines.push((line, is_match));
             }
+            let matches = lines.iter().filter(|(_, is_match)| *is_match).count();
             let count = lines.len();
             let mut output = String::new();
             for (line, _) in lines {
                 output.push_str(&line);
                 output.push('\n');
             }
-            Ok((output, count, truncated, stopped))
+            Ok((output, matches, count, truncated, stopped))
         };
         let errors = async {
             let mut errors = Vec::new();
@@ -316,7 +319,7 @@ pub async fn run(
         .wait()
         .await
         .map_err(|error| failure(format!("Cannot wait for ripgrep: {error}")))?;
-    let ((mut output, count, truncated, stopped), errors) = result?;
+    let ((mut output, matches, count, truncated, stopped), errors) = result?;
     if !stopped
         && !matches!(status.code(), Some(0 | 1))
         && (count == 0
@@ -343,7 +346,7 @@ pub async fn run(
     if !errors.is_empty() {
         output.push_str(&format!("\n[ripgrep: {errors}]\n"));
     }
-    let mut metadata = json!({"matches":count,"count":count,"truncated":truncated,"path":base,"partial":!errors.is_empty()});
+    let mut metadata = json!({"matches":matches,"count":count,"truncated":truncated,"path":base,"partial":!errors.is_empty()});
     if !glob {
         metadata["offset"] = json!(offset);
         if truncated {
@@ -351,7 +354,7 @@ pub async fn run(
         }
     }
     Ok(ToolOutput {
-        title: format!("{count} matches"),
+        title: format!("{matches} matches"),
         output,
         metadata,
     })

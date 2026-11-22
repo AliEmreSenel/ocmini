@@ -15,7 +15,15 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
             vec![
                 json!({"type":"tool_result","tool_use_id":message["tool_call_id"],"content":crate::provider::content::blocks(&message["content"], crate::provider::Protocol::Anthropic, false)?,"is_error":message["is_error"].as_bool().unwrap_or(false)}),
             ]
-        } else if role == "assistant" && message["providerMetadata"]["provider"] == "anthropic" {
+        } else if role == "assistant"
+            && message["providerMetadata"]["provider"] == "anthropic"
+            && message["providerMetadata"]["model"]
+                .as_str()
+                .is_none_or(|model| model == settings.api_model)
+            && message["providerMetadata"]["providerID"]
+                .as_str()
+                .is_none_or(|id| id == settings.provider_id)
+        {
             super::replay::replay_metadata(message)?["content"]
                 .as_array()
                 .cloned()

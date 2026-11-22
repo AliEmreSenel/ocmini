@@ -681,13 +681,9 @@ pub async fn reserve(
     cancel: &CancellationToken,
 ) -> Result<Reservation, OperationError> {
     let input = Input::parse(name, args)?;
-    let dir = directory.to_owned();
-    let (input, targets) = tokio::task::spawn_blocking(move || {
-        let targets = input.targets(&dir)?;
-        Ok::<_, OperationError>((input, targets))
-    })
-    .await
-    .map_err(|e| failure(e.to_string()))??;
+    // Resolve targets before the first `.await` so chained edits to the same
+    // file in `join_all` acquire `lock_edit` strictly in model-call order.
+    let targets = input.targets(directory)?;
     let guard = if input.kind() == Kind::Edit {
         Some(lock_edit(&targets[0].1, cancel).await?)
     } else {
@@ -801,6 +797,38 @@ impl Plan {
                 unified_diff(&c.path, before_str, after_str)
             });
             self.output = file_output(kind, &c.path, after.len(), 1, diff);
+        } else {
+            let root = Path::new(directory)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(directory));
+            let summaries: Vec<Value> = changes
+                .iter()
+                .map(|c| {
+                    let display = c
+                        .path
+                        .strip_prefix(&root)
+                        .unwrap_or(&c.path)
+                        .to_string_lossy()
+                        .into_owned();
+                    let kind = match (&c.before, &c.after) {
+                        (None, Some(_)) => "add",
+                        (Some(_), None) => "delete",
+                        _ => "update",
+                    };
+                    let additions = c
+                        .after
+                        .as_deref()
+                        .map(|b| String::from_utf8_lossy(b).lines().count())
+                        .unwrap_or(0);
+                    let deletions = c
+                        .before
+                        .as_deref()
+                        .map(|b| String::from_utf8_lossy(b).lines().count())
+                        .unwrap_or(0);
+                    json!({"path":display,"type":kind,"additions":additions,"deletions":deletions})
+                })
+                .collect();
+            self.output = patch::output(&summaries);
         }
         self.changes = changes;
         Ok(())

@@ -2,7 +2,7 @@
 // keyboard-driven viewport over the saved sessions.
 use crate::println;
 use crate::store::Store;
-use crate::tui::{decode_event, truncate, Key, Motion, BOLD, DIM, RESET, YELLOW};
+use crate::tui::{decode_event, strip_escapes, Key, Motion, BOLD, DIM, RESET, YELLOW};
 use crate::types::{now_ms, Session};
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::EventStream;
@@ -10,6 +10,8 @@ use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use std::io::Write;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Rows drawn between the header and the footer.
 const VISIBLE: usize = 10;
@@ -109,14 +111,86 @@ fn time_ago(created: i64, now: i64) -> String {
     }
 }
 
-/// Truncate from the front so paths keep their tail (the interesting part).
-fn tail(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
+/// Remove escape sequences and flatten control/newline characters so untrusted
+/// titles, directories or queries can never inject terminal controls or break
+/// row accounting.
+fn sanitize(text: &str) -> String {
+    strip_escapes(text)
+        .chars()
+        .filter_map(|ch| {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                Some(' ')
+            } else if ch.is_control() {
+                None
+            } else {
+                Some(ch)
+            }
+        })
+        .collect()
+}
+
+/// Truncate from the end to fit within `max` display columns.
+fn fit_width(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text.width() <= max {
         return text.to_string();
     }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let w = grapheme.width();
+        if used + w + 1 > max {
+            break;
+        }
+        out.push_str(grapheme);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Pad `text` on the right with spaces to at least `width` display columns.
+fn pad_width(text: &str, width: usize) -> String {
+    let used = text.width();
+    if used >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - used))
+    }
+}
+
+/// Truncate from the front so paths keep their tail (the interesting part),
+/// bounded by `max` display columns.
+fn tail(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text.width() <= max {
+        return text.to_string();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true).rev() {
+        let w = grapheme.width();
+        if used + w + 1 > max {
+            break;
+        }
+        kept.push(grapheme);
+        used += w;
+    }
+    kept.reverse();
     let mut out = String::from("…");
-    out.extend(chars[chars.len() - (max - 1).max(1)..].iter());
+    for grapheme in kept {
+        out.push_str(grapheme);
+    }
     out
 }
 
@@ -139,18 +213,31 @@ fn draw(
             .map_err(|error| format!("Cannot redraw the session list: {error}"))?;
     }
     let (cols, _) = terminal::size().unwrap_or((80, 24));
-    let title_width = (cols as usize).saturating_sub(40).clamp(12, 48);
+    // Keep the last column free so no row ever triggers terminal autowrap.
+    let max_cols = usize::from(cols).saturating_sub(1).max(1);
+    let title_width = max_cols
+        .saturating_sub(40)
+        .clamp(12, 48)
+        .min(max_cols.saturating_sub(6).max(1));
     let top = cursor
         .saturating_sub(VISIBLE - 1)
         .min(rows.len().saturating_sub(1));
-    println!(
-        "{DIM}┌ resume · {} · type to search · Tab sort: {} · Enter open · Esc cancel{RESET}",
-        scope.unwrap_or("all projects"),
-        sort.label()
+    let header = fit_width(
+        &format!(
+            "┌ resume · {} · type to search · Tab sort: {} · Enter open · Esc cancel",
+            sanitize(scope.unwrap_or("all projects")),
+            sort.label()
+        ),
+        max_cols,
     );
-    println!("{DIM}│{RESET} {BOLD}›{RESET} {query}");
+    println!("{DIM}{header}{RESET}");
+    let clean_query = tail(&sanitize(query), max_cols.saturating_sub(4));
+    println!("{DIM}│{RESET} {BOLD}›{RESET} {clean_query}");
     if rows.is_empty() {
-        println!("{DIM}│ no matching sessions{RESET}");
+        println!(
+            "{DIM}{}{RESET}",
+            fit_width("│ no matching sessions", max_cols)
+        );
     }
     let busy_ids: std::collections::HashSet<String> = store
         .busy_sessions()
@@ -162,22 +249,39 @@ fn draw(
         let marker = if index == cursor { "›" } else { " " };
         let style = if index == cursor { BOLD } else { DIM };
         let busy = busy_ids.contains(&session.id);
+        let title = pad_width(
+            &fit_width(&sanitize(&session.title), title_width),
+            title_width,
+        );
+        let busy_text = if busy { " busy" } else { "" };
+        let ago = time_ago(updated(session), now);
+        let fixed = 4 + title.width() + busy_text.len() + 1 + ago.len();
+        let dir_part = if fixed + 4 <= max_cols {
+            format!(
+                " · {}",
+                tail(&sanitize(&session.directory), max_cols - fixed - 3)
+            )
+        } else {
+            String::new()
+        };
+        let meta = fit_width(
+            &format!("{ago}{dir_part}"),
+            max_cols.saturating_sub(4 + title.width() + busy_text.len() + 1),
+        );
         println!(
-            "{DIM}│{RESET} {marker} {style}{:<title_width$}{RESET}{} {DIM}{} · {}{RESET}",
-            truncate(&session.title, title_width),
+            "{DIM}│{RESET} {marker} {style}{title}{RESET}{} {DIM}{meta}{RESET}",
             if busy {
                 format!(" {YELLOW}busy{RESET}")
             } else {
                 String::new()
             },
-            time_ago(updated(session), now),
-            tail(
-                &session.directory,
-                (cols as usize).saturating_sub(title_width + 24).max(8),
-            ),
         );
     }
-    println!("{DIM}└ {}/{}{RESET}", cursor + 1, rows.len());
+    let pos = if rows.is_empty() { 0 } else { cursor + 1 };
+    println!(
+        "{DIM}{}{RESET}",
+        fit_width(&format!("└ {pos}/{}", rows.len()), max_cols)
+    );
     let _ = std::io::stdout().flush();
     Ok(3 + rows.len().clamp(1, VISIBLE))
 }
@@ -294,6 +398,16 @@ mod tests {
         assert!(matches(&session, "SES_a1"));
         assert!(matches(&session, "PROJ"));
         assert!(!matches(&session, "zzz"));
+    }
+
+    #[test]
+    fn sanitize_and_width_helpers_prevent_escapes_and_underflow() {
+        assert_eq!(sanitize("ok\x1b]0;title\x07\nnext\trow"), "ok next row");
+        assert_eq!(sanitize("a\x1b[31mred\x1b[0m"), "ared");
+        assert_eq!(tail("/some/long/path", 0), "");
+        assert_eq!(tail("/some/long/path", 1), "…");
+        assert_eq!(fit_width("中中中", 4), "中…");
+        assert_eq!(pad_width("中", 4), "中  ");
     }
 
     #[test]

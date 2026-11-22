@@ -27,11 +27,11 @@ use clipboard::{
     resolve_user_path, ClipboardResult,
 };
 use completion::{Completion, CompletionContext};
-pub(crate) use input::Motion;
 use input::{
     clean_input, input_prefix, page_move, terminal_size, terminal_width, Display, Draft, History,
     KillRing,
 };
+pub(crate) use input::{strip_escapes, Motion};
 use render::{
     answer_line, option_labels, render_event, render_history, render_question, session_prompts,
 };
@@ -57,6 +57,14 @@ impl RawMode {
         }
         crossterm::execute!(out, EnableBracketedPaste)?;
         Ok(guard)
+    }
+
+    fn leave_alternate_screen(&mut self) {
+        if self.fullscreen {
+            let mut out = std::io::stdout();
+            let _ = crossterm::execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+            self.fullscreen = false;
+        }
     }
 }
 
@@ -115,10 +123,13 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
     out.replace('\n', " ")
 }
 
-/// Transcript rows and retained tool chains. Plain text always stays visible.
+/// Transcript rows and retained tool chains. Plain and literal text always stay visible.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RowKind {
     Plain,
+    /// Literal output (user prompts, permissions, questions, errors, notices)
+    /// that bypasses Markdown parsing.
+    Literal,
     /// Chain of thought: the `◦ thinking` header and every reasoning delta.
     Thinking,
     /// A retained tool chain, rendered in the selected tool view.
@@ -172,7 +183,7 @@ impl Default for Visibility {
 impl Visibility {
     fn visible(&self, kind: RowKind) -> bool {
         match kind {
-            RowKind::Plain => true,
+            RowKind::Plain | RowKind::Literal => true,
             RowKind::Thinking => self.thinking,
             RowKind::Tools(_) | RowKind::Thought(_) => true,
         }
@@ -758,6 +769,13 @@ impl Ui {
                 | Key::Help
                 | Key::ToggleThinking
                 | Key::ToggleTools
+                | Key::PageUp
+                | Key::PageDown
+                | Key::ScrollTop
+                | Key::ScrollBottom
+                | Key::ScrollUp(_)
+                | Key::ScrollDown(_)
+                | Key::Other
         ) {
             return None;
         }
@@ -792,6 +810,18 @@ impl Ui {
                 Some(String::new())
             }
             Key::Enter => {
+                if let PendingPrompt::Question {
+                    id,
+                    questions: items,
+                    ..
+                } = state
+                {
+                    if items.is_empty() {
+                        questions.reply(id, Vec::new());
+                        self.prompt = None;
+                        return Some(String::new());
+                    }
+                }
                 let (finished, text) = answer_question(state);
                 if finished {
                     self.prompt = None;
@@ -803,10 +833,12 @@ impl Ui {
                     current, drafts, ..
                 } = state
                 {
-                    if !drafts[*current].text.is_empty() {
-                        drafts[*current].backspace();
-                    } else if *current > 0 {
-                        return switch_question(state, -1);
+                    if let Some(draft) = drafts.get_mut(*current) {
+                        if !draft.text.is_empty() {
+                            draft.backspace();
+                        } else if *current > 0 {
+                            return switch_question(state, -1);
+                        }
                     }
                 }
                 Some(String::new())
@@ -1026,7 +1058,7 @@ fn format_mcp_status(app: &App) -> String {
     out
 }
 
-pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
+pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), crate::types::OperationError> {
     if args.fork && args.session.is_none() && !args.continue_last && !args.resume {
         return Err("--fork requires --session, --continue, or --resume".into());
     }
@@ -1072,7 +1104,7 @@ pub(crate) async fn run_session(
     mut selected: PromptRequest,
     model_override: Option<crate::types::ModelRef>,
     initial_attachments: Vec<Attachment>,
-) -> Result<(), String> {
+) -> Result<(), crate::types::OperationError> {
     let engine = Engine::new();
     let (mut app, history) = crate::client::activate(&app, &session, &mut selected)?;
     let mut sandbox_presets = available_sandbox_presets(&app);
@@ -1081,7 +1113,7 @@ pub(crate) async fn run_session(
     let fullscreen = matches!(app.config.as_ref().ui.scroll_mode, ScrollMode::Fullscreen);
     let shutdown =
         shutdown_signal().map_err(|error| format!("Cannot listen for shutdown: {error}"))?;
-    let _raw = RawMode::enter(fullscreen)
+    let mut raw = RawMode::enter(fullscreen)
         .map_err(|error| format!("Cannot initialize terminal: {error}"))?;
     let mut events = engine::bus().subscribe();
     let mut keys = EventStream::new();
@@ -1095,14 +1127,14 @@ pub(crate) async fn run_session(
     let mut display = Display::new(fullscreen);
     let mut ui = Ui::default();
     let width = terminal_width();
-    display.output(
+    display.output_literal(
         &format!(
             "{BOLD}ocmini{RESET} {DIM}{}{RESET}\n",
             crate::OPENCODE_COMPAT_VERSION
         ),
         width,
     );
-    display.output(
+    display.output_literal(
         &format!(
             "{DIM}session {} · {}{RESET}\n",
             session.id, session.directory
@@ -1152,7 +1184,7 @@ pub(crate) async fn run_session(
                 let pending_permission = matches!(ui.prompt, Some(PendingPrompt::Permission(_)));
                 let pending_question = matches!(ui.prompt, Some(PendingPrompt::Question { .. }));
                 if let Some(text) = ui.prompt_key(&app, &key) {
-                    if !text.is_empty() { display.output(&text, width); }
+                    if !text.is_empty() { display.output_literal(&text, width); }
                     display.draw_sized(&ui, &draft, size, &status_bar);
                     continue;
                 }
@@ -1163,7 +1195,7 @@ pub(crate) async fn run_session(
                         Some(std::path::Path::new(&session.directory)),
                     );
                     if let Some(msg) = notice {
-                        display.output(&format!("\n{YELLOW}{msg}{RESET}\n"), width);
+                        display.output_literal(&format!("\n{YELLOW}{msg}{RESET}\n"), width);
                     }
                     if handled {
                         let ctx = CompletionContext {
@@ -1181,11 +1213,11 @@ pub(crate) async fn run_session(
                 match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
-                    Key::CtrlC => { ui.prompt = None; status_bar.busy = false; engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), width); }
+                    Key::CtrlC => { ui.prompt = None; status_bar.busy = false; engine.abort(&session.id); display.output_literal(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), width); }
                     Key::CtrlL => display.clear_screen(),
                     Key::Help => {
                         display.finish_line();
-                        display.output(&help_text(fullscreen), width);
+                        display.output_literal(&help_text(fullscreen), width);
                         display.scroll_bottom();
                     }
                     key @ (Key::ToggleThinking | Key::ToggleTools) => {
@@ -1211,6 +1243,9 @@ pub(crate) async fn run_session(
                     Key::CtrlU => {
                         if !pending_permission {
                             active_draft(&mut ui.prompt, &mut draft).clear();
+                            if ui.prompt.is_none() {
+                                prompt_history.reset();
+                            }
                         }
                     }
                     Key::RemoveAttachment if !pending_permission && !pending_question => { draft.attachments.pop(); }
@@ -1233,34 +1268,46 @@ pub(crate) async fn run_session(
                                     false,
                                 ) {
                                     Err(error) => {
-                                        display.output(
+                                        display.output_literal(
                                             &format!("{RED}error:{RESET} {error}\n"),
                                             width,
                                         );
                                     }
                                     Ok(resumed) => {
-                                        selected = PromptRequest { model: model_override.clone(), ..Default::default() };
-                                        let (scoped, history) = crate::client::activate(&app, &resumed, &mut selected)?;
-                                        engine.abort(&session.id);
-                                        app = scoped;
-                                        session = resumed;
-                                        sandbox_presets = available_sandbox_presets(&app);
-                                        ui.interactions.clear();
-                                        ui.text = TextState::default();
-                                        ui.tool_done.clear();
-                                        ui.prompt = None;
-                                        ui.completion = Completion::default();
-                                        status_bar = StatusBar::from_state(&app, &session, &selected, false);
-                                        draft = Draft::default();
-                                        prompt_history.load(session_prompts(&history));
-                                        display.output(
-                                            &format!(
-                                                "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}\n",
-                                                session.id, session.directory
-                                            ),
-                                            width,
-                                        );
-                                        render_history(&mut display, &mut ui, &history);
+                                        let mut next_selected = PromptRequest { model: model_override.clone(), ..Default::default() };
+                                        match crate::client::activate(&app, &resumed, &mut next_selected) {
+                                            Err(error) => {
+                                                display.output_literal(
+                                                    &format!("{RED}error:{RESET} {error}\n"),
+                                                    width,
+                                                );
+                                            }
+                                            Ok((scoped, history)) => {
+                                                engine.abort(&session.id);
+                                                selected = next_selected;
+                                                app = scoped;
+                                                session = resumed;
+                                                sandbox_presets = available_sandbox_presets(&app);
+                                                ui.interactions.clear();
+                                                ui.text = TextState::default();
+                                                ui.tool_done.clear();
+                                                ui.answer_labelled = false;
+                                                ui.prompt = None;
+                                                ui.completion = Completion::default();
+                                                status_bar = StatusBar::from_state(&app, &session, &selected, false);
+                                                draft = Draft::default();
+                                                prompt_history.load(session_prompts(&history));
+                                                display.reset_session();
+                                                display.output_literal(
+                                                    &format!(
+                                                        "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}\n",
+                                                        session.id, session.directory
+                                                    ),
+                                                    width,
+                                                );
+                                                render_history(&mut display, &mut ui, &history);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1275,7 +1322,7 @@ pub(crate) async fn run_session(
                         } else if let Some(path) = pasted_image_path(&text).filter(|_| !pending_question) {
                             match file_attachment(&path) {
                                 Ok(attachment) => draft.attachments.push(attachment),
-                                Err(message) => display.output(&format!("\n{YELLOW}{message}{RESET}\n"), width),
+                                Err(message) => display.output_literal(&format!("\n{YELLOW}{message}{RESET}\n"), width),
                             }
                         } else {
                             // Answers are text-only: attachments stay with the prompt.
@@ -1293,14 +1340,14 @@ pub(crate) async fn run_session(
                                 match command.action {
                                     LocalAction::Help => {
                                         draft.clear_text();
-                                        display.output(&help_text(fullscreen), width);
+                                        display.output_literal(&help_text(fullscreen), width);
                                         display.scroll_bottom();
                                     }
                                     LocalAction::Context => {
                                         draft.clear_text();
                                         match crate::engine_impl::inspect_context(&app, &session, &selected).await {
-                                            Ok(report) => display.output(&format!("\n{report}"), width),
-                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), width),
+                                            Ok(report) => display.output_literal(&format!("\n{report}"), width),
+                                            Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                         }
                                         display.scroll_bottom();
                                     }
@@ -1318,13 +1365,13 @@ pub(crate) async fn run_session(
                                             ..selected.clone()
                                         };
                                         if let Err(error) = engine.admit(app.clone(), session.id.clone(), request).await {
-                                            display.output(&format!("{RED}error:{RESET} {error}\n"), width);
+                                            display.output_literal(&format!("{RED}error:{RESET} {error}\n"), width);
                                         }
                                     }
                                     LocalAction::Model => {
                                         draft.clear_text();
                                         if arguments.is_empty() {
-                                            display.output(&format_model_list(&app, &selected), terminal_width());
+                                            display.output_literal(&format_model_list(&app, &selected), width);
                                         } else {
                                             match parse_model_spec(&arguments) {
                                                 Ok((model_ref, variant)) => {
@@ -1340,10 +1387,10 @@ pub(crate) async fn run_session(
                                                         Some(v) => format!("{model_ref}#{v}"),
                                                         None => model_ref.to_string(),
                                                     };
-                                                    display.output(&format!("\n{DIM}◦ model: {shown}{RESET}\n"), terminal_width());
+                                                    display.output_literal(&format!("\n{DIM}◦ model: {shown}{RESET}\n"), width);
                                                 }
                                                 Err(error) => {
-                                                    display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width());
+                                                    display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width);
                                                 }
                                             }
                                         }
@@ -1352,7 +1399,7 @@ pub(crate) async fn run_session(
                                     LocalAction::Agent => {
                                         draft.clear_text();
                                         if arguments.is_empty() {
-                                            display.output(&format_agent_list(&app, &selected), terminal_width());
+                                            display.output_literal(&format_agent_list(&app, &selected), width);
                                         } else {
                                             let known = crate::inventory::agents_json(&app.config)
                                                 .as_array()
@@ -1360,9 +1407,9 @@ pub(crate) async fn run_session(
                                             if known {
                                                 selected.agent = Some(arguments.clone());
                                                 status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
-                                                display.output(&format!("\n{DIM}◦ agent: {arguments}{RESET}\n"), terminal_width());
+                                                display.output_literal(&format!("\n{DIM}◦ agent: {arguments}{RESET}\n"), width);
                                             } else {
-                                                display.output(&format!("\n{RED}error:{RESET} Unknown agent: {arguments}\n"), terminal_width());
+                                                display.output_literal(&format!("\n{RED}error:{RESET} Unknown agent: {arguments}\n"), width);
                                             }
                                         }
                                         display.scroll_bottom();
@@ -1370,15 +1417,15 @@ pub(crate) async fn run_session(
                                     LocalAction::Variant => {
                                         draft.clear_text();
                                         if arguments.is_empty() {
-                                            display.output(&format_variant_list(&app, &selected), terminal_width());
+                                            display.output_literal(&format_variant_list(&app, &selected), width);
                                         } else if matches!(arguments.as_str(), "default" | "clear" | "off") {
                                             selected.variant = None;
                                             status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
-                                            display.output(&format!("\n{DIM}◦ variant: default{RESET}\n"), terminal_width());
+                                            display.output_literal(&format!("\n{DIM}◦ variant: default{RESET}\n"), width);
                                         } else {
                                             selected.variant = Some(arguments.clone());
                                             status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
-                                            display.output(&format!("\n{DIM}◦ variant: {arguments}{RESET}\n"), terminal_width());
+                                            display.output_literal(&format!("\n{DIM}◦ variant: {arguments}{RESET}\n"), width);
                                         }
                                         display.scroll_bottom();
                                     }
@@ -1388,9 +1435,10 @@ pub(crate) async fn run_session(
                                         let fresh = crate::types::Session::new("tui session", &session.directory);
                                         match crate::sessions::create(&app, fresh, None).await {
                                             Ok(created) => {
-                                                selected = PromptRequest { model: model_override.clone(), ..Default::default() };
-                                                match crate::client::activate(&app, &created, &mut selected) {
+                                                let mut next_selected = PromptRequest { model: model_override.clone(), ..Default::default() };
+                                                match crate::client::activate(&app, &created, &mut next_selected) {
                                                     Ok((scoped, history)) => {
+                                                        selected = next_selected;
                                                         app = scoped;
                                                         session = created;
                                                         sandbox_presets = available_sandbox_presets(&app);
@@ -1402,24 +1450,26 @@ pub(crate) async fn run_session(
                                                         ui.answer_labelled = false;
                                                         status_bar = StatusBar::from_state(&app, &session, &selected, false);
                                                         prompt_history.load(session_prompts(&history));
-                                                        display.clear_screen();
-                                                        display.output(
+                                                        display.reset_session();
+                                                        display.output_literal(
                                                             &format!("{BOLD}new session{RESET} {DIM}{} · {}{RESET}\n", session.id, session.directory),
-                                                            terminal_width(),
+                                                            width,
                                                         );
                                                     }
-                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                    Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                                 }
                                             }
-                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                         }
                                     }
                                     LocalAction::Fork => {
                                         draft.clear_text();
                                         match crate::sessions::fork(&app, &session, None).await {
                                             Ok(forked) => {
-                                                match crate::client::activate(&app, &forked, &mut selected) {
+                                                let mut next_selected = selected.clone();
+                                                match crate::client::activate(&app, &forked, &mut next_selected) {
                                                     Ok((scoped, history)) => {
+                                                        selected = next_selected;
                                                         app = scoped;
                                                         session = forked;
                                                         sandbox_presets = available_sandbox_presets(&app);
@@ -1431,30 +1481,30 @@ pub(crate) async fn run_session(
                                                         ui.answer_labelled = false;
                                                         status_bar = StatusBar::from_state(&app, &session, &selected, false);
                                                         prompt_history.load(session_prompts(&history));
-                                                        display.clear_screen();
-                                                        display.output(
+                                                        display.reset_session();
+                                                        display.output_literal(
                                                             &format!("{BOLD}forked{RESET} {DIM}{} · {}{RESET}\n", session.id, session.title),
-                                                            terminal_width(),
+                                                            width,
                                                         );
                                                         render_history(&mut display, &mut ui, &history);
                                                     }
-                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                    Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                                 }
                                             }
-                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                         }
                                     }
                                     LocalAction::Rename => {
                                         draft.clear_text();
                                         if arguments.is_empty() {
-                                            display.output(&format!("\n{YELLOW}usage: /rename <title>{RESET}\n"), terminal_width());
+                                            display.output_literal(&format!("\n{YELLOW}usage: /rename <title>{RESET}\n"), width);
                                         } else {
                                             match crate::sessions::update(&app, &session, serde_json::json!({"title": arguments})).await {
                                                 Ok(updated) => {
                                                     session = updated;
-                                                    display.output(&format!("\n{DIM}◦ title: {}{RESET}\n", clean_input(&session.title)), terminal_width());
+                                                    display.output_literal(&format!("\n{DIM}◦ title: {}{RESET}\n", clean_input(&session.title)), width);
                                                 }
-                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                             }
                                         }
                                         display.scroll_bottom();
@@ -1462,7 +1512,7 @@ pub(crate) async fn run_session(
                                     LocalAction::Revert => {
                                         draft.clear_text();
                                         if app.store.is_busy(&session.id).unwrap_or(false) {
-                                            display.output(&format!("\n{YELLOW}Stop the current turn before reverting.{RESET}\n"), terminal_width());
+                                            display.output_literal(&format!("\n{YELLOW}Stop the current turn before reverting.{RESET}\n"), width);
                                         } else {
                                             match app.store.messages(&session.id) {
                                                 Ok(messages) => {
@@ -1485,20 +1535,20 @@ pub(crate) async fn run_session(
                                                                 ui.answer_labelled = false;
                                                                 status_bar = StatusBar::from_state(&app, &session, &selected, false);
                                                                 prompt_history.load(session_prompts(&history));
-                                                                display.clear_screen();
+                                                                display.reset_session();
                                                                 render_history(&mut display, &mut ui, &history);
-                                                                display.output(&format!("\n{DIM}◦ reverted last turn{RESET}\n"), terminal_width());
+                                                                display.output_literal(&format!("\n{DIM}◦ reverted last turn{RESET}\n"), width);
                                                                 if !restored_text.is_empty() {
                                                                     draft.insert_str(&restored_text);
                                                                 }
                                                             }
-                                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                            Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                                         }
                                                     } else {
-                                                        display.output(&format!("\n{YELLOW}Nothing to revert.{RESET}\n"), terminal_width());
+                                                        display.output_literal(&format!("\n{YELLOW}Nothing to revert.{RESET}\n"), width);
                                                     }
                                                 }
-                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                             }
                                         }
                                         display.scroll_bottom();
@@ -1510,18 +1560,18 @@ pub(crate) async fn run_session(
                                             (Some("connect"), Some(name)) => {
                                                 app.wait_mcp_ready().await;
                                                 match app.mcp().connect_async(name).await {
-                                                    Ok(st) => display.output(&format!("\n{DIM}◦ mcp {name}: {}{RESET}\n", st["status"].as_str().unwrap_or("unknown")), terminal_width()),
-                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                    Ok(st) => display.output_literal(&format!("\n{DIM}◦ mcp {name}: {}{RESET}\n", st["status"].as_str().unwrap_or("unknown")), width),
+                                                    Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                                 }
                                             }
                                             (Some("disconnect"), Some(name)) => {
                                                 match app.mcp().disconnect(name) {
-                                                    Ok(_) => display.output(&format!("\n{DIM}◦ mcp {name}: disconnected{RESET}\n"), terminal_width()),
-                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                    Ok(_) => display.output_literal(&format!("\n{DIM}◦ mcp {name}: disconnected{RESET}\n"), width),
+                                                    Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                                 }
                                             }
                                             _ => {
-                                                display.output(&format_mcp_status(&app), terminal_width());
+                                                display.output_literal(&format_mcp_status(&app), width);
                                             }
                                         }
                                         display.scroll_bottom();
@@ -1544,23 +1594,23 @@ pub(crate) async fn run_session(
                                                         .filter_map(Value::as_str)
                                                         .collect();
                                                     let forced = info["forced"].as_str().map(|f| format!(" (forced: {f})")).unwrap_or_default();
-                                                    display.output(
+                                                    display.output_literal(
                                                         &format!("\n{BOLD}Sandbox{RESET}: {current}{forced}\n  Presets: {}\n", presets.join(", ")),
-                                                        terminal_width(),
+                                                        width,
                                                     );
                                                 }
-                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                             }
                                         } else if app.store.is_busy(&session.id).unwrap_or(false) {
-                                            display.output(&format!("\n{YELLOW}Stop the current turn before switching sandbox.{RESET}\n"), terminal_width());
+                                            display.output_literal(&format!("\n{YELLOW}Stop the current turn before switching sandbox.{RESET}\n"), width);
                                         } else {
                                             match crate::sessions::select_sandbox(&app, &session, &arguments) {
                                                 Ok(saved) => {
                                                     session.sandbox = Some(saved);
                                                     status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
-                                                    display.output(&format!("\n{DIM}◦ sandbox: {arguments} (applies from next turn){RESET}\n"), terminal_width());
+                                                    display.output_literal(&format!("\n{DIM}◦ sandbox: {arguments} (applies from next turn){RESET}\n"), width);
                                                 }
-                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                             }
                                         }
                                         display.scroll_bottom();
@@ -1570,22 +1620,22 @@ pub(crate) async fn run_session(
                                         match app.store.messages(&session.id) {
                                             Ok(messages) => match last_assistant_text(&messages) {
                                                 Some(reply) => match copy_text(&reply).await {
-                                                    Ok(()) => display.output(
+                                                    Ok(()) => display.output_literal(
                                                         &format!("\n{DIM}◦ copied last reply to clipboard ({} chars){RESET}\n", reply.chars().count()),
-                                                        terminal_width(),
+                                                        width,
                                                     ),
-                                                    Err(error) => display.output(&format!("\n{YELLOW}{error}{RESET}\n"), terminal_width()),
+                                                    Err(error) => display.output_literal(&format!("\n{YELLOW}{error}{RESET}\n"), width),
                                                 },
-                                                None => display.output(&format!("\n{YELLOW}No assistant reply to copy.{RESET}\n"), terminal_width()),
+                                                None => display.output_literal(&format!("\n{YELLOW}No assistant reply to copy.{RESET}\n"), width),
                                             },
-                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            Err(error) => display.output_literal(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                         }
                                         display.scroll_bottom();
                                     }
                                     LocalAction::Attach => {
                                         draft.clear_text();
                                         if arguments.is_empty() {
-                                            display.output(&format!("\n{YELLOW}usage: /attach <path>{RESET}\n"), terminal_width());
+                                            display.output_literal(&format!("\n{YELLOW}usage: /attach <path>{RESET}\n"), width);
                                         } else {
                                             match resolve_user_path(&arguments, &session.directory)
                                                 .and_then(|path| crate::attachments::from_file(&path))
@@ -1593,9 +1643,9 @@ pub(crate) async fn run_session(
                                                 Ok(attachment) => {
                                                     let name = clean_input(&attachment.filename);
                                                     draft.attachments.push(attachment);
-                                                    display.output(&format!("\n{DIM}◦ attached: {name}{RESET}\n"), terminal_width());
+                                                    display.output_literal(&format!("\n{DIM}◦ attached: {name}{RESET}\n"), width);
                                                 }
-                                                Err(error) => display.output(&format!("\n{YELLOW}{error}{RESET}\n"), terminal_width()),
+                                                Err(error) => display.output_literal(&format!("\n{YELLOW}{error}{RESET}\n"), width),
                                             }
                                         }
                                         display.scroll_bottom();
@@ -1624,7 +1674,7 @@ pub(crate) async fn run_session(
                         let (text, files) = draft.take();
                         display.user_prompt(&text, width);
                         for file in &files {
-                            display.output(
+                            display.output_literal(
                                 &format!(
                                     "{DIM}● attached: {}{RESET}\n",
                                     clean_input(&file.filename)
@@ -1662,7 +1712,7 @@ pub(crate) async fn run_session(
                                 Err(error) => Err(error),
                             };
                             if let Err(error) = result {
-                                display.output(
+                                display.output_literal(
                                     &format!("{RED}error:{RESET} {error}\n"),
                                     width,
                                 );
@@ -1830,7 +1880,7 @@ pub(crate) async fn run_session(
                             };
                             ui.completion.update_with(&draft, &ctx);
                             display.clear_screen();
-                            display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), width);
+                            display.output_literal(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), width);
                             render_history(&mut display, &mut ui, &history);
                             for pending in crate::client::pending_events(&app, &session.id) {
                                 display.apply(render_event(&mut ui, &pending, &session.id), width);
@@ -1864,6 +1914,7 @@ pub(crate) async fn run_session(
     }
     display.erase();
     display.finish_line();
+    raw.leave_alternate_screen();
     display.leave_screen();
     engine.abort_and_wait(&session.id).await;
     Ok(())

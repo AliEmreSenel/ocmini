@@ -21,7 +21,15 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
             input.push(json!({"type":"function_call_output","call_id":message["tool_call_id"],"output":output}));
             continue;
         }
-        if role == "assistant" && message["providerMetadata"]["provider"] == "openai-responses" {
+        if role == "assistant"
+            && message["providerMetadata"]["provider"] == "openai-responses"
+            && message["providerMetadata"]["model"]
+                .as_str()
+                .is_none_or(|model| model == settings.api_model)
+            && message["providerMetadata"]["providerID"]
+                .as_str()
+                .is_none_or(|id| id == settings.provider_id)
+        {
             let metadata = super::replay::replay_metadata(message)?;
             if let Some(items) = metadata["output"]
                 .as_array()
@@ -101,11 +109,18 @@ pub(super) async fn stream(
     super::stream::request::<ResponseState>(settings, req, "responses", request_body).await
 }
 
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum Channel {
+    Text,
+    ReasoningSummary,
+    ReasoningText,
+}
+
 #[derive(Default)]
 struct ResponseState {
     output: BTreeMap<u64, Value>,
     item_indices: HashMap<String, u64>,
-    delivered: HashMap<(u64, u64, bool), String>,
+    delivered: HashMap<(u64, u64, Channel), String>,
     usage: Tokens,
     terminal: bool,
     incomplete: Option<String>,
@@ -116,11 +131,11 @@ impl ResponseState {
         &mut self,
         index: u64,
         part: u64,
-        reasoning: bool,
+        channel: Channel,
         text: &str,
         complete: bool,
     ) -> Vec<ProviderEvent> {
-        let previous = self.delivered.entry((index, part, reasoning)).or_default();
+        let previous = self.delivered.entry((index, part, channel)).or_default();
         let delta = if complete {
             text.strip_prefix(previous.as_str())
                 .unwrap_or("")
@@ -132,10 +147,11 @@ impl ResponseState {
         if delta.is_empty() {
             return Vec::new();
         }
-        vec![if reasoning {
-            ProviderEvent::ReasoningDelta(delta)
-        } else {
-            ProviderEvent::TextDelta(delta)
+        vec![match channel {
+            Channel::Text => ProviderEvent::TextDelta(delta),
+            Channel::ReasoningSummary | Channel::ReasoningText => {
+                ProviderEvent::ReasoningDelta(delta)
+            }
         }]
     }
 
@@ -144,14 +160,40 @@ impl ResponseState {
             self.item_indices.insert(id.to_string(), index);
         }
         let mut events = Vec::new();
-        let reasoning = item["type"] == "reasoning";
-        if let Some(parts) = item[if reasoning { "summary" } else { "content" }].as_array() {
+        if item["type"] == "reasoning" {
+            if let Some(parts) = item["summary"].as_array() {
+                for (part, block) in parts.iter().enumerate() {
+                    if let Some(text) = block["text"].as_str() {
+                        events.extend(self.deliver(
+                            index,
+                            part as u64,
+                            Channel::ReasoningSummary,
+                            text,
+                            true,
+                        ));
+                    }
+                }
+            }
+            if let Some(parts) = item["content"].as_array() {
+                for (part, block) in parts.iter().enumerate() {
+                    if let Some(text) = block["text"].as_str() {
+                        events.extend(self.deliver(
+                            index,
+                            part as u64,
+                            Channel::ReasoningText,
+                            text,
+                            true,
+                        ));
+                    }
+                }
+            }
+        } else if let Some(parts) = item["content"].as_array() {
             for (part, block) in parts.iter().enumerate() {
                 if let Some(text) = block["text"].as_str() {
-                    events.extend(self.deliver(index, part as u64, reasoning, text, true));
+                    events.extend(self.deliver(index, part as u64, Channel::Text, text, true));
                 }
                 if let Some(text) = block["refusal"].as_str() {
-                    events.extend(self.deliver(index, part as u64, false, text, true));
+                    events.extend(self.deliver(index, part as u64, Channel::Text, text, true));
                 }
             }
         }
@@ -208,34 +250,34 @@ impl Decoder for ResponseState {
             | "response.refusal.delta"
             | "response.reasoning_summary_text.delta"
             | "response.reasoning_text.delta" => {
-                let reasoning = kind.contains("reasoning");
-                let part = value[if reasoning {
-                    "summary_index"
-                } else {
-                    "content_index"
-                }]
-                .as_u64()
-                .unwrap_or(0);
+                let (channel, field) = match kind {
+                    "response.reasoning_summary_text.delta" => {
+                        (Channel::ReasoningSummary, "summary_index")
+                    }
+                    "response.reasoning_text.delta" => (Channel::ReasoningText, "content_index"),
+                    _ => (Channel::Text, "content_index"),
+                };
+                let part = value[field].as_u64().unwrap_or(0);
                 let delta = value["delta"]
                     .as_str()
                     .ok_or("Responses text delta is not a string")?;
-                Ok(self.deliver(index, part, reasoning, delta, false))
+                Ok(self.deliver(index, part, channel, delta, false))
             }
             "response.output_text.done"
             | "response.reasoning_summary_text.done"
             | "response.reasoning_text.done" => {
-                let reasoning = kind.contains("reasoning");
-                let part = value[if reasoning {
-                    "summary_index"
-                } else {
-                    "content_index"
-                }]
-                .as_u64()
-                .unwrap_or(0);
+                let (channel, field) = match kind {
+                    "response.reasoning_summary_text.done" => {
+                        (Channel::ReasoningSummary, "summary_index")
+                    }
+                    "response.reasoning_text.done" => (Channel::ReasoningText, "content_index"),
+                    _ => (Channel::Text, "content_index"),
+                };
+                let part = value[field].as_u64().unwrap_or(0);
                 Ok(self.deliver(
                     index,
                     part,
-                    reasoning,
+                    channel,
                     value["text"].as_str().unwrap_or_default(),
                     true,
                 ))
@@ -339,7 +381,9 @@ impl Decoder for ResponseState {
                 let mut pieces: Vec<_> = self
                     .delivered
                     .iter()
-                    .filter(|((output, _, reasoning), _)| output == index && !reasoning)
+                    .filter(|((output, _, channel), _)| {
+                        output == index && *channel == Channel::Text
+                    })
                     .collect();
                 pieces.sort_by_key(|((_, part, _), _)| *part);
                 for (_, text) in pieces {

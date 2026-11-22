@@ -248,16 +248,33 @@ pub(super) fn project_messages(
                 }
             }
         }
+        let mut has_user_tail = false;
         for part in &message.parts {
             if part["ocminiInstructionPath"].is_string() {
                 if let Some(text) = part["text"].as_str() {
                     tail.push(json!({"role":"user","content":text}));
+                    has_user_tail = true;
                 }
             }
         }
         if !attachments.is_empty() {
             tail.push(json!({"role":"user","content":attachments}));
+            has_user_tail = true;
         }
+        let compatible = model.is_none_or(|model| {
+            let provider = message
+                .info
+                .provider_id
+                .as_deref()
+                .or_else(|| turn_model.as_ref().map(|m| m.0.as_str()));
+            let source_model = message
+                .info
+                .model_id
+                .as_deref()
+                .or_else(|| turn_model.as_ref().map(|m| m.1.as_str()));
+            provider.is_none_or(|id| id == model.provider_id)
+                && source_model.is_none_or(|id| id == model.model_id)
+        });
         if chat {
             let chat_run = run.get_or_insert_with(|| ChatRun {
                 model: model.cloned(),
@@ -269,20 +286,6 @@ pub(super) fn project_messages(
             for part in &calls {
                 chat_run.calls.push(json!({"id":part["callID"],"type":"function","function":{"name":part["tool"],"arguments":part["state"]["input"].to_string()}}));
             }
-            let compatible = model.is_none_or(|model| {
-                let provider = message
-                    .info
-                    .provider_id
-                    .as_deref()
-                    .or_else(|| turn_model.as_ref().map(|m| m.0.as_str()));
-                let source_model = message
-                    .info
-                    .model_id
-                    .as_deref()
-                    .or_else(|| turn_model.as_ref().map(|m| m.1.as_str()));
-                provider.is_none_or(|id| id == model.provider_id)
-                    && source_model.is_none_or(|id| id == model.model_id)
-            });
             if let Some(meta) = metadata
                 .as_ref()
                 .filter(|m| compatible && m["provider"] == "openai-chat")
@@ -305,13 +308,17 @@ pub(super) fn project_messages(
                 }
             }
             chat_run.tail.extend(tail);
+            if has_user_tail {
+                flush_chat_run(&mut out, run.take());
+            }
         } else {
-            if !text.is_empty() || !calls.is_empty() || metadata.is_some() {
+            let replay_metadata = metadata.filter(|_| compatible);
+            if !text.is_empty() || !calls.is_empty() || replay_metadata.is_some() {
                 let mut value = json!({"role":"assistant","content":if text.is_empty(){Value::Null}else{json!(text)}});
                 if !calls.is_empty() {
                     value["tool_calls"]=json!(calls.iter().map(|p|json!({"id":p["callID"],"type":"function","function":{"name":p["tool"],"arguments":p["state"]["input"].to_string()}})).collect::<Vec<_>>());
                 }
-                if let Some(metadata) = metadata {
+                if let Some(metadata) = replay_metadata {
                     value["providerMetadata"] = metadata;
                 }
                 if message

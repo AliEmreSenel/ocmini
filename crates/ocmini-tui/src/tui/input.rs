@@ -284,8 +284,10 @@ impl Draft {
         } else {
             byte_index(&self.text, hi)
         };
-        let append_ascii =
-            start == self.text.len() && text.is_ascii() && !self.text.ends_with('\r');
+        let append_ascii = start == self.text.len()
+            && text.is_ascii()
+            && !text.contains('\r')
+            && !self.text.ends_with('\r');
         self.replace(start..end, text, typing && lo == hi);
         self.cursor = if append_ascii {
             lo + text.len()
@@ -453,7 +455,7 @@ impl Draft {
             if *r == target && *c <= col {
                 caret = Some(if index >= total {
                     total
-                } else if *w > 0 && c + w <= col {
+                } else if *w > 0 && c + w <= col && l.positions[index + 1].0 == target {
                     index + 1
                 } else {
                     index
@@ -582,6 +584,8 @@ pub(super) struct History {
     entries: Vec<String>,
     /// Current navigation slot while walking; None outside history.
     index: Option<usize>,
+    /// Snapshot of the recalled entry so any edit to the draft exits history mode.
+    recalled: Option<String>,
     /// Draft text saved when entering history, restored below the newest.
     saved: String,
 }
@@ -589,16 +593,20 @@ pub(super) struct History {
 impl History {
     pub fn load(&mut self, prompts: impl IntoIterator<Item = String>) {
         self.entries.clear();
-        self.index = None;
-        self.saved.clear();
+        self.reset();
         for prompt in prompts {
             self.remember(prompt);
         }
     }
 
-    pub fn remember(&mut self, prompt: String) {
+    pub fn reset(&mut self) {
         self.index = None;
+        self.recalled = None;
         self.saved.clear();
+    }
+
+    pub fn remember(&mut self, prompt: String) {
+        self.reset();
         let text = prompt.trim();
         if text.is_empty() {
             return;
@@ -615,6 +623,9 @@ impl History {
     pub fn select(&mut self, draft: &mut Draft, delta: isize) -> bool {
         if self.entries.is_empty() {
             return false;
+        }
+        if self.index.is_some() && self.recalled.as_deref() != Some(draft.text.as_str()) {
+            self.reset();
         }
         let len = self.entries.len();
         let current = match self.index {
@@ -634,9 +645,11 @@ impl History {
         self.index = (next < len).then_some(next);
         draft.reset_undo();
         if next == len {
+            self.recalled = None;
             draft.text = std::mem::take(&mut self.saved);
         } else {
             draft.text.clone_from(&self.entries[next]);
+            self.recalled = Some(draft.text.clone());
         }
         draft.cursor = graphemes(&draft.text);
         draft.anchor = None;
@@ -708,10 +721,12 @@ pub(super) fn page_move(
     prefix: &str,
     delta: isize,
 ) {
+    let in_prompt = prompt.is_none();
     let active = super::active_draft(prompt, draft);
-    if !history.select(active, delta) {
-        active.move_row(prefix, terminal_width(), delta);
+    if in_prompt && history.select(active, delta) {
+        return;
     }
+    active.move_row(prefix, terminal_width(), delta);
 }
 
 pub(super) struct Layout {
@@ -823,15 +838,112 @@ fn layout(
     }
 }
 
-/// Length of the leading SGR/CSI escape in `text`, matching the terminator
-/// range crossterm reports. Escapes are zero-width for layout.
+fn string_escape_len(bytes: &[u8], start: usize, allow_bel: bool) -> usize {
+    let mut i = start;
+    while i < bytes.len() {
+        if allow_bel && bytes[i] == 0x07 {
+            return i + 1;
+        }
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            return i + 2;
+        }
+        if bytes[i] == 0xc2 && i + 1 < bytes.len() && bytes[i + 1] == 0x9c {
+            return i + 2;
+        }
+        if bytes[i] == b'\n' {
+            return i;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Length of the leading terminal escape sequence in `text`.
+/// Consumes strict CSI (`0x20..=0x3F` parameters/intermediates + `0x40..=0x7E`
+/// final byte), OSC, DCS/SOS/PM/APC, nF/2-byte escapes, and C1 equivalents so
+/// untrusted payloads neither reach the terminal nor leak visible garbage.
 fn escape_len(text: &str) -> Option<usize> {
-    if !text.starts_with("\x1b[") {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
         return None;
     }
-    text[2..]
-        .find(|ch: char| ('@'..='~').contains(&ch))
-        .map(|end| end + 3)
+    if bytes[0] == 0x1b {
+        if bytes.len() == 1 {
+            return Some(1);
+        }
+        return Some(match bytes[1] {
+            b'[' => {
+                let mut i = 2;
+                while i < bytes.len() && (0x20..=0x3f).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
+                    i + 1
+                } else {
+                    i
+                }
+            }
+            b']' => string_escape_len(bytes, 2, true),
+            b'P' | b'X' | b'^' | b'_' => string_escape_len(bytes, 2, false),
+            0x20..=0x2f => {
+                let mut i = 2;
+                while i < bytes.len() && (0x20..=0x2f).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() && (0x30..=0x7e).contains(&bytes[i]) {
+                    i + 1
+                } else {
+                    i
+                }
+            }
+            0x30..=0x7e => 2,
+            _ => 1,
+        });
+    }
+    let ch = text.chars().next()?;
+    let start = ch.len_utf8();
+    match ch {
+        '\u{9b}' => {
+            let mut i = start;
+            while i < bytes.len() && (0x20..=0x3f).contains(&bytes[i]) {
+                i += 1;
+            }
+            Some(if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
+                i + 1
+            } else {
+                i
+            })
+        }
+        '\u{9d}' => Some(string_escape_len(bytes, start, true)),
+        '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => Some(string_escape_len(bytes, start, false)),
+        _ => None,
+    }
+}
+
+fn push_style(style: &mut String, escape: &str) {
+    if escape == RESET {
+        style.clear();
+    } else if !style.contains(escape) {
+        style.push_str(escape);
+    }
+}
+
+fn active_style(text: &str) -> String {
+    let mut style = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(end) = escape_len(rest) {
+            let escape = &rest[..end];
+            if escape.ends_with('m') && style_ok(escape) {
+                push_style(&mut style, escape);
+            }
+            rest = &rest[end..];
+        } else {
+            let ch = rest.chars().next().unwrap();
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    style
 }
 
 /// Split one styled transcript row into display rows of at most `width`
@@ -847,11 +959,7 @@ fn wrap_row(row: &str, width: usize) -> Vec<String> {
             let escape = &rest[..end];
             if escape.ends_with('m') && style_ok(escape) {
                 out.push_str(escape);
-                if escape == RESET {
-                    style.clear();
-                } else {
-                    style.push_str(escape);
-                }
+                push_style(&mut style, escape);
             }
             rest = &rest[end..];
             continue;
@@ -862,6 +970,19 @@ fn wrap_row(row: &str, width: usize) -> Vec<String> {
             rows.push(std::mem::take(&mut out));
             out.push_str(&style);
             columns = 0;
+            continue;
+        }
+        if grapheme == "\t" {
+            let spaces = 4 - columns % 4;
+            for _ in 0..spaces {
+                if columns + 1 > width && columns > 0 {
+                    rows.push(std::mem::take(&mut out));
+                    out.push_str(&style);
+                    columns = 0;
+                }
+                out.push(' ');
+                columns += 1;
+            }
             continue;
         }
         if grapheme.chars().any(char::is_control) {
@@ -903,7 +1024,12 @@ fn styled_width(text: &str) -> usize {
         if let Some(end) = escape_len(rest) {
             rest = &rest[end..];
         } else {
-            let end = rest.find("\x1b[").unwrap_or(rest.len());
+            let mut end = rest
+                .find(|c: char| c == '\x1b' || ('\u{80}'..='\u{9f}').contains(&c))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                end = rest.chars().next().map_or(1, char::len_utf8);
+            }
             width += rest[..end].width();
             rest = &rest[end..];
         }
@@ -911,7 +1037,9 @@ fn styled_width(text: &str) -> usize {
     width
 }
 
-#[cfg(test)]
+pub(crate) fn strip_escapes(text: &str) -> String {
+    unstyled(text)
+}
 fn unstyled(text: &str) -> String {
     let mut rest = text;
     let mut plain = String::new();
@@ -1001,6 +1129,8 @@ pub(super) struct Display {
     /// Width the last repaint wrapped transcript rows at: scrolling counts
     /// display rows, so it has to wrap the same way the paint did.
     paint_width: usize,
+    /// Last output width passed to `write`, reused when `finish_line` flushes.
+    wrap_width: usize,
     /// Kind of the row being written, so the unfinished tail is hidden with it.
     tail_kind: RowKind,
     /// Ctrl+T / Ctrl+O state: which kinds are painted.
@@ -1345,6 +1475,7 @@ impl Display {
             scroll: None,
             page: 24,
             paint_width: 80,
+            wrap_width: 80,
             tail_kind: RowKind::Plain,
             visibility: Visibility::default(),
             wrapped: RefCell::new(WrappedRows::default()),
@@ -1382,14 +1513,16 @@ impl Display {
 
     pub fn finish_line(&mut self) {
         // A narrative line the stream stopped in is not lost when a tool chain,
-        // a prompt or a block interrupts it: the renderer writes the whole line
-        // out, replacing the partial rendering it owned. A row that wrapped is
-        // committed, so its text is not rendered into the tail a second time.
+        // a prompt or a block interrupts it: route the final rendered line
+        // through `write` so the escape allowlist and wrapping always apply.
         let line = self.markdown.finish();
         if self.md_row && !line.is_empty() {
             self.tail.truncate(self.md_tail);
-            self.tail.push_str(&line);
             self.columns = styled_width(&self.tail);
+            self.style = active_style(&self.tail);
+            self.md_row = false;
+            let width = self.wrap_width.max(1);
+            self.write(&line, width);
         }
         self.md_row = false;
         if self.columns > 0 {
@@ -1420,7 +1553,7 @@ impl Display {
             return;
         }
         self.ensure_blank();
-        self.output(
+        self.output_literal(
             &format!(
                 "{BOLD}{CYAN}❯ user{RESET}\n  {}\n",
                 text.replace('\n', "\n  ")
@@ -1496,10 +1629,11 @@ impl Display {
             index
         } else {
             self.active_chain = None;
-            self.finish_line();
+            self.ensure_blank();
             self.markdown.restart();
             // The block's rows print right under this anchor, so the next
             // block's separator has to survive the blank-row collapse.
+            self.printed = true;
             self.spacing.blank = false;
             let index = self.thoughts.len();
             self.thoughts.push(Thought::new(
@@ -1649,8 +1783,15 @@ impl Display {
         }
     }
 
+    #[cfg(test)]
     pub fn output(&mut self, text: &str, width: usize) {
         self.output_as(text, width, RowKind::Plain);
+    }
+
+    /// Output literal text (user prompts, permissions, questions, errors,
+    /// banners) without routing it through the Markdown parser.
+    pub fn output_literal(&mut self, text: &str, width: usize) {
+        self.output_as(text, width, RowKind::Literal);
     }
 
     /// Output one run of transcript text tagged with the toggle that can hide
@@ -1676,12 +1817,13 @@ impl Display {
         // Narrative and thinking rows are markdown. Re-render the whole line
         // for every chunk, so the row it is building is replaced rather than
         // appended: that is what lets `**bold**` style text already on screen.
-        // Tool rows keep their own formatting and print their text verbatim.
+        // Literal and tool rows keep their own formatting verbatim.
         if matches!(kind, RowKind::Plain | RowKind::Thinking) {
             let rendered = self.markdown.push(text);
             if self.md_row {
                 self.tail.truncate(self.md_tail);
                 self.columns = styled_width(&self.tail);
+                self.style = active_style(&self.tail);
             }
             // Every rendered span closes itself, so the style in effect where
             // the row starts is exactly the style the write leaves behind.
@@ -1706,6 +1848,7 @@ impl Display {
     }
 
     fn write(&mut self, text: &str, width: usize) {
+        self.wrap_width = width;
         if !is_blank_styled(text) {
             // Only consecutive tool calls belong to a group. Even when
             // thinking is collapsed, intervening messages keep their place.
@@ -1726,11 +1869,7 @@ impl Display {
                 // OSC never reaches a terminal emulator.
                 if escape.ends_with('m') && style_ok(escape) {
                     self.tail.push_str(escape);
-                    if escape == RESET {
-                        self.style.clear();
-                    } else {
-                        self.style.push_str(escape);
-                    }
+                    push_style(&mut self.style, escape);
                 }
                 rest = &rest[end..];
                 continue;
@@ -1809,17 +1948,38 @@ impl Display {
         self.columns = 0;
     }
 
-    /// Leaving full-screen mode: the transcript is printed on the primary
-    /// screen so the conversation stays in the terminal's own scrollback.
+    /// Reset transcript/markdown/scroll state when switching sessions (`Ctrl+R`).
+    /// Full-screen mode drops the old session's retained transcript; native mode
+    /// keeps terminal scrollback intact while resetting parser state.
+    pub fn reset_session(&mut self) {
+        self.lines.clear();
+        self.chains.clear();
+        self.calls.clear();
+        self.active_chain = None;
+        self.thoughts.clear();
+        self.thought_ids.clear();
+        self.spacing = Spacing::default();
+        self.markdown = Markdown::default();
+        self.md_row = false;
+        self.md_tail = 0;
+        self.committed = 0;
+        self.printed = false;
+        *self.wrapped.get_mut() = WrappedRows::default();
+        self.scroll = None;
+        self.tail.clear();
+        self.style.clear();
+        self.columns = 0;
+    }
+
+    /// Leaving full-screen mode: export the retained transcript onto the
+    /// primary screen so the conversation stays in the terminal's scrollback
+    /// without wiping prior primary-screen output. The caller leaves the
+    /// alternate screen first (via `RawMode::leave_alternate_screen`).
     pub fn leave_screen(&mut self) {
         if !self.fullscreen {
             return;
         }
         self.finish_line();
-        // Leave the alternate screen first: a transcript painted on it would
-        // disappear with it, so the conversation lands on the primary screen.
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        print!("\x1b[2J\x1b[H");
         // Export the view the user selected, with one form of each tool call.
         // Rows go through `wrap_row`, so they carry the same escape allowlist
         // and width as live output: a tool result, a fetched page or a hook
@@ -1830,19 +1990,7 @@ impl Display {
                 crate::println!("{row}{RESET}");
             }
         }
-        self.lines.clear();
-        self.chains.clear();
-        self.calls.clear();
-        self.active_chain = None;
-        self.thoughts.clear();
-        self.thought_ids.clear();
-        self.spacing = Spacing::default();
-        self.markdown = Markdown::default();
-        self.md_row = false;
-        self.committed = 0;
-        self.printed = false;
-        *self.wrapped.get_mut() = WrappedRows::default();
-        self.scroll = None;
+        self.reset_session();
     }
 
     /// Scroll the transcript window by `delta` display rows, staying attached
@@ -3520,6 +3668,50 @@ mod tests {
         assert!(display.style.is_empty());
         display.output("\x1b[1mapp styling survives\x1b[0m\n", 80);
         assert!(display.wrapped(80)[1].contains(BOLD));
+        // Unterminated or non-CSI escapes (OSC/DCS) and escapes on an
+        // unfinished line flushed via finish_line must also be stripped.
+        let mut live = Display::new(true);
+        live.output("prefix \x1b]52;c;ZXZpbA==\x07\x1bPignored\x1b\\**ok**", 80);
+        live.finish_line();
+        assert_eq!(plain(&live.wrapped(80)), ["prefix ok"]);
+        assert!(!live.wrapped(80)[0].contains("\x1b]"));
+        assert!(!live.wrapped(80)[0].contains("ZXZpbA=="));
+        assert!(!live.wrapped(80)[0].contains("ignored"));
+    }
+
+    #[test]
+    fn wrap_row_expands_tabs_and_literal_output_skips_markdown() {
+        assert_eq!(wrap_row("a\tb", 20), ["a   b"]);
+        let mut display = Display::new(true);
+        display.output_literal("# not heading **raw** `code`\n", 80);
+        assert_eq!(
+            plain(&display.wrapped(80)),
+            ["# not heading **raw** `code`"]
+        );
+        assert!(!display.wrapped(80)[0].contains(BOLD));
+        assert!(!display.wrapped(80)[0].contains(CYAN));
+    }
+
+    #[test]
+    fn soft_wrap_move_up_and_crlf_append_and_history_reset_behave_cleanly() {
+        // Caret at end of second soft-wrapped row moves onto first row, not row 1 start.
+        let mut draft = Draft::default();
+        draft.insert_str("abcdefgh");
+        draft.move_row("", 6, -1);
+        assert_eq!(draft.cursor, 3);
+        // Appending ASCII containing CRLF must not desync grapheme cursor count.
+        let mut crlf = Draft::default();
+        crlf.insert_str("a\r\nb");
+        assert_eq!(crlf.cursor, graphemes(&crlf.text));
+        // Editing a recalled history entry exits history mode instead of overwriting edits.
+        let mut history = History::default();
+        history.load(["first".into(), "second".into()]);
+        let mut recalled = Draft::default();
+        assert!(history.select(&mut recalled, -1));
+        assert_eq!(recalled.text, "second");
+        recalled.insert('!');
+        assert!(!history.select(&mut recalled, -1));
+        assert_eq!(recalled.text, "second!");
     }
 
     #[test]

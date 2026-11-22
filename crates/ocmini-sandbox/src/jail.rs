@@ -26,6 +26,20 @@ pub struct Child {
     pub control: std::os::unix::net::UnixStream,
     pub packets: Option<std::os::unix::net::UnixStream>,
 }
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+struct StackSlot(#[allow(dead_code)] [u8; 16]);
+
+unsafe fn waitpid_retry(pid: i32) -> i32 {
+    loop {
+        let rc = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        if rc < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+            continue;
+        }
+        return rc;
+    }
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         unsafe {
@@ -36,7 +50,7 @@ impl Drop for Child {
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
             );
-            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+            waitpid_retry(self.pid);
         }
     }
 }
@@ -147,7 +161,7 @@ pub fn probe(policy: &Policy) -> Result<(), String> {
             .open("/dev/net/tun")
             .map_err(|e| format!("/dev/net/tun: {e}"))?;
     }
-    let mut stack = vec![0u8; 64 * 1024];
+    let mut stack = vec![StackSlot([0; 16]); (64 * 1024) / 16];
     extern "C" fn exit_probe(_: *mut libc::c_void) -> i32 {
         unsafe { libc::_exit(0) }
     }
@@ -178,7 +192,7 @@ pub fn probe(policy: &Policy) -> Result<(), String> {
             io::Error::last_os_error()
         ));
     }
-    if unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) } < 0 {
+    if unsafe { waitpid_retry(pid) } < 0 {
         return Err(io::Error::last_os_error().to_string());
     }
     Ok(())
@@ -365,6 +379,14 @@ fn spawn_inner(
     // A private /tmp must not hide explicitly granted projects/toolchains or
     // machinery directories stored under /tmp (including common test setups).
     if spec.policy.tmp {
+        let directory = spec.directory.canonicalize()?;
+        let readable: Vec<PathBuf> = spec
+            .policy
+            .fs
+            .readable
+            .iter()
+            .map(|p| p.canonicalize())
+            .collect::<io::Result<_>>()?;
         let writable: Vec<PathBuf> = spec
             .policy
             .fs
@@ -400,9 +422,7 @@ fn spawn_inner(
                 continue;
             }
             // Only restore a working directory if the policy already grants it.
-            if path == spec.directory
-                && !spec.policy.fs.readable.iter().any(|r| path.starts_with(r))
-            {
+            if path == directory && !readable.iter().any(|r| path.starts_with(r)) {
                 continue;
             }
             mounts.push(Mount {
@@ -422,26 +442,34 @@ fn spawn_inner(
         }
     }
     if spec.policy.network.mode != NetMode::Host {
-        let resolver = spec.scratch.join("resolv.conf");
-        scratch_file(
-            &scratch,
-            c"resolv.conf",
-            if spec.policy.network.mode.mediated() {
-                b"nameserver 198.18.0.2\noptions ndots:0\n"
-            } else {
-                b"nameserver 127.0.0.1\noptions ndots:0\n"
-            },
-        )?;
-        // Resolve the host symlink before mounts (e.g. systemd-resolved).
-        mounts.push(Mount {
-            mask: false,
-            ensure: false,
-            file: false,
-            source: cstr(resolver.as_os_str())?,
-            target: cstr(std::fs::canonicalize("/etc/resolv.conf")?.as_os_str())?,
-            kind: None,
-            flags: libc::MS_BIND,
-        });
+        match std::fs::canonicalize("/etc/resolv.conf") {
+            Ok(target) => {
+                let resolver = spec.scratch.join("resolv.conf");
+                scratch_file(
+                    &scratch,
+                    c"resolv.conf",
+                    if spec.policy.network.mode.mediated() {
+                        b"nameserver 198.18.0.2\noptions ndots:0\n"
+                    } else {
+                        b"nameserver 127.0.0.1\noptions ndots:0\n"
+                    },
+                )?;
+                // Resolve the host symlink before mounts (e.g. systemd-resolved).
+                mounts.push(Mount {
+                    mask: false,
+                    ensure: false,
+                    file: false,
+                    source: cstr(resolver.as_os_str())?,
+                    target: cstr(target.as_os_str())?,
+                    kind: None,
+                    flags: libc::MS_BIND | libc::MS_RDONLY,
+                });
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    && !spec.policy.network.mode.mediated() => {}
+            Err(err) => return Err(err),
+        }
     }
     if !spec.policy.fs.hide.is_empty() {
         let empty_dir = spec.scratch.join("mask-dir");
@@ -455,7 +483,7 @@ fn spawn_inner(
             source: cstr("tmpfs")?,
             target: cstr(empty_dir.as_os_str())?,
             kind: Some(cstr("tmpfs")?),
-            flags: libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            flags: libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY,
         });
         let mut hidden = spec
             .policy
@@ -482,7 +510,7 @@ fn spawn_inner(
                 source: cstr(source.as_os_str())?,
                 target: cstr(target.as_os_str())?,
                 kind: None,
-                flags: libc::MS_BIND,
+                flags: libc::MS_BIND | libc::MS_RDONLY,
             });
             masked.push(target);
         }
@@ -564,7 +592,7 @@ fn spawn_inner(
         .map(|s| s.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
-    let mut stack = vec![0u8; 1024 * 1024];
+    let mut stack = vec![StackSlot([0; 16]); (1024 * 1024) / 16];
     let flags = libc::CLONE_NEWUSER
         | libc::CLONE_NEWNS
         | libc::SIGCHLD
@@ -595,7 +623,7 @@ fn spawn_inner(
         Err(e) => {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                waitpid_retry(pid);
             }
             return Err(e);
         }
@@ -604,7 +632,7 @@ fn spawn_inner(
     std::fs::File::from(error_read).read_to_end(&mut error)?;
     if !error.is_empty() {
         unsafe {
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            waitpid_retry(pid);
         }
         return Err(io::Error::other(format!(
             "jail boot stage {}: {}",
@@ -783,16 +811,42 @@ impl Boot {
                     libc::close(self.trees[mount_index]);
                     continue;
                 }
+                let stage = (20 + mount_index).min(255) as u8;
+                let bind_rdonly =
+                    mount.flags & libc::MS_BIND != 0 && mount.flags & libc::MS_RDONLY != 0;
                 self.check(
-                    (20 + mount_index).min(255) as u8,
+                    stage,
                     libc::mount(
                         mount.source.as_ptr(),
                         mount.target.as_ptr(),
                         mount.kind.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                        mount.flags,
+                        if bind_rdonly {
+                            mount.flags & !libc::MS_RDONLY
+                        } else {
+                            mount.flags
+                        },
                         std::ptr::null(),
                     ) as _,
                 );
+                if bind_rdonly {
+                    let attr = libc::mount_attr {
+                        attr_set: libc::MOUNT_ATTR_RDONLY,
+                        attr_clr: 0,
+                        propagation: 0,
+                        userns_fd: 0,
+                    };
+                    self.check(
+                        stage,
+                        libc::syscall(
+                            libc::SYS_mount_setattr,
+                            libc::AT_FDCWD,
+                            mount.target.as_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
+                            &attr,
+                            std::mem::size_of::<libc::mount_attr>(),
+                        ),
+                    );
+                }
                 if !self.command
                     && mount
                         .kind
@@ -834,16 +888,41 @@ impl Boot {
             // Network bootstrap needs the fresh proc sysctls; apply user masks
             // afterwards, before Landlock and all model-requested work.
             for mount in self.mounts.iter().filter(|m| m.mask) {
+                let bind_rdonly =
+                    mount.flags & libc::MS_BIND != 0 && mount.flags & libc::MS_RDONLY != 0;
                 self.check(
                     2,
                     libc::mount(
                         mount.source.as_ptr(),
                         mount.target.as_ptr(),
                         mount.kind.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                        mount.flags,
+                        if bind_rdonly {
+                            mount.flags & !libc::MS_RDONLY
+                        } else {
+                            mount.flags
+                        },
                         std::ptr::null(),
                     ) as _,
                 );
+                if bind_rdonly {
+                    let attr = libc::mount_attr {
+                        attr_set: libc::MOUNT_ATTR_RDONLY,
+                        attr_clr: 0,
+                        propagation: 0,
+                        userns_fd: 0,
+                    };
+                    self.check(
+                        2,
+                        libc::syscall(
+                            libc::SYS_mount_setattr,
+                            libc::AT_FDCWD,
+                            mount.target.as_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
+                            &attr,
+                            std::mem::size_of::<libc::mount_attr>(),
+                        ),
+                    );
+                }
             }
 
             for rule in &self.rules {

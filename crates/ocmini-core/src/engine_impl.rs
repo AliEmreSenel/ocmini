@@ -349,7 +349,7 @@ impl Engine {
                         .and_then(SessionSlot::active)
                         .is_some_and(|s| s.preserve_pending)
                     {
-                        None
+                        app.store.pause_pending(&sid).err()
                     } else {
                         app.store.cancel_pending(&sid).err()
                     };
@@ -443,7 +443,7 @@ impl Engine {
                 "cancelled"
             } else if let Err(error) = &value {
                 error.kind.as_str()
-            } else if app.store.has_waiting(&sid).unwrap_or(false) {
+            } else if app.store.has_steering(&sid).unwrap_or(false) {
                 "steered"
             } else {
                 "completed"

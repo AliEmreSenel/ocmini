@@ -4,6 +4,7 @@ use serde_json::Value;
 pub enum FailureKind {
     Error,
     Invalid,
+    SandboxRefused,
     NotFound,
     Busy,
     Cancelled,
@@ -15,9 +16,12 @@ pub enum FailureKind {
 impl FailureKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Error | Self::Invalid | Self::NotFound | Self::Busy | Self::HookReentry => {
-                "error"
-            }
+            Self::Error
+            | Self::Invalid
+            | Self::SandboxRefused
+            | Self::NotFound
+            | Self::Busy
+            | Self::HookReentry => "error",
             Self::Cancelled => "cancelled",
             Self::HookRejected => "hook_rejected",
             Self::HookLimit => "hook_limit",
@@ -35,6 +39,9 @@ pub struct OperationError {
 impl OperationError {
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(FailureKind::Invalid, message)
+    }
+    pub fn sandbox_refused(message: impl Into<String>) -> Self {
+        Self::new(FailureKind::SandboxRefused, message)
     }
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(FailureKind::NotFound, message)

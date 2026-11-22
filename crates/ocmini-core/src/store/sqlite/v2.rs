@@ -106,19 +106,22 @@ impl SqliteBackend {
             if let Some(id)=boundary {
                 let row:i64=tx.query_row("SELECT rowid FROM message WHERE session_id=?1 AND id=?2",params![sid,id],|r|r.get(0)).optional()?.ok_or_else(||OperationError::not_found("Revert message not found"))?;
                 tx.execute("DELETE FROM message WHERE session_id=?1 AND rowid>=?2",params![sid,row])?;
-                tx.execute("DELETE FROM inbox WHERE session_id=?1 AND message_id NOT IN(SELECT id FROM message)",[sid])?;
+                tx.execute("DELETE FROM inbox WHERE session_id=?1 AND message_id NOT IN(SELECT id FROM message WHERE session_id=?1)",[sid])?;
+                tx.execute("DELETE FROM hook_turn WHERE session_id=?1 AND message_id NOT IN(SELECT id FROM message WHERE session_id=?1)",[sid])?;
+                tx.execute("DELETE FROM hook_admission WHERE session_id=?1 AND message_id NOT IN(SELECT id FROM message WHERE session_id=?1)",[sid])?;
+                tx.execute("DELETE FROM hook_pending_events WHERE session_id=?1 AND message_id NOT IN(SELECT id FROM message WHERE session_id=?1)",[sid])?;
             }
             tx.execute("UPDATE v2_state SET json=json_remove(json,'$.revert') WHERE session_id=?1",[sid])?;
             Ok(())
         })
     }
     pub fn v2_move(&self, sid: &str, directory: &str) -> Result<(), OperationError> {
-        let mut session = self
-            .get_session(sid)?
-            .ok_or_else(|| OperationError::not_found("Session not found"))?;
-        session.directory = directory.into();
-        session.path = directory.into();
-        self.update_session(&session)?;
+        self.mutate_session(sid, |session| {
+            session.directory = directory.into();
+            session.path = directory.into();
+            Ok(true)
+        })?
+        .ok_or_else(|| OperationError::not_found("Session not found"))?;
         self.scopes.lock().unwrap().remove(sid);
         Ok(())
     }
@@ -206,11 +209,14 @@ impl SqliteBackend {
         value: Option<&Value>,
     ) -> Result<(), OperationError> {
         self.transaction(|tx| {
-            let raw: String = tx.query_row(
-                "SELECT json FROM v2_state WHERE session_id=?1",
-                [sid],
-                |r| r.get(0),
-            )?;
+            let raw: String = tx
+                .query_row(
+                    "SELECT json FROM v2_state WHERE session_id=?1",
+                    [sid],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| OperationError::not_found("Session not found"))?;
             let mut state: Value = serde_json::from_str(&raw).map_err(data_error)?;
             if !state["instructions"].is_object() {
                 state["instructions"] = json!({});

@@ -57,12 +57,18 @@ pub mod config {
     pub use crate::frontmatter::markdown_frontmatter;
     use std::path::{Component, Path, PathBuf};
     pub fn data_home() -> String {
-        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-            format!(
-                "{}/.local/share",
-                std::env::var("HOME").unwrap_or_else(|_| ".".into())
-            )
-        })
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/.local/share",
+                    std::env::var("HOME")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| ".".into())
+                )
+            })
     }
     pub fn normalize_path(path: &Path) -> PathBuf {
         let mut out = PathBuf::new();

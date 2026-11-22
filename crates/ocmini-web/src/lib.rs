@@ -344,11 +344,58 @@ fn binary(prefix: &[u8]) -> bool {
         || std::str::from_utf8(prefix).is_err_and(|error| error.error_len().is_some())
 }
 
+fn content_disposition(path: &Path) -> HeaderValue {
+    let raw = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let sanitized: String = raw
+        .chars()
+        .filter(|&c| c.is_ascii_graphic() || c == ' ')
+        .map(|c| match c {
+            '"' | '\\' | '/' | ';' => '_',
+            _ => c,
+        })
+        .collect();
+    let filename = sanitized.trim();
+    let filename = if filename.is_empty() {
+        "download"
+    } else {
+        filename
+    };
+    HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"))
+}
+
+/// Canonicalizes only the parent directory so symlink renames and deletes
+/// operate on the link itself (including dangling links) rather than its target.
+fn entry_target(path: &Path) -> Result<PathBuf> {
+    let normalized = ocmini_core::config::normalize_path(path);
+    let name = normalized
+        .file_name()
+        .ok_or_else(|| WebError::invalid("path must name a file or directory"))?;
+    let parent = normalized
+        .parent()
+        .ok_or_else(|| WebError::invalid("path must have a parent directory"))?;
+    let parent = changes::target(parent)?;
+    Ok(parent.join(name))
+}
+
 /// Streams a file so a large one is not buffered in server memory. Binary
 /// files are refused unless `raw` is set, since the editor only handles text.
 /// `If-None-Match` with the loaded version answers 304 without reading.
 async fn read(headers: HeaderMap, Query(query): Query<PathQuery>) -> Result<Response> {
     let path = absolute(&query.path)?;
+    // Check metadata before opening so FIFOs and devices cannot block File::open.
+    let pre_meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| WebError::io(&path, e))?;
+    if !pre_meta.is_file() {
+        return Err(WebError::invalid(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
     let mut file = tokio::fs::File::open(&path)
         .await
         .map_err(|e| WebError::io(&path, e))?;
@@ -403,6 +450,10 @@ async fn read(headers: HeaderMap, Query(query): Query<PathQuery>) -> Result<Resp
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(kind)),
             (
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ),
+            (
                 header::HeaderName::from_static("x-ocmini-version"),
                 revision,
             ),
@@ -416,14 +467,9 @@ async fn read(headers: HeaderMap, Query(query): Query<PathQuery>) -> Result<Resp
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("sandbox"),
         );
-        response.headers_mut().insert(
-            header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        );
-        response.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            HeaderValue::from_static("attachment"),
-        );
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, content_disposition(&path));
     }
     Ok(response)
 }
@@ -503,17 +549,23 @@ struct RenameBody {
 }
 
 async fn rename(Json(body): Json<RenameBody>) -> Result<StatusCode> {
-    let from = changes::target(&absolute(&body.from)?)?;
-    let to = changes::target(&absolute(&body.to)?)?;
+    let from = entry_target(&absolute(&body.from)?)?;
+    let to = entry_target(&absolute(&body.to)?)?;
     let guards = locked(&[from.clone(), to.clone()]).await?;
     let result = blocking(move || {
+        from.symlink_metadata()
+            .map_err(|e| WebError::io(&from, e))?;
         // std::fs::rename replaces an existing file; the browser asks for a move.
-        if to.symlink_metadata().is_ok() {
-            return Err(WebError::new(
-                StatusCode::CONFLICT,
-                "FileExistsError",
-                format!("{} already exists", to.display()),
-            ));
+        match to.symlink_metadata() {
+            Ok(_) => {
+                return Err(WebError::new(
+                    StatusCode::CONFLICT,
+                    "FileExistsError",
+                    format!("{} already exists", to.display()),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WebError::io(&to, error)),
         }
         std::fs::rename(&from, &to).map_err(|e| WebError::io(&from, e))?;
         Ok(StatusCode::NO_CONTENT)
@@ -525,8 +577,8 @@ async fn rename(Json(body): Json<RenameBody>) -> Result<StatusCode> {
 
 /// Deletes a file, a link (not its target) or a directory tree.
 async fn remove(Json(body): Json<PathBody>) -> Result<StatusCode> {
-    let path = absolute(&body.path)?;
-    let guards = locked(std::slice::from_ref(&changes::target(&path)?)).await?;
+    let path = entry_target(&absolute(&body.path)?)?;
+    let guards = locked(std::slice::from_ref(&path)).await?;
     let result = blocking(move || {
         let meta = path
             .symlink_metadata()
@@ -597,18 +649,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff"
+            );
             if raw {
                 assert_eq!(
                     response.headers()[header::CONTENT_SECURITY_POLICY],
                     "sandbox"
                 );
                 assert_eq!(
-                    response.headers()[header::X_CONTENT_TYPE_OPTIONS],
-                    "nosniff"
-                );
-                assert_eq!(
                     response.headers()[header::CONTENT_DISPOSITION],
-                    "attachment"
+                    "attachment; filename=\"test.html\""
                 );
             } else {
                 assert_eq!(
@@ -866,5 +918,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(miss.status(), StatusCode::OK);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_and_delete_operate_on_symlinks_including_dangling_ones() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("real.txt");
+        std::fs::write(&target, "keep me").unwrap();
+        let link = root.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+        let moved_link = root.path().join("renamed-link.txt");
+
+        let (status, _) = call(
+            "POST",
+            "/web/api/fs/rename",
+            Some(json!({"from": link, "to": moved_link})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            target.exists(),
+            "renaming a symlink must not move its target"
+        );
+        assert!(moved_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let dangling = root.path().join("dangling");
+        let moved_dangling = root.path().join("dangling-moved");
+        symlink(root.path().join("missing-target"), &dangling).unwrap();
+        let (status, _) = call(
+            "POST",
+            "/web/api/fs/rename",
+            Some(json!({"from": dangling, "to": moved_dangling})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(moved_dangling
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let (status, _) = call(
+            "POST",
+            "/web/api/fs/delete",
+            Some(json!({"path": moved_dangling})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(moved_dangling.symlink_metadata().is_err());
     }
 }

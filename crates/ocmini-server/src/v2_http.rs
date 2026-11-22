@@ -1,7 +1,7 @@
 use crate::{config::Config, engine::App, server::AppState, types::*};
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -22,15 +22,23 @@ type Result<T> = std::result::Result<T, Error>;
 impl From<OperationError> for Error {
     fn from(error: OperationError) -> Self {
         let (status, tag) = match error.kind {
-            FailureKind::Invalid => (StatusCode::BAD_REQUEST, "InvalidRequestError"),
-            FailureKind::NotFound => (StatusCode::NOT_FOUND, "SessionNotFoundError"),
+            FailureKind::Invalid | FailureKind::SandboxRefused => {
+                (StatusCode::BAD_REQUEST, "InvalidRequestError")
+            }
+            FailureKind::NotFound => (StatusCode::NOT_FOUND, "NotFoundError"),
             FailureKind::Busy => (StatusCode::CONFLICT, "SessionBusyError"),
+            FailureKind::HookReentry => (StatusCode::CONFLICT, "HookReentryError"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "UnknownError"),
         };
         Self {
             status,
-            value: json!({"_tag":tag,"message":error.message,"sessionID":""}),
+            value: json!({"_tag":tag,"message":error.message}),
         }
+    }
+}
+impl From<crate::error::HttpError> for Error {
+    fn from(error: crate::error::HttpError) -> Self {
+        OperationError::new(error.kind, error.message).into()
     }
 }
 impl IntoResponse for Error {
@@ -162,9 +170,16 @@ async fn events(
     let types: Vec<String> = query
         .into_iter()
         .filter(|(key, _)| key == "types")
-        .flat_map(|(_, value)| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .flat_map(|(_, value)| {
+            value
+                .split(',')
+                .map(|part| part.trim().to_owned())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+        })
         .collect();
     let stream = async_stream::stream! {
+        // Always emit the initial server.connected handshake even when ?types= filters events.
         yield Ok::<Event,std::io::Error>(Event::default().data(json!({"id":hex_id("evt_"),"created":now_ms(),"type":"server.connected","data":{}}).to_string()));
         loop {
             tokio::select! {
@@ -180,9 +195,16 @@ async fn events(
             }
         }
     };
-    Ok(Sse::new(stream)
+    let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
-        .into_response())
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(response)
 }
 async fn catalog(st: &AppState, dir: &str) -> Result<Config> {
     let config = Config::load_for(dir).map_err(OperationError::invalid)?;
@@ -354,9 +376,11 @@ async fn skills(Query(query): Query<HashMap<String, String>>) -> Result<Json<Val
         let path = skill["location"]
             .as_str()
             .ok_or_else(|| invalid("Skill location missing"))?;
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| OperationError::from(e.to_string()))?;
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(OperationError::from(error.to_string()).into()),
+        };
         list.push(json!({"id":skill["name"],"name":skill["name"],"description":skill["description"].as_str().unwrap_or_default(),"path":path,"content":content}));
     }
     Ok(located(&dir, json!(list)))
@@ -429,6 +453,13 @@ async fn list(
         .collect();
     Ok(Json(json!({"data":data,"cursor":cursors})))
 }
+fn agent_available(cfg: &Config, agent: &str) -> bool {
+    if cfg.agent.get(agent).is_some_and(|a| a["disable"] == true) {
+        return false;
+    }
+    ["build", "plan", "general", "explore"].contains(&agent) || cfg.agent.contains_key(agent)
+}
+
 async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<Json<Value>> {
     if !body.is_object() {
         return Err(invalid("Session body must be an object"));
@@ -452,9 +483,7 @@ async fn create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<J
         .transpose()?;
     if let Some(agent) = agent {
         let cfg = Config::load_for(&dir).map_err(OperationError::invalid)?;
-        if !["build", "plan", "general", "explore"].contains(&agent)
-            && !cfg.agent.contains_key(agent)
-        {
+        if !agent_available(&cfg, agent) {
             return Err(invalid("Unknown agent"));
         }
     }
@@ -515,7 +544,7 @@ async fn session(State(st): State<AppState>, Path(sid): Path<String>) -> Result<
     Ok(data(wire::session(&s, &st.app.store.v2_state(&sid)?)))
 }
 async fn active(State(st): State<AppState>) -> Json<Value> {
-    let statuses = st.app.statuses.lock().unwrap();
+    let statuses = st.app.statuses.lock().unwrap_or_else(|e| e.into_inner());
     let active: serde_json::Map<_, _> = statuses
         .keys()
         .map(|s| (s.clone(), json!({"type":"running"})))
@@ -555,25 +584,23 @@ async fn update(
 }
 async fn remove(State(st): State<AppState>, Path(sid): Path<String>) -> Result<StatusCode> {
     let session = required(&st, &sid)?;
-    let mut ids = vec![sid];
-    let mut pos = 0;
-    while pos < ids.len() {
-        ids.extend(st.app.store.children(&ids[pos])?.into_iter().map(|c| c.id));
-        pos += 1;
-    }
-    for id in &ids {
-        st.engine.abort(id);
-    }
-    for id in ids.into_iter().rev() {
-        // Runtime cancellation owns tool cleanup; do not erase active effects.
-        st.engine.wait_idle(&id).await;
-        for pending in st.app.store.v2_inbox(&id)? {
-            if let Some(mid) = pending["id"].as_str() {
-                st.app.store.v2_cancel_input(&id, mid)?;
+    let st_stop = st.clone();
+    crate::sessions::delete_stopping(&st.app, &session, move |ids| async move {
+        for id in &ids {
+            st_stop.engine.abort(id);
+        }
+        for id in ids.into_iter().rev() {
+            // Runtime cancellation owns tool cleanup; do not erase active effects.
+            st_stop.engine.wait_idle(&id).await;
+            for pending in st_stop.app.store.v2_inbox(&id)? {
+                if let Some(mid) = pending["id"].as_str() {
+                    st_stop.app.store.v2_cancel_input(&id, mid)?;
+                }
             }
         }
-    }
-    crate::sessions::delete(&st.app, &session).await?;
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn select_model(
@@ -604,7 +631,7 @@ async fn select_agent(
     let s = required(&st, &sid)?;
     let agent = wire::string(&body, "agent")?;
     let cfg = Config::load_for(&s.directory).map_err(OperationError::invalid)?;
-    if !["build", "plan", "general", "explore"].contains(&agent) && !cfg.agent.contains_key(agent) {
+    if !agent_available(&cfg, agent) {
         return Err(invalid("Unknown agent"));
     }
     st.app.store.v2_transition(
@@ -641,12 +668,14 @@ fn input(body: &Value, kind: &str, payload: Value) -> Result<Input> {
     })
 }
 async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Json<Value>> {
-    let s = required(st, sid)?;
-    let state = st.app.store.v2_state(sid)?;
-    if let Some(boundary) = state["revert"]["messageID"].as_str() {
-        st.app.store.v2_revert(sid, Some(boundary))?;
+    if !body.is_object() {
+        return Err(invalid("Prompt body must be an object"));
     }
-    if let Some(id) = body["id"].as_str() {
+    let s = required(st, sid)?;
+    let requested_id = optional(body, "id")
+        .map(|v| v.as_str().ok_or_else(|| invalid("id must be a string")))
+        .transpose()?;
+    if let Some(id) = requested_id {
         if let Some(existing) = st.app.store.message(sid, id)? {
             if existing.info.role != "user"
                 || existing
@@ -683,8 +712,9 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
             } else {
                 let mime = uri
                     .strip_prefix("data:")
-                    .and_then(|s| s.split_once(';'))
-                    .map(|s| s.0)
+                    .and_then(|s| s.split_once(','))
+                    .map(|(meta, _)| meta.split(';').next().unwrap_or_default().trim())
+                    .filter(|s| !s.is_empty())
                     .unwrap_or("application/octet-stream");
                 json!({"type":"file","url":uri,"filename":name,"mime":mime})
             };
@@ -716,9 +746,7 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
             parts.push(json!({"type":"ocmini_skill","skill":id,"text":content,"synthetic":true}));
         }
     }
-    let id = optional(body, "id")
-        .map(|v| v.as_str().ok_or_else(|| invalid("id must be a string")))
-        .transpose()?
+    let id = requested_id
         .map(str::to_owned)
         .unwrap_or_else(|| hex_id("msg_"));
     let request = PromptRequest {
@@ -731,6 +759,10 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
         )?),
         ..Default::default()
     };
+    let state = st.app.store.v2_state(sid)?;
+    if let Some(boundary) = state["revert"]["messageID"].as_str() {
+        st.app.store.v2_revert(sid, Some(boundary))?;
+    }
     let receiver = st.engine.admit(st.app.clone(), sid.into(), request).await?;
     drop(receiver);
     let message = st
@@ -759,18 +791,20 @@ async fn command(
     Path(sid): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode> {
-    let s = required(&st, &sid)?;
-    let state = st.app.store.v2_state(&sid)?;
-    if let Some(boundary) = state["revert"]["messageID"].as_str() {
-        st.app.store.v2_revert(&sid, Some(boundary))?;
+    if !body.is_object() {
+        return Err(invalid("Command body must be an object"));
     }
+    let s = required(&st, &sid)?;
     let cfg = Config::load_for(&s.directory).map_err(OperationError::invalid)?;
     let name = wire::string(&body, "name")?;
     let text = optional(&body, "text")
         .map(|v| v.as_str().ok_or_else(|| invalid("text must be a string")))
         .transpose()?
         .unwrap_or("");
-    let request = crate::commands::prepare(
+    if !cfg.command.contains_key(name) {
+        return Err(missing("CommandNotFoundError", &sid, "command", name));
+    }
+    let mut request = crate::commands::prepare(
         &cfg,
         name,
         text,
@@ -781,6 +815,16 @@ async fn command(
         None,
     )
     .map_err(OperationError::invalid)?;
+    if let Some(expanded) = request.parts.first().and_then(|part| part["text"].as_str()) {
+        let expanded = expanded.to_owned();
+        if let Some(v2) = request.v2.as_mut() {
+            v2.payload["text"] = json!(expanded);
+        }
+    }
+    let state = st.app.store.v2_state(&sid)?;
+    if let Some(boundary) = state["revert"]["messageID"].as_str() {
+        st.app.store.v2_revert(&sid, Some(boundary))?;
+    }
     drop(st.engine.admit(st.app.clone(), sid, request).await?);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -871,8 +915,13 @@ async fn interrupt(
     }
     Ok(Json(json!({"interrupted":interrupted})))
 }
-async fn wait(State(st): State<AppState>, Path(sid): Path<String>) -> Result<StatusCode> {
-    required(&st, &sid)?;
+async fn wait(
+    State(st): State<AppState>,
+    Path(sid): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
+    let session = required(&st, &sid)?;
+    crate::server::reject_hook_reentry(&st, &session, &headers)?;
     st.engine.wait_idle(&sid).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -921,6 +970,8 @@ struct Cursor {
     session: String,
     after: i64,
     descending: bool,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    filter_type: Option<String>,
 }
 const MESSAGE_TYPES: &[&str] = &[
     "agent-switched",
@@ -948,11 +999,11 @@ async fn messages(
             return Err(invalid("order must be asc or desc"));
         }
     }
-    let filter_type = query
+    let mut filter_type = query
         .get("type")
         .map(|kind| {
             if MESSAGE_TYPES.contains(&kind.as_str()) {
-                Ok(kind.as_str())
+                Ok(kind.clone())
             } else {
                 Err(invalid("Invalid message type filter"))
             }
@@ -976,8 +1027,17 @@ async fn messages(
                 value: json!({"_tag":"InvalidCursorError","message":"Cursor belongs to another session"}),
             });
         }
+        if let Some(kind) = cursor.filter_type.as_deref() {
+            if !MESSAGE_TYPES.contains(&kind) {
+                return Err(Error {
+                    status: StatusCode::BAD_REQUEST,
+                    value: json!({"_tag":"InvalidCursorError","message":"Invalid message cursor"}),
+                });
+            }
+        }
         after = Some(cursor.after);
         descending = cursor.descending;
+        filter_type = cursor.filter_type;
     }
     let limit = query
         .get("limit")
@@ -1002,7 +1062,7 @@ async fn messages(
             let Some(projected) = wire::message(&m) else {
                 continue;
             };
-            if let Some(kind) = filter_type {
+            if let Some(kind) = filter_type.as_deref() {
                 if projected["type"].as_str() != Some(kind) {
                     continue;
                 }
@@ -1025,6 +1085,7 @@ async fn messages(
                     session: sid,
                     after,
                     descending,
+                    filter_type,
                 })
                 .expect("cursor JSON"),
             )
@@ -1075,6 +1136,30 @@ async fn session_context(
         .collect();
     Ok(data(json!(projected)))
 }
+fn last_public_message_id(st: &AppState, sid: &str) -> Result<Option<String>> {
+    let pending: std::collections::HashSet<String> = st
+        .app
+        .store
+        .v2_inbox(sid)?
+        .into_iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut scan_after = None;
+    loop {
+        let rows = st.app.store.v2_page(sid, scan_after, true, 50)?;
+        let fetched_more = rows.len() > 50;
+        let page_len = rows.len();
+        for (seq, m) in rows {
+            scan_after = Some(seq);
+            if !pending.contains(&m.info.id) && wire::message(&m).is_some() {
+                return Ok(Some(m.info.id));
+            }
+        }
+        if !fetched_more || page_len == 0 {
+            return Ok(None);
+        }
+    }
+}
 async fn fork(
     State(st): State<AppState>,
     Path(sid): Path<String>,
@@ -1082,13 +1167,13 @@ async fn fork(
 ) -> Result<Json<Value>> {
     let s = required(&st, &sid)?;
     let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    if !body.is_object() {
+        return Err(invalid("Fork body must be an object"));
+    }
     let before = optional(&body, "before")
         .map(|v| v.as_str().ok_or_else(|| invalid("before must be a string")))
         .transpose()?;
-    let mut fork = crate::sessions::fork(&st.app, &s, before).await?;
-    fork.cost = 0.0;
-    fork.tokens = Tokens::default();
-    st.app.store.update_session(&fork)?;
+    let fork = crate::sessions::fork_v2(&st.app, &s, before).await?;
     st.app.v2.enable(&fork.id)?;
     let mut state = st.app.store.v2_state(&sid)?;
     state.as_object_mut().unwrap().remove("revert");
@@ -1097,13 +1182,7 @@ async fn fork(
     state.as_object_mut().unwrap().remove("idle");
     let boundary_id = match before {
         Some(id) => id.to_owned(),
-        None => st
-            .app
-            .store
-            .messages_limited(&sid, Some(1))?
-            .last()
-            .map(|m| m.info.id.clone())
-            .unwrap_or_default(),
+        None => last_public_message_id(&st, &sid)?.unwrap_or_default(),
     };
     state["fork"] = json!({"sessionID":sid,"boundary":{"type":if before.is_some(){"before"}else{"through"},"messageID":boundary_id}});
     st.app.store.v2_update(&fork.id, &state)?;
@@ -1183,6 +1262,7 @@ async fn permission_requests(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
     let dir = directory(&query)?;
+    let target = crate::config::directory_identity(std::path::Path::new(&dir));
     let list: Vec<_> = st
         .app
         .perms
@@ -1192,7 +1272,9 @@ async fn permission_requests(
             st.app
                 .store
                 .directory_of(&p.session_id)
-                .is_some_and(|session_dir| session_dir == dir)
+                .is_some_and(|session_dir| {
+                    crate::config::directory_identity(std::path::Path::new(&session_dir)) == target
+                })
         })
         .map(|p| wire::permission(&p))
         .collect();
@@ -1241,7 +1323,7 @@ async fn forms(State(st): State<AppState>, Path(sid): Path<String>) -> Result<Js
 }
 fn question(st: &AppState, sid: &str, id: &str) -> Result<QuestionRequest> {
     required(st, sid)?;
-    let legacy = format!("que_{}", id.trim_start_matches("frm_"));
+    let legacy = format!("que_{}", id.strip_prefix("frm_").unwrap_or(id));
     st.app
         .questions
         .list()
@@ -1284,7 +1366,10 @@ async fn form_reply(
     q.validate_answers(&answers)
         .map_err(OperationError::invalid)?;
     if !st.app.questions.reply(&q.id, answers) {
-        return Err(missing("FormAlreadySettledError", &sid, "formID", &id));
+        return Err(Error {
+            status: StatusCode::CONFLICT,
+            value: json!({"_tag":"FormAlreadySettledError","sessionID":sid,"formID":id,"message":format!("FormAlreadySettledError: {id}")}),
+        });
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1294,7 +1379,12 @@ async fn form_cancel(
     Query(_query): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
     let q = question(&st, &sid, &id)?;
-    st.app.questions.reject(&q.id);
+    if !st.app.questions.reject(&q.id) {
+        return Err(Error {
+            status: StatusCode::CONFLICT,
+            value: json!({"_tag":"FormAlreadySettledError","sessionID":sid,"formID":id,"message":format!("FormAlreadySettledError: {id}")}),
+        });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn instructions(State(st): State<AppState>, Path(sid): Path<String>) -> Result<Json<Value>> {

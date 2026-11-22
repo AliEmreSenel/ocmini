@@ -236,7 +236,14 @@ impl Effects {
             }
             "webfetch_hop" => {
                 let input: crate::web::Input = crate::decode(&args)?;
-                match crate::web::fetch_hop(&input, cancel).await? {
+                let hop = if let Some(ms) = args["timeoutMs"].as_u64() {
+                    let ceiling = crate::web::request_timeout_from_args(&args)?;
+                    let timeout = std::time::Duration::from_millis(ms.max(1)).min(ceiling);
+                    crate::web::fetch_hop_with_timeout(&input, timeout, cancel).await?
+                } else {
+                    crate::web::fetch_hop(&input, cancel).await?
+                };
+                match hop {
                     crate::web::Hop::Done(output) => {
                         let output =
                             crate::output::limit(output, crate::output::directory()).await?;

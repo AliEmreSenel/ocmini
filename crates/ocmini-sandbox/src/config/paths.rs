@@ -17,12 +17,15 @@ pub struct PathContext {
     pub data_home: PathBuf,
     pub cache_home: PathBuf,
 }
+fn env_non_empty(key: &str) -> Option<OsString> {
+    std::env::var_os(key).filter(|value| !value.is_empty())
+}
 impl PathContext {
     pub fn current(workspace: &Path) -> Result<Self, String> {
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-        let user = std::env::var_os("USER")
-            .or_else(|| std::env::var_os("LOGNAME"))
-            .or_else(|| std::env::var_os("USERNAME"));
+        let home = env_non_empty("HOME").or_else(|| env_non_empty("USERPROFILE"));
+        let user = env_non_empty("USER")
+            .or_else(|| env_non_empty("LOGNAME"))
+            .or_else(|| env_non_empty("USERNAME"));
         #[cfg(unix)]
         let (uid, gid, account) = {
             let uid = unsafe { libc::geteuid() };
@@ -184,7 +187,7 @@ fn append_environment_paths(
     Ok(())
 }
 fn xdg(key: &str, root: &Path, suffix: &str) -> PathBuf {
-    std::env::var_os(key)
+    env_non_empty(key)
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join(suffix))
 }

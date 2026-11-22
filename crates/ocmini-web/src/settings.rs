@@ -46,8 +46,20 @@ async fn session_status(
     UrlPath(sid): UrlPath<String>,
 ) -> Result<Json<Value>> {
     blocking(move || {
+        if st.app.store.get_session(&sid)?.is_none() {
+            return Err(WebError::new(
+                StatusCode::NOT_FOUND,
+                "NotFoundError",
+                "Session not found",
+            ));
+        }
         let busy = st.app.store.is_busy(&sid)?;
-        let local = st.app.statuses.lock().unwrap().contains_key(&sid);
+        let local = st
+            .app
+            .statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&sid);
         Ok(Json(json!({"busy": busy, "local": local})))
     })
     .await
@@ -56,7 +68,9 @@ async fn session_status(
 impl From<ocmini_core::types::OperationError> for WebError {
     fn from(error: ocmini_core::types::OperationError) -> Self {
         let (status, tag) = match error.kind {
-            FailureKind::Invalid => (StatusCode::BAD_REQUEST, "InvalidRequestError"),
+            FailureKind::Invalid | FailureKind::SandboxRefused => {
+                (StatusCode::BAD_REQUEST, "InvalidRequestError")
+            }
             FailureKind::NotFound => (StatusCode::NOT_FOUND, "NotFoundError"),
             FailureKind::Busy => (StatusCode::CONFLICT, "SessionBusyError"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "UnknownError"),
@@ -198,7 +212,7 @@ struct ConfigPatch {
 }
 
 /// Sets or (with null) removes form fields in one scope's file. The merged
-/// configuration is validated afterwards; an invalid result restores the file.
+/// configuration is validated in memory before writing to disk.
 async fn patch_config(
     State(st): State<AppState>,
     Json(body): Json<ConfigPatch>,
@@ -232,29 +246,35 @@ async fn patch_config(
             .as_object_mut()
             .ok_or_else(|| WebError::invalid(format!("{} is not a JSON object", path.display())))?;
         for (key, field) in body.set {
+            if key == "sandbox" {
+                if let Some(existing) = object.get_mut("sandbox").and_then(Value::as_object_mut) {
+                    if field.is_null() {
+                        existing.remove("preset");
+                        if existing.is_empty() {
+                            object.remove("sandbox");
+                        }
+                        continue;
+                    }
+                    if field.is_string() {
+                        existing.insert("preset".into(), field);
+                        continue;
+                    }
+                }
+            }
             set_path(object, &key, field);
         }
         let text = serde_json::to_string_pretty(&value).expect("JSON") + "\n";
-        ocmini_core::tools::files::atomic_write(&path, text.as_bytes())?;
-        let checked = Config::load_fresh(&directory).and_then(|config| {
+        let checked = Config::load_with_override(&directory, &path, &text).and_then(|config| {
             sessions::sandbox_choices(&st.app, &config)
                 .map(|_| ())
                 .map_err(|error| error.message)
         });
         if let Err(error) = checked {
-            let restored = match &previous {
-                Some(text) => ocmini_core::tools::files::atomic_write(&path, text.as_bytes()),
-                None => std::fs::remove_file(&path).map_err(|e| e.to_string()),
-            };
-            let mut message = format!("The configuration was not saved: {error}");
-            if let Err(restore) = restored {
-                message.push_str(&format!(
-                    " (restoring {} failed: {restore})",
-                    path.display()
-                ));
-            }
-            return Err(WebError::invalid(message));
+            return Err(WebError::invalid(format!(
+                "The configuration was not saved: {error}"
+            )));
         }
+        ocmini_core::tools::files::atomic_write(&path, text.as_bytes())?;
         snapshot(&st, &directory).map(Json)
     })
     .await;

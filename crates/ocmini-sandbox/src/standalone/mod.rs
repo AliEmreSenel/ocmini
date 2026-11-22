@@ -27,11 +27,12 @@ struct Cli {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
-    let directory = cli
-        .directory
-        .unwrap_or(std::env::current_dir().map_err(refusal)?)
-        .canonicalize()
-        .map_err(refusal)?;
+    let directory = match cli.directory {
+        Some(directory) => directory,
+        None => std::env::current_dir().map_err(refusal)?,
+    }
+    .canonicalize()
+    .map_err(refusal)?;
     let context = config::PathContext::current(&directory).map_err(refusal)?;
     let folder = cli
         .presets_dir
@@ -39,7 +40,11 @@ fn run(cli: Cli) -> Result<i32, String> {
     config::initialize(&folder).map_err(refusal)?;
     let selection = cli
         .preset
-        .or_else(|| std::env::var("OCMINI_SANDBOX_PRESET").ok())
+        .or_else(|| {
+            std::env::var("OCMINI_SANDBOX_PRESET")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "read-only".into());
     let policy = config::load_with_overrides(
         &folder,

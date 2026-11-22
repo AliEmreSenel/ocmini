@@ -61,10 +61,21 @@ pub fn validate(input: &Input) -> Result<(), OperationError> {
     Ok(())
 }
 
+pub fn request_timeout_from_args(args: &serde_json::Value) -> Result<Duration, OperationError> {
+    let input: Input = crate::decode(args)?;
+    request_timeout(input.timeout)
+}
+
 pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutput, OperationError> {
+    let timeout = request_timeout(input.timeout)?;
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut hop = input.clone();
     for step in 0..=MAX_REDIRECTS {
-        match fetch_hop(&hop, cancel.clone()).await? {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(failure("Fetch timed out"));
+        }
+        match fetch_hop_with_timeout(&hop, remaining, cancel.clone()).await? {
             Hop::Done(output) => return Ok(output),
             Hop::Redirect(next) => {
                 if step == MAX_REDIRECTS {
@@ -82,9 +93,17 @@ pub async fn fetch(input: &Input, cancel: CancellationToken) -> Result<ToolOutpu
 }
 
 pub async fn fetch_hop(input: &Input, cancel: CancellationToken) -> Result<Hop, OperationError> {
+    let timeout = request_timeout(input.timeout)?;
+    fetch_hop_with_timeout(input, timeout, cancel).await
+}
+
+pub async fn fetch_hop_with_timeout(
+    input: &Input,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<Hop, OperationError> {
     let parsed = validate_url(&input.url)?;
     let format = input.format;
-    let timeout = request_timeout(input.timeout)?;
     let client = client();
     let operation = async {
         let response = client
@@ -131,21 +150,26 @@ pub async fn fetch_hop(input: &Input, cancel: CancellationToken) -> Result<Hop, 
             .and_then(|value| value.to_str().ok())
             .unwrap_or("text/plain")
             .to_owned();
+        let media = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         let final_url = response.url().to_string();
         let bytes = crate::http::read_body(response, None, MAX_BODY).await?;
         if bytes.contains(&0)
-            || !(content_type.starts_with("text/")
-                || content_type.contains("json")
-                || content_type.contains("xml")
-                || content_type.contains("javascript")
-                || content_type.contains("x-www-form-urlencoded"))
+            || !(media.starts_with("text/")
+                || media.contains("json")
+                || media.contains("xml")
+                || media.contains("javascript")
+                || media.contains("x-www-form-urlencoded"))
         {
             return Err(failure(format!(
                 "Response is {content_type}; webfetch returns text resources only"
             )));
         }
-        let is_html =
-            content_type.contains("text/html") || content_type.contains("application/xhtml+xml");
+        let is_html = media == "text/html" || media == "application/xhtml+xml";
         let body = if is_html && format != Format::Html {
             tokio::task::spawn_blocking(move || render_html(&bytes, format))
                 .await
@@ -160,7 +184,7 @@ pub async fn fetch_hop(input: &Input, cancel: CancellationToken) -> Result<Hop, 
         }))
     };
     tokio::select! {
-        result = operation => result,
+        result = tokio::time::timeout(timeout, operation) => result.map_err(|_| failure("Fetch timed out"))?,
         _ = cancel.cancelled() => Err(failure("Fetch cancelled")),
     }
 }

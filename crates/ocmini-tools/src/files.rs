@@ -212,7 +212,7 @@ pub fn read(
     let page_size = if ranges.is_some() {
         MAX_OUTPUT - RANGE_PAGE_NOTES
     } else {
-        MAX_OUTPUT
+        MAX_OUTPUT - 80
     };
     let total = scan_text_with(
         &path,
@@ -244,11 +244,7 @@ pub fn read(
                 preview.push_str("... (line truncated to 2000 chars)");
             }
             let formatted = format!("{index}: {preview}\n");
-            let size = if ranges.is_some() {
-                formatted.len()
-            } else {
-                preview.len() + usize::from(returned > 0)
-            };
+            let size = formatted.len();
             if text_bytes + size <= page_size {
                 text.push_str(&formatted);
                 text_bytes += size;
@@ -622,6 +618,14 @@ pub fn prepare_edit(
 }
 
 pub fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
+    atomic_write_with_permissions(path, content, None)
+}
+
+pub fn atomic_write_with_permissions(
+    path: &Path,
+    content: &[u8],
+    explicit_permissions: Option<&std::fs::Permissions>,
+) -> Result<(), String> {
     let target = if path.symlink_metadata().is_ok() {
         path.canonicalize()
             .map_err(|e| format!("Cannot resolve {}: {e}", path.display()))?
@@ -636,15 +640,18 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
         .ok_or_else(|| format!("{} has no parent directory", target.display()))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("Cannot create parent directory {}: {e}", parent.display()))?;
-    let permissions = std::fs::metadata(&target)
-        .ok()
-        .map(|meta| meta.permissions());
+    let permissions = explicit_permissions.cloned().or_else(|| {
+        std::fs::metadata(&target)
+            .ok()
+            .map(|meta| meta.permissions())
+    });
     let mut builder = tempfile::Builder::new();
     builder.prefix(".ocmini-");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
+        let initial_mode = if permissions.is_some() { 0o600 } else { 0o666 };
+        builder.permissions(std::fs::Permissions::from_mode(initial_mode));
     }
     let mut file = builder
         .tempfile_in(parent)

@@ -184,7 +184,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, OperationError> {
         #[cfg(feature = "sandbox")]
         {
             Self::new_inner(Default::default())
@@ -198,18 +198,20 @@ impl App {
     #[cfg(feature = "sandbox")]
     pub fn new_with_sandbox_overrides(
         overrides: ocmini_sandbox::config::Overrides,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, OperationError> {
         Self::new_inner(overrides)
     }
 
     fn new_inner(
         #[cfg(feature = "sandbox")] overrides: ocmini_sandbox::config::Overrides,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, OperationError> {
         let directory = std::env::current_dir().unwrap_or_default();
         let directory = directory.to_string_lossy().into_owned();
         let config = Config::load_for(&directory)?;
         #[cfg(not(feature = "sandbox"))]
-        config.check_sandbox_support()?;
+        config
+            .check_sandbox_support()
+            .map_err(OperationError::sandbox_refused)?;
 
         crate::tools::cleanup_outputs()?;
         let hook_runtime = crate::hooks::Runtime::new();
@@ -253,7 +255,7 @@ impl App {
         #[cfg(not(feature = "sandbox"))]
         config
             .check_sandbox_support()
-            .map_err(OperationError::invalid)?;
+            .map_err(OperationError::sandbox_refused)?;
         let hooks = self
             .hook_runtime
             .install(&config, directory)

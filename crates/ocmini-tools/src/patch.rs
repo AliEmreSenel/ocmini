@@ -222,15 +222,7 @@ pub fn commit(change: &Change, rollback: bool) -> Result<(), String> {
         &change.after
     };
     if let Some(bytes) = content {
-        files::atomic_write(&change.path, bytes)?;
-        if let Some(permissions) = &change.permissions {
-            std::fs::set_permissions(&change.path, permissions.clone()).map_err(|e| {
-                format!(
-                    "Cannot restore permissions on {}: {e}",
-                    change.path.display()
-                )
-            })?;
-        }
+        files::atomic_write_with_permissions(&change.path, bytes, change.permissions.as_ref())?;
     } else if change.path.exists() {
         std::fs::remove_file(&change.path)
             .map_err(|e| format!("Cannot remove {}: {e}", change.path.display()))?;
@@ -378,9 +370,11 @@ fn patch_path(path: &str) -> Result<String, String> {
 }
 
 fn update(content: &str, hunks: &[Hunk]) -> Result<String, String> {
+    let bom = content.starts_with('\u{feff}');
+    let body = content.trim_start_matches('\u{feff}');
     let mut saw_crlf = false;
     let mut saw_bare_lf = false;
-    let bytes = content.as_bytes();
+    let bytes = body.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'\n' {
             if i > 0 && bytes[i - 1] == b'\r' {
@@ -391,11 +385,31 @@ fn update(content: &str, hunks: &[Hunk]) -> Result<String, String> {
             }
         }
     }
-    let crlf = saw_crlf && !saw_bare_lf;
-    let bom = content.starts_with('\u{feff}');
-    let normalized = content.trim_start_matches('\u{feff}').replace("\r\n", "\n");
-    let final_newline = normalized.ends_with('\n');
-    let mut lines: Vec<String> = normalized.lines().map(str::to_owned).collect();
+    let default_eol = if saw_crlf && !saw_bare_lf {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let final_newline = body.ends_with('\n');
+    let mut lines: Vec<String> = Vec::new();
+    let mut endings: Vec<&'static str> = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        if let Some(pos) = rest.find('\n') {
+            if pos > 0 && rest.as_bytes()[pos - 1] == b'\r' {
+                lines.push(rest[..pos - 1].to_owned());
+                endings.push("\r\n");
+            } else {
+                lines.push(rest[..pos].to_owned());
+                endings.push("\n");
+            }
+            rest = &rest[pos + 1..];
+        } else {
+            lines.push(rest.to_owned());
+            endings.push("");
+            break;
+        }
+    }
     let mut cursor = 0;
     for hunk in hunks {
         if let Some(anchor) = &hunk.anchor {
@@ -404,7 +418,11 @@ fn update(content: &str, hunks: &[Hunk]) -> Result<String, String> {
             cursor = index + 1;
         }
         let index = if hunk.old.is_empty() {
-            lines.len()
+            if hunk.anchor.is_some() && !hunk.eof {
+                cursor
+            } else {
+                lines.len()
+            }
         } else {
             seek(&lines, &hunk.old, cursor, hunk.eof).ok_or_else(|| {
                 format!(
@@ -418,18 +436,45 @@ fn update(content: &str, hunks: &[Hunk]) -> Result<String, String> {
                 )
             })?
         };
+        if index > 0 && index == lines.len() && endings.last() == Some(&"") && !hunk.new.is_empty()
+        {
+            *endings.last_mut().unwrap() = default_eol;
+        }
+        let old_endings = &endings[index..index + hunk.old.len()];
+        let new_endings: Vec<&'static str> = hunk
+            .new
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if hunk.old.get(i) == Some(line) {
+                    old_endings
+                        .get(i)
+                        .copied()
+                        .filter(|e| !e.is_empty())
+                        .unwrap_or(default_eol)
+                } else {
+                    default_eol
+                }
+            })
+            .collect();
         lines.splice(index..index + hunk.old.len(), hunk.new.clone());
+        endings.splice(index..index + hunk.old.len(), new_endings);
         cursor = index + hunk.new.len();
     }
-    let mut updated = lines.join("\n");
-    if final_newline && !lines.is_empty() {
-        updated.push('\n');
+    if let Some(last) = endings.last_mut() {
+        if !final_newline {
+            *last = "";
+        } else if last.is_empty() {
+            *last = default_eol;
+        }
     }
-    if crlf {
-        updated = updated.replace('\n', "\r\n");
-    }
+    let mut updated = String::with_capacity(content.len());
     if bom {
-        updated.insert(0, '\u{feff}');
+        updated.push('\u{feff}');
+    }
+    for (line, eol) in lines.iter().zip(endings.iter()) {
+        updated.push_str(line);
+        updated.push_str(eol);
     }
     Ok(updated)
 }

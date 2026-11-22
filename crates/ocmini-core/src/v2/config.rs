@@ -78,12 +78,18 @@ pub fn normalize(value: &mut Value) -> Result<(), String> {
                             let id = variant["id"]
                                 .as_str()
                                 .ok_or("Variant id must be a string")?;
-                            let mut body =
+                            let mut entry =
                                 variant["settings"].as_object().cloned().unwrap_or_default();
-                            if let Some(options) = variant["body"].as_object() {
-                                body.extend(options.clone());
+                            if let Some(body) = variant.get("body").filter(|v| v.is_object()) {
+                                if let Some(existing) =
+                                    entry.get_mut("body").filter(|v| v.is_object())
+                                {
+                                    deep_merge(existing, body.clone());
+                                } else {
+                                    entry.insert("body".into(), body.clone());
+                                }
                             }
-                            normalized.insert(id.into(), json!(body));
+                            normalized.insert(id.into(), Value::Object(entry));
                         }
                         model["variants"] = json!(normalized);
                     }
