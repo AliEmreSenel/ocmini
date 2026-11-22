@@ -165,25 +165,64 @@ fn fence_marker(text: &str) -> Option<(char, usize, &str)> {
     (count >= 3 && !rest.contains(mark)).then_some((mark, count, rest.trim()))
 }
 
-/// Inline spans: `**strong**` and `` `code` ``. A lone `*` is emphasis, shown
-/// the same way as strong, because the transcript has no italic style.
+/// Inline spans: `***strong***`, `**strong**`, `*emphasis*`, and `` `code` ``.
+/// Multi-backtick code spans (e.g. `` ``a ` b`` ``) match an exact closing run.
 fn inline(text: &str, out: &mut String) {
     let mut rest = text;
     while let Some(index) = rest.find(['`', '*']) {
         out.push_str(&rest[..index]);
-        let span = if rest[index..].starts_with("**") {
-            "**"
-        } else {
-            &rest[index..index + 1]
-        };
-        let style = if span == "`" { CYAN } else { BOLD };
-        let body = &rest[index + span.len()..];
+        let ch = rest.as_bytes()[index];
+        if ch == b'`' {
+            let ticks = rest[index..].bytes().take_while(|&b| b == b'`').count();
+            let span = &rest[index..index + ticks];
+            let body = &rest[index + ticks..];
+            let mut search = 0;
+            let mut found = None;
+            while let Some(rel) = body[search..].find(span) {
+                let pos = search + rel;
+                let run_end = pos + body[pos..].bytes().take_while(|&b| b == b'`').count();
+                if run_end - pos == ticks {
+                    found = Some(pos);
+                    break;
+                }
+                search = run_end;
+            }
+            if let Some(end) = found {
+                let mut styled = &body[..end];
+                if ticks > 1
+                    && styled.len() >= 2
+                    && styled.starts_with(' ')
+                    && styled.ends_with(' ')
+                    && styled.bytes().any(|b| b != b' ')
+                {
+                    styled = &styled[1..styled.len() - 1];
+                }
+                if !styled.is_empty()
+                    && (ticks > 1 || (!styled.starts_with(' ') && !styled.ends_with(' ')))
+                {
+                    out.push_str(&format!("{CYAN}{styled}{RESET}"));
+                    rest = &body[end + ticks..];
+                    continue;
+                }
+            }
+            out.push_str(span);
+            rest = body;
+            continue;
+        }
+        let stars = rest[index..].bytes().take_while(|&b| b == b'*').count();
+        if stars > 3 {
+            out.push_str(&rest[index..index + stars]);
+            rest = &rest[index + stars..];
+            continue;
+        }
+        let span = &rest[index..index + stars];
+        let body = &rest[index + stars..];
         if let Some(end) = body.find(span) {
             let styled = &body[..end];
             // Prose asterisks (`2 * 3`) and padded spans print as typed, so a
             // stray marker cannot restyle half a paragraph.
             if !styled.is_empty() && !styled.starts_with(' ') && !styled.ends_with(' ') {
-                out.push_str(style);
+                out.push_str(BOLD);
                 out.push_str(styled);
                 out.push_str(RESET);
                 rest = &body[end + span.len()..];
@@ -305,5 +344,19 @@ mod tests {
             "the line renders once, not twice"
         );
         assert_eq!(second.line, 0);
+    }
+
+    #[test]
+    fn triple_asterisks_and_multi_backtick_code_spans_render_cleanly() {
+        let bold_italic = Markdown::default().push("***bold italic***\n").text;
+        assert_eq!(plain(&bold_italic), "bold italic\n");
+        assert!(bold_italic.contains(&format!("{BOLD}bold italic{RESET}")));
+
+        let multi_tick = Markdown::default().push("use ``a ` b`` here\n").text;
+        assert_eq!(plain(&multi_tick), "use a ` b here\n");
+        assert!(multi_tick.contains(&format!("{CYAN}a ` b{RESET}")));
+
+        let unmatched = Markdown::default().push("``unclosed ` span\n").text;
+        assert_eq!(plain(&unmatched), "``unclosed ` span\n");
     }
 }

@@ -21,6 +21,13 @@ pub struct Plan {
     pub input: Input,
     parent: TaskSession,
     model: Option<Model>,
+    variant: Option<String>,
+}
+fn split_model_variant(spec: &str) -> (&str, Option<String>) {
+    match spec.split_once('#') {
+        Some((model, variant)) => (model, (!variant.is_empty()).then(|| variant.to_owned())),
+        None => (spec, None),
+    }
 }
 fn options<A: Host>(
     ctx: &ToolCtx<A>,
@@ -98,11 +105,16 @@ pub async fn prepare<A: Host>(
     mut args: Value,
 ) -> Result<(Value, Plan), OperationError> {
     let input: Input = decode(&args)?;
+    let initial_variant = input
+        .model
+        .as_deref()
+        .and_then(|s| split_model_variant(s).1);
     let (parent, model) = options(ctx, &input, None)?;
     let mut plan = Plan {
         input,
         parent,
         model,
+        variant: initial_variant.clone(),
     };
     if ctx.app.has_hook(crate::hooks::TASK_SPAWN_BEFORE) {
         let mut payload = args.clone();
@@ -110,24 +122,50 @@ pub async fn prepare<A: Host>(
         let mut validator = |before: &Value, set: &mut serde_json::Map<String, Value>| {
             let mut candidate = before.clone();
             candidate.as_object_mut().unwrap().extend(set.clone());
-            let model = if !candidate["model"].is_null()
-                && (set.contains_key("model")
-                    || candidate["subagent_type"] == before["subagent_type"])
+            let (selected, variant) = if set.contains_key("model") {
+                if candidate["model"].is_null() {
+                    (None, None)
+                } else if let Some(spec) = candidate["model"].as_str() {
+                    let (model_str, variant) = split_model_variant(spec);
+                    (
+                        Some(Model::parse(model_str).map_err(String::from)?),
+                        variant,
+                    )
+                } else {
+                    let parsed: Model = serde_json::from_value(candidate["model"].clone())
+                        .map_err(|e| e.to_string())?;
+                    let variant = if candidate["model"] == before["model"] {
+                        initial_variant.clone()
+                    } else {
+                        None
+                    };
+                    (Some(parsed), variant)
+                }
+            } else if !candidate["model"].is_null()
+                && candidate["subagent_type"] == before["subagent_type"]
             {
-                Some(
-                    serde_json::from_value(candidate["model"].clone())
-                        .map_err(|e| e.to_string())?,
+                (
+                    Some(
+                        serde_json::from_value(candidate["model"].clone())
+                            .map_err(|e| e.to_string())?,
+                    ),
+                    initial_variant.clone(),
                 )
             } else {
-                None
+                (None, None)
             };
-            let input: Input = decode(&candidate).map_err(String::from)?;
-            let (parent, model) = options(ctx, &input, model).map_err(String::from)?;
+            let mut decode_candidate = candidate;
+            if let Some(obj) = decode_candidate.as_object_mut() {
+                obj.remove("model");
+            }
+            let input: Input = decode(&decode_candidate).map_err(String::from)?;
+            let (parent, model) = options(ctx, &input, selected).map_err(String::from)?;
             set.insert("model".into(), json!(model));
             plan = Plan {
                 input,
                 parent,
                 model,
+                variant,
             };
             Ok(())
         };
@@ -186,11 +224,7 @@ pub async fn run<A: Host>(ctx: &ToolCtx<A>, plan: &Plan) -> Result<ToolOutput, O
         model: plan.model.clone(),
         prompt: input.prompt.clone(),
         agent: input.subagent_type.clone(),
-        variant: input
-            .model
-            .as_deref()
-            .and_then(|s| s.split_once('#'))
-            .map(|(_, v)| v.into()),
+        variant: plan.variant.clone(),
     };
     let done = tokio::select! {r=ctx.app.admit(&ctx.engine,&child.id,request)=>r?,_=ctx.cancel.cancelled()=>return Err(failure("Subagent cancelled"))};
     let mut context = hook_context(ctx, "task");

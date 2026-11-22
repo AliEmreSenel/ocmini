@@ -249,14 +249,26 @@ impl Host for App {
             "Background task failed"
         };
         let text=format!("<task id=\"{child}\" state=\"{state}\">\n<summary>{summary}: {description}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>");
-        let agent = self
-            .store
-            .message(&parent, &parent_message)
-            .ok()
-            .flatten()
-            .and_then(|m| m.info.agent);
-        let model = self.store.last_model(&parent).ok().flatten();
-        let v2=self.v2.enabled(&parent).then(||crate::v2::Input{kind:"synthetic".into(),payload:json!({"text":text,"metadata":{"source":"subagent","childID":child,"state":state,"description":description}}),..Default::default()});
+        let v2_enabled = self.v2.enabled(&parent);
+        let agent = if v2_enabled {
+            None
+        } else {
+            self.store
+                .message(&parent, &parent_message)
+                .ok()
+                .flatten()
+                .and_then(|m| m.info.agent)
+        };
+        let model = if v2_enabled {
+            None
+        } else {
+            self.store.last_model(&parent).ok().flatten()
+        };
+        let v2 = v2_enabled.then(|| crate::v2::Input {
+            kind: "synthetic".into(),
+            payload: json!({"text":text,"metadata":{"source":"subagent","childID":child,"state":state,"description":description}}),
+            ..Default::default()
+        });
         if let Ok(done) = engine
             .admit(
                 self.clone(),

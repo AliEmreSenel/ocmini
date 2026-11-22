@@ -370,6 +370,7 @@ where
                     let _: DiscoverInput = decode(&args)?;
                 }
                 Builtin::Bash => {
+                    strip_caller_env(&mut args);
                     let input: ShellInput = decode(&alias(&args, "workdir", "cwd"))?;
                     if input.timeout == Some(0) {
                         return Err(failure(
@@ -435,9 +436,16 @@ where
     let result = match &input.tool {
         Tool::Effect if Builtin::from_name(name) == Some(Builtin::WebFetch) => {
             let mut hop_args = input.args.clone();
+            let timeout = web::request_timeout_from_args(&hop_args)?;
+            let deadline = tokio::time::Instant::now() + timeout;
             let mut final_output = None;
             for step in 0..=web::MAX_REDIRECTS {
                 ctx.app.ownership(&ctx.session_id)?;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(failure("Fetch timed out"));
+                }
+                hop_args["timeoutMs"] = json!(remaining.as_millis().max(1) as u64);
                 let value = ctx
                     .app
                     .effect(ctx, "webfetch_hop", hop_args.clone())
@@ -471,19 +479,20 @@ where
         }
         Tool::Effect => {
             let mut args = input.args.clone();
-            if Builtin::from_name(name) == Some(Builtin::Bash)
-                && ctx.app.has_hook(crate::hooks::SHELL_ENV)
-            {
-                let mut context = hook_context(ctx, name);
-                context["workdir"] = json!(resolve_path(
-                    &ctx.dir,
-                    args["workdir"]
-                        .as_str()
-                        .or(args["cwd"].as_str())
-                        .unwrap_or(".")
-                ));
-                let env=ctx.app.hook(crate::hooks::SHELL_ENV,&context,json!({"env":{},"command":args["command"],"background":args["background"]==true}),&ctx.cancel,None).await?;
-                args["env"] = env["env"].clone();
+            if Builtin::from_name(name) == Some(Builtin::Bash) {
+                strip_caller_env(&mut args);
+                if ctx.app.has_hook(crate::hooks::SHELL_ENV) {
+                    let mut context = hook_context(ctx, name);
+                    context["workdir"] = json!(resolve_path(
+                        &ctx.dir,
+                        args["workdir"]
+                            .as_str()
+                            .or(args["cwd"].as_str())
+                            .unwrap_or(".")
+                    ));
+                    let env=ctx.app.hook(crate::hooks::SHELL_ENV,&context,json!({"env":{},"command":args["command"],"background":args["background"]==true}),&ctx.cancel,None).await?;
+                    args["env"] = env["env"].clone();
+                }
             }
             ctx.app.ownership(&ctx.session_id)?;
             let value = ctx
@@ -493,6 +502,7 @@ where
             value.output()
         }
         Tool::File { handle, .. } => {
+            ctx.app.ownership(&ctx.session_id)?;
             let value = ctx
                 .app
                 .effect(ctx, "commit", json!({"handle":handle}))
@@ -628,6 +638,12 @@ pub fn cleanup_outputs() -> Result<(), String> {
     Ok(())
 }
 
+fn strip_caller_env(args: &mut Value) {
+    if let Some(object) = args.as_object_mut() {
+        object.remove("env");
+    }
+}
+
 #[cfg(test)]
 mod permission_tests {
     use super::*;
@@ -642,5 +658,22 @@ mod permission_tests {
             tool.permission("webfetch", &[]),
             ("webfetch", vec!["https://example.com/page?q=1".into()])
         );
+    }
+
+    #[test]
+    fn bash_strip_caller_env_removes_injected_variables() {
+        let mut args = json!({
+            "command": "echo hi",
+            "env": {
+                "LD_PRELOAD": "/tmp/evil.so",
+                "BASH_ENV": "/tmp/evil.sh"
+            }
+        });
+        strip_caller_env(&mut args);
+        assert!(
+            args.get("env").is_none(),
+            "caller-supplied env must be stripped before shell execution"
+        );
+        assert_eq!(args["command"], "echo hi");
     }
 }

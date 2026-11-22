@@ -27,32 +27,40 @@ pub struct Registry {
     preset: Option<String>,
 }
 impl Registry {
-    pub fn new(config: &Config) -> Result<Self, String> {
+    pub fn new(config: &Config) -> Result<Self, OperationError> {
         Self::new_with_overrides(config, Overrides::default())
     }
 
-    pub fn new_with_overrides(config: &Config, overrides: Overrides) -> Result<Self, String> {
+    pub fn new_with_overrides(
+        config: &Config,
+        overrides: Overrides,
+    ) -> Result<Self, OperationError> {
         let folder = PathBuf::from(crate::config::config_home()).join("opencode/sandbox/presets");
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-        ocmini_sandbox::config::initialize(&folder).map_err(ocmini_sandbox::refusal)?;
+        ocmini_sandbox::config::initialize(&folder)
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         let registry = Self {
             entries: Default::default(),
             folder,
             overrides,
-            preset: std::env::var("OCMINI_SANDBOX_PRESET").ok(),
+            preset: std::env::var("OCMINI_SANDBOX_PRESET")
+                .ok()
+                .filter(|value| !value.is_empty()),
         };
-        config.sandbox_preset().map_err(ocmini_sandbox::refusal)?;
+        config
+            .sandbox_preset()
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         // Both defaults and explicit CLI additions need the thread's saved
         // settings before selection. Validate the library now, then validate
         // the effective policy when the selected session is known.
-        let context =
-            ocmini_sandbox::config::PathContext::current(&cwd).map_err(ocmini_sandbox::refusal)?;
+        let context = ocmini_sandbox::config::PathContext::current(&cwd)
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         ocmini_sandbox::config::validate_folder(&registry.folder, &context)
-            .map_err(ocmini_sandbox::refusal)?;
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         Ok(registry)
     }
     /// A server's process-wide CLI policy must also work for new sessions.
-    pub fn validate_cli_defaults(&self, config: &Config) -> Result<(), String> {
+    pub fn validate_cli_defaults(&self, config: &Config) -> Result<(), OperationError> {
         if self.preset.is_some() || !self.overrides.is_empty() {
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             self.settings(config, &cwd, None, &self.overrides)?;
@@ -65,8 +73,10 @@ impl Registry {
         directory: &std::path::Path,
         saved: Option<&Value>,
         overrides: &Overrides,
-    ) -> Result<(Arc<Value>, Option<Policy>), String> {
-        let configured = config.sandbox_preset().map_err(ocmini_sandbox::refusal)?;
+    ) -> Result<(Arc<Value>, Option<Policy>), OperationError> {
+        let configured = config
+            .sandbox_preset()
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         let saved: Option<Settings> = saved
             .filter(|saved| {
                 self.preset
@@ -76,14 +86,18 @@ impl Registry {
             .cloned()
             .map(serde_json::from_value)
             .transpose()
-            .map_err(|e| ocmini_sandbox::refusal(format!("Invalid saved sandbox settings: {e}")))?;
+            .map_err(|e| {
+                OperationError::sandbox_refused(ocmini_sandbox::refusal(format!(
+                    "Invalid saved sandbox settings: {e}"
+                )))
+            })?;
         let context = ocmini_sandbox::config::PathContext::current(directory)
-            .map_err(ocmini_sandbox::refusal)?;
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         let (settings, policy) = match saved {
             Some(mut saved) => {
                 let policy = saved
                     .apply(&context, overrides)
-                    .map_err(ocmini_sandbox::refusal)?;
+                    .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
                 (saved, policy)
             }
             _ => ocmini_sandbox::config::load_settings(
@@ -92,18 +106,21 @@ impl Registry {
                 &context,
                 overrides,
             )
-            .map_err(ocmini_sandbox::refusal)?,
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?,
         };
         #[cfg(not(target_os = "linux"))]
         if policy.is_some() {
-            return Err(ocmini_sandbox::refusal("sandbox requires Linux"));
+            return Err(OperationError::sandbox_refused(ocmini_sandbox::refusal(
+                "sandbox requires Linux",
+            )));
         }
         #[cfg(target_os = "linux")]
         if let Some(policy) = &policy {
-            ocmini_sandbox::jail::probe(policy).map_err(ocmini_sandbox::refusal)?;
+            ocmini_sandbox::jail::probe(policy)
+                .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         }
-        let saved =
-            serde_json::to_value(settings).map_err(|e| ocmini_sandbox::refusal(e.to_string()))?;
+        let saved = serde_json::to_value(settings)
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e.to_string())))?;
         Ok((Arc::new(saved), policy))
     }
     /// Preset files available for selection, by name.
@@ -144,30 +161,30 @@ impl Registry {
             )));
         }
         let context = ocmini_sandbox::config::PathContext::current(std::path::Path::new(directory))
-            .map_err(ocmini_sandbox::refusal)?;
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         let (settings, _) = ocmini_sandbox::config::load_settings(
             &self.folder,
             preset,
             &context,
             &Overrides::default(),
         )
-        .map_err(|e| OperationError::invalid(ocmini_sandbox::refusal(e)))?;
-        let saved =
-            serde_json::to_value(&settings).map_err(|e| ocmini_sandbox::refusal(e.to_string()))?;
+        .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
+        let saved = serde_json::to_value(&settings)
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e.to_string())))?;
         let policy = settings
             .clone()
             .apply(&context, &self.overrides)
-            .map_err(|e| OperationError::invalid(ocmini_sandbox::refusal(e)))?;
+            .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         #[cfg(not(target_os = "linux"))]
         if policy.is_some() {
-            return Err(OperationError::invalid(ocmini_sandbox::refusal(
+            return Err(OperationError::sandbox_refused(ocmini_sandbox::refusal(
                 "sandbox requires Linux",
             )));
         }
         #[cfg(target_os = "linux")]
         if let Some(policy) = &policy {
             ocmini_sandbox::jail::probe(policy)
-                .map_err(|e| OperationError::invalid(ocmini_sandbox::refusal(e)))?;
+                .map_err(|e| OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
         }
         Ok(saved)
     }
@@ -242,7 +259,7 @@ impl Registry {
         }
         let current = app.store.get_session(root_id)?;
         if current.as_ref().and_then(|s| s.sandbox.as_ref()) != Some(root.settings.as_ref()) {
-            return Err(OperationError::invalid(ocmini_sandbox::refusal(
+            return Err(OperationError::sandbox_refused(ocmini_sandbox::refusal(
                 "Saved sandbox settings changed; restart ocmini before resuming this session",
             )));
         }
@@ -512,7 +529,7 @@ impl Runner {
                 Some(std::path::Component::Normal(_))
             )
         {
-            return Err(OperationError::invalid(ocmini_sandbox::refusal(
+            return Err(OperationError::sandbox_refused(ocmini_sandbox::refusal(
                 "session ID must be a single path component",
             )));
         }
@@ -526,7 +543,8 @@ impl Runner {
             scratch,
             spill: spill.clone(),
             directory: session.directory.clone().into(),
-        })?;
+        })
+        .map_err(OperationError::sandbox_refused)?;
         let socket = child.control.try_clone().map_err(|e| e.to_string())?;
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         let socket = tokio::net::UnixStream::from_std(socket).map_err(|e| e.to_string())?;
@@ -627,7 +645,9 @@ impl Runner {
     }
     #[cfg(not(target_os = "linux"))]
     fn start(_session: &Session, _policy: Policy) -> Result<Arc<Self>, OperationError> {
-        Err(ocmini_sandbox::refusal("sandbox requires Linux").into())
+        Err(OperationError::sandbox_refused(ocmini_sandbox::refusal(
+            "sandbox requires Linux",
+        )))
     }
     fn fail(&self, message: &str) {
         let mut failure = self.failure.lock().unwrap();
@@ -759,7 +779,9 @@ struct Runner;
 #[cfg(not(target_os = "linux"))]
 impl Runner {
     fn start(_: &Session, _: Policy) -> Result<Arc<Self>, OperationError> {
-        Err(ocmini_sandbox::refusal("sandbox requires Linux").into())
+        Err(OperationError::sandbox_refused(ocmini_sandbox::refusal(
+            "sandbox requires Linux",
+        )))
     }
     fn fail(&self, _: &str) {}
     async fn request(
@@ -770,6 +792,8 @@ impl Runner {
         _: Option<Box<dyn Send>>,
         _: Option<String>,
     ) -> Result<Value, OperationError> {
-        Err(ocmini_sandbox::refusal("sandbox requires Linux").into())
+        Err(OperationError::sandbox_refused(ocmini_sandbox::refusal(
+            "sandbox requires Linux",
+        )))
     }
 }

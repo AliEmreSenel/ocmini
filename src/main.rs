@@ -171,34 +171,66 @@ enum SessionCommand {
 }
 
 fn parse_hostname(value: &str) -> Result<String, String> {
-    let hostname = value.trim_start_matches('[').trim_end_matches(']');
+    let hostname = if value.starts_with('[') || value.ends_with(']') {
+        let inner = value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or_else(|| "hostname has unmatched brackets".to_string())?;
+        if inner.contains(['[', ']']) || inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("bracketed hostname must be a valid IPv6 address".into());
+        }
+        inner
+    } else {
+        if value.contains(['[', ']']) {
+            return Err("hostname contains unexpected brackets".into());
+        }
+        value
+    };
     if hostname.is_empty() {
         return Err("hostname must not be empty".into());
     }
     Ok(hostname.to_owned())
 }
 
-async fn with_app<F: std::future::Future<Output = Result<(), String>>>(
+fn tsv_field(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|ch| {
+            if matches!(ch, '\t' | '\n' | '\r') {
+                Some(' ')
+            } else if ch.is_control() {
+                None
+            } else {
+                Some(ch)
+            }
+        })
+        .collect()
+}
+
+async fn with_app<F: std::future::Future<Output = Result<(), types::OperationError>>>(
     app: engine::App,
     run: impl FnOnce(engine::App) -> F,
-) -> Result<(), String> {
+) -> Result<(), types::OperationError> {
     let runtime = app.hook_runtime.clone();
     let result = run(app).await;
     runtime.shutdown().await;
     result
 }
 
-async fn run(cli: Cli) -> Result<(), String> {
+async fn run(cli: Cli) -> Result<(), types::OperationError> {
     #[cfg(feature = "sandbox")]
     let cli = {
         let mut cli = cli;
         cli.merge_sandbox();
         cli
     };
-    let create_app = || {
+    let create_app = || -> Result<engine::App, types::OperationError> {
         #[cfg(feature = "sandbox")]
         {
-            let overrides = cli.sandbox.overrides().map_err(ocmini_sandbox::refusal)?;
+            let overrides = cli
+                .sandbox
+                .overrides()
+                .map_err(|e| types::OperationError::sandbox_refused(ocmini_sandbox::refusal(e)))?;
             engine::App::new_with_sandbox_overrides(overrides)
         }
         #[cfg(not(feature = "sandbox"))]
@@ -221,8 +253,10 @@ async fn run(cli: Cli) -> Result<(), String> {
                 roots,
             } => {
                 let directory = directory.as_deref().map(sessions::directory).transpose()?;
-                let store = store::Store::open(&config::store_path(), &types::hex_id("ocm_"))?;
-                let mut sessions = store.list_sessions(directory.as_deref())?;
+                let mut sessions = store::Store::list_sessions_readonly(
+                    &config::store_path(),
+                    directory.as_deref(),
+                )?;
                 if roots {
                     sessions.retain(|s| s.parent_id.is_none());
                 }
@@ -236,7 +270,12 @@ async fn run(cli: Cli) -> Result<(), String> {
                     );
                 } else {
                     for session in sessions {
-                        println!("{}\t{}\t{}", session.id, session.title, session.directory);
+                        println!(
+                            "{}\t{}\t{}",
+                            tsv_field(&session.id),
+                            tsv_field(&session.title),
+                            tsv_field(&session.directory)
+                        );
                     }
                 }
                 Ok(())
@@ -481,8 +520,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             let (routes, notice) = (ocmini_web::router(), Some("ocmini web interface"));
             #[cfg(not(feature = "web"))]
             let (routes, notice) = (Default::default(), None);
-            with_app(app, |app| {
+            with_app(app, |app| async move {
                 server::serve_with(app, hostname, port, routes, notice)
+                    .await
+                    .map_err(types::OperationError::from)
             })
             .await
         }
@@ -497,7 +538,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     let auth = auth::AuthStore::load();
                     let (config, errors) = provider::discover_models(&config, &auth).await;
                     if !errors.is_empty() && config.catalog().is_empty() {
-                        return Err(errors.join("; "));
+                        return Err(errors.join("; ").into());
                     }
                     for error in errors {
                         eprintln!("ocmini: model discovery: {error}");
@@ -637,13 +678,13 @@ fn main() {
     let result = runtime
         .enable_all()
         .build()
-        .map_err(|error| format!("Cannot start runtime: {error}"))
+        .map_err(|error| types::OperationError::from(format!("Cannot start runtime: {error}")))
         .and_then(|runtime| runtime.block_on(run(cli)));
     // Background shell jobs outlive their tool call; they end with the runtime.
     tools::stop_background_jobs();
     if let Err(error) = result {
         eprintln!("ocmini: {error}");
-        std::process::exit(if error.contains("Sandbox startup refused:") {
+        std::process::exit(if error.kind == types::FailureKind::SandboxRefused {
             78
         } else {
             1
@@ -654,4 +695,27 @@ fn main() {
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 fn ocmini_tools_stop() {
     tools::stop_background_jobs();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hostname_validates_brackets_strictly() {
+        assert_eq!(parse_hostname("[::1]").unwrap(), "::1");
+        assert_eq!(parse_hostname("127.0.0.1").unwrap(), "127.0.0.1");
+        assert_eq!(parse_hostname("localhost").unwrap(), "localhost");
+        assert!(parse_hostname("[::1").is_err());
+        assert!(parse_hostname("::1]").is_err());
+        assert!(parse_hostname("[[::1]]").is_err());
+        assert!(parse_hostname("[localhost]").is_err());
+        assert!(parse_hostname("[]").is_err());
+        assert!(parse_hostname("").is_err());
+    }
+
+    #[test]
+    fn tsv_field_sanitizes_tabs_newlines_and_controls() {
+        assert_eq!(tsv_field("a\tb\nc\r\x1bd"), "a b c d");
+    }
 }

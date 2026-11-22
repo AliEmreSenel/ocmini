@@ -2,9 +2,7 @@
 mod backend;
 mod shared;
 pub mod sqlite;
-use crate::types::OperationError;
-#[cfg(test)]
-use crate::types::Session;
+use crate::types::{OperationError, Session};
 pub use backend::{
     AdmissionReservation, HistoryBackend, HookDeliveryBudget, HookDeliveryRecord, InterruptedTurn,
     OutboxIntent, RecoveredTurn, SessionScope,
@@ -30,6 +28,13 @@ impl Store {
         directory: &str,
     ) -> Result<Vec<serde_json::Value>, OperationError> {
         SelectedBackend::inspect_hook_deliveries(path, directory)
+    }
+    /// Read-only session listing, without creating, migrating, or recovering the database.
+    pub fn list_sessions_readonly(
+        path: &Path,
+        directory: Option<&str>,
+    ) -> Result<Vec<Session>, OperationError> {
+        SelectedBackend::list_sessions_readonly(path, directory)
     }
 }
 impl<B: HistoryBackend> Store<B> {

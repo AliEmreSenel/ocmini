@@ -62,7 +62,9 @@ fn finish(
         text.push_str("\n[stderr]\n");
         text.push_str(&String::from_utf8_lossy(&err));
     }
-    if stdout_total + stderr_total > (out.len() + err.len()) as u64 {
+    let omitted = stdout_total + stderr_total > (out.len() + err.len()) as u64;
+    let will_spill = omitted || text.len() + annotation.len() > output::MAX_OUTPUT;
+    if omitted && !will_spill {
         text.push_str(&format!(
             "\n[{} bytes omitted from captured process output]",
             stdout_total + stderr_total - (out.len() + err.len()) as u64
@@ -74,7 +76,7 @@ fn finish(
         output: text,
         metadata: json!({"exit":exit,"truncated":false,"outputBytes":stdout_total+stderr_total}),
     };
-    if result.output.len() <= output::MAX_OUTPUT {
+    if !will_spill {
         return Ok(result);
     }
     let mut file = output::create(directory)?;
@@ -88,15 +90,48 @@ fn finish(
     Ok(output::with_file(result, &path))
 }
 
-fn shell_command(command: &str, directory: &Path) -> tokio::process::Command {
-    let mut process = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "bash" });
+fn build_shell_command(
+    program: &str,
+    command: &str,
+    directory: &Path,
+    env: &serde_json::Map<String, serde_json::Value>,
+) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(program);
     if cfg!(windows) {
         process.args(["/C", command]);
     } else {
         process.args(["-c", command]);
     }
     process.current_dir(directory);
+    for (key, value) in env {
+        if let Some(value) = value.as_str() {
+            process.env(key, value);
+        } else {
+            process.env_remove(key);
+        }
+    }
     process
+}
+
+fn spawn_shell(
+    command: &str,
+    directory: &Path,
+    env: &serde_json::Map<String, serde_json::Value>,
+    configure: impl Fn(&mut tokio::process::Command) -> Result<(), OperationError>,
+) -> Result<tokio::process::Child, OperationError> {
+    let primary = if cfg!(windows) { "cmd" } else { "bash" };
+    let mut process = build_shell_command(primary, command, directory, env);
+    configure(&mut process)?;
+    match process.spawn() {
+        Ok(child) => Ok(child),
+        #[cfg(unix)]
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut fallback = build_shell_command("sh", command, directory, env);
+            configure(&mut fallback)?;
+            fallback.spawn().map_err(|e| spawn_failure(directory, e))
+        }
+        Err(error) => Err(spawn_failure(directory, error)),
+    }
 }
 
 fn spawn_failure(directory: &Path, error: std::io::Error) -> OperationError {
@@ -146,35 +181,27 @@ pub async fn shell_with_env(
 ) -> Result<ToolOutput, OperationError> {
     // Let the OS capture output directly; only bounded previews enter memory.
     let capture_dir = output_directory.to_owned();
-    let (stdout, stderr, child_stdout, child_stderr) = tokio::task::spawn_blocking(move || {
+    let (stdout, stderr) = tokio::task::spawn_blocking(move || {
         std::fs::create_dir_all(&capture_dir)
             .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
         let stdout = tempfile::tempfile_in(&capture_dir)
             .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
         let stderr = tempfile::tempfile_in(&capture_dir)
             .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
-        let child_stdout = stdout.try_clone().map_err(|e| failure(e.to_string()))?;
-        let child_stderr = stderr.try_clone().map_err(|e| failure(e.to_string()))?;
-        Ok::<_, OperationError>((stdout, stderr, child_stdout, child_stderr))
+        Ok::<_, OperationError>((stdout, stderr))
     })
     .await
     .map_err(|e| failure(format!("Shell setup task failed: {e}")))??;
-    let mut process = shell_command(command, directory);
-    for (key, value) in env {
-        if let Some(value) = value.as_str() {
-            process.env(key, value);
-        } else {
-            process.env_remove(key);
-        }
-    }
-    process
-        .stdin(Stdio::null())
-        .stdout(child_stdout)
-        .stderr(child_stderr)
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    process.process_group(0);
-    let mut child = process.spawn().map_err(|e| spawn_failure(directory, e))?;
+    let mut child = spawn_shell(command, directory, env, |process| {
+        process
+            .stdin(Stdio::null())
+            .stdout(stdout.try_clone().map_err(|e| failure(e.to_string()))?)
+            .stderr(stderr.try_clone().map_err(|e| failure(e.to_string()))?)
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        process.process_group(0);
+        Ok(())
+    })?;
     let group = crate::process_group::Group::new(
         child
             .id()
@@ -234,6 +261,11 @@ pub async fn shell_with_env(
 /// when it is aborted or deleted, and the runtime ends the rest when it exits.
 #[cfg(unix)]
 static BACKGROUND: Mutex<Vec<BackgroundJob>> = Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn lock_background() -> std::sync::MutexGuard<'static, Vec<BackgroundJob>> {
+    BACKGROUND.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(unix)]
 const EXITED_JOB_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -541,7 +573,7 @@ pub fn read_background(
     {
         use std::os::unix::fs::{FileExt, OpenOptionsExt};
         let (id, exit, handle, path, identity) = {
-            let jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+            let jobs = lock_background();
             let job = jobs
                 .iter()
                 .find(|job| job.session == session && job.id == input.job_id)
@@ -657,25 +689,21 @@ pub fn read_background(
 use crate::process_group::kill_group;
 
 #[cfg(unix)]
-fn take_jobs(keep: impl Fn(&BackgroundJob) -> bool) -> Vec<u32> {
-    let mut jobs = BACKGROUND.lock().unwrap();
-    let pids = jobs
-        .iter()
-        .filter(|job| !keep(job))
-        .filter(|job| job.exit.is_none())
-        .map(|job| job.pid)
-        .collect();
+fn stop_matching_jobs(keep: impl Fn(&BackgroundJob) -> bool) {
+    let mut jobs = lock_background();
+    for job in jobs.iter() {
+        if !keep(job) && job.exit.is_none() {
+            kill_group(job.pid);
+        }
+    }
     jobs.retain(keep);
-    pids
 }
 
 /// Ends every background job. Called when the runtime exits, matching the
 /// registry's process-local lifetime.
 pub fn stop_background_jobs() {
     #[cfg(unix)]
-    for pid in take_jobs(|_| false) {
-        kill_group(pid);
-    }
+    stop_matching_jobs(|_| false);
 }
 
 /// Ends the background jobs one session started. Aborting a turn and deleting a
@@ -684,9 +712,7 @@ pub fn cancel_background_jobs(session_id: &str) {
     #[cfg(not(unix))]
     let _ = session_id;
     #[cfg(unix)]
-    for pid in take_jobs(|job| job.session != session_id) {
-        kill_group(pid);
-    }
+    stop_matching_jobs(|job| job.session != session_id);
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -704,6 +730,20 @@ pub async fn shell_background(
         &serde_json::Map::new(),
     )
     .await
+}
+
+struct CleanupPath(Option<std::path::PathBuf>);
+impl CleanupPath {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for CleanupPath {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 pub async fn shell_background_with_env(
@@ -729,7 +769,7 @@ pub async fn shell_background_with_description(
     let _ = (session_id, description);
     let capture_dir = output_directory.to_owned();
     #[cfg(unix)]
-    let (file, child_stdout, log, log_handle, identity) = tokio::task::spawn_blocking(move || {
+    let (file, log, log_handle, identity) = tokio::task::spawn_blocking(move || {
         std::fs::create_dir_all(&capture_dir)
             .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
         // The log lives with the other tool-output files so existing retention
@@ -740,60 +780,58 @@ pub async fn shell_background_with_description(
             .keep()
             .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
         let log_handle = file.try_clone().map_err(|e| failure(e.to_string()))?;
-        let child_stdout = file.try_clone().map_err(|e| failure(e.to_string()))?;
         let identity =
             LogIdentity::from_metadata(&file.metadata().map_err(|e| failure(e.to_string()))?);
-        Ok::<_, OperationError>((file, child_stdout, log, log_handle, identity))
+        Ok::<_, OperationError>((file, log, log_handle, identity))
     })
     .await
     .map_err(|e| failure(format!("Shell setup task failed: {e}")))??;
     #[cfg(not(unix))]
-    let (file, child_stdout, log) = tokio::task::spawn_blocking(move || {
+    let (file, log) = tokio::task::spawn_blocking(move || {
         std::fs::create_dir_all(&capture_dir)
             .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
         let (file, log) = output::create(&capture_dir)
             .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?
             .keep()
             .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
-        let child_stdout = file.try_clone().map_err(|e| failure(e.to_string()))?;
-        Ok::<_, OperationError>((file, child_stdout, log))
+        Ok::<_, OperationError>((file, log))
     })
     .await
     .map_err(|e| failure(format!("Shell setup task failed: {e}")))??;
-    let mut process = shell_command(command, directory);
-    for (key, value) in env {
-        if let Some(value) = value.as_str() {
-            process.env(key, value);
-        } else {
-            process.env_remove(key);
+    let mut cleanup = CleanupPath(Some(log.clone()));
+    let mut child = spawn_shell(command, directory, env, |process| {
+        process
+            .stdin(Stdio::null())
+            .stdout(file.try_clone().map_err(|e| failure(e.to_string()))?)
+            .stderr(file.try_clone().map_err(|e| failure(e.to_string()))?);
+        #[cfg(unix)]
+        // A new session keeps the job outside every process group the harness kills
+        // when a command exits, and outside the terminal's own signals.
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
-    }
-    process
-        .stdin(Stdio::null())
-        .stdout(child_stdout)
-        .stderr(file);
-    #[cfg(unix)]
-    // A new session keeps the job outside every process group the harness kills
-    // when a command exits, and outside the terminal's own signals.
-    unsafe {
-        process.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = process.spawn().map_err(|e| spawn_failure(directory, e))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| failure("Shell has no process id"))?;
+        Ok(())
+    })?;
+    drop(file);
+    let pid = match child.id() {
+        Some(pid) => pid,
+        None => {
+            let _ = child.kill().await;
+            return Err(failure("Shell has no process id"));
+        }
+    };
     let job_id = crate::types::hex_id("job_");
     #[cfg(unix)]
     let done = std::sync::Arc::new(tokio::sync::Notify::new());
     #[cfg(unix)]
     {
         let now = std::time::Instant::now();
-        let mut jobs = BACKGROUND.lock().map_err(|e| failure(e.to_string()))?;
+        let mut jobs = lock_background();
         prune_exited(&mut jobs, now, EXITED_JOB_TTL);
         jobs.push(BackgroundJob {
             session: session_id.to_string(),
@@ -813,27 +851,84 @@ pub async fn shell_background_with_description(
             done: done.clone(),
         });
     }
-    // Reap the job so an exited command never becomes a zombie.
+    cleanup.disarm();
+    // Reap the job so an exited command never becomes a zombie. Wait with
+    // WNOWAIT first so stop_matching_jobs can never signal a reaped PID.
     #[cfg(unix)]
     let waiter_id = job_id.clone();
     tokio::spawn(async move {
-        let status = child.wait().await.ok().and_then(|status| status.code());
-        #[cfg(not(unix))]
-        let _ = status;
         #[cfg(unix)]
         {
-            if let Some(job) = BACKGROUND
-                .lock()
-                .unwrap()
-                .iter_mut()
-                .find(|job| job.id == waiter_id)
+            if let Ok(mut exits) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
             {
-                job.log = None;
-                job.exit = Some(status);
-                job.exited_at = Some(std::time::Instant::now());
+                loop {
+                    enum Poll {
+                        Retry,
+                        Exited,
+                        Pending,
+                    }
+                    let state = {
+                        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                        let rc = unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                pid,
+                                &mut info,
+                                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                            )
+                        };
+                        if rc < 0 {
+                            if std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                            {
+                                Poll::Retry
+                            } else {
+                                Poll::Exited
+                            }
+                        } else if unsafe { info.si_pid() } == pid as i32 {
+                            Poll::Exited
+                        } else {
+                            Poll::Pending
+                        }
+                    };
+                    match state {
+                        Poll::Retry => continue,
+                        Poll::Exited => break,
+                        Poll::Pending => {
+                            if exits.recv().await.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let reaped = {
+                let mut jobs = lock_background();
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if let Some(job) = jobs.iter_mut().find(|job| job.id == waiter_id) {
+                            job.log = None;
+                            job.exit = Some(status.code());
+                            job.exited_at = Some(std::time::Instant::now());
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !reaped {
+                let code = child.wait().await.ok().and_then(|status| status.code());
+                if let Some(job) = lock_background().iter_mut().find(|job| job.id == waiter_id) {
+                    job.log = None;
+                    job.exit = Some(code);
+                    job.exited_at = Some(std::time::Instant::now());
+                }
             }
             done.notify_waiters();
         }
+        #[cfg(not(unix))]
+        let _ = child.wait().await;
     });
     let polling = if cfg!(unix) {
         "Use background_read with job_id and offset for progress, background_list to inspect jobs, or background_stop with pid to stop it; "
@@ -856,9 +951,7 @@ pub async fn shell_background_with_description(
 pub fn tracked_background(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        BACKGROUND
-            .lock()
-            .unwrap()
+        lock_background()
             .iter()
             .any(|job| job.pid == pid && job.exit.is_none())
     }

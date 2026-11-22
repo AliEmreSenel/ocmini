@@ -289,6 +289,7 @@ storage {
     fn next_prompt(&self, session_id: &str) -> Result<Option<PromptRequest>, OperationError>;
     fn finish_prompt(&self, id: &str) -> Result<(), OperationError>;
     fn cancel_pending(&self, sid: &str) -> Result<(), OperationError>;
+    fn pause_pending(&self, sid: &str) -> Result<(), OperationError>;
     fn pending_sessions(&self) -> Result<Vec<String>, OperationError>;
     fn has_waiting(&self, sid: &str) -> Result<bool, OperationError>;
     fn is_pending_message(&self, id: &str) -> Result<bool, OperationError>;

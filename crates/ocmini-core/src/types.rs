@@ -239,6 +239,9 @@ impl OperationError {
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(FailureKind::Invalid, message)
     }
+    pub fn sandbox_refused(message: impl Into<String>) -> Self {
+        Self::new(FailureKind::SandboxRefused, message)
+    }
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(FailureKind::NotFound, message)
     }

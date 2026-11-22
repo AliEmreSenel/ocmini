@@ -28,6 +28,17 @@ pub(super) async fn inspection_system_prompt(
     Ok(system)
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct PromptCacheKey {
+    directory: String,
+    agent: String,
+    local_only: bool,
+    config_home: String,
+    instructions: Vec<String>,
+    agent_prompt: Option<String>,
+    skill_paths: Vec<String>,
+}
+
 /// The AGENTS.md/skills/agent-prompt base is identical for every turn in a
 /// directory; reading those files per turn scales with sessions, so cache it.
 async fn system_prompt_base(
@@ -36,10 +47,22 @@ async fn system_prompt_base(
     agent: &str,
     local_only: bool,
 ) -> Result<String, String> {
-    type PromptCache = Mutex<HashMap<(String, String, bool), (std::time::Instant, String)>>;
+    type PromptCache = Mutex<HashMap<PromptCacheKey, (std::time::Instant, String)>>;
     static CACHE: std::sync::OnceLock<PromptCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let key = (directory.to_string(), agent.to_string(), local_only);
+    let key = PromptCacheKey {
+        directory: directory.to_string(),
+        agent: agent.to_string(),
+        local_only,
+        config_home: crate::config::config_home(),
+        instructions: cfg.instructions.clone(),
+        agent_prompt: cfg
+            .agent
+            .get(agent)
+            .and_then(|a| a["prompt"].as_str())
+            .map(str::to_owned),
+        skill_paths: cfg.skill_paths(),
+    };
     if let Some((created, prompt)) = cache.lock().unwrap().get(&key) {
         if created.elapsed() < std::time::Duration::from_secs(10) {
             return Ok(prompt.clone());

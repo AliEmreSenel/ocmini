@@ -632,8 +632,12 @@ async fn worker(weak: Weak<Observer>) {
         if batch_ms > 0 {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(batch_ms)) => {},
+                _ = observer.retired.cancelled() => return,
                 _ = process.cancelled(None) => return,
             };
+        }
+        if process.is_shutdown() || observer.retired.is_cancelled() {
+            return;
         }
         let (events, gaps) = {
             let mut q = observer.queue.lock().unwrap();
@@ -667,6 +671,9 @@ async fn worker(weak: Weak<Observer>) {
             q.gaps = 0;
             (events, gaps)
         };
+        if events.is_empty() {
+            continue;
+        }
         let event_refs: Vec<&BusEvent> = events.iter().map(Arc::as_ref).collect();
         let _ = invoke_observer(&observer, &event_refs, gaps, None).await;
     }

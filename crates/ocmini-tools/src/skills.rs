@@ -11,14 +11,20 @@ pub struct Input {
 }
 
 pub fn list(directory: Option<&str>, extra: &[String]) -> Vec<Value> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let config = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
-    let mut roots = vec![
-        PathBuf::from(&home).join(".agents/skills"),
-        PathBuf::from(&home).join(".claude/skills"),
-        PathBuf::from(&config).join("opencode/skill"),
-        PathBuf::from(&config).join("opencode/skills"),
-    ];
+    let home = std::env::var("HOME").ok().filter(|v| !v.is_empty());
+    let config = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| home.as_deref().map(|h| format!("{h}/.config")));
+    let mut roots = Vec::new();
+    if let Some(home) = &home {
+        roots.push(PathBuf::from(home).join(".agents/skills"));
+        roots.push(PathBuf::from(home).join(".claude/skills"));
+    }
+    if let Some(config) = &config {
+        roots.push(PathBuf::from(config).join("opencode/skill"));
+        roots.push(PathBuf::from(config).join("opencode/skills"));
+    }
     if let Some(directory) = directory {
         let mut ancestors: Vec<_> = Path::new(directory).ancestors().collect();
         ancestors.reverse();

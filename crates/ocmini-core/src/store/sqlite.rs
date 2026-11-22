@@ -99,6 +99,38 @@ impl SqliteBackend {
         })
     }
 
+    /// Read-only session listing without creating, migrating, or recovering the database.
+    pub fn list_sessions_readonly(
+        path: &Path,
+        directory: Option<&str>,
+    ) -> Result<Vec<Session>, OperationError> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let directory = directory.map(str::to_owned);
+        crate::blocking::run(|| {
+            let connection =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            connection.busy_timeout(BUSY_TIMEOUT)?;
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Ok(Vec::new());
+            }
+            let store = Self {
+                conn: Mutex::new(connection),
+                read: None,
+                scopes: Mutex::new(Default::default()),
+                instance: "readonly".into(),
+                claims: Mutex::new(HashMap::new()),
+            };
+            store.list_sessions(directory.as_deref())
+        })
+    }
+
     /// Open the shared session database. Several ocmini processes use this file
     /// at once, so opening is fallible: contention must surface as a clean
     /// startup error, never as a panic.
@@ -127,13 +159,16 @@ impl SqliteBackend {
         if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(data_error)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Let checkpoints release an oversized WAL left by a large transcript.
         conn.pragma_update(None, "journal_size_limit", 1024 * 1024)?;
-        conn.execute_batch(
+        // Serialize schema creation and one-time migrations under BEGIN IMMEDIATE
+        // so concurrent startups cannot race on ALTER TABLE ADD COLUMN.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS session(id TEXT PRIMARY KEY, json TEXT NOT NULL, time_created INTEGER, time_updated INTEGER, parent_id TEXT, busy INTEGER DEFAULT 0);
              CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, json TEXT NOT NULL, time_created INTEGER, completed INTEGER);
              CREATE TABLE IF NOT EXISTS part(id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, json TEXT NOT NULL, time_created INTEGER, kind TEXT, status TEXT);
@@ -174,20 +209,20 @@ impl SqliteBackend {
                DELETE FROM part WHERE message_id=OLD.id;
              END;",
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM hook_delivery WHERE expires<=?1",
             params![now_ms()],
         )?;
         // One-time schema migrations run under the write lock exactly once per
         // database; every instance opening the file must not repeat these writes.
-        let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 2 {
-            conn.execute_batch(
+            tx.execute_batch(
                 "DELETE FROM part WHERE session_id NOT IN (SELECT id FROM session) OR message_id NOT IN (SELECT id FROM message);
                  DELETE FROM message WHERE session_id NOT IN (SELECT id FROM session);
                  DELETE FROM inbox WHERE session_id NOT IN (SELECT id FROM session);
                  DELETE FROM todo WHERE session_id NOT IN (SELECT id FROM session);")?;
-            conn.pragma_update(None, "user_version", 2)?;
+            tx.pragma_update(None, "user_version", 2)?;
         }
         if version < 3 {
             // Startup recovery looked for unfinished work inside the JSON, so
@@ -200,50 +235,54 @@ impl SqliteBackend {
                 ("part", "kind", "TEXT"),
                 ("part", "status", "TEXT"),
             ] {
-                add_column(&conn, table, column, kind)?;
+                add_column(&tx, table, column, kind)?;
             }
             // Malformed legacy rows keep NULL markers: they stay out of recovery,
             // as they already stay out of history reads.
-            conn.execute_batch(
+            tx.execute_batch(
                 "UPDATE message SET completed=json_extract(json,'$.time.completed') WHERE json_valid(json);
                  UPDATE part SET kind=json_extract(json,'$.type'), status=json_extract(json,'$.state.status') WHERE json_valid(json);
                  CREATE INDEX IF NOT EXISTS msg_unfinished ON message(session_id) WHERE role='assistant' AND completed IS NULL;
                  CREATE INDEX IF NOT EXISTS part_unfinished ON part(session_id) WHERE kind='tool' AND status IN ('pending','running');")?;
-            conn.pragma_update(None, "user_version", 3)?;
+            tx.pragma_update(None, "user_version", 3)?;
         }
+        if version < 4 {
+            add_column(&tx, "owner", "lease_token", "TEXT")?;
+            tx.pragma_update(None, "user_version", 4)?;
+        }
+        if version < 5 {
+            add_column(&tx, "session", "directory", "TEXT")?;
+            tx.execute("UPDATE session SET directory=json_extract(json,'$.directory') WHERE json_valid(json)", [])?;
+            tx.execute("CREATE INDEX IF NOT EXISTS session_directory_updated ON session(directory,time_updated DESC)", [])?;
+            let directories: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT directory FROM session WHERE directory IS NOT NULL",
+                )?;
+                let rows = stmt.query_map([], |row| row.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for directory in directories {
+                tx.execute(
+                    "UPDATE session SET directory=?2 WHERE directory=?1",
+                    params![directory, scope_key(&directory)],
+                )?;
+            }
+            tx.pragma_update(None, "user_version", 5)?;
+        }
+        if version < 6 {
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS msg_sid_rowid ON message(session_id);
+                 CREATE INDEX IF NOT EXISTS session_updated_id ON session(time_updated DESC, id DESC);
+                 CREATE INDEX IF NOT EXISTS session_directory_updated_id ON session(directory, time_updated DESC, id DESC);",
+            )?;
+            tx.pragma_update(None, "user_version", 6)?;
+        }
+        tx.commit()?;
         let read = if path.to_string_lossy() == ":memory:" {
             None
         } else {
             Some(Mutex::new(open_connection(path)?))
         };
-        if version < 4 {
-            add_column(&conn, "owner", "lease_token", "TEXT")?;
-            conn.pragma_update(None, "user_version", 4)?;
-        }
-        if version < 5 {
-            add_column(&conn, "session", "directory", "TEXT")?;
-            conn.execute("UPDATE session SET directory=json_extract(json,'$.directory') WHERE json_valid(json)", [])?;
-            conn.execute("CREATE INDEX IF NOT EXISTS session_directory_updated ON session(directory,time_updated DESC)", [])?;
-            let directories: Vec<String> = conn
-                .prepare("SELECT DISTINCT directory FROM session WHERE directory IS NOT NULL")?
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            for directory in directories {
-                conn.execute(
-                    "UPDATE session SET directory=?2 WHERE directory=?1",
-                    params![directory, scope_key(&directory)],
-                )?;
-            }
-            conn.pragma_update(None, "user_version", 5)?;
-        }
-        if version < 6 {
-            conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS msg_sid_rowid ON message(session_id);
-                 CREATE INDEX IF NOT EXISTS session_updated_id ON session(time_updated DESC, id DESC);
-                 CREATE INDEX IF NOT EXISTS session_directory_updated_id ON session(directory, time_updated DESC, id DESC);",
-            )?;
-            conn.pragma_update(None, "user_version", 6)?;
-        }
         let store = Self {
             conn: Mutex::new(conn),
             read,
@@ -991,6 +1030,16 @@ impl SqliteBackend {
             tx.execute("UPDATE part SET json=json_set(json,'$.ignored',json('true')) WHERE message_id IN (SELECT message_id FROM inbox WHERE session_id=?1 AND started=0)",params![sid])?;
             tx.execute("DELETE FROM inbox WHERE session_id=?1", params![sid])
                 ?;
+            Ok(())
+        })
+    }
+
+    pub fn pause_pending(&self, sid: &str) -> Result<(), OperationError> {
+        self.transaction(|tx| {
+            tx.execute(
+                "UPDATE inbox SET request=json_set(request,'$.v2.resume',json('false')) WHERE session_id=?1 AND started=0",
+                params![sid],
+            )?;
             Ok(())
         })
     }

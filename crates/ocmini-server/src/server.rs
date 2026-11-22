@@ -27,7 +27,9 @@ pub struct AppState {
 impl IntoResponse for OperationError {
     fn into_response(self) -> Response {
         let (status, name) = match self.kind {
-            FailureKind::Invalid => (StatusCode::BAD_REQUEST, "ValidationError"),
+            FailureKind::Invalid | FailureKind::SandboxRefused => {
+                (StatusCode::BAD_REQUEST, "ValidationError")
+            }
             FailureKind::NotFound => (StatusCode::NOT_FOUND, "NotFoundError"),
             FailureKind::Busy => (StatusCode::CONFLICT, "SessionBusyError"),
             FailureKind::HookReentry => (StatusCode::CONFLICT, "HookReentryError"),
@@ -87,11 +89,38 @@ async fn auth_gate(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let Ok(origin) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(origin.scheme(), "http" | "https") {
+        return false;
+    }
+    let Ok(host_url) = reqwest::Url::parse(&format!("{}://{host}", origin.scheme())) else {
+        return false;
+    };
+    if !host_url.username().is_empty()
+        || host_url.password().is_some()
+        || !matches!(host_url.path(), "" | "/")
+        || host_url.query().is_some()
+        || host_url.fragment().is_some()
+    {
+        return false;
+    }
+    origin
+        .host_str()
+        .zip(host_url.host_str())
+        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        && origin.port_or_known_default() == host_url.port_or_known_default()
+}
+
+fn is_v2_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/") || path.starts_with("/web/api/")
+}
+
 async fn request_site_gate(req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    let api = path == "/api"
-        || path.starts_with("/api/")
-        || path.starts_with("/web/api/")
+    let api = is_v2_path(path)
         || matches!(
             path.split('/').nth(1),
             Some(
@@ -113,23 +142,13 @@ async fn request_site_gate(req: Request, next: Next) -> Response {
         let navigate = headers
             .get("sec-fetch-mode")
             .is_some_and(|v| v == "navigate");
-        let disallowed_origin = headers.get(header::ORIGIN).is_some_and(|origin| {
-            let origin = origin
-                .to_str()
-                .ok()
-                .and_then(|v| reqwest::Url::parse(v).ok());
-            let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-            !origin.as_ref().zip(host).is_some_and(|(origin, host)| {
-                origin.host_str().is_some_and(|name| {
-                    let authority = match origin.port() {
-                        Some(port) => format!("{name}:{port}"),
-                        None => name.to_owned(),
-                    };
-                    authority.eq_ignore_ascii_case(host)
-                })
-            })
-        });
-        if navigate || disallowed_origin {
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        let allowed_origin = headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .zip(host)
+            .is_some_and(|(origin, host)| origin_matches_host(origin, host));
+        if navigate || !allowed_origin {
             return (StatusCode::FORBIDDEN, Json(json!({"_tag":"ForbiddenError","message":"Cross-site requests to the API are not allowed"}))).into_response();
         }
     }
@@ -335,7 +354,12 @@ async fn session_status(
     Query(query): Query<ScopeQuery>,
 ) -> Result<Json<Value>, OperationError> {
     let directory = requested_directory(&headers, &query)?;
-    let statuses = st.app.statuses.lock().unwrap().clone();
+    let statuses = st
+        .app
+        .statuses
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let mut status = Map::new();
     for id in st.app.store.busy_sessions()? {
         if st
@@ -396,7 +420,7 @@ async fn prompt_async(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn reject_hook_reentry(
+pub(crate) fn reject_hook_reentry(
     st: &AppState,
     session: &Session,
     headers: &HeaderMap,
@@ -572,8 +596,9 @@ fn event_types(csv: Option<&str>) -> Option<std::collections::HashSet<String>> {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(str::to_owned)
-            .collect()
+            .collect::<std::collections::HashSet<_>>()
     })
+    .filter(|types| !types.is_empty())
 }
 
 fn event_in_directory(event: &BusEvent, app: &App, directory: Option<&str>) -> bool {
@@ -629,7 +654,14 @@ async fn event_stream(
             }
         }
     };
-    Ok(Sse::new(events).into_response())
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        Sse::new(events),
+    )
+        .into_response())
 }
 
 async fn permission_list(
@@ -903,6 +935,7 @@ async fn access_log(request: Request, next: Next) -> Response {
 
 async fn panic_to_json(request: Request, next: Next) -> Response {
     use futures::FutureExt;
+    let v2 = is_v2_path(request.uri().path());
     match std::panic::AssertUnwindSafe(next.run(request))
         .catch_unwind()
         .await
@@ -910,14 +943,26 @@ async fn panic_to_json(request: Request, next: Next) -> Response {
         Ok(response) => response,
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"_tag":"UnknownError","message":"Internal server error"})),
+            Json(if v2 {
+                json!({"_tag":"UnknownError","message":"Internal server error"})
+            } else {
+                json!({"name":"UnknownError","data":{"message":"Internal server error"}})
+            }),
         )
             .into_response(),
     }
 }
 
-async fn not_found() -> OperationError {
-    OperationError::not_found("Route not found")
+async fn not_found(request: Request) -> Response {
+    if is_v2_path(request.uri().path()) {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"_tag":"NotFoundError","message":"Route not found"})),
+        )
+            .into_response()
+    } else {
+        OperationError::not_found("Route not found").into_response()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -967,11 +1012,11 @@ pub fn router_with(state: AppState, extra: Router<AppState>) -> Router {
         .route("/skill", get(skills))
         .route("/command", get(commands))
         .fallback(not_found)
-        .layer(middleware::from_fn(panic_to_json))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn(request_site_gate))
         .layer(middleware::from_fn(auth_gate))
         .layer(middleware::from_fn(access_log))
+        .layer(middleware::from_fn(panic_to_json))
         .with_state(state)
 }
 
@@ -1043,8 +1088,18 @@ pub async fn serve_with(
             {
                 let _ = tokio::signal::ctrl_c().await;
             }
-            for id in shutdown_state.app.store.busy_sessions().unwrap_or_default() {
-                shutdown_state.engine.abort(&id);
+            let busy = shutdown_state.app.store.busy_sessions().unwrap_or_default();
+            for id in &busy {
+                shutdown_state.engine.abort(id);
+            }
+            if !busy.is_empty() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    futures::future::join_all(
+                        busy.iter().map(|id| shutdown_state.engine.wait_idle(id)),
+                    ),
+                )
+                .await;
             }
             shutdown_state.shutdown.cancel();
         })
@@ -1063,7 +1118,8 @@ mod tests {
         assert_eq!(types.len(), 2);
         assert!(types.contains("file.edited"));
         assert!(!types.contains("file"));
-        assert!(event_types(Some("")).unwrap().is_empty());
+        assert!(event_types(Some("")).is_none());
+        assert!(event_types(Some(" , ")).is_none());
         let event = BusEvent {
             id: "event".into(),
             kind: event::EventKind::File(event::FileKind::Edited),
@@ -1162,6 +1218,8 @@ mod request_site_tests {
                 "https://proxy.test:8443",
                 StatusCode::FORBIDDEN,
             ),
+            ("/api/test", "cross-site", "cors", "", StatusCode::FORBIDDEN),
+            ("/api/test", "same-site", "cors", "", StatusCode::FORBIDDEN),
             (
                 "/web/api/test",
                 "cross-site",
@@ -1218,5 +1276,32 @@ mod request_site_tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["_tag"], "UnknownError");
+    }
+
+    #[test]
+    fn origin_matches_host_handles_default_ports_and_ipv6() {
+        assert!(origin_matches_host(
+            "http://example.test",
+            "example.test:80"
+        ));
+        assert!(origin_matches_host(
+            "https://example.test",
+            "example.test:443"
+        ));
+        assert!(origin_matches_host(
+            "http://example.test:80",
+            "example.test"
+        ));
+        assert!(origin_matches_host(
+            "https://example.test:443",
+            "example.test"
+        ));
+        assert!(origin_matches_host("http://[::1]:4096", "[::1]:4096"));
+        assert!(origin_matches_host("http://[::1]", "[::1]:80"));
+        assert!(!origin_matches_host(
+            "http://example.test",
+            "example.test:443"
+        ));
+        assert!(!origin_matches_host("https://evil.test", "example.test"));
     }
 }

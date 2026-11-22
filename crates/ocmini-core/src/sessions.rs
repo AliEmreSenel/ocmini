@@ -155,7 +155,7 @@ pub fn sandbox_settings(app: &App, directory: &str, preset: &str) -> Result<Valu
     {
         let _ = (app, directory);
         if preset != "off" {
-            return Err(OperationError::invalid(
+            return Err(OperationError::sandbox_refused(
                 "Sandbox startup refused: this binary was built without the sandbox feature",
             ));
         }
@@ -199,7 +199,7 @@ fn prepare_sandbox(app: &App, session: &mut Session) -> Result<(), OperationErro
 #[cfg(not(feature = "sandbox"))]
 fn disabled_sandbox(app: &App, session: &Session) -> Result<Value, OperationError> {
     let refusal = || {
-        OperationError::invalid(
+        OperationError::sandbox_refused(
             "Sandbox startup refused: this binary was built without the sandbox feature",
         )
     };
@@ -246,13 +246,13 @@ fn disabled_sandbox(app: &App, session: &Session) -> Result<Value, OperationErro
     }
     app.config
         .check_sandbox_support()
-        .map_err(OperationError::invalid)?;
+        .map_err(OperationError::sandbox_refused)?;
     Ok(json!({"preset":"off","config":{"off":true}}))
 }
 
 /// User/resource creation; automatic accounting and title updates use Store directly.
 pub fn set_status(app: &App, sid: &str, status: event::SessionStatus) {
-    let mut statuses = app.statuses.lock().unwrap();
+    let mut statuses = app.statuses.lock().unwrap_or_else(|e| e.into_inner());
     match status {
         event::SessionStatus::Idle => {
             statuses.remove(sid);
@@ -485,6 +485,23 @@ pub async fn fork(
     source: &Session,
     boundary: Option<&str>,
 ) -> Result<Session, OperationError> {
+    fork_inner(app, source, boundary, false).await
+}
+
+pub async fn fork_v2(
+    app: &App,
+    source: &Session,
+    boundary: Option<&str>,
+) -> Result<Session, OperationError> {
+    fork_inner(app, source, boundary, true).await
+}
+
+async fn fork_inner(
+    app: &App,
+    source: &Session,
+    boundary: Option<&str>,
+    zero_usage: bool,
+) -> Result<Session, OperationError> {
     let app = app.for_directory(&source.directory)?;
     if app.store.is_busy(&source.id)? {
         return Err(OperationError::busy("Session is busy"));
@@ -540,6 +557,10 @@ pub async fn fork(
             session.title = fields.title;
             session.sandbox = fields.sandbox;
             session.extra.extend(fields.extra);
+            if zero_usage {
+                session.cost = 0.0;
+                session.tokens = crate::types::Tokens::default();
+            }
             Ok(true)
         })?
         .ok_or_else(|| OperationError::not_found("Session not found"))?;
@@ -560,6 +581,31 @@ pub async fn fork(
 }
 
 pub async fn delete(app: &App, session: &Session) -> Result<(), OperationError> {
+    delete_inner(app, session, true, |_| async { Ok(()) }).await
+}
+
+pub async fn delete_stopping<F, Fut>(
+    app: &App,
+    session: &Session,
+    stop: F,
+) -> Result<(), OperationError>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), OperationError>>,
+{
+    delete_inner(app, session, false, stop).await
+}
+
+async fn delete_inner<F, Fut>(
+    app: &App,
+    session: &Session,
+    require_idle_before_hooks: bool,
+    stop: F,
+) -> Result<(), OperationError>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), OperationError>>,
+{
     let mut sessions = vec![session.clone()];
     let mut ids = std::collections::HashSet::from([session.id.clone()]);
     let mut index = 0;
@@ -573,9 +619,11 @@ pub async fn delete(app: &App, session: &Session) -> Result<(), OperationError> 
         index += 1;
     }
     // Cascade vetoes all run before the transaction or process cleanup begins.
-    for session in &sessions {
-        if app.store.is_busy(&session.id)? {
-            return Err(OperationError::busy("Session or a child session is busy"));
+    if require_idle_before_hooks {
+        for session in &sessions {
+            if app.store.is_busy(&session.id)? {
+                return Err(OperationError::busy("Session or a child session is busy"));
+            }
         }
     }
     let scopes = sessions
@@ -594,14 +642,20 @@ pub async fn delete(app: &App, session: &Session) -> Result<(), OperationError> 
             )
             .await?;
     }
+    let id_list: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+    stop(id_list.clone()).await?;
+    if !require_idle_before_hooks {
+        for session in &sessions {
+            if app.store.is_busy(&session.id)? {
+                return Err(OperationError::busy("Session or a child session is busy"));
+            }
+        }
+    }
     let v2_events = sessions
         .iter()
         .map(|s| app.v2.prepare_delete(s))
         .collect::<Result<Vec<_>, _>>()?;
-    if !app.store.delete_session_checked(
-        &session.id,
-        &sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
-    )? {
+    if !app.store.delete_session_checked(&session.id, &id_list)? {
         return Err(OperationError::not_found("Session not found"));
     }
     for (session, frame) in sessions.iter().zip(v2_events) {

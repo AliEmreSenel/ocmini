@@ -119,15 +119,33 @@
     const root = state.dir.endsWith(state.sep) ? state.dir : state.dir + state.sep;
     return path.startsWith(root) ? path.slice(root.length) : path;
   }
+  function normalizePath(path) {
+    if (!path) return "";
+    const sep = state.sep || "/";
+    const winDrive = path.match(/^([A-Za-z]:)[\\/]?/);
+    const prefix = winDrive ? winDrive[1] + sep : path.startsWith("/") || path.startsWith("\\") ? sep : "";
+    const rest = winDrive ? path.slice(winDrive[0].length) : prefix ? path.replace(/^[\\/]+/, "") : path;
+    const parts = [];
+    for (const part of rest.split(/[\\/]+/)) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        if (parts.length && parts[parts.length - 1] !== "..") parts.pop();
+        else if (!prefix) parts.push("..");
+      } else {
+        parts.push(part);
+      }
+    }
+    return prefix + parts.join(sep);
+  }
   function join(dir, name) {
-    if (isAbsolute(name)) return name;
-    return dir.replace(/[\\/]+$/, "") + state.sep + name;
+    if (isAbsolute(name)) return normalizePath(name);
+    return normalizePath(dir.replace(/[\\/]+$/, "") + state.sep + name);
   }
   const isAbsolute = (path) => /^([A-Za-z]:)?[\\/]/.test(path);
   // Tools accept paths relative to the session directory; the file API needs absolute ones.
-  const resolve = (path) => (isAbsolute(path) ? path : join(state.dir, path));
-  // Paths are truncated from the left with direction: rtl; a leading LRM keeps them in order.
-  const ltr = (text) => "\u200e" + text;
+  const resolve = (path) => (isAbsolute(path) ? normalizePath(path) : join(state.dir, path));
+  // Paths are truncated from the left with direction: rtl; LRI..PDI keeps the whole text LTR.
+  const ltr = (text) => "\u2066" + text + "\u2069";
   const basename = (path) => path.split(/[\\/]/).filter(Boolean).pop() || path;
   function fileUri(path) {
     const parts = path.replace(/\\/g, "/").split("/").map(encodeURIComponent).join("/");
@@ -156,16 +174,17 @@
   const store = {
     get(key) { try { return localStorage.getItem("ocmini." + key); } catch { return null; } },
     set(key, value) { try { localStorage.setItem("ocmini." + key, value); } catch { /* private mode */ } },
+    remove(key) { try { localStorage.removeItem("ocmini." + key); } catch { /* private mode */ } },
   };
   const narrow = () => matchMedia("(max-width: 900px)").matches;
 
   // ---------- markdown ----------
   function inline(text) {
-    // Code spans and links become placeholders so emphasis never edits inside them.
+    // Strip NUL bytes so user text cannot forge internal placeholder tokens.
     const held = [];
     const hold = (html) => "\u0000" + (held.push(html) - 1) + "\u0000";
     const link = (label, url) => hold('<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + label + "</a>");
-    let out = esc(text)
+    let out = esc(String(text).replace(/\u0000/g, ""))
       .replace(/`([^`\n]+)`/g, (_, code) => hold("<code>" + code + "</code>"))
       .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => link(label, url))
       .replace(/(^|[\s(])(https?:\/\/[^\s<)\u0000]+)/g, (_, before, url) => before + link(url, url));
@@ -175,7 +194,8 @@
       .replace(/(^|[^*\w])\*([^*\s][^*\n]*)\*(?!\w)/g, "$1<em>$2</em>")
       .replace(/(^|[^_\w])_([^_\s][^_\n]*)_(?!\w)/g, "$1<em>$2</em>")
       .replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
-    return out.replace(/\u0000(\d+)\u0000/g, (_, n) => held[+n]);
+    const restore = (s) => s.replace(/\u0000(\d+)\u0000/g, (_, n) => restore(held[+n]));
+    return restore(out);
   }
   const LIST = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
   const blockStart = (line) => /^\s*(```|~~~|#{1,6}\s|>|([-*+]|\d+[.)])\s)/.test(line) || /^\s*(---+|\*\*\*+|___+)\s*$/.test(line);
@@ -185,9 +205,10 @@
     for (let i = 0; i < lines.length; ) {
       const line = lines[i];
       const fence = line.match(/^\s*(`{3,}|~{3,})\s*([^\s`]*)/);
-      if (fence) {
+      if (fence && !(fence[1][0] === "`" && line.slice(line.indexOf(fence[1]) + fence[1].length).includes("`"))) {
+        const close = new RegExp("^\\s*" + fence[1][0] + "{" + fence[1].length + ",}\\s*$");
         const body = [];
-        for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) body.push(lines[i]);
+        for (i++; i < lines.length && !close.test(lines[i]); i++) body.push(lines[i]);
         i++;
         out.push('<pre class="code"><div class="bar"><span>' + esc(fence[2] || "") +
           '</span><button type="button" data-copy>Copy</button></div><code>' + esc(body.join("\n")) + "</code></pre>");
@@ -354,15 +375,19 @@
   async function renameSession(s) {
     const title = prompt("Session title", s.title);
     if (title == null || !title.trim()) return;
-    await api("PATCH", sessionPath(s.id), { title: title.trim() }).catch(fail);
-    if (state.session && state.session.id === s.id) state.session.title = title.trim();
-    renderHeader();
-    reloadSessions();
+    try {
+      await api("PATCH", sessionPath(s.id), { title: title.trim() });
+      if (state.session && state.session.id === s.id) state.session.title = title.trim();
+      renderHeader();
+      reloadSessions();
+    } catch (error) { fail(error); }
   }
   async function archiveSession(s) {
-    await api("PATCH", sessionPath(s.id), { archived: true }).catch(fail);
-    if (s.id === state.sid) clearSession();
-    reloadSessions();
+    try {
+      await api("PATCH", sessionPath(s.id), { archived: true });
+      if (s.id === state.sid) clearSession();
+      reloadSessions();
+    } catch (error) { fail(error); }
   }
   async function unarchiveSession(s) {
     await api("PATCH", sessionPath(s.id), { archived: false }).catch(fail);
@@ -371,9 +396,11 @@
   }
   async function deleteSession(s) {
     if (!confirm(`Delete "${s.title}" and its subagent sessions? This cannot be undone.`)) return;
-    await api("DELETE", sessionPath(s.id)).catch(fail);
-    if (s.id === state.sid) clearSession();
-    reloadSessions();
+    try {
+      await api("DELETE", sessionPath(s.id));
+      if (s.id === state.sid) clearSession();
+      reloadSessions();
+    } catch (error) { fail(error); }
   }
 
   function clearSession() {
@@ -559,24 +586,49 @@
   }
   async function selectModel() {
     const key = $("#model").value;
+    if (!key) {
+      state.selection = null;
+      store.remove("model");
+      if (state.sid) {
+        try {
+          const def = await api("GET", "/api/model/default?" + located());
+          if (def && def.data) {
+            const selection = { providerID: def.data.providerID, id: def.data.id };
+            await api("POST", sessionPath(state.sid, "/model"), { model: selection });
+            if (state.session) state.session.model = selection;
+          } else {
+            toast("No default model configured", true);
+          }
+        } catch (error) { fail(error); }
+      }
+      renderSelectors();
+      return;
+    }
     const found = state.models.find((m) => modelKey(m) === key);
-    if (!found) return;
+    if (!found) return renderSelectors();
     const selection = { providerID: found.providerID, id: found.id };
     const variant = $("#variant").value;
     if (variant && (found.variants || []).some((v) => v.id === variant)) selection.variant = variant;
-    state.selection = selection;
-    store.set("model", JSON.stringify(selection));
-    if (state.sid) {
-      await api("POST", sessionPath(state.sid, "/model"), { model: selection }).catch(fail);
-      if (state.session) state.session.model = selection;
-    }
+    try {
+      if (state.sid) {
+        await api("POST", sessionPath(state.sid, "/model"), { model: selection });
+        if (state.session) state.session.model = selection;
+      }
+      state.selection = selection;
+      store.set("model", JSON.stringify(selection));
+    } catch (error) { fail(error); }
     renderSelectors();
   }
   async function selectAgent() {
     const agent = $("#agent").value;
     if (!state.sid) return;
-    await api("POST", sessionPath(state.sid, "/agent"), { agent }).catch(fail);
-    if (state.session) state.session.agent = agent;
+    try {
+      await api("POST", sessionPath(state.sid, "/agent"), { agent });
+      if (state.session) state.session.agent = agent;
+    } catch (error) {
+      fail(error);
+      renderSelectors();
+    }
   }
 
   // ---------- transcript rendering ----------
@@ -825,7 +877,7 @@
     const isOpen = block.open != null ? !!block.open : state.toolView === "full";
     const node = h("details", { class: "tool " + status, open: isOpen, ontoggle: (e) => { block.open = e.target.open; } });
     const arg = toolArg(block.name, input);
-    const path = input && (input.filePath || input.path);
+    const path = input && (input.filePath || input.path || input.file_path);
     const childSid = s.metadata && (s.metadata.sessionID || s.metadata.sessionId);
     const summary = h("summary", {},
       h("span", { class: "state", text: icon }),
@@ -989,7 +1041,9 @@
       const answer = {};
       for (const field of form.fields || []) {
         if (field.type === "multiselect") {
-          answer[field.key] = [...node.querySelectorAll(`input[name="f${CSS.escape(field.key)}"]:checked`)].map((i) => i.value);
+          const picked = [...node.querySelectorAll(`input[name="f${CSS.escape(field.key)}"]:checked`)].map((i) => i.value);
+          if (field.required && !picked.length) return toast("Answer every question first", true);
+          answer[field.key] = picked;
         } else {
           const custom = node.querySelector(`input[name="c${CSS.escape(field.key)}"]`);
           const picked = node.querySelector(`input[name="f${CSS.escape(field.key)}"]:checked`);
@@ -1057,18 +1111,29 @@
   async function refreshHistory(sid) {
     const page = await api("GET", sessionPath(sid, "/message?order=desc&limit=80"));
     if (sid !== state.sid) return;
-    const signature = page.data.length + ":" + JSON.stringify(page.data[0] || null).length;
+    const signature = JSON.stringify(page.data);
     if (signature === watchSignature) return;
     watchSignature = signature;
     const open = new Set();
-    for (const m of state.messages) for (const b of m.content || []) if (b && b.open) open.add(b.id || b);
+    for (const m of state.messages) {
+      (m.content || []).forEach((b, idx) => {
+        if (b && b.open) open.add(b.id ? "id:" + b.id : m.id + ":" + idx);
+      });
+    }
+    const fresh = page.data.slice().reverse();
+    const freshIds = new Set(fresh.map((m) => m.id));
+    const overlap = state.messages.findIndex((m) => freshIds.has(m.id));
+    const keptOlder = overlap > 0 ? state.messages.slice(0, overlap) : [];
     state.messages = [];
     state.byId.clear();
-    for (const m of page.data.slice().reverse()) {
-      for (const b of m.content || []) if (b && b.id && open.has(b.id)) b.open = true;
+    for (const m of keptOlder) addMessage(m);
+    for (const m of fresh) {
+      (m.content || []).forEach((b, idx) => {
+        if (b && open.has(b.id ? "id:" + b.id : m.id + ":" + idx)) b.open = true;
+      });
       addMessage(m);
     }
-    state.olderCursor = page.cursor && page.cursor.next;
+    if (!keptOlder.length) state.olderCursor = page.cursor && page.cursor.next;
     stick = nearBottom();
     renderMessages();
     scrollToBottom();
@@ -1237,6 +1302,9 @@
         if (item && !state.byId.has(item.id) && sid === state.sid && !delivered.has(item.id)) {
           state.pending.set(item.id, item);
         }
+        state.attachments = [];
+        state.selectedSkills = [];
+        renderAttachments();
       }
       if (text.trim() && state.promptHistory[state.promptHistory.length - 1] !== text.trim()) {
         state.promptHistory.push(text.trim());
@@ -1244,9 +1312,6 @@
       state.historyIndex = -1;
       state.historyDraft = "";
       input.value = "";
-      state.attachments = [];
-      state.selectedSkills = [];
-      renderAttachments();
       autosize();
       store.set("draft", "");
       stick = true;
@@ -1351,31 +1416,47 @@
   const delivered = new Set();
   let source = null;
   let retry = 0;
+  let retryTimer = 0;
+  async function loadActive() {
+    const active = await api("GET", "/api/session/active");
+    state.busy = new Set(Object.keys((active && active.data) || {}));
+    renderSessions();
+    renderStatus();
+    renderSandbox();
+  }
   function connect() {
+    clearTimeout(retryTimer);
+    retryTimer = 0;
     if (source) source.close();
-    source = new EventSource("/api/event");
+    const es = new EventSource("/api/event");
+    source = es;
     const conn = $("#conn");
-    source.onopen = () => {
+    es.onopen = () => {
+      if (source !== es) return;
       conn.className = "conn live";
       conn.title = "Live";
       if (retry) resync();
       retry = 0;
     };
-    source.onerror = () => {
+    es.onerror = () => {
+      if (source !== es) return;
       conn.className = "conn down";
       conn.title = "Disconnected; reconnecting";
-      if (source.readyState === EventSource.CLOSED) {
+      if (es.readyState === EventSource.CLOSED) {
         retry++;
-        setTimeout(connect, Math.min(30000, 1000 * 2 ** Math.min(retry, 5)));
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(connect, Math.min(30000, 1000 * 2 ** Math.min(retry, 5)));
       } else retry = Math.max(retry, 1);
     };
-    source.onmessage = (e) => {
+    es.onmessage = (e) => {
+      if (source !== es) return;
       let event;
       try { event = JSON.parse(e.data); } catch { return; }
       try { handle(event); } catch (error) { console.error(error, event); }
     };
   }
   function resync() {
+    loadActive().catch(() => {});
     reloadSessions();
     if (state.sid) openSession(state.sid);
   }
@@ -1535,10 +1616,11 @@
       }
       case "session.tool.input.ended": {
         // The complete input arrives before approval, so a waiting call can show its target.
-        const block = assistant(data).content.find((b) => b && b.type === "tool" && b.id === data.id);
+        const m = assistant(data);
+        const block = m.content.find((b) => b && b.type === "tool" && b.id === data.id);
         if (block && block.state.status === "streaming") {
           block.state = { status: "streaming", input: data.text };
-          touch(block, null);
+          touch(m, block.node ? block : null);
         }
         return;
       }
@@ -1677,7 +1759,9 @@
     };
     const selected = state.tree && find(state.tree);
     if (!selected) return state.dir;
-    return selected.type === "directory" ? selected.path : selected.path.slice(0, selected.path.length - selected.name.length - 1);
+    if (selected.type === "directory") return selected.path;
+    const parent = selected.path.slice(0, selected.path.length - selected.name.length - 1);
+    return parent || state.sep;
   }
   async function newFile() {
     const folder = selectedFolder();
@@ -1685,9 +1769,9 @@
     if (!name || !name.trim()) return;
     const path = join(folder, name.trim());
     try {
-      await api("PUT", "/web/api/fs/write", { path, content: "", create: true });
+      const created = await api("PUT", "/web/api/fs/write", { path, content: "", create: true });
       refreshTree();
-      openFile(path);
+      openFile((created && created.path) || path);
     } catch (error) { fail(error); }
   }
   async function newFolder() {
@@ -1704,7 +1788,7 @@
       await api("POST", "/web/api/fs/rename", { from: node.path, to });
       for (const f of state.files) {
         if (f.path === node.path || f.path.startsWith(node.path + state.sep)) {
-          f.path = to + f.path.slice(node.path.length);
+          f.path = normalizePath(to + f.path.slice(node.path.length));
           f.name = basename(f.path);
         }
       }
@@ -1747,16 +1831,26 @@
     }
     return { text, readonly, version: response.headers.get("x-ocmini-version") };
   }
+  const opening = new Map();
   async function openFile(path, quiet = false) {
+    path = normalizePath(path);
     showView("editor");
     let file = state.files.find((f) => f.path === path);
     if (!file) {
+      let pending = opening.get(path);
+      if (!pending) {
+        pending = fetchFile(path).finally(() => opening.delete(path));
+        opening.set(path, pending);
+      }
       try {
-        const loaded = await fetchFile(path);
-        file = { path, name: basename(path), text: loaded.text, saved: loaded.text, version: loaded.version,
-          diskVersion: loaded.version, readonly: loaded.readonly, dirty: false, scroll: [0, 0], cursor: [0, 0] };
-        if (loaded.readonly) toast(basename(path) + " is not valid UTF-8; opened read-only", true);
-        state.files.push(file);
+        const loaded = await pending;
+        file = state.files.find((f) => f.path === path);
+        if (!file) {
+          file = { path, name: basename(path), text: loaded.text, saved: loaded.text, version: loaded.version,
+            diskVersion: loaded.version, readonly: loaded.readonly, dirty: false, scroll: [0, 0], cursor: [0, 0] };
+          if (loaded.readonly) toast(basename(path) + " is not valid UTF-8; opened read-only", true);
+          state.files.push(file);
+        }
       } catch (error) {
         if (quiet) return;
         if (error.status === 415) toast(basename(path) + " looks like a binary file and cannot be edited here", true);
@@ -1802,7 +1896,7 @@
       h("span", { class: "fname", text: f.name }),
       h("button", { type: "button", "aria-label": "Close " + f.name, text: "✕", onclick: (e) => { e.stopPropagation(); closeFile(f); } }))));
     if (state.active) {
-      $("#editor-path").textContent = ltr(state.active.path) + (state.active.readonly ? " (read-only)" : "") + (state.active.missing ? " (deleted)" : "");
+      $("#editor-path").textContent = ltr(state.active.path + (state.active.readonly ? " (read-only)" : "") + (state.active.missing ? " (deleted)" : ""));
       $("#save").disabled = !!state.active.readonly;
     }
   }
@@ -1902,15 +1996,17 @@
     const file = state.active;
     if (!file || file.readonly) return;
     stash();
-    const body = { path: file.path, content: file.text };
+    const content = file.text;
+    const body = { path: file.path, content };
     if (!force && !file.missing) body.version = file.version;
     try {
       const result = await api("PUT", "/web/api/fs/write", body);
       file.version = result.version;
       file.diskVersion = result.version;
-      file.saved = file.text;
-      file.dirty = false;
+      file.saved = content;
       file.missing = false;
+      if (state.active === file) file.text = code().value;
+      file.dirty = file.text !== file.saved;
       renderTabs();
       toast("Saved " + file.name);
       refreshTree();
@@ -2252,6 +2348,7 @@
       state.models.map((m) => h("option", { value: modelKey(m), text: modelKey(m) + (m.name && m.name !== m.id ? " — " + m.name : "") })));
     const boolOptions = () => [h("option", { value: "", text: "Not set" }), h("option", { value: "true", text: "On" }), h("option", { value: "false", text: "Off" })];
     const controls = {};
+    const initial = {};
     const field = (key, options, hint) => {
       const select = h("select", { id: "set-" + key.replace(".", "-"), disabled: !file.editable }, ...options);
       const raw = values[key];
@@ -2259,6 +2356,7 @@
       select.value = value;
       if (select.value !== value) { select.append(h("option", { value, text: value })); select.value = value; }
       controls[key] = select;
+      initial[key] = select.value;
       return h("div", { class: "field" }, h("label", { for: select.id, text: SETTING_LABELS[key] }), select,
         hint ? h("div", { class: "hint", text: hint }) : null);
     };
@@ -2270,8 +2368,10 @@
       const set = {};
       for (const [key, select] of Object.entries(controls)) {
         const v = select.value;
+        if (v === initial[key]) continue;
         set[key] = v === "" ? null : key.startsWith("compaction.") ? v === "true" : v;
       }
+      if (!Object.keys(set).length) return toast("No changes to save");
       try {
         const updated = await api("PATCH", "/web/api/config", { scope, directory: state.dir, set });
         toast("Settings saved");
@@ -2354,18 +2454,39 @@
       divider.setPointerCapture(e.pointerId);
       const main = document.querySelector("main").getBoundingClientRect();
       const move = (ev) => {
-        const width = Math.min(Math.max(main.right - ev.clientX, 240), main.width - 280);
+        const max = Math.max(240, main.width - 280);
+        const width = Math.min(Math.max(main.right - ev.clientX, 240), max);
         document.documentElement.style.setProperty("--editor-width", width + "px");
       };
-      const up = () => {
+      const done = () => {
         divider.removeEventListener("pointermove", move);
+        divider.removeEventListener("pointerup", done);
+        divider.removeEventListener("pointercancel", done);
+        divider.removeEventListener("lostpointercapture", done);
         store.set("editorWidth", getComputedStyle(document.documentElement).getPropertyValue("--editor-width"));
       };
       divider.addEventListener("pointermove", move);
-      divider.addEventListener("pointerup", up, { once: true });
+      divider.addEventListener("pointerup", done);
+      divider.addEventListener("pointercancel", done);
+      divider.addEventListener("lostpointercapture", done);
     });
     const saved = store.get("editorWidth");
     if (saved) document.documentElement.style.setProperty("--editor-width", saved);
+  }
+  async function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch { /* fall back to execCommand on non-HTTPS origins */ }
+    }
+    const area = h("textarea", { value: text });
+    area.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0";
+    document.body.append(area);
+    area.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    area.remove();
+    if (!ok) throw new Error("Copy to clipboard failed");
   }
 
   // ---------- wiring ----------
@@ -2505,7 +2626,7 @@
       const button = e.target.closest("[data-copy]");
       if (!button) return;
       const text = button.closest("pre").querySelector("code").textContent;
-      navigator.clipboard.writeText(text).then(() => { button.textContent = "Copied"; setTimeout(() => (button.textContent = "Copy"), 1200); }, fail);
+      copyText(text).then(() => { button.textContent = "Copied"; setTimeout(() => (button.textContent = "Copy"), 1200); }, fail);
     });
 
     $("#new-file").onclick = newFile;
@@ -2565,6 +2686,7 @@
     }
     state.sep = info.separator || "/";
     connect();
+    loadActive().catch(() => {});
     const sid = location.hash.slice(1);
     let dir = store.get("dir") || info.cwd;
     if (sid) await openSession(sid);

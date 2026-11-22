@@ -1,6 +1,10 @@
 //! Incremental ClientHello inspection, including handshakes split over records.
 //! Sizes are TLS wire lengths, never arbitrary parser truncation limits.
 use crate::config::normalize_name;
+/// Maximum wire size of a valid TLS ClientHello body under RFC 5246 / RFC 8446:
+/// 2 (version) + 32 (random) + 1 + 255 (session_id) + 2 + 65535 (cipher_suites)
+/// + 1 + 255 (compression_methods) + 2 + 65535 (extensions).
+const MAX_CLIENT_HELLO_BODY: usize = 34 + 1 + 255 + 2 + 65535 + 1 + 255 + 2 + 65535;
 #[derive(Debug, PartialEq, Eq)]
 pub struct Hello {
     pub name: Option<String>,
@@ -12,37 +16,85 @@ pub enum Parse {
     Hello(Hello),
     Invalid,
 }
-pub fn inspect(bytes: &[u8]) -> Parse {
-    let mut records = bytes;
-    let mut handshake = Vec::new();
-    loop {
-        if records.len() < 5 {
-            return Parse::More;
-        }
-        if records[0] != 22 || records[1] != 3 {
+#[derive(Default)]
+pub struct Inspector {
+    header: [u8; 5],
+    header_len: usize,
+    record_rem: usize,
+    handshake: Vec<u8>,
+    expected_len: Option<usize>,
+    done: bool,
+}
+impl Inspector {
+    pub fn feed(&mut self, mut input: &[u8]) -> Parse {
+        if self.done {
             return Parse::Invalid;
         }
-        let length = u16::from_be_bytes([records[3], records[4]]) as usize;
-        if length == 0 || length > 18432 {
-            return Parse::Invalid;
-        }
-        if records.len() < length + 5 {
-            return Parse::More;
-        }
-        handshake.extend_from_slice(&records[5..5 + length]);
-        records = &records[5 + length..];
-        if handshake.len() >= 4 {
-            if handshake[0] != 1 {
-                return Parse::Invalid;
+        while !input.is_empty() {
+            if self.record_rem == 0 {
+                let need = 5 - self.header_len;
+                let take = input.len().min(need);
+                self.header[self.header_len..self.header_len + take]
+                    .copy_from_slice(&input[..take]);
+                self.header_len += take;
+                input = &input[take..];
+                if self.header_len < 5 {
+                    return Parse::More;
+                }
+                if self.header[0] != 22 || self.header[1] != 3 {
+                    self.done = true;
+                    return Parse::Invalid;
+                }
+                let length = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+                if length == 0 || length > 18432 {
+                    self.done = true;
+                    return Parse::Invalid;
+                }
+                self.record_rem = length;
+                self.header_len = 0;
             }
-            let length = ((handshake[1] as usize) << 16)
-                | ((handshake[2] as usize) << 8)
-                | handshake[3] as usize;
-            if handshake.len() >= 4 + length {
-                return parse_hello(&handshake[4..4 + length]).map_or(Parse::Invalid, Parse::Hello);
+            let take = input.len().min(self.record_rem);
+            if let Some(expected) = self.expected_len {
+                let want = expected.saturating_sub(self.handshake.len());
+                self.handshake.extend_from_slice(&input[..take.min(want)]);
+            } else {
+                self.handshake.extend_from_slice(&input[..take]);
+            }
+            self.record_rem -= take;
+            input = &input[take..];
+            if self.expected_len.is_none() && self.handshake.len() >= 4 {
+                if self.handshake[0] != 1 {
+                    self.done = true;
+                    return Parse::Invalid;
+                }
+                let body_len = ((self.handshake[1] as usize) << 16)
+                    | ((self.handshake[2] as usize) << 8)
+                    | self.handshake[3] as usize;
+                if body_len > MAX_CLIENT_HELLO_BODY {
+                    self.done = true;
+                    return Parse::Invalid;
+                }
+                self.expected_len = Some(4 + body_len);
+                if self.handshake.len() > 4 + body_len {
+                    self.handshake.truncate(4 + body_len);
+                }
+            }
+            if self.record_rem == 0 {
+                if let Some(expected) = self.expected_len {
+                    if self.handshake.len() >= expected {
+                        self.done = true;
+                        return parse_hello(&self.handshake[4..expected])
+                            .map_or(Parse::Invalid, Parse::Hello);
+                    }
+                }
             }
         }
+        Parse::More
     }
+}
+#[cfg(test)]
+pub fn inspect(bytes: &[u8]) -> Parse {
+    Inspector::default().feed(bytes)
 }
 fn take<'a>(input: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
     if input.len() < length {
@@ -170,5 +222,31 @@ mod tests {
             bytes.extend(chunk);
         }
         assert!(matches!(inspect(&bytes), Parse::Hello(_)));
+    }
+
+    #[test]
+    fn incremental_inspector_parses_byte_by_byte() {
+        let r = record("example.org", true);
+        let mut inspector = Inspector::default();
+        for &b in &r[..r.len() - 1] {
+            assert_eq!(inspector.feed(&[b]), Parse::More);
+        }
+        assert_eq!(
+            inspector.feed(&r[r.len() - 1..]),
+            Parse::Hello(Hello {
+                name: Some("example.org".into()),
+                ech: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_client_hello_exceeding_rfc_maximum() {
+        let mut rec = vec![22, 3, 3, 0, 8, 1, 0x0f, 0x00, 0x00, 3, 3, 0, 0];
+        assert_eq!(inspect(&rec), Parse::Invalid);
+        rec[6] = 0x02;
+        rec[7] = 0x02;
+        rec[8] = 0x25;
+        assert_eq!(inspect(&rec), Parse::Invalid);
     }
 }

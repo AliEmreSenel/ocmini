@@ -141,12 +141,18 @@ impl Echo {
 }
 fn header(p: &[u8]) -> Option<(IpAddr, IpAddr, usize, u8)> {
     match p.first()? >> 4 {
-        4 if p.len() >= 20 => Some((
-            Ipv4Addr::new(p[12], p[13], p[14], p[15]).into(),
-            Ipv4Addr::new(p[16], p[17], p[18], p[19]).into(),
-            ((p[0] & 15) as usize) * 4,
-            p[9],
-        )),
+        4 if p.len() >= 20 => {
+            let offset = ((p[0] & 15) as usize) * 4;
+            if offset < 20 {
+                return None;
+            }
+            Some((
+                Ipv4Addr::new(p[12], p[13], p[14], p[15]).into(),
+                Ipv4Addr::new(p[16], p[17], p[18], p[19]).into(),
+                offset,
+                p[9],
+            ))
+        }
         6 if p.len() >= 40 => Some((
             Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).ok()?).into(),
             Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).ok()?).into(),

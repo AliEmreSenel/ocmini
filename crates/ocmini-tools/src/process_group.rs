@@ -8,15 +8,28 @@ use std::sync::{
 
 static TRACKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
     std::sync::LazyLock::new(Default::default);
+fn lock_tracked() -> std::sync::MutexGuard<'static, std::collections::HashSet<u32>> {
+    TRACKED.lock().unwrap_or_else(|e| e.into_inner())
+}
 pub fn tracked(pid: u32) -> bool {
-    TRACKED.lock().unwrap().contains(&pid)
+    lock_tracked().contains(&pid)
+}
+
+struct Inner {
+    id: u32,
+    reaped: AtomicBool,
+}
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if !self.reaped.load(Ordering::Acquire) {
+            kill_group(self.id);
+        }
+        lock_tracked().remove(&self.id);
+    }
 }
 
 #[derive(Clone)]
-pub struct Group {
-    id: u32,
-    reaped: Arc<AtomicBool>,
-}
+pub struct Group(Arc<Inner>);
 pub fn kill_group(id: u32) {
     #[cfg(unix)]
     if id > 1 && id <= i32::MAX as u32 {
@@ -29,22 +42,22 @@ pub fn kill_group(id: u32) {
 }
 impl Group {
     pub fn new(id: u32) -> Self {
-        TRACKED.lock().unwrap().insert(id);
-        Self {
+        lock_tracked().insert(id);
+        Self(Arc::new(Inner {
             id,
-            reaped: Arc::new(AtomicBool::new(false)),
-        }
+            reaped: AtomicBool::new(false),
+        }))
     }
     pub fn kill(&self) {
-        if !self.reaped.load(Ordering::Acquire) {
-            kill_group(self.id);
+        if !self.0.reaped.load(Ordering::Acquire) {
+            kill_group(self.0.id);
         }
     }
     pub async fn wait(
         &self,
         child: &mut tokio::process::Child,
     ) -> io::Result<std::process::ExitStatus> {
-        let (id, reaped) = (self.id, &self.reaped);
+        let (id, reaped) = (self.0.id, &self.0.reaped);
         #[cfg(unix)]
         {
             let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
@@ -87,13 +100,5 @@ impl Group {
         let status = child.wait().await?;
         reaped.store(true, Ordering::Release);
         Ok(status)
-    }
-}
-impl Drop for Group {
-    fn drop(&mut self) {
-        self.kill();
-        if Arc::strong_count(&self.reaped) == 1 {
-            TRACKED.lock().unwrap().remove(&self.id);
-        }
     }
 }

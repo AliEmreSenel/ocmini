@@ -432,7 +432,10 @@ pub(super) fn render_event(
     if ui.interactions.apply(event) {
         ui.prompt = None;
         if let Some(request) = ui.interactions.current().cloned() {
-            rows.push(Row::Text(RowKind::Plain, render_interaction(ui, &request)));
+            rows.push(Row::Text(
+                RowKind::Literal,
+                render_interaction(ui, &request),
+            ));
         }
     }
     let notice = match event.kind {
@@ -462,9 +465,20 @@ pub(super) fn render_event(
         // A notice stands at block level, so it opens with the transcript's
         // separator instead of a newline baked into its own text.
         rows.push(Row::Blank);
-        rows.push(Row::Text(RowKind::Plain, notice));
+        rows.push(Row::Text(RowKind::Literal, notice));
     }
     rows
+}
+
+fn user_message_text(message: &MessageWithParts) -> String {
+    message
+        .parts
+        .iter()
+        .filter(|part| part["type"].as_str() == Some("text"))
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[MessageWithParts]) {
@@ -476,29 +490,33 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
             if message.info.role == "user" {
                 // A prompt starts an answer, so its label is available again.
                 ui.answer_labelled = false;
-                display.user_prompt(
-                    message
-                        .parts
-                        .iter()
-                        .find(|part| part["type"] == "text")
-                        .and_then(|part| part["text"].as_str())
-                        .unwrap_or_default(),
-                    width,
-                );
+                display.user_prompt(&user_message_text(message), width);
             } else {
                 display.ensure_blank();
-                display.output(&format!("{BOLD}{}{RESET}\n", message.info.role), width);
+                display.output_literal(&format!("{BOLD}{}{RESET}\n", message.info.role), width);
             }
         }
         for part in &message.parts {
             match part["type"].as_str() {
                 // A user prompt's text is on its landmark row already.
                 Some("text") if message.info.role == "user" => {}
-                Some("text") if message.info.role != "assistant" => display.output(
+                Some("text") if message.info.role != "assistant" => display.output_literal(
                     &format!("{}\n", part["text"].as_str().unwrap_or_default()),
                     width,
                 ),
-                Some("file") => display.output(
+                Some("compaction") => {
+                    let focus = part["ocminiFocus"]
+                        .as_str()
+                        .filter(|focus| !focus.trim().is_empty())
+                        .map(|focus| format!(": {}", truncate(focus, 80)))
+                        .unwrap_or_default();
+                    display.ensure_blank();
+                    display.output_literal(
+                        &format!("{DIM}◦ compacting context{focus}{RESET}\n"),
+                        width,
+                    );
+                }
+                Some("file") => display.output_literal(
                     &format!(
                         "{DIM}attachment: {}{RESET}\n",
                         part["filename"].as_str().unwrap_or("attachment")
@@ -511,7 +529,7 @@ pub(super) fn render_history(display: &mut Display, ui: &mut Ui, history: &[Mess
             }
         }
         if let Some(error) = &message.info.error {
-            display.output(
+            display.output_literal(
                 &format!(
                     "{RED}error: {}{RESET}\n",
                     error["data"]["message"].as_str().unwrap_or("interrupted")
@@ -543,14 +561,8 @@ pub(super) fn session_prompts(messages: &[MessageWithParts]) -> impl Iterator<It
     messages
         .iter()
         .filter(|message| message.info.role == "user")
-        .filter_map(|message| {
-            message
-                .parts
-                .iter()
-                .find(|part| part["type"].as_str() == Some("text"))
-                .and_then(|part| part["text"].as_str())
-                .map(str::to_string)
-        })
+        .map(user_message_text)
+        .filter(|text| !text.is_empty())
 }
 
 pub(crate) fn display_model(

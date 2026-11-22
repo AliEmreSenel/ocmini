@@ -62,10 +62,14 @@ pub async fn request(
             match event {
                 ProviderEvent::Finished { finish, usage } => return Ok((finish, usage)),
                 ProviderEvent::Error(message) => {
+                    let overflow = super::context_overflow(&message);
+                    let image_decode = super::image_decode_error(&message);
                     return Err(ProviderError {
-                        retryable: super::stream_retryable(&message),
+                        retryable: !overflow && !image_decode && super::stream_retryable(&message),
+                        overflow,
+                        image_decode,
                         ..ProviderError::fatal(message)
-                    })
+                    });
                 }
                 event => consume(event).map_err(ProviderError::from)?,
             }

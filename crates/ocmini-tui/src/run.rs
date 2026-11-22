@@ -9,13 +9,58 @@ use crate::engine::{bus, App, EngineApi};
 use crate::engine_impl::Engine;
 use crate::sessions;
 use crate::tui;
-use crate::types::{self, BusEvent, PromptRequest, TurnResult};
+use crate::types::{self, BusEvent, OperationError, PromptRequest, TurnResult};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+/// Lazy detached OS-thread stdin line reader so Tokio runtime teardown never
+/// blocks waiting on an unanswered stdin read after Ctrl+C or turn completion.
+#[derive(Default)]
+struct StdinLines {
+    rx: Option<mpsc::UnboundedReceiver<std::io::Result<String>>>,
+}
+
+impl StdinLines {
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        let rx = self.rx.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            std::thread::spawn(move || {
+                let stdin = std::io::stdin();
+                let mut reader = std::io::BufReader::new(stdin.lock());
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if line.ends_with('\n') {
+                                line.pop();
+                                if line.ends_with('\r') {
+                                    line.pop();
+                                }
+                            }
+                            if tx.send(Ok(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+            });
+            rx
+        });
+        match rx.recv().await {
+            Some(Ok(line)) => Ok(Some(line)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+}
 
 enum Pending {
     Permission(String),
@@ -25,7 +70,7 @@ enum Pending {
         answers: Vec<Vec<String>>,
     },
 }
-pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
+pub async fn run(app: App, args: crate::RunArgs) -> Result<(), OperationError> {
     if args.fork && args.session.is_none() && !args.continue_last && !args.resume {
         return Err("--fork requires --session, --continue, or --resume".into());
     }
@@ -125,7 +170,9 @@ pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
     );
     let engine = Engine::new();
     let mut events = bus().subscribe();
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = StdinLines::default();
+    let shutdown = crate::client::shutdown_signal().map_err(|e| e.to_string())?;
+    tokio::pin!(shutdown);
     loop {
         let result = pump(
             &app,
@@ -139,6 +186,7 @@ pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
                 .await?,
             &mut events,
             &mut lines,
+            &mut shutdown,
         )
         .await;
         match result {
@@ -165,7 +213,12 @@ pub async fn run(app: App, args: crate::RunArgs) -> Result<(), String> {
         }
         // Non-TTY / JSON fallback: keep prompting via line loop.
         let line = loop {
-            let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? else {
+            let next = tokio::select! {
+                biased;
+                _ = &mut shutdown => return Err("Aborted".into()),
+                line = lines.next_line() => line.map_err(|e| e.to_string())?,
+            };
+            let Some(line) = next else {
                 return Ok(());
             };
             if matches!(line.trim(), "/exit" | "/quit") {
@@ -197,9 +250,16 @@ struct State {
     interactions: crate::client::Interactions,
     text: TextState,
     headered: HashSet<String>,
-    printed_answer: bool,
+    need_newline: bool,
     turn_error: Option<String>,
     pending: Option<Pending>,
+}
+
+fn ensure_newline(st: &mut State, json: bool) {
+    if !json && st.need_newline {
+        println!();
+        st.need_newline = false;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -219,7 +279,7 @@ fn on_event(
     if st.interactions.apply(&event) {
         st.pending = None;
         if let Some(request) = st.interactions.current().cloned() {
-            show_interaction(st, app, args, tty, &request);
+            show_interaction(st, app, args, json, tty, &request);
         }
     }
     // JSON reads accepted final parts from storage; it needs no live text buffer.
@@ -232,10 +292,14 @@ fn on_event(
                 } else {
                     println!("\n[response updated]");
                 }
+                st.need_newline = false;
             }
-            print!("{}", terminal_text(&update.text));
-            st.printed_answer |= update.kind == TextKind::Text && !update.text.is_empty();
-            let _ = std::io::stdout().flush();
+            let rendered = terminal_text(&update.text);
+            if !rendered.is_empty() {
+                print!("{rendered}");
+                st.need_newline = !rendered.ends_with('\n');
+                let _ = std::io::stdout().flush();
+            }
         }
     }
     match event.kind {
@@ -258,19 +322,30 @@ fn on_event(
                 Some("tool") => {
                     if !json {
                         if st.headered.insert(id) {
+                            ensure_newline(st, false);
                             println!(
                                 "\u{2192} {} {}",
                                 terminal_text(part["tool"].as_str().unwrap_or("tool")),
                                 terminal_text(&tui::summarize_input(&part["state"]["input"]))
                             );
                         }
-                    } else if part["state"]["status"].as_str() == Some("completed")
-                        && !part["state"]["input"].is_null()
+                    } else if matches!(
+                        part["state"]["status"].as_str(),
+                        Some("completed" | "error")
+                    ) && !part["state"]["input"].is_null()
+                        && st.headered.insert(id.clone())
                     {
-                        println!(
-                            "{}",
-                            json!({"type": "tool_use", "tool": part["tool"], "id": id, "input": part["state"]["input"]})
-                        );
+                        let mut record = json!({
+                            "type": "tool_use",
+                            "tool": part["tool"],
+                            "id": id,
+                            "status": part["state"]["status"],
+                            "input": part["state"]["input"]
+                        });
+                        if let Some(error) = part["state"]["error"].as_str() {
+                            record["error"] = json!(error);
+                        }
+                        println!("{record}");
                     }
                 }
                 _ => {}
@@ -308,28 +383,48 @@ fn on_event(
     }
 }
 
-fn show_interaction(st: &mut State, app: &App, args: &crate::RunArgs, tty: bool, event: &BusEvent) {
+fn emit_prompt_line(json: bool, line: &str) {
+    if json {
+        eprintln!("{line}");
+        let _ = std::io::stderr().flush();
+    } else {
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn show_interaction(
+    st: &mut State,
+    app: &App,
+    args: &crate::RunArgs,
+    json: bool,
+    tty: bool,
+    event: &BusEvent,
+) {
     match event.kind {
         event::EventKind::Permission(event::PermissionKind::Asked) => {
             let id = event.properties["id"].as_str().unwrap_or_default();
             if args.auto {
                 app.perms.reply(id, "once");
             } else if tty {
-                println!(
-                    "\u{26a0} allow {}: {}? [y] once [a]lways [n]o",
-                    terminal_text(event.properties["permission"].as_str().unwrap_or("tool")),
-                    terminal_text(
-                        &event.properties["patterns"]
-                            .as_array()
-                            .map(|list| list
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", "))
-                            .unwrap_or_default()
-                    )
+                ensure_newline(st, json);
+                emit_prompt_line(
+                    json,
+                    &format!(
+                        "\u{26a0} allow {}: {}? [y] once [a]lways [n]o",
+                        terminal_text(event.properties["permission"].as_str().unwrap_or("tool")),
+                        terminal_text(
+                            &event.properties["patterns"]
+                                .as_array()
+                                .map(|list| list
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", "))
+                                .unwrap_or_default()
+                        )
+                    ),
                 );
-                let _ = std::io::stdout().flush();
                 st.pending = Some(Pending::Permission(id.to_string()));
             } else {
                 // Non-interactive: refuse rather than hang.
@@ -337,25 +432,25 @@ fn show_interaction(st: &mut State, app: &App, args: &crate::RunArgs, tty: bool,
             }
         }
         event::EventKind::Question(event::QuestionKind::Asked) => {
+            let id = event.properties["id"].as_str().unwrap_or_default();
             if tty {
                 let questions = event.properties["questions"]
                     .as_array()
                     .cloned()
                     .unwrap_or_default();
                 if let Some(question) = questions.first() {
-                    show_question(question);
+                    ensure_newline(st, json);
+                    show_question(question, json);
+                    st.pending = Some(Pending::Question {
+                        id: id.to_owned(),
+                        questions,
+                        answers: Vec::new(),
+                    });
+                } else {
+                    let _ = app.questions.reply(id, Vec::new());
                 }
-                st.pending = Some(Pending::Question {
-                    id: event.properties["id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned(),
-                    questions,
-                    answers: Vec::new(),
-                });
             } else {
-                app.questions
-                    .reject(event.properties["id"].as_str().unwrap_or_default());
+                app.questions.reject(id);
             }
         }
         _ => {}
@@ -374,7 +469,7 @@ fn drain(
     session_id: &str,
     user_mid: &str,
     events: &mut broadcast::Receiver<Arc<BusEvent>>,
-) -> Result<(), String> {
+) -> Result<(), OperationError> {
     loop {
         match events.try_recv() {
             Ok(event) => on_event(st, app, args, json, tty, session_id, user_mid, event),
@@ -382,7 +477,7 @@ fn drain(
                 return Err("Event stream lagged; output may be incomplete".into())
             }
             Err(broadcast::error::TryRecvError::Closed) => {
-                return Err("Event bus closed".to_string());
+                return Err("Event bus closed".into());
             }
             Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
         }
@@ -392,7 +487,7 @@ fn drain(
 /// Streams one turn: renders bus events, answers permission prompts, and
 /// resolves when the turn's completion receiver fires.
 #[allow(clippy::too_many_arguments)]
-async fn pump(
+async fn pump<S: std::future::Future<Output = ()> + Unpin>(
     app: &App,
     args: &crate::RunArgs,
     json: bool,
@@ -401,35 +496,39 @@ async fn pump(
     user_mid: &str,
     done: oneshot::Receiver<TurnResult>,
     events: &mut broadcast::Receiver<Arc<BusEvent>>,
-    lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
-) -> Result<bool, String> {
+    lines: &mut StdinLines,
+    shutdown: &mut S,
+) -> Result<bool, OperationError> {
     let mut st = State::default();
-    let shutdown = crate::client::shutdown_signal().map_err(|e| e.to_string())?;
-    tokio::pin!(shutdown);
     let mut done = Box::pin(done);
     loop {
         drain(&mut st, app, args, json, tty, session_id, user_mid, events)?;
         tokio::select! {
             biased;
-            _ = &mut shutdown => return Err("Aborted".into()),
+            _ = &mut *shutdown => {
+                reject_pending(app, st.pending.take());
+                return Err("Aborted".into());
+            }
             response = &mut done => {
                 drain(&mut st, app, args, json, tty, session_id, user_mid, events)?;
                 let value = response.map_err(|_| {
-                    st.turn_error
-                        .take()
-                        .unwrap_or_else(|| "Turn ended without a result".to_string())
+                    OperationError::from(
+                        st.turn_error
+                            .take()
+                            .unwrap_or_else(|| "Turn ended without a result".to_string()),
+                    )
                 })?;
-                value.map_err(String::from)?;
+                value?;
                 if let Some(error) = st.turn_error.take() {
-                    return Err(if json { error } else { terminal_text(&error).into_owned() });
+                    return Err(OperationError::from(if json { error } else { terminal_text(&error).into_owned() }));
                 }
-                return Ok(st.printed_answer);
+                return Ok(st.need_newline);
             }
             event = events.recv() => {
                 match event {
                     Ok(event) => on_event(&mut st, app, args, json, tty, session_id, user_mid, event),
                     Err(broadcast::error::RecvError::Lagged(_)) => return Err("Event stream lagged; output may be incomplete".into()),
-                    Err(_) => return Err("Event bus closed".to_string()),
+                    Err(_) => return Err("Event bus closed".into()),
                 }
             }
             line = lines.next_line(), if st.pending.is_some() => {
@@ -437,8 +536,8 @@ async fn pump(
                     Some(line) => {
                         match st.pending.take() {
                             Some(Pending::Permission(id)) => {
-                                let reply = match line.trim() {
-                                    "y" | "yes" => "once",
+                                let reply = match line.trim().to_ascii_lowercase().as_str() {
+                                    "y" | "yes" | "o" | "once" => "once",
                                     "a" | "always" => "always",
                                     _ => "reject",
                                 };
@@ -449,23 +548,45 @@ async fn pump(
                                     let labels: Vec<String> = question["options"].as_array().map(|options| options.iter()
                                         .filter_map(|o| o["label"].as_str().map(str::to_owned)).collect()).unwrap_or_default();
                                     let answer = parse_answer(&line, &labels);
-                                    if crate::types::validate_answer(question, &answer).is_err() {
-                                        println!("Choose one answer.");
-                                    } else { answers.push(answer); }
+                                    if answer.is_empty() {
+                                        emit_prompt_line(json, "Enter an answer.");
+                                    } else if crate::types::validate_answer(question, &answer).is_err() {
+                                        emit_prompt_line(json, "Choose one answer.");
+                                    } else {
+                                        answers.push(answer);
+                                    }
                                 }
-                                if answers.len() == questions.len() && app.questions.reply(&id, answers.clone()) {
+                                if answers.len() >= questions.len() {
+                                    let _ = app.questions.reply(&id, answers);
                                 } else {
-                                    if let Some(question) = questions.get(answers.len()) { show_question(question); }
+                                    if let Some(question) = questions.get(answers.len()) {
+                                        show_question(question, json);
+                                    }
                                     st.pending = Some(Pending::Question { id, questions, answers });
                                 }
                             }
                             None => {}
                         }
                     }
-                    None => return Err("Prompt cancelled".to_string()),
+                    None => {
+                        reject_pending(app, st.pending.take());
+                        return Err("Prompt cancelled".into());
+                    }
                 }
             }
         }
+    }
+}
+
+fn reject_pending(app: &App, pending: Option<Pending>) {
+    match pending {
+        Some(Pending::Permission(id)) => {
+            app.perms.reply(&id, "reject");
+        }
+        Some(Pending::Question { id, .. }) => {
+            app.questions.reject(&id);
+        }
+        None => {}
     }
 }
 
@@ -483,7 +604,7 @@ fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn show_question(question: &Value) {
+fn show_question(question: &Value, json: bool) {
     let labels = question["options"]
         .as_array()
         .map(|options| {
@@ -495,10 +616,12 @@ fn show_question(question: &Value) {
                 .join(" | ")
         })
         .unwrap_or_default();
-    println!(
-        "? {} ({})",
-        terminal_text(question["question"].as_str().unwrap_or_default()),
-        terminal_text(&labels)
+    emit_prompt_line(
+        json,
+        &format!(
+            "? {} ({})",
+            terminal_text(question["question"].as_str().unwrap_or_default()),
+            terminal_text(&labels)
+        ),
     );
-    let _ = std::io::stdout().flush();
 }

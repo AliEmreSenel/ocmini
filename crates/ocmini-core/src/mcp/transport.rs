@@ -104,7 +104,7 @@ pub(super) fn create_local(
                 break "MCP server emitted a message without jsonrpc 2.0".into();
             }
             if let Some(method) = value["method"].as_str() {
-                if let Some(id) = value.get("id") {
+                if let Some(id) = value.get("id").filter(|id| !id.is_null()) {
                     let response = if method == "ping" {
                         json!({"jsonrpc":"2.0","id":id,"result":{}})
                     } else {
@@ -481,21 +481,25 @@ async fn remote_send(remote: &Remote, message: Value, id: Option<u64>) -> Result
 }
 
 fn remote_request(remote: &Remote, message: &Value) -> reqwest::RequestBuilder {
-    let mut request = remote
+    let mut headers = remote.headers.clone();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(protocol) = HeaderValue::from_str(&remote.protocol.lock().unwrap().clone()) {
+        headers.insert(HeaderName::from_static("mcp-protocol-version"), protocol);
+    }
+    if let Some(session) = remote.session.lock().unwrap().clone() {
+        if let Ok(value) = HeaderValue::from_str(&session) {
+            headers.insert(HeaderName::from_static("mcp-session-id"), value);
+        }
+    }
+    remote
         .client
         .post(&remote.url)
-        .headers(remote.headers.clone())
-        .header(ACCEPT, "application/json, text/event-stream")
-        .header(CONTENT_TYPE, "application/json")
-        .header(
-            "MCP-Protocol-Version",
-            remote.protocol.lock().unwrap().clone(),
-        )
-        .json(message);
-    if let Some(session) = remote.session.lock().unwrap().clone() {
-        request = request.header("Mcp-Session-Id", session);
-    }
-    request
+        .headers(headers)
+        .json(message)
 }
 
 async fn handle_remote_event(
@@ -507,7 +511,7 @@ async fn handle_remote_event(
         return Err("MCP SSE message omitted jsonrpc 2.0".into());
     }
     if let Some(method) = value["method"].as_str() {
-        if let Some(request_id) = value.get("id") {
+        if let Some(request_id) = value.get("id").filter(|id| !id.is_null()) {
             let response = if method == "ping" {
                 json!({"jsonrpc":"2.0","id":request_id,"result":{}})
             } else {

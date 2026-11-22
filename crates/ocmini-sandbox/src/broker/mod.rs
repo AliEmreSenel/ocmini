@@ -92,12 +92,27 @@ struct TcpFlow {
     host: Option<std::sync::Arc<TcpStream>>,
     connecting: bool,
     inspect: bool,
+    inspector: Option<tls::Inspector>,
     prefix: Vec<u8>,
     sent: usize,
     read_eof: bool,
     write_eof: bool,
     touched: Instant,
     _buffers: buffers::TcpBuffers,
+}
+fn insert_tcp_flow(
+    tcp_flows: &mut HashMap<Tuple, TcpFlow>,
+    sockets: &mut SocketSet<'_>,
+    key: Tuple,
+    flow: TcpFlow,
+) {
+    if let Some(previous) = tcp_flows.insert(key, flow) {
+        sockets.remove(previous.handle);
+        drop(previous);
+    }
+}
+fn is_internal_dns(address: SocketAddr) -> bool {
+    address.port() == 53 && (address.ip() == IpAddr::V4(PEER4) || address.ip() == IpAddr::V6(PEER6))
 }
 struct UdpFlow {
     reply_to: Option<SocketAddr>,
@@ -181,8 +196,10 @@ pub async fn run(
         for handle in [icmp4, icmp6].into_iter().flatten() {
             let sock = sockets.get_mut::<raw::Socket>(handle);
             while sock.can_recv() {
-                let packet = sock.recv().map_err(io::Error::other)?;
-                echoes.receive(packet, &policy.network.outbound).await?;
+                let Ok(packet) = sock.recv() else {
+                    break;
+                };
+                let _ = echoes.receive(packet, &policy.network.outbound).await;
             }
         }
         // The stack's local echo responder must not impersonate external hosts.
@@ -195,14 +212,20 @@ pub async fn run(
                 let mut bytes = vec![0; sock.recv_queue()];
                 let n = sock.recv_slice(&mut bytes).unwrap_or(0);
                 bytes.truncate(n);
-                flow.prefix.extend(bytes);
+                flow.prefix.extend_from_slice(&bytes);
                 flow.touched = Instant::now();
-                progress = n > 0;
-                match tls::inspect(&flow.prefix) {
+                progress |= n > 0;
+                let parsed = flow
+                    .inspector
+                    .get_or_insert_with(tls::Inspector::default)
+                    .feed(&bytes);
+                match parsed {
                     tls::Parse::More => {}
                     tls::Parse::Invalid => {
                         sock.abort();
                         flow.inspect = false;
+                        flow.inspector = None;
+                        flow.prefix = Vec::new();
                     }
                     tls::Parse::Hello(hello) => {
                         let name = hello.name.as_deref();
@@ -211,8 +234,10 @@ pub async fn run(
                             r.matches(Protocol::Tcp, key.remote.ip(), key.remote.port(), name)
                         });
                         flow.inspect = false;
+                        flow.inspector = None;
                         if denied || (hello.ech && policy.network.ech == Ech::Deny) {
                             sock.abort();
+                            flow.prefix = Vec::new();
                         } else {
                             flow.connecting = true;
                             let key = *key;
@@ -262,6 +287,10 @@ pub async fn run(
                         }
                         Ok(n) => {
                             flow.sent += n;
+                            if flow.sent == flow.prefix.len() {
+                                flow.prefix = Vec::new();
+                                flow.sent = 0;
+                            }
                             flow.touched = Instant::now();
                             progress = true;
                         }
@@ -308,6 +337,7 @@ pub async fn run(
                 }
                 if !sock.may_recv()
                     && sock.recv_queue() == 0
+                    && flow.sent == flow.prefix.len()
                     && !flow.write_eof
                     && !matches!(sock.state(), tcp::State::SynSent | tcp::State::SynReceived)
                 {
@@ -342,19 +372,19 @@ pub async fn run(
             sockets.remove(f.handle);
             drop(f);
         }
-        for listener in udp_listeners.values() {
+        for listener in udp_listeners.values_mut() {
             let sock = sockets.get_mut::<udp::Socket>(listener.handle);
             while sock.can_recv() {
-                let (payload, metadata) = sock.recv().map_err(io::Error::other)?;
+                let Ok((payload, metadata)) = sock.recv() else {
+                    break;
+                };
+                listener.touched = Instant::now();
                 let guest = address(metadata.endpoint);
                 let key = Tuple {
                     guest,
                     remote: listener.address,
                 };
-                if listener.address.port() == 53
-                    && (listener.address.ip() == IpAddr::V4(PEER4)
-                        || listener.address.ip() == IpAddr::V6(PEER6))
-                {
+                if is_internal_dns(listener.address) {
                     let resolver = resolver.clone();
                     let query = payload.to_vec();
                     let rules = policy.network.outbound.clone();
@@ -373,17 +403,22 @@ pub async fn run(
                     ) {
                         continue;
                     }
-                    let host = std::net::UdpSocket::bind(if key.remote.is_ipv4() {
+                    let Ok(host) = std::net::UdpSocket::bind(if key.remote.is_ipv4() {
                         "0.0.0.0:0"
                     } else {
                         "[::]:0"
-                    })?;
-                    if host.connect(key.remote).is_err() {
+                    }) else {
+                        continue;
+                    };
+                    if host.connect(key.remote).is_err() || host.set_nonblocking(true).is_err() {
                         continue;
                     }
-                    host.set_nonblocking(true)?;
-                    let host = UdpSocket::from_std(host)?;
-                    host.writable().await?;
+                    let Ok(host) = UdpSocket::from_std(host) else {
+                        continue;
+                    };
+                    if host.writable().await.is_err() {
+                        continue;
+                    }
                     e.insert(UdpFlow {
                         host: std::sync::Arc::new(host),
                         reply_to: None,
@@ -425,7 +460,7 @@ pub async fn run(
         let stale: Vec<_> = udp_listeners
             .iter()
             .filter(|(address, listener)| {
-                address.port() != 53
+                !is_internal_dns(**address)
                     && listener.touched.elapsed() > Duration::from_secs(30)
                     && !udp_flows
                         .values()
@@ -485,39 +520,53 @@ pub async fn run(
                     if protocol==Protocol::Tcp && syn && !tcp_flows.contains_key(&key){
                         let inspect=key.remote.port()==443 && (policy.network.outbound.inspects_tls() || policy.network.ech==Ech::Deny);
                         if inspect{
-                            let(mut sock,backing)=socket(&policy)?;sock.listen(endpoint(key.remote)).map_err(io::Error::other)?;let handle=sockets.add(sock);
-                            tcp_flows.insert(key,TcpFlow{handle,host:None,connecting:false,inspect,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
+                            if let Ok((mut sock,backing))=socket(&policy){
+                                if sock.listen(endpoint(key.remote)).is_ok(){
+                                    let handle=sockets.add(sock);
+                                    insert_tcp_flow(&mut tcp_flows,&mut sockets,key,TcpFlow{handle,host:None,connecting:false,inspect,inspector:Some(tls::Inspector::default()),prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
+                                }
+                            }
                         }else if policy.network.outbound.permits(protocol,key.remote.ip(),key.remote.port(),None){
                             pending.insert(key,packet);
                             connects.push(Box::pin(async move{(key,TcpStream::connect(key.remote).await)}));
                             continue;
                         }
                     }else if protocol==Protocol::Udp && !udp_listeners.contains_key(&key.remote){
-                        let ring=policy.buffers.udp_ring;let bytes=ring.checked_mul(wire::MTU).ok_or_else(||io::Error::other("UDP buffer overflow"))?.max(65535);
-                        let mut sock=udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;bytes]),udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;bytes]));sock.bind(endpoint(key.remote)).map_err(io::Error::other)?;
-                        let handle=sockets.add(sock);udp_listeners.insert(key.remote,UdpListener{touched:Instant::now(),handle,address:key.remote});
+                        let ring=policy.buffers.udp_ring;
+                        if let Some(bytes)=ring.checked_mul(wire::MTU){
+                            let bytes=bytes.max(65535);
+                            let mut sock=udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;bytes]),udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;bytes]));
+                            if sock.bind(endpoint(key.remote)).is_ok(){
+                                let handle=sockets.add(sock);udp_listeners.insert(key.remote,UdpListener{touched:Instant::now(),handle,address:key.remote});
+                            }
+                        }
                     }
                 }
                 device.incoming=Some(packet);
             },
             Some((key,result))=connects.next(),if !connects.is_empty()=>{if let Some(syn)=pending.remove(&key){
                 if let Ok(host)=result{
-                    host.set_nodelay(true)?;
-                    let(mut sock,backing)=socket(&policy)?;sock.listen(endpoint(key.remote)).map_err(io::Error::other)?;let handle=sockets.add(sock);
-                    tcp_flows.insert(key,TcpFlow{handle,host:Some(std::sync::Arc::new(host)),connecting:false,inspect:false,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
+                    if host.set_nodelay(true).is_ok(){
+                        if let Ok((mut sock,backing))=socket(&policy){
+                            if sock.listen(endpoint(key.remote)).is_ok(){
+                                let handle=sockets.add(sock);
+                                insert_tcp_flow(&mut tcp_flows,&mut sockets,key,TcpFlow{handle,host:Some(std::sync::Arc::new(host)),connecting:false,inspect:false,inspector:None,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
+                            }
+                        }
+                    }
                 }
                 // Replay the held SYN: the new listener answers it, or with no
                 // listener the stack resets it. A packet already queued wins;
                 // the guest retransmits its SYN.
                 if device.incoming.is_none(){device.incoming=Some(syn);}
-            }else if let Some(flow)=tcp_flows.get_mut(&key){flow.connecting=false;match result{Ok(host)=>{host.set_nodelay(true)?;flow.host=Some(std::sync::Arc::new(host));},Err(_)=>sockets.get_mut::<tcp::Socket>(flow.handle).abort()}}},
+            }else if let Some(flow)=tcp_flows.get_mut(&key){flow.connecting=false;match result{Ok(host)=>{if host.set_nodelay(true).is_ok(){flow.host=Some(std::sync::Arc::new(host));}else{sockets.get_mut::<tcp::Socket>(flow.handle).abort();}},Err(_)=>sockets.get_mut::<tcp::Socket>(flow.handle).abort()}}},
             Some((handle,guest,answer))=dns_jobs.next(),if !dns_jobs.is_empty()=>{let _=sockets.get_mut::<udp::Socket>(handle).send_slice(&answer,endpoint(guest));},
             _=ready.next(),if !ready.is_empty()=>{},
             _=udp_ready.next(),if !udp_ready.is_empty()=>{},
             _=echoes.ready()=>{},
-            _=discovery.tick()=>{previews.discover(&policy)?;},
+            _=discovery.tick()=>{let _=previews.discover(&policy);},
             datagram=udp_ingress.receive()=>{
-                let(host,peer,destination,bytes)=datagram?;
+                let Ok((host,peer,destination,bytes))=datagram else {continue;};
                 if !policy.network.inbound.permits(Protocol::Udp,peer.ip(),destination.port(),None){continue;}
                 let source = if peer.ip().is_loopback() {
                     if destination.is_ipv4() {
@@ -529,17 +578,26 @@ pub async fn run(
                     peer
                 };
                 let key=Tuple{guest:destination,remote:source};
-                if let std::collections::hash_map::Entry::Vacant(e) = udp_listeners.entry(source) {let ring=policy.buffers.udp_ring;let capacity=ring.checked_mul(wire::MTU).ok_or_else(||io::Error::other("UDP buffer overflow"))?.max(65535);let mut sock=udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]),udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]));sock.bind(endpoint(source)).map_err(io::Error::other)?;let handle=sockets.add(sock);e.insert(UdpListener{touched:Instant::now(),handle,address:source});}
-                let handle=udp_listeners[&source].handle;let _=sockets.get_mut::<udp::Socket>(handle).send_slice(bytes,endpoint(destination));
+                if let std::collections::hash_map::Entry::Vacant(e) = udp_listeners.entry(source) {
+                    let ring=policy.buffers.udp_ring;
+                    let Some(capacity)=ring.checked_mul(wire::MTU) else {continue;};
+                    let capacity=capacity.max(65535);
+                    let mut sock=udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]),udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]));
+                    if sock.bind(endpoint(source)).is_err(){continue;}
+                    let handle=sockets.add(sock);e.insert(UdpListener{touched:Instant::now(),handle,address:source});
+                }
+                let handle=udp_listeners[&source].handle;let _=sockets.get_mut::<udp::Socket>(handle).send_slice(bytes.as_ref(),endpoint(destination));
                 udp_flows.insert(key,UdpFlow{host,handle,reply_to:Some(peer),touched:Instant::now(),answered:false});
             },
             accepted=previews.accept()=>{
-                if let Some((host,peer,destination,preview))=accepted?{
+                if let Ok(Some((host,peer,destination,preview)))=accepted{
                     if !policy.network.inbound.permits(Protocol::Tcp,peer.ip(),destination.port(),None){continue;}
                     let source=if !preview && !peer.ip().is_loopback(){peer}else if destination.is_ipv4(){SocketAddr::new(PEER4.into(),peer.port())}else{SocketAddr::new(PEER6.into(),peer.port())};
-                    let key=Tuple{guest:destination,remote:source};if tcp_flows.contains_key(&key){continue;}
-                    let(mut sock,backing)=socket(&policy)?;sock.connect(iface.context(),endpoint(destination),endpoint(source)).map_err(io::Error::other)?;let handle=sockets.add(sock);
-                    tcp_flows.insert(key,TcpFlow{handle,host:Some(std::sync::Arc::new(host)),connecting:false,inspect:false,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
+                    let key=Tuple{guest:destination,remote:source};if tcp_flows.contains_key(&key) || pending.contains_key(&key){continue;}
+                    let Ok((mut sock,backing))=socket(&policy) else {continue;};
+                    if sock.connect(iface.context(),endpoint(destination),endpoint(source)).is_err(){continue;}
+                    let handle=sockets.add(sock);
+                    insert_tcp_flow(&mut tcp_flows,&mut sockets,key,TcpFlow{handle,host:Some(std::sync::Arc::new(host)),connecting:false,inspect:false,inspector:None,prefix:vec![],sent:0,read_eof:false,write_eof:false,touched:Instant::now(),_buffers:backing});
                 }
             },
             _=tokio::time::sleep(delay)=>{},
@@ -559,6 +617,10 @@ fn tuple(packet: &[u8]) -> Option<(Protocol, Tuple, bool)> {
         if u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff != 0 {
             return None;
         }
+        let offset = ((packet[0] & 15) as usize) * 4;
+        if offset < 20 {
+            return None;
+        }
         (
             IpAddr::V4(Ipv4Addr::new(
                 packet[12], packet[13], packet[14], packet[15],
@@ -567,7 +629,7 @@ fn tuple(packet: &[u8]) -> Option<(Protocol, Tuple, bool)> {
                 packet[16], packet[17], packet[18], packet[19],
             )),
             packet[9],
-            ((packet[0] & 15) as usize) * 4,
+            offset,
         )
     } else if version == 6 {
         if packet.len() < 40 {
@@ -671,4 +733,89 @@ pub fn relay_inherited() -> io::Result<Relay> {
         Ok::<(), io::Error>(())
     });
     Ok(Relay { incoming, outgoing })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tuple_rejects_short_ipv4_ihl() {
+        let mut packet = vec![0u8; 40];
+        // Version 4, IHL = 4 (16 bytes < 20)
+        packet[0] = 0x44;
+        packet[9] = 6; // TCP
+        assert!(tuple(&packet).is_none());
+        // Version 4, IHL = 0
+        packet[0] = 0x40;
+        assert!(tuple(&packet).is_none());
+        // Version 4, valid IHL = 5 (20 bytes)
+        packet[0] = 0x45;
+        assert!(tuple(&packet).is_some());
+    }
+
+    #[test]
+    fn internal_dns_only_matches_peer_dns_endpoints() {
+        assert!(is_internal_dns(SocketAddr::new(PEER4.into(), 53)));
+        assert!(is_internal_dns(SocketAddr::new(PEER6.into(), 53)));
+        assert!(!is_internal_dns(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53
+        )));
+        assert!(!is_internal_dns(SocketAddr::new(PEER4.into(), 5353)));
+    }
+
+    #[test]
+    fn insert_tcp_flow_removes_replaced_socket_before_dropping_buffers() {
+        let mut tcp_flows: HashMap<Tuple, TcpFlow> = HashMap::new();
+        let mut sockets = SocketSet::new(vec![]);
+        let key = Tuple {
+            guest: SocketAddr::new(GUEST4.into(), 40000),
+            remote: SocketAddr::new(PEER4.into(), 8080),
+        };
+        let (sock1, backing1) = buffers::TcpBuffers::socket(65536, 65536).unwrap();
+        let h1 = sockets.add(sock1);
+        insert_tcp_flow(
+            &mut tcp_flows,
+            &mut sockets,
+            key,
+            TcpFlow {
+                handle: h1,
+                host: None,
+                connecting: false,
+                inspect: false,
+                inspector: None,
+                prefix: vec![],
+                sent: 0,
+                read_eof: false,
+                write_eof: false,
+                touched: Instant::now(),
+                _buffers: backing1,
+            },
+        );
+        let (sock2, backing2) = buffers::TcpBuffers::socket(65536, 65536).unwrap();
+        let h2 = sockets.add(sock2);
+        insert_tcp_flow(
+            &mut tcp_flows,
+            &mut sockets,
+            key,
+            TcpFlow {
+                handle: h2,
+                host: None,
+                connecting: false,
+                inspect: false,
+                inspector: None,
+                prefix: vec![],
+                sent: 0,
+                read_eof: false,
+                write_eof: false,
+                touched: Instant::now(),
+                _buffers: backing2,
+            },
+        );
+        assert_eq!(sockets.iter().count(), 1);
+        assert_eq!(tcp_flows[&key].handle, h2);
+        drop(sockets);
+        drop(tcp_flows);
+    }
 }
