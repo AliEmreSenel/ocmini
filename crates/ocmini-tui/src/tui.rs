@@ -23,12 +23,14 @@ use crate::client::{parse_answer, shutdown_signal, TextState};
 #[cfg(test)]
 use clipboard::image_attachment;
 use clipboard::{
-    copy_text, file_attachment, paste_clipboard, pasted_image_path, resolve_user_path,
+    apply_clipboard, clipboard_image, copy_text, file_attachment, pasted_image_path,
+    resolve_user_path, ClipboardResult,
 };
 use completion::{Completion, CompletionContext};
 pub(crate) use input::Motion;
 use input::{
-    clean_input, input_prefix, page_move, terminal_width, Display, Draft, History, KillRing,
+    clean_input, input_prefix, page_move, terminal_size, terminal_width, Display, Draft, History,
+    KillRing,
 };
 use render::{
     answer_line, option_labels, render_event, render_history, render_question, session_prompts,
@@ -196,6 +198,8 @@ struct Ui {
     completion: Completion,
     /// Live transcript toggles, mirrored into the display on every change.
     visibility: Visibility,
+    /// When running in native scrollback mode, only build the active tool variant.
+    native_tool_view: Option<ToolView>,
     /// The answer's `assistant` label is already on screen. A turn runs one
     /// model step per tool batch, each step in its own assistant message, so a
     /// label per message printed one in the middle of the same answer. The next
@@ -1105,25 +1109,51 @@ pub(crate) async fn run_session(
         ),
         width,
     );
+    if !fullscreen {
+        ui.native_tool_view = Some(ui.visibility.tools);
+    }
     render_history(&mut display, &mut ui, &history);
-    display.draw(&ui, &draft, terminal_width(), &status_bar);
+    let initial_size = terminal_size();
+    display.draw_sized(&ui, &draft, initial_size, &status_bar);
+    let (clipboard_tx, mut clipboard_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ClipboardResult>();
+    let spawn_clipboard = |tx: &tokio::sync::mpsc::UnboundedSender<ClipboardResult>| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), clipboard_image()).await;
+            let _ = tx.send(result);
+        });
+    };
 
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            Some(result) = clipboard_rx.recv() => {
+                let size = terminal_size();
+                display.erase();
+                apply_clipboard(result, &mut draft, &mut display, size.0);
+                display.draw_sized(&ui, &draft, size, &status_bar);
+            }
             event = keys.next() => {
                 let Some(event) = event else { break; };
                 let event = event.map_err(|error| error.to_string())?;
+                let is_resize = matches!(event, Event::Resize(_, _));
+                let key = decode_event(event);
+                if !is_resize && matches!(key, Key::Other) {
+                    continue;
+                }
+                let size = terminal_size();
+                let width = size.0;
                 display.erase();
-                if matches!(event, Event::Resize(_, _)) && !fullscreen {
+                if is_resize && !fullscreen {
                     display.finish_line();
                 }
-                let key = decode_event(event);
                 let pending_permission = matches!(ui.prompt, Some(PendingPrompt::Permission(_)));
                 let pending_question = matches!(ui.prompt, Some(PendingPrompt::Question { .. }));
                 if let Some(text) = ui.prompt_key(&app, &key) {
-                    if !text.is_empty() { display.output(&text, terminal_width()); }
-                    display.draw(&ui, &draft, terminal_width(), &status_bar);
+                    if !text.is_empty() { display.output(&text, width); }
+                    display.draw_sized(&ui, &draft, size, &status_bar);
                     continue;
                 }
                 if ui.prompt.is_none() {
@@ -1133,7 +1163,7 @@ pub(crate) async fn run_session(
                         Some(std::path::Path::new(&session.directory)),
                     );
                     if let Some(msg) = notice {
-                        display.output(&format!("\n{YELLOW}{msg}{RESET}\n"), terminal_width());
+                        display.output(&format!("\n{YELLOW}{msg}{RESET}\n"), width);
                     }
                     if handled {
                         let ctx = CompletionContext {
@@ -1144,18 +1174,18 @@ pub(crate) async fn run_session(
                             sandbox_presets: &sandbox_presets,
                         };
                         ui.completion.update_with(&draft, &ctx);
-                        display.draw(&ui, &draft, terminal_width(), &status_bar);
+                        display.draw_sized(&ui, &draft, size, &status_bar);
                         continue;
                     }
                 }
                 match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
-                    Key::CtrlC => { ui.prompt = None; status_bar.busy = false; engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
+                    Key::CtrlC => { ui.prompt = None; status_bar.busy = false; engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), width); }
                     Key::CtrlL => display.clear_screen(),
                     Key::Help => {
                         display.finish_line();
-                        display.output(&help_text(fullscreen), terminal_width());
+                        display.output(&help_text(fullscreen), width);
                         display.scroll_bottom();
                     }
                     key @ (Key::ToggleThinking | Key::ToggleTools) => {
@@ -1163,13 +1193,18 @@ pub(crate) async fn run_session(
                         // views. Native mode keeps brief/full for new output.
                         match key {
                             Key::ToggleThinking => ui.visibility.thinking = !ui.visibility.thinking,
-                            _ => ui.visibility.tools = if fullscreen {
-                                ui.visibility.tools.next()
-                            } else if ui.visibility.tools == ToolView::Full {
-                                ToolView::Brief
-                            } else {
-                                ToolView::Full
-                            },
+                            _ => {
+                                ui.visibility.tools = if fullscreen {
+                                    ui.visibility.tools.next()
+                                } else if ui.visibility.tools == ToolView::Full {
+                                    ToolView::Brief
+                                } else {
+                                    ToolView::Full
+                                };
+                                if !fullscreen {
+                                    ui.native_tool_view = Some(ui.visibility.tools);
+                                }
+                            }
                         }
                         display.set_visibility(ui.visibility);
                     }
@@ -1180,7 +1215,7 @@ pub(crate) async fn run_session(
                     }
                     Key::RemoveAttachment if !pending_permission && !pending_question => { draft.attachments.pop(); }
                     Key::CtrlV if !pending_permission && !pending_question => {
-                        paste_clipboard(&mut draft, &mut display).await;
+                        spawn_clipboard(&clipboard_tx);
                     }
                     Key::CtrlR if !pending_permission && !pending_question => {
                         display.finish_line();
@@ -1200,7 +1235,7 @@ pub(crate) async fn run_session(
                                     Err(error) => {
                                         display.output(
                                             &format!("{RED}error:{RESET} {error}\n"),
-                                            terminal_width(),
+                                            width,
                                         );
                                     }
                                     Ok(resumed) => {
@@ -1223,7 +1258,7 @@ pub(crate) async fn run_session(
                                                 "\n{BOLD}resumed{RESET} {DIM}{} · {}{RESET}\n",
                                                 session.id, session.directory
                                             ),
-                                            terminal_width(),
+                                            width,
                                         );
                                         render_history(&mut display, &mut ui, &history);
                                     }
@@ -1235,12 +1270,12 @@ pub(crate) async fn run_session(
                     Key::Paste(text) => {
                         if text.is_empty() {
                             if !pending_question {
-                                paste_clipboard(&mut draft, &mut display).await;
+                                spawn_clipboard(&clipboard_tx);
                             }
                         } else if let Some(path) = pasted_image_path(&text).filter(|_| !pending_question) {
                             match file_attachment(&path) {
                                 Ok(attachment) => draft.attachments.push(attachment),
-                                Err(message) => display.output(&format!("\n{YELLOW}{message}{RESET}\n"), terminal_width()),
+                                Err(message) => display.output(&format!("\n{YELLOW}{message}{RESET}\n"), width),
                             }
                         } else {
                             // Answers are text-only: attachments stay with the prompt.
@@ -1258,14 +1293,14 @@ pub(crate) async fn run_session(
                                 match command.action {
                                     LocalAction::Help => {
                                         draft.clear_text();
-                                        display.output(&help_text(fullscreen), terminal_width());
+                                        display.output(&help_text(fullscreen), width);
                                         display.scroll_bottom();
                                     }
                                     LocalAction::Context => {
                                         draft.clear_text();
                                         match crate::engine_impl::inspect_context(&app, &session, &selected).await {
-                                            Ok(report) => display.output(&format!("\n{report}"), terminal_width()),
-                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            Ok(report) => display.output(&format!("\n{report}"), width),
+                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), width),
                                         }
                                         display.scroll_bottom();
                                     }
@@ -1274,7 +1309,7 @@ pub(crate) async fn run_session(
                                         if !arguments.is_empty() {
                                             part["ocminiFocus"] = Value::String(arguments);
                                         }
-                                        display.user_prompt(draft.text.trim(), terminal_width());
+                                        display.user_prompt(draft.text.trim(), width);
                                         draft.clear_text();
                                         let request = PromptRequest {
                                             message_id: Some(crate::types::hex_id("msg_")),
@@ -1283,7 +1318,7 @@ pub(crate) async fn run_session(
                                             ..selected.clone()
                                         };
                                         if let Err(error) = engine.admit(app.clone(), session.id.clone(), request).await {
-                                            display.output(&format!("{RED}error:{RESET} {error}\n"), terminal_width());
+                                            display.output(&format!("{RED}error:{RESET} {error}\n"), width);
                                         }
                                     }
                                     LocalAction::Model => {
@@ -1566,7 +1601,7 @@ pub(crate) async fn run_session(
                                         display.scroll_bottom();
                                     }
                                     LocalAction::Quit => {
-                                        display.user_prompt(&draft.text, terminal_width());
+                                        display.user_prompt(&draft.text, width);
                                         break;
                                     }
                                 }
@@ -1578,7 +1613,7 @@ pub(crate) async fn run_session(
                                     sandbox_presets: &sandbox_presets,
                                 };
                                 ui.completion.update_with(&draft, &ctx);
-                                display.draw(&ui, &draft, terminal_width(), &status_bar);
+                                display.draw_sized(&ui, &draft, size, &status_bar);
                                 continue;
                             }
                             Some((Command::Configured { name, .. }, arguments)) => {
@@ -1587,14 +1622,14 @@ pub(crate) async fn run_session(
                             None => None,
                         };
                         let (text, files) = draft.take();
-                        display.user_prompt(&text, terminal_width());
+                        display.user_prompt(&text, width);
                         for file in &files {
                             display.output(
                                 &format!(
                                     "{DIM}● attached: {}{RESET}\n",
                                     clean_input(&file.filename)
                                 ),
-                                terminal_width(),
+                                width,
                             );
                         }
                         prompt_history.remember(text.clone());
@@ -1629,7 +1664,7 @@ pub(crate) async fn run_session(
                             if let Err(error) = result {
                                 display.output(
                                     &format!("{RED}error:{RESET} {error}\n"),
-                                    terminal_width(),
+                                    width,
                                 );
                             }
                         }
@@ -1712,68 +1747,118 @@ pub(crate) async fn run_session(
                     sandbox_presets: &sandbox_presets,
                 };
                 ui.completion.update_with(&draft, &ctx);
-                display.draw(&ui, &draft, terminal_width(), &status_bar);
+                display.draw_sized(&ui, &draft, size, &status_bar);
             }
             event = events.recv() => {
-                display.erase();
-                match event {
-                    Ok(event) => {
-                        if !crate::client::accepts(&app.store, &session.id, &event) { continue; }
-                        let is_current = crate::client::event_session(&event)
-                            .is_none_or(|id| id == session.id);
-                        if is_current {
-                            match event.kind {
-                                crate::events::EventKind::Session(crate::events::SessionKind::Status) => {
-                                    let kind = event.properties["status"]["type"].as_str().unwrap_or_default();
-                                    status_bar.busy = matches!(kind, "busy" | "retry");
-                                }
-                                crate::events::EventKind::Session(crate::events::SessionKind::Idle) => {
-                                    status_bar.busy = false;
-                                    if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
-                                        session = fresh;
-                                        status_bar = StatusBar::from_state(&app, &session, &selected, false);
+                let size = terminal_size();
+                let width = size.0;
+                let mut dirty = false;
+                let mut closed = false;
+                let mut current = Some(event);
+                while let Some(item) = current.take() {
+                    match item {
+                        Ok(event) => {
+                            if crate::client::accepts(&app.store, &session.id, &event) {
+                                let is_current = crate::client::event_session(&event)
+                                    .is_none_or(|id| id == session.id);
+                                if is_current {
+                                    let status_changed = match event.kind {
+                                        crate::events::EventKind::Session(crate::events::SessionKind::Status) => {
+                                            let kind = event.properties["status"]["type"].as_str().unwrap_or_default();
+                                            let busy = matches!(kind, "busy" | "retry");
+                                            let changed = status_bar.busy != busy;
+                                            status_bar.busy = busy;
+                                            changed
+                                        }
+                                        crate::events::EventKind::Session(crate::events::SessionKind::Idle) => {
+                                            status_bar.busy = false;
+                                            if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
+                                                session = fresh;
+                                                status_bar = StatusBar::from_state(&app, &session, &selected, false);
+                                            }
+                                            true
+                                        }
+                                        crate::events::EventKind::Part(crate::events::PartKind::Updated)
+                                            if event.properties["part"]["type"].as_str() == Some("step-finish") =>
+                                        {
+                                            if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
+                                                session = fresh;
+                                                status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                            }
+                                            true
+                                        }
+                                        _ => false,
+                                    };
+                                    if status_changed && !dirty {
+                                        display.erase();
+                                        dirty = true;
                                     }
                                 }
-                                crate::events::EventKind::Part(crate::events::PartKind::Updated)
-                                    if event.properties["part"]["type"].as_str() == Some("step-finish") =>
-                                {
-                                    if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
-                                        session = fresh;
-                                        status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                let event_session = crate::client::event_session(&event).unwrap_or(&session.id);
+                                let rows = render_event(&mut ui, &event, event_session);
+                                if !rows.is_empty() {
+                                    if !dirty {
+                                        display.erase();
+                                        dirty = true;
                                     }
+                                    display.apply(rows, width);
                                 }
-                                _ => {}
                             }
                         }
-                        let event_session = crate::client::event_session(&event).unwrap_or(&session.id);
-                        display.apply(render_event(&mut ui, &event, event_session), terminal_width());
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if !dirty {
+                                display.erase();
+                                dirty = true;
+                            }
+                            let history = app.store.messages(&session.id)?;
+                            if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
+                                session = fresh;
+                            }
+                            let busy = app.store.is_busy(&session.id).unwrap_or(false);
+                            status_bar = StatusBar::from_state(&app, &session, &selected, busy);
+                            ui = Ui {
+                                visibility: ui.visibility,
+                                native_tool_view: ui.native_tool_view,
+                                ..Default::default()
+                            };
+                            let ctx = CompletionContext {
+                                config: &app.config,
+                                auth: &app.auth,
+                                directory: std::path::Path::new(&session.directory),
+                                active_model: selected.model.as_ref(),
+                                sandbox_presets: &sandbox_presets,
+                            };
+                            ui.completion.update_with(&draft, &ctx);
+                            display.clear_screen();
+                            display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), width);
+                            render_history(&mut display, &mut ui, &history);
+                            for pending in crate::client::pending_events(&app, &session.id) {
+                                display.apply(render_event(&mut ui, &pending, &session.id), width);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            closed = true;
+                            break;
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let history = app.store.messages(&session.id)?;
-                        if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
-                            session = fresh;
+                    match events.try_recv() {
+                        Ok(next) => current = Some(Ok(next)),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                            current = Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(n)));
                         }
-                        let busy = app.store.is_busy(&session.id).unwrap_or(false);
-                        status_bar = StatusBar::from_state(&app, &session, &selected, busy);
-                        ui = Ui { visibility: ui.visibility, ..Default::default() };
-                        let ctx = CompletionContext {
-                            config: &app.config,
-                            auth: &app.auth,
-                            directory: std::path::Path::new(&session.directory),
-                            active_model: selected.model.as_ref(),
-                            sandbox_presets: &sandbox_presets,
-                        };
-                        ui.completion.update_with(&draft, &ctx);
-                        display.clear_screen();
-                        display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), terminal_width());
-                        render_history(&mut display, &mut ui, &history);
-                        for pending in crate::client::pending_events(&app, &session.id) {
-                            display.apply(render_event(&mut ui, &pending, &session.id), terminal_width());
+                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                            closed = true;
+                            break;
                         }
-                    },
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                    }
                 }
-                display.draw(&ui, &draft, terminal_width(), &status_bar);
+                if closed {
+                    break;
+                }
+                if dirty {
+                    display.draw_sized(&ui, &draft, size, &status_bar);
+                }
             }
         }
     }

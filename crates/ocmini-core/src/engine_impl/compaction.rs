@@ -88,13 +88,13 @@ pub(super) fn compaction_messages(
                 .map(|(index, _)| index)
         })
         .unwrap_or(first);
-    let mut bytes = user.map_or(0, |index| messages[index].to_string().len());
+    let mut bytes = user.map_or(0, |index| json_byte_len(&messages[index]));
     let mut start = messages.len();
     for index in (recent_first..messages.len()).rev().filter(|_| retain) {
         let size = if Some(index) == user {
             0
         } else {
-            messages[index].to_string().len()
+            json_byte_len(&messages[index])
         };
         if bytes.saturating_add(size) > budget {
             break;
@@ -127,7 +127,7 @@ pub(super) fn compaction_messages(
     let mut total = 0usize;
     let mut start = messages.len();
     while start > first {
-        let size = messages[start - 1].to_string().len();
+        let size = json_byte_len(&messages[start - 1]);
         if start < messages.len() && total.saturating_add(size) > budget {
             break;
         }
@@ -326,7 +326,7 @@ pub(super) async fn summarize_history(
             return Err("Nothing to compact".into());
         }
         prepare_summary_messages(&mut request_messages);
-        let source_bytes = request_messages.iter().map(|v| v.to_string().len()).sum();
+        let source_bytes = request_messages.iter().map(json_byte_len).sum();
         let mut request = ChatRequest {
             model: model.model_id.clone(),
             system: {

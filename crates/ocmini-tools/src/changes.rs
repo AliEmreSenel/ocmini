@@ -450,7 +450,13 @@ pub async fn reserve(
     cancel: &CancellationToken,
 ) -> Result<Reservation, OperationError> {
     let input = Input::parse(name, args)?;
-    let targets = input.targets(directory)?;
+    let dir = directory.to_owned();
+    let (input, targets) = tokio::task::spawn_blocking(move || {
+        let targets = input.targets(&dir)?;
+        Ok::<_, OperationError>((input, targets))
+    })
+    .await
+    .map_err(|e| failure(e.to_string()))??;
     let guard = if input.kind() == Kind::Edit {
         Some(lock_edit(&targets[0].1, cancel).await?)
     } else {
@@ -523,21 +529,34 @@ impl Plan {
             "edit" => Kind::Edit,
             _ => Kind::Patch,
         };
-        let (mut changes, _) = transformed_changes(directory, kind, wire, &self.changes)?;
+        let dir = directory.to_owned();
+        let wire = wire.clone();
+        let existing_changes = self.changes.clone();
+        let (mut changes, _) = tokio::task::spawn_blocking(move || {
+            transformed_changes(&dir, kind, &wire, &existing_changes)
+        })
+        .await
+        .map_err(|e| failure(e.to_string()))??;
         if kind == Kind::Edit && changes[0].path != self.changes[0].path {
             drop(self.edit_lock.get_mut().unwrap().take());
             *self.edit_lock.get_mut().unwrap() = Some(lock_edit(&changes[0].path, &cancel).await?);
         }
         let original_paths: HashSet<_> = self.paths().map(Path::to_owned).collect();
-        for change in &mut changes {
-            if !original_paths.contains(&change.path) {
-                change.before = current(&change.path)?;
-                change.permissions = std::fs::metadata(&change.path)
-                    .ok()
-                    .map(|m| m.permissions());
+        let cancel_blocking = cancel.clone();
+        let changes = tokio::task::spawn_blocking(move || {
+            for change in &mut changes {
+                if !original_paths.contains(&change.path) {
+                    change.before = current(&change.path)?;
+                    change.permissions = std::fs::metadata(&change.path)
+                        .ok()
+                        .map(|m| m.permissions());
+                }
             }
-        }
-        validate_changes(&changes, &cancel)?;
+            validate_changes(&changes, &cancel_blocking)?;
+            Ok::<_, OperationError>(changes)
+        })
+        .await
+        .map_err(|e| failure(e.to_string()))??;
         if kind != Kind::Patch {
             let c = &changes[0];
             self.output = file_output(kind, &c.path, c.after.as_ref().unwrap().len(), 1);

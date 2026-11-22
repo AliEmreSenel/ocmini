@@ -149,12 +149,51 @@ impl SqliteBackend {
         limit: usize,
     ) -> Result<Vec<(i64, MessageWithParts)>, OperationError> {
         self.with_read(|c| {
-            let direction=if descending {"DESC"} else {"ASC"};
-            let compare=if descending {"<"} else {">"};
-            let sql=format!("SELECT m.rowid,m.id FROM message m LEFT JOIN inbox i ON i.message_id=m.id AND i.started=0 WHERE m.session_id=?1 AND i.message_id IS NULL AND coalesce(json_extract(m.json,'$.ocminiV2Cancelled'),0)=0 AND coalesce(json_extract(m.json,'$.command'),'')!='__ocmini_compact' AND (?2 IS NULL OR m.rowid {compare} ?2) ORDER BY m.rowid {direction} LIMIT ?3");
-            let mut q=c.prepare(&sql)?;
-            let ids=q.query_map(params![sid,after,limit.saturating_add(1).min(i64::MAX as usize) as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
-            ids.into_iter().map(|(seq,id)|read_message(c,sid,&id)?.map(|m|(seq,m)).ok_or_else(||OperationError::not_found("Message disappeared"))).collect()
+            let tx = c.unchecked_transaction()?;
+            let direction = if descending { "DESC" } else { "ASC" };
+            let after_clause = if after.is_some() {
+                if descending {
+                    "AND m.rowid < ?2"
+                } else {
+                    "AND m.rowid > ?2"
+                }
+            } else {
+                "AND ?2 IS NULL"
+            };
+            let sql = format!(
+                "SELECT m.rowid,m.id,m.json FROM message m LEFT JOIN inbox i ON i.message_id=m.id AND i.started=0 WHERE m.session_id=?1 AND i.message_id IS NULL AND coalesce(json_extract(m.json,'$.ocminiV2Cancelled'),0)=0 AND coalesce(json_extract(m.json,'$.command'),'')!='__ocmini_compact' {after_clause} ORDER BY m.rowid {direction} LIMIT ?3"
+            );
+            let mut q = tx.prepare(&sql)?;
+            let rows = q.query_map(
+                params![
+                    sid,
+                    after,
+                    limit.saturating_add(1).min(i64::MAX as usize) as i64
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            let mut seqs = Vec::new();
+            let mut ids = Vec::new();
+            let mut messages = Vec::new();
+            for row in rows {
+                let (seq, id, raw) = row?;
+                seqs.push(seq);
+                ids.push(id);
+                messages.push(MessageWithParts {
+                    info: serde_json::from_str(&raw).map_err(data_error)?,
+                    parts: Vec::new(),
+                });
+            }
+            drop(q);
+            attach_parts(&tx, sid, &ids, &mut messages)?;
+            tx.commit()?;
+            Ok(seqs.into_iter().zip(messages).collect())
         })
     }
 }
@@ -201,13 +240,51 @@ impl SqliteBackend {
         limit: usize,
     ) -> Result<Vec<(Session, Value)>, OperationError> {
         self.with_read(|c| {
-            let ascending=filter.ascending ^ cursor.is_some_and(|c| c.previous);
-            let (order,compare)=if ascending { ("ASC",">") } else { ("DESC","<") };
-            let search=filter.search.as_deref().map(crate::v2::list::title_pattern);
-            let sql=format!("SELECT s.json,coalesce(v.json,'{{}}') FROM session s LEFT JOIN v2_state v ON v.session_id=s.id WHERE (?1 IS NULL OR s.directory=?1) AND (?2 IS NULL OR s.json->>'$.projectID'=?2) AND (?3 IS NULL OR s.json->>'$.title' GLOB ?3) AND (?4 IS NULL OR CASE WHEN ?4='null' THEN s.parent_id IS NULL ELSE s.parent_id=?4 END) AND (?5 IS NULL OR (s.json->>'$.time.archived' IS NOT NULL)=?5) AND (?6 IS NULL OR s.time_updated {compare} ?6 OR (s.time_updated=?6 AND s.id {compare} ?7)) ORDER BY s.time_updated {order},s.id {order} LIMIT ?8");
-            let mut stmt=c.prepare(&sql)?;
-            let rows=stmt.query_map(params![filter.directory,filter.project,search,filter.parent,filter.archived,cursor.map(|c|c.time),cursor.map(|c|c.id.as_str()),limit.saturating_add(1).min(i64::MAX as usize) as i64], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
-            rows.map(|row| { let (session,state)=row?; Ok((serde_json::from_str(&session).map_err(data_error)?,serde_json::from_str(&state).map_err(data_error)?)) }).collect()
+            let ascending = filter.ascending ^ cursor.is_some_and(|c| c.previous);
+            let (order, compare) = if ascending {
+                ("ASC", ">")
+            } else {
+                ("DESC", "<")
+            };
+            let search = filter
+                .search
+                .as_deref()
+                .map(crate::v2::list::title_pattern);
+            let dir_predicate = if filter.directory.is_some() {
+                "s.directory=?1"
+            } else {
+                "?1 IS NULL"
+            };
+            let cursor_predicate = if cursor.is_some() {
+                format!("(s.time_updated,s.id) {compare} (?6,?7)")
+            } else {
+                "(?6 IS NULL AND ?7 IS NULL)".into()
+            };
+            let sql = format!(
+                "SELECT s.json,coalesce(v.json,'{{}}') FROM session s LEFT JOIN v2_state v ON v.session_id=s.id WHERE {dir_predicate} AND (?2 IS NULL OR s.json->>'$.projectID'=?2) AND (?3 IS NULL OR s.json->>'$.title' GLOB ?3) AND (?4 IS NULL OR CASE WHEN ?4='null' THEN s.parent_id IS NULL ELSE s.parent_id=?4 END) AND (?5 IS NULL OR (s.json->>'$.time.archived' IS NOT NULL)=?5) AND {cursor_predicate} ORDER BY s.time_updated {order},s.id {order} LIMIT ?8"
+            );
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    filter.directory,
+                    filter.project,
+                    search,
+                    filter.parent,
+                    filter.archived,
+                    cursor.map(|c| c.time),
+                    cursor.map(|c| c.id.as_str()),
+                    limit.saturating_add(1).min(i64::MAX as usize) as i64
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            rows.map(|row| {
+                let (session, state) = row?;
+                Ok((
+                    serde_json::from_str(&session).map_err(data_error)?,
+                    serde_json::from_str(&state).map_err(data_error)?,
+                ))
+            })
+            .collect()
         })
     }
 }
@@ -313,6 +390,69 @@ mod tests {
         assert!(
             reopened.v2_sequence(&s.id, end + 1, end, 2).unwrap().0 > end,
             "range exhaustion must allocate, never drop work"
+        );
+    }
+
+    #[test]
+    fn v2_paging_queries_use_indexes_without_temp_sort_and_batch_parts() {
+        let store = SqliteBackend::open(Path::new(":memory:"), "plan").unwrap();
+        let s = Session::new("Indexed", "/tmp/work");
+        store.create_session(&s).unwrap();
+        for i in 0..4 {
+            let id = format!("msg_{i}");
+            store
+                .add_message(&MessageWithParts {
+                    info: crate::types::MessageInfo {
+                        id: id.clone(),
+                        session_id: s.id.clone(),
+                        role: "user".into(),
+                        time: crate::types::MessageTime {
+                            created: 100 + i,
+                            completed: None,
+                        },
+                        ..Default::default()
+                    },
+                    parts: vec![
+                        json!({"id":format!("p_{i}_a"),"messageID":id,"sessionID":s.id,"type":"text","text":format!("a{i}")}),
+                        json!({"id":format!("p_{i}_b"),"messageID":id,"sessionID":s.id,"type":"text","text":format!("b{i}")}),
+                    ],
+                })
+                .unwrap();
+        }
+        let first = store.v2_page(&s.id, None, true, 2).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0].1.info.id, "msg_3");
+        assert_eq!(first[0].1.parts.len(), 2);
+        assert_eq!(first[0].1.parts[0]["text"], "a3");
+        assert_eq!(first[0].1.parts[1]["text"], "b3");
+        let next = store.v2_page(&s.id, Some(first[1].0), true, 2).unwrap();
+        assert_eq!(next.len(), 2);
+        assert_eq!(next[0].1.info.id, "msg_1");
+        assert_eq!(next[1].1.info.id, "msg_0");
+
+        let conn = store.conn.lock().unwrap();
+        let explain = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let page_plan = explain("SELECT m.rowid,m.id,m.json FROM message m LEFT JOIN inbox i ON i.message_id=m.id AND i.started=0 WHERE m.session_id='s' AND i.message_id IS NULL AND m.rowid < 10 ORDER BY m.rowid DESC LIMIT 5");
+        assert!(
+            page_plan.contains("msg_sid_rowid") && !page_plan.contains("TEMP B-TREE"),
+            "v2_page plan: {page_plan}"
+        );
+        let dir_plan = explain("SELECT s.json,coalesce(v.json,'{}') FROM session s LEFT JOIN v2_state v ON v.session_id=s.id WHERE s.directory='/tmp' AND (s.time_updated,s.id) < (100,'z') ORDER BY s.time_updated DESC,s.id DESC LIMIT 10");
+        assert!(
+            dir_plan.contains("session_directory_updated_id") && !dir_plan.contains("TEMP B-TREE"),
+            "directory session page plan: {dir_plan}"
+        );
+        let all_plan = explain("SELECT s.json,coalesce(v.json,'{}') FROM session s LEFT JOIN v2_state v ON v.session_id=s.id WHERE NULL IS NULL ORDER BY s.time_updated DESC,s.id DESC LIMIT 10");
+        assert!(
+            all_plan.contains("session_updated_id") && !all_plan.contains("TEMP B-TREE"),
+            "all sessions page plan: {all_plan}"
         );
     }
 }

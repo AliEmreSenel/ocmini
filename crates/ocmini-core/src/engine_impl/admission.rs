@@ -10,8 +10,8 @@ impl EngineApi for Engine {
         sid: &str,
     ) -> Result<Option<CancellationToken>, OperationError> {
         crate::blocking::run(|| {
-            let mut running = self.running.lock().unwrap();
-            let Some(state) = running.get_mut(sid) else {
+            let mut running = self.lock_running();
+            let Some(state) = running.get_mut(sid).and_then(SessionSlot::active_mut) else {
                 return Ok(None);
             };
             if state.cancel.is_cancelled() || app.store.has_waiting(sid)? {
@@ -24,7 +24,11 @@ impl EngineApi for Engine {
     }
     fn finish_end_gate(&self, sid: &str, token: &CancellationToken) {
         crate::blocking::run(|| {
-            if let Some(state) = self.running.lock().unwrap().get_mut(sid) {
+            if let Some(state) = self
+                .lock_running()
+                .get_mut(sid)
+                .and_then(SessionSlot::active_mut)
+            {
                 if state
                     .end_gate
                     .as_ref()
@@ -37,8 +41,11 @@ impl EngineApi for Engine {
     }
     fn allow_hook_continuation(&self, app: &App, sid: &str) -> Result<bool, OperationError> {
         crate::blocking::run(|| {
-            let running = self.running.lock().unwrap();
-            Ok(running.get(sid).is_some_and(|s| !s.cancel.is_cancelled())
+            let running = self.lock_running();
+            Ok(running
+                .get(sid)
+                .and_then(SessionSlot::active)
+                .is_some_and(|s| !s.cancel.is_cancelled())
                 && !app.store.has_waiting(sid)?)
         })
     }
@@ -86,9 +93,10 @@ impl EngineApi for Engine {
         let cancel = CancellationToken::new();
         let token = loop {
             let reservation = crate::blocking::run(|| {
-                let running = self.running.lock().unwrap();
+                let running = self.lock_settled(&sid);
                 if running
                     .get(&sid)
+                    .and_then(SessionSlot::active)
                     .is_some_and(|state| state.cancel.is_cancelled())
                 {
                     return Err(OperationError::busy(
@@ -217,7 +225,7 @@ impl EngineApi for Engine {
                 .store
                 .get_session(&sid)?
                 .ok_or_else(|| OperationError::not_found("Session not found"))?;
-            let mut guard = self.running.lock().unwrap();
+            let mut guard = self.lock_settled(&sid);
             let mid = request.message_id.clone().unwrap_or_else(|| hex_id("msg_"));
             validate_message_id(&mid, request.v2.is_some() || app.v2.enabled(&sid))?;
             let (tx, rx) = oneshot::channel();
@@ -238,7 +246,7 @@ impl EngineApi for Engine {
                 }
                 if let Some((value, finalizing)) = app.store.turn_result(&mid)? {
                     if finalizing {
-                        if let Some(state) = guard.get_mut(&sid) {
+                        if let Some(state) = guard.get_mut(&sid).and_then(SessionSlot::active_mut) {
                             state.waiters.entry(mid).or_default().push(tx);
                             return Ok(rx);
                         }
@@ -262,13 +270,14 @@ impl EngineApi for Engine {
                     return Ok(rx);
                 }
                 if app.store.is_pending_message(&mid)? {
-                    if let Some(state) = guard.get_mut(&sid) {
+                    if let Some(state) = guard.get_mut(&sid).and_then(SessionSlot::active_mut) {
                         state.waiters.entry(mid).or_default().push(tx);
                         return Ok(rx);
                     }
                     let scoped = app.for_directory(&session.directory)?;
                     let cancel = self.claim(&mut guard, &scoped, &sid, Some((mid, tx)))?;
                     drop(guard);
+                    crate::sessions::set_status(&scoped, &sid, event::SessionStatus::Busy);
                     let engine = self.clone();
                     tokio::spawn(async move {
                         engine.drain(scoped, sid, cancel).await;
@@ -281,6 +290,7 @@ impl EngineApi for Engine {
             }
             if guard
                 .get(&sid)
+                .and_then(SessionSlot::active)
                 .is_some_and(|state| state.cancel.is_cancelled())
             {
                 return Err(OperationError::busy(
@@ -390,7 +400,7 @@ impl EngineApi for Engine {
             if let Some(model) = &request.model {
                 title::launch(app.clone(), sid.clone(), &message.parts, model);
             }
-            if let Some(state) = guard.get_mut(&sid) {
+            if let Some(state) = guard.get_mut(&sid).and_then(SessionSlot::active_mut) {
                 if let Some(gate) = state.end_gate.as_ref().filter(|_| {
                     request
                         .v2
@@ -404,6 +414,7 @@ impl EngineApi for Engine {
             }
             let cancel = self.claim(&mut guard, &app, &sid, Some((mid, tx)))?;
             drop(guard);
+            crate::sessions::set_status(&app, &sid, event::SessionStatus::Busy);
             let engine = self.clone();
             tokio::spawn(async move {
                 engine.drain(app, sid, cancel).await;
@@ -421,8 +432,8 @@ impl EngineApi for Engine {
     }
 
     fn interrupt(&self, sid: &str) -> bool {
-        let mut running = self.running.lock().unwrap();
-        let Some(state) = running.get_mut(sid) else {
+        let mut running = self.lock_running();
+        let Some(state) = running.get_mut(sid).and_then(SessionSlot::active_mut) else {
             return false;
         };
         state.preserve_pending = true;
@@ -452,7 +463,7 @@ impl EngineApi for Engine {
 
         crate::blocking::run(|| {
             let mut queue = vec![sid.to_string()];
-            let running = self.running.lock().unwrap();
+            let running = self.lock_running();
             let mut visited = HashSet::new();
             while let Some(id) = queue.pop() {
                 if !visited.insert(id.clone()) {
@@ -469,7 +480,7 @@ impl EngineApi for Engine {
                     let _ = admission.app.store.cancel_hook_admissions(&id);
                 }
                 crate::tools::cancel_background_jobs(&id);
-                if let Some(state) = running.get(&id) {
+                if let Some(state) = running.get(&id).and_then(SessionSlot::active) {
                     state.cancel.cancel();
                     // This also rejects reservations held by sibling
                     // instances, even when there are no local input hooks.

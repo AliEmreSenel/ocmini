@@ -345,10 +345,10 @@ pub async fn inspect_context(
     });
     let estimate = |bytes: usize| bytes.div_ceil(4);
     let instructions = estimate(system.len());
-    let tools = estimate(serde_json::to_vec(&defs).unwrap_or_default().len());
+    let tools = estimate(json_byte_len(&defs));
     let (mut conversation, mut results) = (0, 0);
     for message in &messages {
-        let size = estimate(message.to_string().len());
+        let size = estimate(json_byte_len(message));
         if message["role"] == "tool" {
             results += size;
         } else {

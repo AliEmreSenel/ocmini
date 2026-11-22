@@ -34,18 +34,44 @@ pub async fn write_frame(
     payload: &[u8],
 ) -> io::Result<()> {
     validate(tag, payload.len())?;
-    writer
-        .write_all(&(payload.len() as u32).to_be_bytes())
-        .await?;
-    writer.write_u8(tag).await?;
-    writer.write_all(payload).await
+    let len = (payload.len() as u32).to_be_bytes();
+    let header = [len[0], len[1], len[2], len[3], tag];
+    let mut h_off = 0;
+    let mut p_off = 0;
+    while h_off < header.len() || p_off < payload.len() {
+        let written = if h_off < header.len() {
+            let bufs = [
+                io::IoSlice::new(&header[h_off..]),
+                io::IoSlice::new(&payload[p_off..]),
+            ];
+            writer.write_vectored(&bufs).await?
+        } else {
+            writer.write(&payload[p_off..]).await?
+        };
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write whole frame",
+            ));
+        }
+        let h_rem = header.len() - h_off;
+        if written <= h_rem {
+            h_off += written;
+        } else {
+            h_off = header.len();
+            p_off += written - h_rem;
+        }
+    }
+    Ok(())
 }
 pub async fn read_frame(
     reader: &mut (impl AsyncRead + Unpin),
     expected: u8,
 ) -> io::Result<Vec<u8>> {
-    let length = reader.read_u32().await? as usize;
-    let tag = reader.read_u8().await?;
+    let mut header = [0u8; 5];
+    reader.read_exact(&mut header).await?;
+    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let tag = header[4];
     validate(tag, length)?;
     if tag != expected {
         return Err(io::Error::new(
@@ -466,6 +492,64 @@ mod tests {
             assert!(spill
                 .unpack(serde_json::json!({"$spill":"wire-link.json"}))
                 .is_err());
+        }
+    }
+    #[tokio::test]
+    async fn vectored_write_frame_handles_partial_writes_across_header_and_payload() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        struct ChunkedWriter {
+            max_write: usize,
+            out: Vec<u8>,
+        }
+        impl AsyncWrite for ChunkedWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let n = buf.len().min(self.max_write);
+                self.out.extend_from_slice(&buf[..n]);
+                Poll::Ready(Ok(n))
+            }
+            fn poll_write_vectored(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                let mut left = self.max_write;
+                let mut total = 0;
+                for slice in bufs {
+                    if left == 0 {
+                        break;
+                    }
+                    let n = slice.len().min(left);
+                    self.out.extend_from_slice(&slice[..n]);
+                    left -= n;
+                    total += n;
+                }
+                Poll::Ready(Ok(total))
+            }
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let payload = b"hello vectored frame payload!";
+        for max_write in [1, 2, 3, 5, 7, 64] {
+            let mut writer = ChunkedWriter {
+                max_write,
+                out: Vec::new(),
+            };
+            write_frame(&mut writer, b'P', payload).await.unwrap();
+            let mut cursor = std::io::Cursor::new(writer.out);
+            let decoded = read_frame(&mut cursor, b'P').await.unwrap();
+            assert_eq!(decoded, payload, "max_write={max_write}");
         }
     }
 }

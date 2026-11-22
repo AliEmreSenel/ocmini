@@ -83,19 +83,33 @@ pub fn session(s: &Session, state: &Value) -> Value {
     }
     value
 }
-pub fn inbox(sid: &str, request: &PromptRequest, created: i64) -> Value {
-    let input = request.v2.clone().unwrap_or_default();
+fn inbox_parts(
+    sid: &str,
+    message_id: Option<&str>,
+    parts: &[Value],
+    input: super::Input,
+    created: i64,
+) -> Value {
     let mut payload =
         if input.payload.is_object() && input.payload.as_object().is_some_and(|p| !p.is_empty()) {
             input.payload
         } else {
-            json!({"text":text_parts(&request.parts).collect::<Vec<_>>().join("\n")})
+            json!({"text":text_parts(parts).collect::<Vec<_>>().join("\n")})
         };
-    let files = files(&request.parts);
+    let files = files(parts);
     if !files.is_empty() {
         payload["files"] = json!(files);
     }
-    json!({"id":request.message_id,"sessionID":sid,"time":{"created":created},"type":input.kind,"payload":payload,"delivery":input.delivery})
+    json!({"id":message_id,"sessionID":sid,"time":{"created":created},"type":input.kind,"payload":payload,"delivery":input.delivery})
+}
+pub fn inbox(sid: &str, request: &PromptRequest, created: i64) -> Value {
+    inbox_parts(
+        sid,
+        request.message_id.as_deref(),
+        &request.parts,
+        request.v2.clone().unwrap_or_default(),
+        created,
+    )
 }
 pub fn receipt(sid: &str, message: &MessageWithParts) -> Result<Value, OperationError> {
     let input = message
@@ -106,14 +120,11 @@ pub fn receipt(sid: &str, message: &MessageWithParts) -> Result<Value, Operation
         .map(serde_json::from_value::<super::Input>)
         .transpose()
         .map_err(|e| OperationError::from(e.to_string()))?;
-    Ok(inbox(
+    Ok(inbox_parts(
         sid,
-        &PromptRequest {
-            message_id: Some(message.info.id.clone()),
-            parts: message.parts.clone(),
-            v2: input,
-            ..Default::default()
-        },
+        Some(&message.info.id),
+        &message.parts,
+        input.unwrap_or_default(),
         message.info.time.created,
     ))
 }

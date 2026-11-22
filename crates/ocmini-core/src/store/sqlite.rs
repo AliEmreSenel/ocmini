@@ -236,6 +236,14 @@ impl SqliteBackend {
             }
             conn.pragma_update(None, "user_version", 5)?;
         }
+        if version < 6 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS msg_sid_rowid ON message(session_id);
+                 CREATE INDEX IF NOT EXISTS session_updated_id ON session(time_updated DESC, id DESC);
+                 CREATE INDEX IF NOT EXISTS session_directory_updated_id ON session(directory, time_updated DESC, id DESC);",
+            )?;
+            conn.pragma_update(None, "user_version", 6)?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
             read,
@@ -783,8 +791,11 @@ impl SqliteBackend {
             summary: bool,
             created: i64,
             ordinal: i64,
+            parent_pos: Option<(i64, i64)>,
         }
         fn header(row: &rusqlite::Row<'_>) -> rusqlite::Result<Header> {
+            let parent_created: Option<i64> = row.get(6)?;
+            let parent_ordinal: Option<i64> = row.get(7)?;
             Ok(Header {
                 id: row.get(0)?,
                 role: row.get(1)?,
@@ -792,62 +803,94 @@ impl SqliteBackend {
                 summary: row.get(3)?,
                 created: row.get(4)?,
                 ordinal: row.get(5)?,
+                parent_pos: parent_created.zip(parent_ordinal),
             })
         }
-        const FIELDS: &str = "id,json_extract(json,'$.role'),json_extract(json,'$.parentID'),json_extract(json,'$.summary') IS 1 AND json_extract(json,'$.time.completed') IS NOT NULL AND json_extract(json,'$.error') IS NULL,time_created,rowid";
+        const SELECT: &str = "SELECT m.id,json_extract(m.json,'$.role'),json_extract(m.json,'$.parentID'),json_extract(m.json,'$.summary') IS 1 AND json_extract(m.json,'$.time.completed') IS NOT NULL AND json_extract(m.json,'$.error') IS NULL,m.time_created,m.rowid,p.time_created,p.rowid,m.json FROM message m LEFT JOIN message p ON p.id=json_extract(m.json,'$.parentID') AND p.session_id=m.session_id AND json_extract(p.json,'$.role')='user'";
         self.with_read(|c| {
             let tx = c.unchecked_transaction()?;
-            let boundary: Option<(i64, i64)> = tx.query_row(
-                "SELECT time_created,rowid FROM message WHERE session_id=?1 AND id=?2",
-                params![sid, through], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-            let mut users = HashMap::new();
-            let mut eligible = |h: &Header| -> Result<bool, OperationError> {
+            let boundary: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT time_created,rowid FROM message WHERE session_id=?1 AND id=?2",
+                    params![sid, through],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let eligible = |h: &Header| -> bool {
                 if h.role == "user" {
-                    return Ok(boundary.is_none_or(|end| (h.created, h.ordinal) <= end));
+                    return boundary.is_none_or(|end| (h.created, h.ordinal) <= end);
                 }
-                let Some(parent) = &h.parent else { return Ok(true); };
-                if let Some(eligible) = users.get(parent) {
-                    return Ok(*eligible);
+                if h.parent.is_none() {
+                    return true;
                 }
-                let position: Option<(i64, i64)> = tx.query_row(
-                    "SELECT time_created,rowid FROM message WHERE session_id=?1 AND id=?2 AND json_extract(json,'$.role')='user'",
-                    params![sid, parent], |row| Ok((row.get(0)?, row.get(1)?)),
-                ).optional()?;
-                let eligible = position.is_some_and(|position| boundary.is_none_or(|end| position <= end));
-                users.insert(parent.clone(), eligible);
-                Ok(eligible)
+                h.parent_pos
+                    .is_some_and(|position| boundary.is_none_or(|end| position <= end))
             };
             // Walk the session index backwards and stop at the newest usable
             // checkpoint. Archived headers need not be decoded on every round.
-            let mut stmt = tx.prepare(&format!("SELECT {FIELDS} FROM message WHERE session_id=?1 ORDER BY time_created DESC,rowid DESC"))?;
-            let rows = stmt.query_map(params![sid], header)?;
-            let mut tail = Vec::new();
+            let mut stmt = tx.prepare_cached(&format!(
+                "{SELECT} WHERE m.session_id=?1 ORDER BY m.time_created DESC,m.rowid DESC"
+            ))?;
+            let mut rows = stmt.query(params![sid])?;
+            let mut tail: Vec<(String, String)> = Vec::new();
             let mut messages = Vec::new();
-            for h in rows {
-                let h = h?;
-                if !eligible(&h)? { continue; }
+            while let Some(row) = rows.next()? {
+                let h = header(row)?;
+                if !eligible(&h) {
+                    continue;
+                }
+                let raw: String = row.get(8)?;
                 if h.summary {
-                    let message = read_message(&tx, sid, &h.id)?.ok_or_else(|| OperationError::not_found("Message not found"))?;
-                    if message.parts.iter().any(|part| part["type"] == "text" && part["text"].as_str().is_some_and(|text| !text.trim().is_empty())) {
-                        let pending = message.parts.iter().find_map(|part| part["compactionPending"].as_str());
-                        if let Some(pending) = pending {
-                            let pending = tx.query_row(&format!("SELECT {FIELDS} FROM message WHERE session_id=?1 AND id=?2"), params![sid, pending], header).optional()?;
-                            if let Some(pending) = pending.filter(|p| (p.created, p.ordinal) < (h.created, h.ordinal)) {
-                                if eligible(&pending)? {
-                                    messages.push(read_message(&tx, sid, &pending.id)?.ok_or_else(|| OperationError::not_found("Message not found"))?);
+                    let info: MessageInfo = serde_json::from_str(&raw).map_err(data_error)?;
+                    let parts = read_parts(&tx, sid, &h.id)?;
+                    if parts.iter().any(|part| {
+                        part["type"] == "text"
+                            && part["text"]
+                                .as_str()
+                                .is_some_and(|text| !text.trim().is_empty())
+                    }) {
+                        let pending = parts
+                            .iter()
+                            .find_map(|part| part["compactionPending"].as_str());
+                        if let Some(pending_id) = pending {
+                            let pending_row: Option<(Header, String)> = tx
+                                .prepare_cached(&format!(
+                                    "{SELECT} WHERE m.session_id=?1 AND m.id=?2"
+                                ))?
+                                .query_row(params![sid, pending_id], |r| {
+                                    Ok((header(r)?, r.get(8)?))
+                                })
+                                .optional()?;
+                            if let Some((p, p_raw)) = pending_row
+                                .filter(|(p, _)| (p.created, p.ordinal) < (h.created, h.ordinal))
+                            {
+                                if eligible(&p) {
+                                    messages.push(MessageWithParts {
+                                        info: serde_json::from_str(&p_raw).map_err(data_error)?,
+                                        parts: read_parts(&tx, sid, &p.id)?,
+                                    });
                                 }
                             }
                         }
-                        messages.insert(0, message);
+                        messages.insert(0, MessageWithParts { info, parts });
                         break;
                     }
                 }
-                tail.push(h);
+                tail.push((h.id, raw));
             }
+            drop(rows);
             drop(stmt);
-            for h in tail.into_iter().rev() {
-                messages.push(read_message(&tx, sid, &h.id)?.ok_or_else(|| OperationError::not_found("Message not found"))?);
+            if !tail.is_empty() {
+                let start = messages.len();
+                let mut ids = Vec::with_capacity(tail.len());
+                for (id, raw) in tail.into_iter().rev() {
+                    ids.push(id);
+                    messages.push(MessageWithParts {
+                        info: serde_json::from_str(&raw).map_err(data_error)?,
+                        parts: Vec::new(),
+                    });
+                }
+                attach_parts(&tx, sid, &ids, &mut messages[start..])?;
             }
             tx.commit()?;
             Ok(messages)
@@ -1198,6 +1241,49 @@ fn save_part(
     Ok(())
 }
 
+fn read_parts(c: &Connection, sid: &str, id: &str) -> Result<Vec<Value>, OperationError> {
+    let mut stmt = c.prepare_cached(
+        "SELECT json FROM part WHERE message_id=?1 AND session_id=?2 ORDER BY rowid",
+    )?;
+    let parts = stmt
+        .query_map(params![id, sid], |row| row.get::<_, String>(0))?
+        .map(|row| serde_json::from_str(&row?).map_err(data_error))
+        .collect();
+    parts
+}
+
+fn attach_parts(
+    c: &Connection,
+    sid: &str,
+    ids: &[String],
+    messages: &mut [MessageWithParts],
+) -> Result<(), OperationError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let indices: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    let ids_json = serde_json::to_string(ids).map_err(data_error)?;
+    let mut ps = c.prepare_cached(
+        "SELECT message_id,json FROM part WHERE session_id=?1 AND message_id IN (SELECT value FROM json_each(?2)) ORDER BY rowid",
+    )?;
+    let rows = ps.query_map(params![sid, ids_json], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (mid, raw) = row?;
+        if let Some(&index) = indices.get(mid.as_str()) {
+            messages[index]
+                .parts
+                .push(serde_json::from_str(&raw).map_err(data_error)?);
+        }
+    }
+    Ok(())
+}
+
 fn read_message(
     c: &Connection,
     sid: &str,
@@ -1210,13 +1296,7 @@ fn read_message(
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let mut stmt = c.prepare_cached(
-        "SELECT json FROM part WHERE message_id=?1 AND session_id=?2 ORDER BY rowid",
-    )?;
-    let parts = stmt
-        .query_map(params![id, sid], |row| row.get::<_, String>(0))?
-        .map(|row| serde_json::from_str(&row?).map_err(data_error))
-        .collect::<Result<_, _>>()?;
+    let parts = read_parts(c, sid, id)?;
     Ok(Some(MessageWithParts {
         info: serde_json::from_str(&raw).map_err(data_error)?,
         parts,
@@ -1677,7 +1757,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             connection
@@ -1748,7 +1828,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 

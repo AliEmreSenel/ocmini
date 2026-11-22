@@ -95,7 +95,7 @@ pub enum Protocol {
     #[default]
     Any,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     #[serde(default)]
@@ -103,6 +103,8 @@ pub struct Rule {
     pub source: Option<String>,
     pub destination: Option<String>,
     pub port: Option<u16>,
+    #[serde(skip)]
+    pub(crate) cidr: std::sync::OnceLock<Option<(IpAddr, u8)>>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -151,8 +153,13 @@ impl Rule {
     pub fn address(&self) -> Option<&str> {
         self.destination.as_deref().or(self.source.as_deref())
     }
+    fn cidr(&self) -> Option<(IpAddr, u8)> {
+        *self
+            .cidr
+            .get_or_init(|| self.address().and_then(|a| parse_cidr(a).ok()))
+    }
     pub fn domain(&self) -> Option<&str> {
-        self.address().filter(|a| parse_cidr(a).is_err())
+        self.address().filter(|_| self.cidr().is_none())
     }
     pub fn matches(&self, protocol: Protocol, ip: IpAddr, port: u16, name: Option<&str>) -> bool {
         if self.protocol != Protocol::Any && self.protocol != protocol {
@@ -161,11 +168,10 @@ impl Rule {
         if self.port.is_some_and(|p| p != port) {
             return false;
         }
-        self.address()
-            .is_none_or(|address| match parse_cidr(address) {
-                Ok((network, prefix)) => cidr_contains(network, prefix, ip),
-                Err(_) => name.is_some_and(|name| domain_matches(address, name)),
-            })
+        self.address().is_none_or(|address| match self.cidr() {
+            Some((network, prefix)) => cidr_contains(network, prefix, ip),
+            None => name.is_some_and(|name| domain_matches(address, name)),
+        })
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -631,16 +637,23 @@ impl Policy {
         &self,
         inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     ) -> Result<BTreeMap<std::ffi::OsString, std::ffi::OsString>, String> {
+        let allow: Vec<glob::Pattern> = self
+            .env
+            .allow
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+        let deny: Vec<glob::Pattern> = self
+            .env
+            .deny
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
         let mut env = BTreeMap::new();
         for (key, value) in inherited {
             let name = key.to_string_lossy();
-            let matches = |patterns: &[String]| {
-                patterns
-                    .iter()
-                    .any(|p| glob::Pattern::new(p).is_ok_and(|p| p.matches(&name)))
-            };
-            if (!self.env.clear || matches(&self.env.allow))
-                && !matches(&self.env.deny)
+            if (!self.env.clear || allow.iter().any(|p| p.matches(&name)))
+                && !deny.iter().any(|p| p.matches(&name))
                 && name != "PATH"
             {
                 env.insert(key, value);
@@ -823,12 +836,14 @@ mod tests {
             source: None,
             destination: Some("*.example.org".into()),
             port: Some(443),
+            ..Default::default()
         });
         direction.deny.push(Rule {
             protocol: Protocol::Tcp,
             source: None,
             destination: Some("blocked.example.org".into()),
             port: Some(443),
+            ..Default::default()
         });
         assert!(direction.dns_permitted("api.example.org"));
         assert!(!direction.dns_permitted("example.org"));
@@ -845,6 +860,7 @@ mod tests {
             source: None,
             destination: Some("192.0.2.0/24".into()),
             port: None,
+            ..Default::default()
         });
         assert!(!direction.permits(
             Protocol::Tcp,

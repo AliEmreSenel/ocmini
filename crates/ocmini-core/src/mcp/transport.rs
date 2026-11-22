@@ -205,6 +205,19 @@ pub(super) fn fail_pending(pending: &Pending, error: &str) {
     }
 }
 
+fn remote_client() -> Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("MCP HTTP client failed: {e}"))?;
+    Ok(CLIENT.get_or_init(|| built).clone())
+}
+
 pub(super) fn create_remote(config: &Value, changed: Arc<AtomicBool>) -> Result<Remote, String> {
     let mut headers = HeaderMap::new();
     if let Some(values) = config.get("headers").filter(|v| !v.is_null()) {
@@ -220,11 +233,7 @@ pub(super) fn create_remote(config: &Value, changed: Arc<AtomicBool>) -> Result<
             headers.insert(name, value);
         }
     }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("MCP HTTP client failed: {e}"))?;
+    let client = remote_client()?;
     Ok(Remote {
         client,
         url: config["url"].as_str().unwrap_or_default().into(),

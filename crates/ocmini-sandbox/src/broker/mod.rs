@@ -165,7 +165,7 @@ pub async fn run(
     let mut dns_jobs = FuturesUnordered::new();
     let resolver = dns::Resolver::default();
     let mut previews = preview::Publisher::new(host_pid, &policy)?;
-    let udp_ingress = preview::UdpIngress::new(&policy)?;
+    let mut udp_ingress = preview::UdpIngress::new(&policy)?;
     let mut discovery = tokio::time::interval(Duration::from_millis(250));
     let mut udp_bytes = vec![0; 65535];
     let mut echoes = icmp::Echo::default();
@@ -520,7 +520,7 @@ pub async fn run(
                 let source=if peer.ip().is_loopback(){SocketAddr::new(PEER4.into(),peer.port())}else{peer};
                 let key=Tuple{guest:destination,remote:source};
                 if let std::collections::hash_map::Entry::Vacant(e) = udp_listeners.entry(source) {let ring=policy.buffers.udp_ring;let capacity=ring.checked_mul(wire::MTU).ok_or_else(||io::Error::other("UDP buffer overflow"))?.max(65535);let mut sock=udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]),udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY;ring],vec![0;capacity]));sock.bind(endpoint(source)).map_err(io::Error::other)?;let handle=sockets.add(sock);e.insert(UdpListener{touched:Instant::now(),handle,address:source});}
-                let handle=udp_listeners[&source].handle;let _=sockets.get_mut::<udp::Socket>(handle).send_slice(&bytes,endpoint(destination));
+                let handle=udp_listeners[&source].handle;let _=sockets.get_mut::<udp::Socket>(handle).send_slice(bytes,endpoint(destination));
                 udp_flows.insert(key,UdpFlow{host,handle,reply_to:Some(peer),touched:Instant::now(),answered:false});
             },
             accepted=previews.accept()=>{

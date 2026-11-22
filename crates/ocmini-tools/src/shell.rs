@@ -145,16 +145,20 @@ pub async fn shell_with_env(
     env: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<ToolOutput, OperationError> {
     // Let the OS capture output directly; only bounded previews enter memory.
-    std::fs::create_dir_all(output_directory)
-        .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
-    let capture = || -> std::io::Result<_> {
-        Ok((
-            tempfile::tempfile_in(output_directory)?,
-            tempfile::tempfile_in(output_directory)?,
-        ))
-    };
-    let (stdout, stderr) =
-        capture().map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+    let capture_dir = output_directory.to_owned();
+    let (stdout, stderr, child_stdout, child_stderr) = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&capture_dir)
+            .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+        let stdout = tempfile::tempfile_in(&capture_dir)
+            .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+        let stderr = tempfile::tempfile_in(&capture_dir)
+            .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+        let child_stdout = stdout.try_clone().map_err(|e| failure(e.to_string()))?;
+        let child_stderr = stderr.try_clone().map_err(|e| failure(e.to_string()))?;
+        Ok::<_, OperationError>((stdout, stderr, child_stdout, child_stderr))
+    })
+    .await
+    .map_err(|e| failure(format!("Shell setup task failed: {e}")))??;
     let mut process = shell_command(command, directory);
     for (key, value) in env {
         if let Some(value) = value.as_str() {
@@ -165,8 +169,8 @@ pub async fn shell_with_env(
     }
     process
         .stdin(Stdio::null())
-        .stdout(stdout.try_clone().map_err(|e| failure(e.to_string()))?)
-        .stderr(stderr.try_clone().map_err(|e| failure(e.to_string()))?)
+        .stdout(child_stdout)
+        .stderr(child_stderr)
         .kill_on_drop(true);
     #[cfg(unix)]
     process.process_group(0);
@@ -472,20 +476,39 @@ pub async fn shell_background_with_env(
 ) -> Result<ToolOutput, OperationError> {
     #[cfg(not(unix))]
     let _ = session_id;
-    std::fs::create_dir_all(output_directory)
-        .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
-    // The log lives with the other tool-output files so existing retention
-    // rules remove it. Unlike captured shell output it is not size-bounded.
-    // keep() leaves the log on disk; into_file() would unlink it.
-    let (file, log) = output::create(output_directory)
-        .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?
-        .keep()
-        .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
+    let capture_dir = output_directory.to_owned();
     #[cfg(unix)]
-    let log_handle = file.try_clone().map_err(|e| failure(e.to_string()))?;
-    #[cfg(unix)]
-    let identity =
-        LogIdentity::from_metadata(&file.metadata().map_err(|e| failure(e.to_string()))?);
+    let (file, child_stdout, log, log_handle, identity) = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&capture_dir)
+            .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+        // The log lives with the other tool-output files so existing retention
+        // rules remove it. Unlike captured shell output it is not size-bounded.
+        // keep() leaves the log on disk; into_file() would unlink it.
+        let (file, log) = output::create(&capture_dir)
+            .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?
+            .keep()
+            .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
+        let log_handle = file.try_clone().map_err(|e| failure(e.to_string()))?;
+        let child_stdout = file.try_clone().map_err(|e| failure(e.to_string()))?;
+        let identity =
+            LogIdentity::from_metadata(&file.metadata().map_err(|e| failure(e.to_string()))?);
+        Ok::<_, OperationError>((file, child_stdout, log, log_handle, identity))
+    })
+    .await
+    .map_err(|e| failure(format!("Shell setup task failed: {e}")))??;
+    #[cfg(not(unix))]
+    let (file, child_stdout, log) = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&capture_dir)
+            .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?;
+        let (file, log) = output::create(&capture_dir)
+            .map_err(|e| failure(format!("Cannot capture shell output: {e}")))?
+            .keep()
+            .map_err(|e| failure(format!("Cannot capture shell output: {}", e.error)))?;
+        let child_stdout = file.try_clone().map_err(|e| failure(e.to_string()))?;
+        Ok::<_, OperationError>((file, child_stdout, log))
+    })
+    .await
+    .map_err(|e| failure(format!("Shell setup task failed: {e}")))??;
     let mut process = shell_command(command, directory);
     for (key, value) in env {
         if let Some(value) = value.as_str() {
@@ -496,7 +519,7 @@ pub async fn shell_background_with_env(
     }
     process
         .stdin(Stdio::null())
-        .stdout(file.try_clone().map_err(|e| failure(e.to_string()))?)
+        .stdout(child_stdout)
         .stderr(file);
     #[cfg(unix)]
     // A new session keeps the job outside every process group the harness kills

@@ -46,28 +46,37 @@ pub(super) struct Markdown {
 impl Markdown {
     /// Render one chunk of model text.
     pub fn push(&mut self, text: &str) -> Rendered {
-        let source = std::mem::take(&mut self.line) + text;
-        let mut out = String::new();
-        let mut rest = source.as_str();
-        while let Some(index) = rest.find('\n') {
+        self.line.push_str(text);
+        let mut out = String::with_capacity(self.line.len());
+        let mut consumed = 0usize;
+        while let Some(rel) = self.line[consumed..].find('\n') {
             // A line that prints no row consumes its newline with it, so a
             // closing fence leaves no blank row in the transcript.
-            if Self::row(&mut self.fence, &rest[..index], &mut out) {
+            if Self::row(
+                &mut self.fence,
+                &self.line[consumed..consumed + rel],
+                &mut out,
+            ) {
                 out.push('\n');
             }
-            rest = &rest[index + 1..];
+            consumed += rel + 1;
         }
         // The unfinished line renders too: it is the row under the caret. Its
         // fences are previewed on a copy, because a partial ``` marker is not
         // a fence: the whole line that completes it opens the block. An empty
         // remainder is a line boundary: no row is under the caret yet.
         let start = out.len();
+        let rest = &self.line[consumed..];
         if !rest.is_empty() {
             let mut preview = self.fence;
             Self::row(&mut preview, rest, &mut out);
         }
         let line = out.len() - start;
-        self.line = rest.to_string();
+        if consumed == self.line.len() {
+            self.line.clear();
+        } else if consumed > 0 {
+            self.line.drain(..consumed);
+        }
         Rendered { text: out, line }
     }
 
@@ -111,9 +120,15 @@ impl Markdown {
                 return false;
             }
             if text.is_empty() {
-                out.push_str(&format!("{DIM}│{RESET}"));
+                out.push_str(DIM);
+                out.push('│');
+                out.push_str(RESET);
             } else {
-                out.push_str(&format!("{DIM}│{RESET} {line}"));
+                out.push_str(DIM);
+                out.push('│');
+                out.push_str(RESET);
+                out.push(' ');
+                out.push_str(line);
             }
             return true;
         }
@@ -123,12 +138,16 @@ impl Markdown {
             if language.is_empty() {
                 return false;
             }
-            out.push_str(&format!("{BOLD}{language}{RESET}"));
+            out.push_str(BOLD);
+            out.push_str(language);
+            out.push_str(RESET);
             return true;
         }
         let hashes = text.chars().take_while(|ch| *ch == '#').count();
         if (1..=6).contains(&hashes) && text[hashes..].starts_with(' ') {
-            out.push_str(&format!("{BOLD}{}{RESET}", text[hashes..].trim_start()));
+            out.push_str(BOLD);
+            out.push_str(text[hashes..].trim_start());
+            out.push_str(RESET);
             return true;
         }
         inline(line, out);
@@ -164,7 +183,9 @@ fn inline(text: &str, out: &mut String) {
             // Prose asterisks (`2 * 3`) and padded spans print as typed, so a
             // stray marker cannot restyle half a paragraph.
             if !styled.is_empty() && !styled.starts_with(' ') && !styled.ends_with(' ') {
-                out.push_str(&format!("{style}{styled}{RESET}"));
+                out.push_str(style);
+                out.push_str(styled);
+                out.push_str(RESET);
                 rest = &body[end + span.len()..];
                 continue;
             }

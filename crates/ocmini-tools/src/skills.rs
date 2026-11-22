@@ -32,8 +32,19 @@ pub fn list(directory: Option<&str>, extra: &[String]) -> Vec<Value> {
     for path in extra {
         roots.push(resolve_path(directory.unwrap_or("."), path));
     }
+    // Keep the last occurrence of each root to preserve last-wins precedence
+    // without walking overlapping global and ancestor directories twice.
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::with_capacity(roots.len());
+    for root in roots.into_iter().rev() {
+        let key = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if seen.insert(key) {
+            unique.push(root);
+        }
+    }
+    unique.reverse();
     let mut skills = BTreeMap::new();
-    for root in roots {
+    for root in unique {
         for path in discover(&root) {
             if let Some(skill) = read_skill(&path) {
                 skills.insert(skill["name"].as_str().unwrap().to_owned(), skill);

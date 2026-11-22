@@ -376,22 +376,20 @@ async fn execute_part(
             .await
         }
     };
-    // Task/question tools may publish metadata while blocked. Preserve it.
-    let existing = ctx
-        .app
-        .store
-        .message_part(&ctx.session_id, &ctx.message_id, &ctx.part_id)
-        .ok()
-        .flatten();
-    let running_metadata = existing
-        .as_ref()
-        .map(|p| p["state"]["metadata"].clone())
-        .unwrap_or_else(|| json!({}));
     part["state"] = match output {
         Ok(out) => {
             json!({"status":"completed","input":visible_input,"output":out.output,"title":out.title,"metadata":out.metadata,"time":{"start":start,"end":now_ms()}})
         }
         Err(error) => {
+            // Task/question tools may publish metadata while blocked. Preserve it.
+            let running_metadata = ctx
+                .app
+                .store
+                .message_part(&ctx.session_id, &ctx.message_id, &ctx.part_id)
+                .ok()
+                .flatten()
+                .map(|p| p["state"]["metadata"].clone())
+                .unwrap_or_else(|| json!({}));
             json!({"status":"error","input":visible_input,"error":error.message,"metadata":running_metadata,"time":{"start":start,"end":now_ms()}})
         }
     };
@@ -849,14 +847,23 @@ pub(super) async fn expand_shell_templates(
     static SHELL_TEMPLATE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re =
         SHELL_TEMPLATE.get_or_init(|| regex::Regex::new(r"!`([^`]+)`").expect("constant regex"));
+    let mut changed = false;
     for part in &mut user.parts {
         if part["type"] != "text" {
             continue;
         }
-        let original = part["text"].as_str().unwrap_or_default().to_string();
+        let Some(original) = part["text"].as_str() else {
+            continue;
+        };
+        if !original.contains("!`") {
+            continue;
+        }
+        let original = original.to_owned();
         let mut replaced = String::new();
         let mut offset = 0;
+        let mut part_changed = false;
         for capture in re.captures_iter(&original) {
+            part_changed = true;
             let matched = capture.get(0).ok_or("Invalid shell template")?;
             let command = capture.get(1).ok_or("Empty shell template")?.as_str();
             if ["plan", "explore"].contains(&request.agent.as_deref().unwrap_or("build")) {
@@ -888,9 +895,14 @@ pub(super) async fn expand_shell_templates(
             replaced.push_str(&output.output);
             offset = matched.end();
         }
-        replaced.push_str(&original[offset..]);
-        part["text"] = json!(replaced);
+        if part_changed {
+            replaced.push_str(&original[offset..]);
+            part["text"] = json!(replaced);
+            changed = true;
+        }
     }
-    crate::messages::update_parts(app, &user)?;
+    if changed {
+        crate::messages::update_parts(app, &user)?;
+    }
     Ok(())
 }

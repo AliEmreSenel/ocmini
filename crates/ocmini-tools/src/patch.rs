@@ -378,7 +378,20 @@ fn patch_path(path: &str) -> Result<String, String> {
 }
 
 fn update(content: &str, hunks: &[Hunk]) -> Result<String, String> {
-    let crlf = content.contains("\r\n") && !content.replace("\r\n", "").contains('\n');
+    let mut saw_crlf = false;
+    let mut saw_bare_lf = false;
+    let bytes = content.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            if i > 0 && bytes[i - 1] == b'\r' {
+                saw_crlf = true;
+            } else {
+                saw_bare_lf = true;
+                break;
+            }
+        }
+    }
+    let crlf = saw_crlf && !saw_bare_lf;
     let bom = content.starts_with('\u{feff}');
     let normalized = content.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     let final_newline = normalized.ends_with('\n');

@@ -54,12 +54,16 @@ fn updated(session: &Session) -> i64 {
 }
 
 /// Case-insensitive substring search over title, ID and directory.
+fn matches_lower(session: &Session, query_lower: &str) -> bool {
+    query_lower.is_empty()
+        || session.title.to_lowercase().contains(query_lower)
+        || session.id.to_lowercase().contains(query_lower)
+        || session.directory.to_lowercase().contains(query_lower)
+}
+
+#[cfg(test)]
 fn matches(session: &Session, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    query.is_empty()
-        || session.title.to_lowercase().contains(&query)
-        || session.id.to_lowercase().contains(&query)
-        || session.directory.to_lowercase().contains(&query)
+    matches_lower(session, &query.trim().to_lowercase())
 }
 
 fn title_key(session: &Session) -> (String, String) {
@@ -148,10 +152,16 @@ fn draw(
     if rows.is_empty() {
         println!("{DIM}│ no matching sessions{RESET}");
     }
+    let busy_ids: std::collections::HashSet<String> = store
+        .busy_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let now = now_ms();
     for (index, session) in rows.iter().enumerate().skip(top).take(VISIBLE) {
         let marker = if index == cursor { "›" } else { " " };
         let style = if index == cursor { BOLD } else { DIM };
-        let busy = store.is_busy(&session.id).unwrap_or(false);
+        let busy = busy_ids.contains(&session.id);
         println!(
             "{DIM}│{RESET} {marker} {style}{:<title_width$}{RESET}{} {DIM}{} · {}{RESET}",
             truncate(&session.title, title_width),
@@ -160,7 +170,7 @@ fn draw(
             } else {
                 String::new()
             },
-            time_ago(updated(session), now_ms()),
+            time_ago(updated(session), now),
             tail(
                 &session.directory,
                 (cols as usize).saturating_sub(title_width + 24).max(8),
@@ -187,44 +197,74 @@ pub(crate) async fn select(
     let mut drawn = 0usize;
     let mut view = None;
     let mut rows = Vec::new();
+    let mut dirty = true;
     loop {
-        let key = (query.clone(), sort);
-        if view.as_ref() != Some(&key) {
-            rows = all
-                .iter()
-                .filter(|session| matches(session, &query))
-                .collect();
-            sort_sessions(&mut rows, sort);
-            view = Some(key);
+        if dirty {
+            let key = (query.clone(), sort);
+            if view.as_ref() != Some(&key) {
+                let query_lower = query.trim().to_lowercase();
+                rows = all
+                    .iter()
+                    .filter(|session| matches_lower(session, &query_lower))
+                    .collect();
+                sort_sessions(&mut rows, sort);
+                view = Some(key);
+            }
+            cursor = cursor.min(rows.len().saturating_sub(1));
+            drawn = draw(store, scope, &rows, &query, sort, cursor, drawn)?;
+            dirty = false;
         }
-        cursor = cursor.min(rows.len().saturating_sub(1));
-        drawn = draw(store, scope, &rows, &query, sort, cursor, drawn)?;
         let event = keys
             .next()
             .await
             .ok_or_else(|| "Terminal input closed".to_string())?
             .map_err(|error| error.to_string())?;
+        let is_resize = matches!(event, crossterm::event::Event::Resize(_, _));
+        let prev_cursor = cursor;
         match decode_event(event) {
             Key::Enter => return Ok(rows.get(cursor).copied().cloned()),
             Key::Esc | Key::CtrlC | Key::CtrlD => return Ok(None),
             Key::Tab => {
                 sort = sort.next();
                 cursor = 0;
+                dirty = true;
             }
             Key::Char(ch) => {
                 query.push(ch);
                 cursor = 0;
+                dirty = true;
             }
             Key::Backspace => {
-                query.pop();
-                cursor = 0;
+                if query.pop().is_some() {
+                    cursor = 0;
+                    dirty = true;
+                }
             }
-            Key::Up(steps) => cursor = cursor.saturating_sub(steps),
-            Key::Down(steps) => cursor = (cursor + steps).min(rows.len().saturating_sub(1)),
-            Key::PageUp => cursor = cursor.saturating_sub(VISIBLE),
-            Key::PageDown => cursor = (cursor + VISIBLE).min(rows.len().saturating_sub(1)),
-            Key::Move(Motion::Home, false) => cursor = 0,
-            Key::Move(Motion::End, false) => cursor = rows.len().saturating_sub(1),
+            Key::Up(steps) => {
+                cursor = cursor.saturating_sub(steps);
+                dirty = cursor != prev_cursor;
+            }
+            Key::Down(steps) => {
+                cursor = (cursor + steps).min(rows.len().saturating_sub(1));
+                dirty = cursor != prev_cursor;
+            }
+            Key::PageUp => {
+                cursor = cursor.saturating_sub(VISIBLE);
+                dirty = cursor != prev_cursor;
+            }
+            Key::PageDown => {
+                cursor = (cursor + VISIBLE).min(rows.len().saturating_sub(1));
+                dirty = cursor != prev_cursor;
+            }
+            Key::Move(Motion::Home, false) => {
+                cursor = 0;
+                dirty = cursor != prev_cursor;
+            }
+            Key::Move(Motion::End, false) => {
+                cursor = rows.len().saturating_sub(1);
+                dirty = cursor != prev_cursor;
+            }
+            _ if is_resize => dirty = true,
             _ => {}
         }
     }

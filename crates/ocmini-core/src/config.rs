@@ -246,29 +246,30 @@ impl Config {
 
     pub fn load() -> Result<Config, String> {
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::load_for(&directory.to_string_lossy())
+        Self::load_for(&directory.to_string_lossy()).map(|config| (*config).clone())
     }
 
     /// Configs are loaded from disk per request scope. With many concurrent
-    /// sessions this is a hot disk path, so entries are cached briefly; T3
-    /// config overlays take effect within the TTL.
-    pub fn load_for(directory: &str) -> Result<Config, String> {
+    /// sessions this is a hot disk path, so entries are cached briefly as shared
+    /// `Arc<Config>` handles; T3 config overlays take effect within the TTL.
+    pub fn load_for(directory: &str) -> Result<std::sync::Arc<Config>, String> {
         let directory = directory_identity(&absolute_path(
             Path::new(directory),
             &std::env::current_dir().unwrap_or_default(),
         ));
         let directory = directory.to_string_lossy();
         let directory = directory.as_ref();
-        static CACHE: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Config)>>,
-        > = std::sync::OnceLock::new();
+        type ConfigCache = std::sync::Mutex<
+            std::collections::HashMap<String, (std::time::Instant, std::sync::Arc<Config>)>,
+        >;
+        static CACHE: std::sync::OnceLock<ConfigCache> = std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         if let Some((created, config)) = cache.lock().unwrap().get(directory) {
             if created.elapsed() < std::time::Duration::from_secs(3) {
                 return Ok(config.clone());
             }
         }
-        let config = Self::load_uncached(directory)?;
+        let config = std::sync::Arc::new(Self::load_uncached(directory)?);
         let mut cache = cache.lock().unwrap();
         cache.retain(|_, (created, _)| created.elapsed() < std::time::Duration::from_secs(3));
         cache.insert(
@@ -1082,5 +1083,14 @@ mod tests {
         let error = load_markdown(&mut json!({}), root.path(), "command", "template").unwrap_err();
         assert!(error.contains("invalid frontmatter"));
         assert!(error.contains("review.md"));
+    }
+
+    #[test]
+    fn load_for_returns_shared_arc_on_cache_hit() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_str().unwrap();
+        let first = Config::load_for(dir).unwrap();
+        let second = Config::load_for(dir).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 }

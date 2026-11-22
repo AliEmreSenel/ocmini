@@ -137,6 +137,7 @@ mod tests {
             source: None,
             destination: Some("10.0.0.0/8".into()),
             port: None,
+            ..Default::default()
         });
         assert!(!policy.dns_permitted("secret.invalid"));
     }

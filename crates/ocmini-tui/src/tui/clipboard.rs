@@ -1,4 +1,4 @@
-use super::input::{terminal_width, Display, Draft};
+use super::input::{Display, Draft};
 use super::{RESET, YELLOW};
 use crate::attachments::Attachment;
 use std::path::{Path, PathBuf};
@@ -68,8 +68,15 @@ pub(super) fn is_image_file(path: &Path) -> bool {
     crate::tools::media_type(&head[..read]).is_some_and(|mime| mime.starts_with("image/"))
 }
 
-pub(super) async fn paste_clipboard(draft: &mut Draft, display: &mut Display) {
-    let result = tokio::time::timeout(std::time::Duration::from_secs(3), clipboard_image()).await;
+pub(super) type ClipboardResult =
+    Result<Result<Option<Attachment>, String>, tokio::time::error::Elapsed>;
+
+pub(super) fn apply_clipboard(
+    result: ClipboardResult,
+    draft: &mut Draft,
+    display: &mut Display,
+    width: usize,
+) {
     let message = match result {
         Ok(Ok(Some(attachment))) => {
             draft.attachments.push(attachment);
@@ -81,12 +88,19 @@ pub(super) async fn paste_clipboard(draft: &mut Draft, display: &mut Display) {
         Ok(Err(message)) => message,
         Err(_) => "Clipboard read timed out. Paste an image file path to attach it.".into(),
     };
-    display.output(&format!("\n{YELLOW}{message}{RESET}\n"), terminal_width());
+    display.output(&format!("\n{YELLOW}{message}{RESET}\n"), width);
 }
 
 #[cfg(target_os = "linux")]
 pub(super) async fn clipboard_image() -> Result<Option<Attachment>, String> {
     use tokio::process::Command;
+    const SUPPORTED: &[&str] = &[
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "text/uri-list",
+    ];
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let x11 = std::env::var_os("DISPLAY").is_some();
     if !wayland && !x11 {
@@ -104,47 +118,62 @@ pub(super) async fn clipboard_image() -> Result<Option<Attachment>, String> {
         if !enabled {
             continue;
         }
-        for mime in [
-            "image/png",
-            "image/jpeg",
-            "image/webp",
-            "image/gif",
-            "text/uri-list",
-        ] {
-            let mut command = Command::new(program);
-            if program == "wl-paste" {
-                // --no-newline keeps binary payloads byte-exact.
-                command.args(["--type", mime, "--no-newline"]);
-            } else {
-                command.args(["-selection", "clipboard", "-t", mime, "-o"]);
+        // Query offered MIME targets once instead of spawning one process per MIME type.
+        let mut list = Command::new(program);
+        if program == "wl-paste" {
+            list.arg("--list-types");
+        } else {
+            list.args(["-selection", "clipboard", "-t", "TARGETS", "-o"]);
+        }
+        let offered = match list.kill_on_drop(true).output().await {
+            Ok(out) => {
+                available = true;
+                if !out.status.success() {
+                    continue;
+                }
+                String::from_utf8_lossy(&out.stdout).into_owned()
             }
-            match command.kill_on_drop(true).output().await {
-                Ok(out) => {
-                    available = true;
-                    if out.status.success() {
-                        if mime == "text/uri-list" {
-                            if let Ok(text) = std::str::from_utf8(&out.stdout) {
-                                let paths: Vec<_> = text
-                                    .lines()
-                                    .filter(|line| {
-                                        !line.starts_with('#') && !line.trim().is_empty()
-                                    })
-                                    .collect();
-                                if let [path] = paths.as_slice() {
-                                    if let Some(path) = pasted_image_path(path) {
-                                        return file_attachment(&path).map(Some);
-                                    }
-                                }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Cannot read clipboard using {program}: {error}"));
+            }
+        };
+        let Some(mime) = SUPPORTED
+            .iter()
+            .copied()
+            .find(|wanted| offered.lines().any(|line| line.trim() == *wanted))
+        else {
+            continue;
+        };
+        let mut command = Command::new(program);
+        if program == "wl-paste" {
+            // --no-newline keeps binary payloads byte-exact.
+            command.args(["--type", mime, "--no-newline"]);
+        } else {
+            command.args(["-selection", "clipboard", "-t", mime, "-o"]);
+        }
+        match command.kill_on_drop(true).output().await {
+            Ok(out) if out.status.success() => {
+                if mime == "text/uri-list" {
+                    if let Ok(text) = std::str::from_utf8(&out.stdout) {
+                        let paths: Vec<_> = text
+                            .lines()
+                            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+                            .collect();
+                        if let [path] = paths.as_slice() {
+                            if let Some(path) = pasted_image_path(path) {
+                                return file_attachment(&path).map(Some);
                             }
-                        } else if let Some(attachment) = image_attachment(out.stdout) {
-                            return Ok(Some(attachment));
                         }
                     }
+                } else if let Some(attachment) = image_attachment(out.stdout) {
+                    return Ok(Some(attachment));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error) => {
-                    return Err(format!("Cannot read clipboard using {program}: {error}"))
-                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Cannot read clipboard using {program}: {error}"));
             }
         }
     }

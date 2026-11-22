@@ -179,7 +179,7 @@
   }
   const LIST = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
   const blockStart = (line) => /^\s*(```|~~~|#{1,6}\s|>|([-*+]|\d+[.)])\s)/.test(line) || /^\s*(---+|\*\*\*+|___+)\s*$/.test(line);
-  function markdown(source) {
+  function markdownBlocks(source) {
     const lines = String(source).split("\n");
     const out = [];
     for (let i = 0; i < lines.length; ) {
@@ -234,7 +234,31 @@
       for (; i < lines.length && lines[i].trim() && !(para.length && blockStart(lines[i])); i++) para.push(inline(lines[i]));
       out.push("<p>" + para.join("<br>") + "</p>");
     }
-    return out.join("");
+    return out;
+  }
+  function markdown(source) {
+    return markdownBlocks(source).join("");
+  }
+  function updateMarkdown(target, text) {
+    const next = markdownBlocks(text || "");
+    const prev = target._blocks;
+    if (!prev || prev.length !== target.children.length) {
+      target.innerHTML = next.join("");
+      target._blocks = next;
+      return;
+    }
+    let common = 0;
+    while (common < prev.length && common < next.length && prev[common] === next[common]) common++;
+    while (target.children.length > next.length) target.lastElementChild.remove();
+    const tpl = document.createElement("template");
+    for (let i = common; i < next.length; i++) {
+      tpl.innerHTML = next[i];
+      const fresh = tpl.content.firstElementChild;
+      if (!fresh) continue;
+      if (i < target.children.length) target.children[i].replaceWith(fresh);
+      else target.append(fresh);
+    }
+    target._blocks = next;
   }
 
   // ---------- sessions ----------
@@ -303,7 +327,7 @@
   function sessionRow(s) {
     const isArchived = !!(state.showArchived || (s.time && s.time.archived));
     return (
-        h("li", { class: s.id === state.sid ? "active" : "", tabindex: 0, title: s.title, onclick: () => openSession(s.id),
+        h("li", { "data-sid": s.id, class: s.id === state.sid ? "active" : "", tabindex: 0, title: s.title, onclick: () => openSession(s.id),
           onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); } },
           state.busy.has(s.id) ? h("span", { class: "dot", title: "Working" }) : null,
           h("span", { class: "name", text: s.title || s.id }),
@@ -318,6 +342,14 @@
                   onclick: (e) => { e.stopPropagation(); archiveSession(s); } }),
             h("button", { type: "button", title: "Delete", "aria-label": "Delete", text: "✕",
               onclick: (e) => { e.stopPropagation(); deleteSession(s); } }))));
+  }
+  function updateSessionBusy(sid) {
+    const row = Array.from($("#sessions").children).find((el) => el.dataset && el.dataset.sid === sid);
+    if (!row) return;
+    const busy = state.busy.has(sid);
+    const dot = row.querySelector(":scope > .dot");
+    if (busy && !dot) row.prepend(h("span", { class: "dot", title: "Working" }));
+    else if (!busy && dot) dot.remove();
   }
   async function renameSession(s) {
     const title = prompt("Session title", s.title);
@@ -431,7 +463,10 @@
     for (const m of older) state.byId.set(m.id, m);
     state.messages = older.concat(state.messages);
     state.olderCursor = page.cursor && page.cursor.next;
-    renderMessages();
+    const nodes = older.map(renderMessage).filter(Boolean);
+    if (nodes.length) $("#messages").prepend(...nodes);
+    $("#older").hidden = !state.olderCursor;
+    $("#empty").hidden = !!(state.messages.length || state.pending.size);
     box.scrollTop += box.scrollHeight - height;
   }
   function addMessage(m) {
@@ -739,11 +774,14 @@
   function renderBlock(block) {
     let node;
     if (block.type === "text") {
-      node = h("div", { class: "md", html: markdown(block.text || "") });
+      node = h("div", { class: "md" });
+      updateMarkdown(node, block.text || "");
     } else if (block.type === "reasoning") {
+      const md = h("div", { class: "md" });
+      updateMarkdown(md, block.text || "");
       node = h("details", { class: "reasoning", open: !!block.open, ontoggle: (e) => { block.open = e.target.open; } },
         h("summary", { text: block.done === false ? "Thinking…" : "Thought" }),
-        h("div", { class: "md", html: markdown(block.text || "") }));
+        md);
     } else if (block.type === "tool") {
       node = renderTool(block);
     } else return h("span");
@@ -876,7 +914,7 @@
         if (item.type === "tool") item.node.replaceWith(renderBlock(item));
         else {
           const target = item.node.classList.contains("md") ? item.node : item.node.querySelector(".md");
-          if (target) target.innerHTML = markdown(item.text || "");
+          if (target) updateMarkdown(target, item.text || "");
           const summary = item.node.querySelector("summary");
           if (summary) summary.textContent = item.done === false ? "Thinking…" : "Thought";
         }
@@ -1396,14 +1434,14 @@
       }
       case "session.execution.started":
         state.busy.add(sid);
-        renderSessions();
+        updateSessionBusy(sid);
         if (sid === state.sid) { renderStatus(); renderSandbox(); }
         return;
       case "session.execution.succeeded":
       case "session.execution.failed":
       case "session.execution.interrupted":
         state.busy.delete(sid);
-        renderSessions();
+        updateSessionBusy(sid);
         if (sid !== state.sid) return reloadSessions();
         renderStatus();
         renderSandbox();
@@ -1532,6 +1570,20 @@
         m.cost = data.cost;
         m.finish = data.finish;
         if (data.error) m.error = data.error;
+        if (m.node && m.node.isConnected) {
+          let err = m.node.querySelector(":scope > .error");
+          if (m.error) {
+            if (!err) { err = h("div", { class: "error" }); m.node.append(err); }
+            err.textContent = m.error.message || "Failed";
+          } else if (err) err.remove();
+          const footerText = m.time && m.time.completed ? usage(m.tokens, m.cost) : "";
+          let footer = m.node.querySelector(":scope > .footer");
+          if (footerText) {
+            if (!footer) { footer = h("div", { class: "footer" }); m.node.append(footer); }
+            footer.textContent = footerText;
+          } else if (footer) footer.remove();
+          return;
+        }
         return touch(m);
       }
       case "session.retry.scheduled":
@@ -1549,18 +1601,22 @@
   }
 
   // ---------- file tree ----------
-  async function loadDir(node) {
-    const result = await api("GET", "/web/api/fs/list?" + q({ path: node.path }));
+  function applyDirEntries(node, result) {
     const previous = new Map((node.children || []).map((c) => [c.path, c]));
     node.children = result.entries.map((e) => {
       const old = previous.get(e.path);
       return old && old.type === e.type ? Object.assign(old, e) : { ...e, open: false, children: null };
     });
   }
-  async function initTree() {
+  async function loadDir(node) {
+    const result = await api("GET", "/web/api/fs/list?" + q({ path: node.path }));
+    applyDirEntries(node, result);
+  }
+  async function initTree(initial) {
     state.tree = { path: state.dir, name: basename(state.dir), type: "directory", open: true, children: null };
     state.treeSelected = state.dir;
-    await loadDir(state.tree).catch(fail);
+    if (initial) applyDirEntries(state.tree, initial);
+    else await loadDir(state.tree).catch(fail);
     renderTree();
   }
   let treeTimer = 0;
@@ -1698,7 +1754,7 @@
       try {
         const loaded = await fetchFile(path);
         file = { path, name: basename(path), text: loaded.text, saved: loaded.text, version: loaded.version,
-          readonly: loaded.readonly, dirty: false, scroll: [0, 0], cursor: [0, 0] };
+          diskVersion: loaded.version, readonly: loaded.readonly, dirty: false, scroll: [0, 0], cursor: [0, 0] };
         if (loaded.readonly) toast(basename(path) + " is not valid UTF-8; opened read-only", true);
         state.files.push(file);
       } catch (error) {
@@ -1778,10 +1834,15 @@
   }
   function updateCursor() {
     const c = code();
-    const before = c.value.slice(0, c.selectionStart);
-    const line = before.split("\n").length;
-    const col = c.selectionStart - before.lastIndexOf("\n");
-    $("#cursor").textContent = "Ln " + line + ", Col " + col;
+    const text = c.value;
+    const pos = c.selectionStart;
+    let line = 1;
+    let last = -1;
+    for (let i = text.indexOf("\n"); i !== -1 && i < pos; i = text.indexOf("\n", i + 1)) {
+      line++;
+      last = i;
+    }
+    $("#cursor").textContent = "Ln " + line + ", Col " + (pos - last);
   }
   function onEdit() {
     const file = state.active;
@@ -1846,6 +1907,7 @@
     try {
       const result = await api("PUT", "/web/api/fs/write", body);
       file.version = result.version;
+      file.diskVersion = result.version;
       file.saved = file.text;
       file.dirty = false;
       file.missing = false;
@@ -1862,25 +1924,36 @@
       fail(error);
     }
   }
+  function applyLoadedFile(file, loaded) {
+    const c = code();
+    const keep = file === state.active ? [c.scrollTop, c.selectionStart] : null;
+    Object.assign(file, {
+      text: loaded.text,
+      saved: loaded.text,
+      version: loaded.version,
+      diskVersion: loaded.version,
+      readonly: loaded.readonly,
+      dirty: false,
+      missing: false,
+    });
+    if (keep) {
+      c.value = file.text;
+      c.scrollTop = keep[0];
+      c.setSelectionRange(Math.min(keep[1], file.text.length), Math.min(keep[1], file.text.length));
+      lines = -1;
+      renderGutter();
+      updateCursor();
+    }
+    renderTabs();
+  }
   async function reloadFile(file = state.active, ask = true) {
     if (!file) return;
     if (ask && file.dirty && !confirm("Discard your changes to " + file.name + "?")) return;
     try {
       const loaded = await fetchFile(file.path);
-      const c = code();
-      const keep = file === state.active ? [c.scrollTop, c.selectionStart] : null;
-      Object.assign(file, { text: loaded.text, saved: loaded.text, version: loaded.version, readonly: loaded.readonly, dirty: false, missing: false });
-      if (keep) {
-        c.value = file.text;
-        c.scrollTop = keep[0];
-        c.setSelectionRange(Math.min(keep[1], file.text.length), Math.min(keep[1], file.text.length));
-        lines = -1;
-        renderGutter();
-        updateCursor();
-      }
-      renderTabs();
+      applyLoadedFile(file, loaded);
     } catch (error) {
-      if (error.status === 404) { file.missing = true; file.dirty = true; renderTabs(); } else fail(error);
+      if (error.status === 404) { file.missing = true; file.dirty = true; file.diskVersion = null; renderTabs(); } else fail(error);
     }
   }
   // After agent edits, refresh clean buffers; a conditional read costs one stat when unchanged.
@@ -1891,15 +1964,16 @@
       stash();
       for (const file of state.files) {
         try {
-          const loaded = await fetchFile(file.path, file.version);
+          const loaded = await fetchFile(file.path, file.diskVersion || file.version);
           if (!loaded) continue;
+          file.diskVersion = loaded.version;
           if (file.dirty) {
             toast(file.name + " changed on disk; saving will ask before overwriting");
             continue;
           }
-          await reloadFile(file, false);
+          applyLoadedFile(file, loaded);
         } catch (error) {
-          if (error.status === 404 && !file.missing) { file.missing = true; file.dirty = true; renderTabs(); }
+          if (error.status === 404 && !file.missing) { file.missing = true; file.dirty = true; file.diskVersion = null; renderTabs(); }
         }
       }
     }, 300);
@@ -1918,7 +1992,7 @@
     if (!keepSession) clearSession();
     renderHeader();
     const sessions = changed || state.scope === "project" ? loadSessions().catch(fail) : (renderSessions(), null);
-    await Promise.all([sessions, loadCatalogs().catch(fail), loadSandboxChoices(), initTree()]);
+    await Promise.all([sessions, loadCatalogs().catch(fail), loadSandboxChoices(), initTree(listing)]);
   }
   function changeDirectory() {
     const known = [...new Set([state.dir].concat(state.sessions.map(sessionDir), recentProjects()))].filter(Boolean);
@@ -2162,11 +2236,13 @@
     "compaction.auto": "Auto compaction",
     "compaction.prune": "Prune old tool output",
   };
-  async function openSettings(scope = store.get("settingsScope") || "project") {
-    let data;
-    try {
-      data = await api("GET", "/web/api/config?" + q({ directory: state.dir }));
-    } catch (error) { return fail(error); }
+  async function openSettings(scope = store.get("settingsScope") || "project", initialData = null) {
+    let data = initialData;
+    if (!data) {
+      try {
+        data = await api("GET", "/web/api/config?" + q({ directory: state.dir }));
+      } catch (error) { return fail(error); }
+    }
     store.set("settingsScope", scope);
     const file = data.files[scope];
     const values = file.values || {};
@@ -2197,10 +2273,13 @@
         set[key] = v === "" ? null : key.startsWith("compaction.") ? v === "true" : v;
       }
       try {
-        await api("PATCH", "/web/api/config", { scope, directory: state.dir, set });
+        const updated = await api("PATCH", "/web/api/config", { scope, directory: state.dir, set });
         toast("Settings saved");
-        await Promise.all([loadCatalogs(), loadSandboxChoices()]);
-        openSettings(scope);
+        if (updated && updated.sandbox) {
+          state.sandboxChoices = updated.sandbox;
+          renderSandbox();
+        }
+        openSettings(scope, updated);
       } catch (error) { fail(error); }
     };
     const openConfig = async () => {
@@ -2488,14 +2567,16 @@
     connect();
     const sid = location.hash.slice(1);
     let dir = store.get("dir") || info.cwd;
-    try {
-      await setDirectory(dir, !!sid);
-    } catch {
-      dir = info.cwd;
-      await setDirectory(dir, !!sid).catch(fail);
-    }
     if (sid) await openSession(sid);
-    else renderAll();
+    if (!state.dir) {
+      try {
+        await setDirectory(dir, !!state.sid);
+      } catch {
+        dir = info.cwd;
+        await setDirectory(dir, !!state.sid).catch(fail);
+      }
+      if (!state.sid) renderAll();
+    }
     let saved = [];
     try { saved = JSON.parse(store.get("files") || "[]"); } catch { /* ignore */ }
     for (const path of saved) await openFile(path, true);

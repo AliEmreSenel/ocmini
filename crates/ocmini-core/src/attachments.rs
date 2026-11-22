@@ -88,7 +88,11 @@ fn snapshot_file(part: &mut Value) -> Result<(), String> {
         .map_err(|_| "Invalid local file URL")?;
     let file = std::fs::File::open(&path)
         .map_err(|e| format!("Cannot read attachment {}: {e}", path.display()))?;
-    let mut bytes = Vec::new();
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    if len > MAX_BYTES {
+        return Err("Attachment exceeds 20 MiB".into());
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
     file.take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
@@ -171,6 +175,12 @@ mod tests {
             .set_len(MAX_BYTES + 1)
             .unwrap();
         assert!(from_file(&path).err().unwrap().contains("20 MiB"));
+        let mut local = json!({
+            "type": "file",
+            "mime": "image/png",
+            "url": reqwest::Url::from_file_path(&path).unwrap().to_string(),
+        });
+        assert!(snapshot(&mut local).unwrap_err().contains("20 MiB"));
         let mut part = json!({"type":"file","mime":"image/png","url":format!("data:image/png;base64,{}", "A".repeat((MAX_BYTES * 2) as usize))});
         assert!(snapshot(&mut part).unwrap_err().contains("20 MiB"));
     }
