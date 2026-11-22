@@ -1,13 +1,13 @@
 use crate::events as event;
 use crate::types::BusEvent;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, RwLock, Weak};
 use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub struct Bus {
     tx: broadcast::Sender<Arc<BusEvent>>,
     v2: Arc<RwLock<Arc<Vec<Weak<crate::v2::Events>>>>>,
-    observers: Arc<Mutex<Vec<Weak<crate::hooks::ObserverRegistry>>>>,
+    observers: Arc<RwLock<Arc<Vec<Weak<crate::hooks::ObserverRegistry>>>>>,
 }
 
 impl Bus {
@@ -16,7 +16,7 @@ impl Bus {
         Self {
             tx,
             v2: Arc::new(RwLock::new(Arc::new(Vec::new()))),
-            observers: Arc::new(Mutex::new(Vec::new())),
+            observers: Arc::new(RwLock::new(Arc::new(Vec::new()))),
         }
     }
 
@@ -36,25 +36,18 @@ impl Bus {
         for bridge in bridges.iter().filter_map(Weak::upgrade) {
             bridge.observe(&ev);
         }
-        let observers = {
-            let mut observers = self.observers.lock().unwrap();
-            observers.retain(|registry| registry.strong_count() > 0);
-            observers
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>()
-        };
-        for observer in observers {
+        let observers = self.observers.read().unwrap().clone();
+        for observer in observers.iter().filter_map(Weak::upgrade) {
             observer.observe(&ev);
         }
         let _ = self.tx.send(ev);
     }
 
     pub fn register_observers(&self, registry: &Arc<crate::hooks::ObserverRegistry>) {
-        self.observers
-            .lock()
-            .unwrap()
-            .push(Arc::downgrade(registry));
+        let mut observers = self.observers.write().unwrap();
+        let observers = Arc::make_mut(&mut observers);
+        observers.retain(|registry| registry.strong_count() > 0);
+        observers.push(Arc::downgrade(registry));
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<BusEvent>> {

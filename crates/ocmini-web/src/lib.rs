@@ -70,10 +70,21 @@ fn files<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/web/api/fs/delete", post(remove))
 }
 
+fn etag_matches(header: &HeaderValue, etag: &HeaderValue) -> bool {
+    let (Ok(value), Ok(target)) = (header.to_str(), etag.to_str()) else {
+        return false;
+    };
+    let target = target.strip_prefix("W/").unwrap_or(target).trim();
+    value.split(',').any(|part| {
+        let candidate = part.trim();
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate).trim() == target
+    })
+}
+
 async fn asset(headers: HeaderMap, body: &'static str, kind: &'static str) -> Response {
     let mut response = if headers
         .get(header::IF_NONE_MATCH)
-        .is_some_and(|tag| tag == *ETAG)
+        .is_some_and(|tag| etag_matches(tag, &ETAG))
     {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
@@ -351,7 +362,7 @@ async fn read(headers: HeaderMap, Query(query): Query<PathQuery>) -> Result<Resp
     let revision = HeaderValue::from_str(&version(&meta)).expect("ASCII version");
     if headers
         .get(header::IF_NONE_MATCH)
-        .is_some_and(|tag| tag == revision)
+        .is_some_and(|tag| etag_matches(tag, &revision))
     {
         return Ok((
             StatusCode::NOT_MODIFIED,
@@ -798,5 +809,62 @@ mod tests {
             .map(|e| e["relative"].as_str().unwrap())
             .collect();
         assert_eq!(rels, ["src/main.rs", "src/ui/panel.rs"]);
+    }
+
+    #[tokio::test]
+    async fn asset_if_none_match_supports_weak_etags_lists_and_wildcard() {
+        let app = files::<()>();
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let etag = initial
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for header_value in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"other\", W/{etag}"),
+            "*".to_owned(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/web/app.js")
+                        .header(header::IF_NONE_MATCH, header_value.as_str())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "{header_value}"
+            );
+        }
+        let miss = app
+            .oneshot(
+                Request::builder()
+                    .uri("/web/app.js")
+                    .header(header::IF_NONE_MATCH, "W/\"0000000000000000\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), StatusCode::OK);
     }
 }

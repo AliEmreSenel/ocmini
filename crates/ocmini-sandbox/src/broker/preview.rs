@@ -193,6 +193,7 @@ fn ipv6_address(hex: &str) -> Option<Ipv6Addr> {
 }
 pub struct UdpIngress {
     listeners: Vec<(u16, Arc<tokio::net::UdpSocket>)>,
+    buf: Vec<u8>,
 }
 impl UdpIngress {
     pub fn new(policy: &Policy) -> io::Result<Self> {
@@ -209,44 +210,41 @@ impl UdpIngress {
                 }
             }
         }
-        Ok(Self { listeners })
+        let buf = if listeners.is_empty() {
+            Vec::new()
+        } else {
+            vec![0; 65535]
+        };
+        Ok(Self { listeners, buf })
     }
-    pub fn receive(
-        &self,
-    ) -> impl std::future::Future<
-        Output = io::Result<(Arc<tokio::net::UdpSocket>, SocketAddr, SocketAddr, Vec<u8>)>,
-    > + Send
-           + 'static {
-        let futures = FuturesUnordered::new();
-        for (port, socket) in &self.listeners {
-            let socket = socket.clone();
-            let port = *port;
-            futures.push(async move {
-                loop {
-                    socket.readable().await?;
-                    let mut bytes = vec![0; 65535];
-                    match socket.try_recv_from(&mut bytes) {
-                        Ok((n, peer)) => {
-                            bytes.truncate(n);
-                            return Ok((
-                                socket,
-                                peer,
-                                SocketAddr::new(super::GUEST4.into(), port),
-                                bytes,
-                            ));
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
-            });
+    pub async fn receive(
+        &mut self,
+    ) -> io::Result<(Arc<tokio::net::UdpSocket>, SocketAddr, SocketAddr, &[u8])> {
+        if self.listeners.is_empty() {
+            return std::future::pending().await;
         }
-        async move {
-            let mut futures = futures;
-            if futures.is_empty() {
-                std::future::pending().await
-            } else {
-                futures.next().await.unwrap()
+        loop {
+            let mut ready = FuturesUnordered::new();
+            for (index, (_, socket)) in self.listeners.iter().enumerate() {
+                let socket = socket.clone();
+                ready.push(async move {
+                    socket.readable().await?;
+                    Ok::<_, io::Error>(index)
+                });
+            }
+            let index = ready.next().await.unwrap()?;
+            let (port, socket) = &self.listeners[index];
+            match socket.try_recv_from(&mut self.buf) {
+                Ok((n, peer)) => {
+                    return Ok((
+                        socket.clone(),
+                        peer,
+                        SocketAddr::new(super::GUEST4.into(), *port),
+                        &self.buf[..n],
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
             }
         }
     }

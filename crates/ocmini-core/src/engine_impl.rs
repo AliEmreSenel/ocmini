@@ -26,10 +26,52 @@ use model_step::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use tokio::sync::oneshot;
 use tool_execution::*;
 use turn::run_turn;
+
+pub(super) fn json_byte_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+enum SessionSlot {
+    Active(Running),
+    Finishing(CancellationToken),
+}
+
+impl SessionSlot {
+    fn active(&self) -> Option<&Running> {
+        match self {
+            Self::Active(running) => Some(running),
+            Self::Finishing(_) => None,
+        }
+    }
+    fn active_mut(&mut self) -> Option<&mut Running> {
+        match self {
+            Self::Active(running) => Some(running),
+            Self::Finishing(_) => None,
+        }
+    }
+    fn done(&self) -> CancellationToken {
+        match self {
+            Self::Active(running) => running.done.clone(),
+            Self::Finishing(done) => done.clone(),
+        }
+    }
+}
 
 struct Running {
     preserve_pending: bool,
@@ -84,11 +126,59 @@ impl Drop for AdmissionGuard {
 pub struct Engine {
     #[cfg(feature = "sandbox")]
     sandboxes: Arc<Mutex<HashMap<String, std::sync::Weak<crate::sandbox::Registry>>>>,
-    running: Arc<Mutex<HashMap<String, Running>>>,
+    running: Arc<(Mutex<HashMap<String, SessionSlot>>, Condvar)>,
     admissions: Arc<Mutex<HashMap<String, Admitting>>>,
 }
 
 impl Engine {
+    fn lock_running(&self) -> MutexGuard<'_, HashMap<String, SessionSlot>> {
+        self.running.0.lock().unwrap()
+    }
+
+    /// Wait until any in-flight `finish_running` for `sid` has emitted `Idle`
+    /// and released its SQLite lease, without blocking unrelated sessions.
+    fn lock_settled(&self, sid: &str) -> MutexGuard<'_, HashMap<String, SessionSlot>> {
+        let mut running = self.running.0.lock().unwrap();
+        while matches!(running.get(sid), Some(SessionSlot::Finishing(_))) {
+            running = self.running.1.wait(running).unwrap();
+        }
+        running
+    }
+
+    fn begin_finishing(running: &mut HashMap<String, SessionSlot>, sid: &str) -> Option<Running> {
+        match running.remove(sid) {
+            Some(SessionSlot::Active(state)) => {
+                running.insert(sid.to_owned(), SessionSlot::Finishing(state.done.clone()));
+                Some(state)
+            }
+            Some(slot @ SessionSlot::Finishing(_)) => {
+                running.insert(sid.to_owned(), slot);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn complete_finishing(
+        &self,
+        app: &App,
+        sid: &str,
+        running: Option<Running>,
+        error: Option<&str>,
+    ) {
+        let state = finish_running(app, sid, running, error);
+        {
+            let mut map = self.lock_running();
+            if matches!(map.get(sid), Some(SessionSlot::Finishing(_))) {
+                map.remove(sid);
+            }
+            self.running.1.notify_all();
+        }
+        // Drop `Running` after removing `Finishing` so `wait_for_idle` wakes
+        // with the slot already absent.
+        drop(state);
+    }
+
     fn recover_once(&self, app: &App) {
         if let Err(error) = crate::hooks::recover(app.store.backend()) {
             emit_error(app, "", &error, false);
@@ -121,12 +211,7 @@ impl Engine {
 
     pub async fn wait_for_idle(&self, sid: &str) {
         loop {
-            let done = self
-                .running
-                .lock()
-                .unwrap()
-                .get(sid)
-                .map(|state| state.done.clone());
+            let done = self.lock_running().get(sid).map(SessionSlot::done);
             match done {
                 Some(done) => done.cancelled().await,
                 None => return,
@@ -136,7 +221,7 @@ impl Engine {
 
     fn wake(&self, app: App, sid: String) -> Result<(), OperationError> {
         crate::blocking::run(|| {
-            let mut running = self.running.lock().unwrap();
+            let mut running = self.lock_settled(&sid);
             if running.contains_key(&sid) {
                 return Ok(());
             }
@@ -147,6 +232,7 @@ impl Engine {
             crate::sessions::start_sandbox(&app, &session)?;
             let cancel = self.claim(&mut running, &app, &sid, None)?;
             drop(running);
+            crate::sessions::set_status(&app, &sid, event::SessionStatus::Busy);
             let engine = self.clone();
             tokio::spawn(async move {
                 engine.drain(app, sid, cancel).await;
@@ -157,7 +243,7 @@ impl Engine {
 
     fn claim(
         &self,
-        running: &mut HashMap<String, Running>,
+        running: &mut HashMap<String, SessionSlot>,
         app: &App,
         sid: &str,
         waiter: Option<(String, oneshot::Sender<TurnResult>)>,
@@ -166,7 +252,7 @@ impl Engine {
         let cancel = CancellationToken::new();
         running.insert(
             sid.into(),
-            Running {
+            SessionSlot::Active(Running {
                 preserve_pending: false,
                 end_gate: None,
                 done: CancellationToken::new(),
@@ -176,9 +262,8 @@ impl Engine {
                     .into_iter()
                     .map(|(mid, tx)| (mid, vec![tx]))
                     .collect(),
-            },
+            }),
         );
-        crate::sessions::set_status(app, sid, event::SessionStatus::Busy);
         Ok(cancel)
     }
 
@@ -214,10 +299,9 @@ impl Engine {
         let cancel = cancel.clone();
         loop {
             let preserve_pending = self
-                .running
-                .lock()
-                .unwrap()
+                .lock_running()
                 .get(&sid)
+                .and_then(SessionSlot::active)
                 .is_some_and(|s| s.preserve_pending);
             if cancel.is_cancelled() && !preserve_pending {
                 // Local admissions are fenced by Running.cancel under the
@@ -239,10 +323,9 @@ impl Engine {
                     let _ =
                         finalize_turn(&scoped, &sid, &request, &value, "cancelled", false).await;
                     if let Some(waiters) = self
-                        .running
-                        .lock()
-                        .unwrap()
+                        .lock_running()
                         .get_mut(&sid)
+                        .and_then(SessionSlot::active_mut)
                         .and_then(|s| s.waiters.remove(mid))
                     {
                         for waiter in waiters {
@@ -253,34 +336,62 @@ impl Engine {
             }
             // Admission and the idle transition share this lock. A prompt cannot
             // land between the final inbox check and releasing session ownership.
-            let request = crate::blocking::run(|| {
-                let mut running = self.running.lock().unwrap();
+            struct FinishStep {
+                removed: Option<Running>,
+                emit: Option<OperationError>,
+                waiter_error: Option<String>,
+            }
+            let step: Result<Box<PromptRequest>, Box<FinishStep>> = crate::blocking::run(|| {
+                let mut running = self.lock_running();
                 if cancel.is_cancelled() {
-                    if let Err(e) = if running.get(&sid).is_some_and(|s| s.preserve_pending) {
-                        Ok(())
+                    let emit = if running
+                        .get(&sid)
+                        .and_then(SessionSlot::active)
+                        .is_some_and(|s| s.preserve_pending)
+                    {
+                        None
                     } else {
-                        app.store.cancel_pending(&sid)
-                    } {
-                        emit_error(&app, &sid, &e, false);
-                    }
-                    finish_running(&app, &sid, running.remove(&sid), Some("Aborted"));
-                    return None;
+                        app.store.cancel_pending(&sid).err()
+                    };
+                    return Err(Box::new(FinishStep {
+                        removed: Self::begin_finishing(&mut running, &sid),
+                        emit,
+                        waiter_error: Some("Aborted".into()),
+                    }));
                 }
                 match app.store.next_prompt(&sid) {
-                    Ok(Some(request)) => Some(request),
-                    Ok(None) => {
-                        finish_running(&app, &sid, running.remove(&sid), None);
-                        None
-                    }
+                    Ok(Some(request)) => Ok(Box::new(request)),
+                    Ok(None) => Err(Box::new(FinishStep {
+                        removed: Self::begin_finishing(&mut running, &sid),
+                        emit: None,
+                        waiter_error: None,
+                    })),
                     Err(error) => {
-                        emit_error(&app, &sid, &error, false);
-                        finish_running(&app, &sid, running.remove(&sid), Some(&error));
-                        None
+                        let waiter_error = error.to_string();
+                        Err(Box::new(FinishStep {
+                            removed: Self::begin_finishing(&mut running, &sid),
+                            emit: Some(error),
+                            waiter_error: Some(waiter_error),
+                        }))
                     }
                 }
             });
-            let Some(request) = request else {
-                return;
+            let request = match step {
+                Ok(request) => *request,
+                Err(finish) => {
+                    crate::blocking::run(|| {
+                        if let Some(error) = &finish.emit {
+                            emit_error(&app, &sid, error, false);
+                        }
+                        self.complete_finishing(
+                            &app,
+                            &sid,
+                            finish.removed,
+                            finish.waiter_error.as_deref(),
+                        );
+                    });
+                    return;
+                }
             };
             let mid = request.message_id.clone().unwrap_or_default();
             let mut scoped = app.clone();
@@ -342,27 +453,32 @@ impl Engine {
                 emit_error(&app, &sid, &error, false);
             }
             let idle = crate::blocking::run(|| {
-                let mut running = self.running.lock().unwrap();
-                let waiters = running
-                    .get_mut(&sid)
-                    .and_then(|state| state.waiters.remove(&mid))
-                    .unwrap_or_default();
-                let idle = match app.store.has_waiting(&sid) {
-                    Ok(waiting) => !waiting,
-                    Err(error) => {
-                        emit_error(&app, &sid, &error, false);
-                        finish_running(&app, &sid, running.remove(&sid), Some(&error));
-                        for waiter in waiters {
-                            let _ = waiter.send(value.clone());
+                let (waiters, finishing) = {
+                    let mut running = self.lock_running();
+                    let waiters = running
+                        .get_mut(&sid)
+                        .and_then(SessionSlot::active_mut)
+                        .and_then(|state| state.waiters.remove(&mid))
+                        .unwrap_or_default();
+                    let finishing = match app.store.has_waiting(&sid) {
+                        Ok(true) => None,
+                        Ok(false) => Some((Self::begin_finishing(&mut running, &sid), None)),
+                        Err(error) => {
+                            Some((Self::begin_finishing(&mut running, &sid), Some(error)))
                         }
-                        return true;
-                    }
+                    };
+                    (waiters, finishing)
                 };
-                if idle {
+                let idle = finishing.is_some();
+                if let Some((removed, error)) = finishing {
                     // A completed synchronous response promises resumable work.
                     // Release ownership before waking its client, which may exit
                     // or restart the server as soon as it receives the response.
-                    finish_running(&app, &sid, running.remove(&sid), None);
+                    if let Some(error) = &error {
+                        emit_error(&app, &sid, error, false);
+                    }
+                    let message = error.as_ref().map(|e| e.to_string());
+                    self.complete_finishing(&app, &sid, removed, message.as_deref());
                 }
                 for waiter in waiters {
                     let _ = waiter.send(value.clone());
@@ -376,7 +492,12 @@ impl Engine {
     }
 }
 
-fn finish_running(app: &App, sid: &str, mut running: Option<Running>, error: Option<&str>) {
+fn finish_running(
+    app: &App,
+    sid: &str,
+    mut running: Option<Running>,
+    error: Option<&str>,
+) -> Option<Running> {
     app.perms.reject_all(sid);
     app.questions.reject_all(sid);
     if let Some(running) = &mut running {
@@ -393,6 +514,7 @@ fn finish_running(app: &App, sid: &str, mut running: Option<Running>, error: Opt
         &app.session_context(sid, json!({})),
     );
     app.store.release(sid);
+    running
 }
 
 async fn wait_for_finalization(
@@ -874,5 +996,18 @@ mod tests {
         }
         assert!(!execution_tool("read"));
         assert!(!execution_tool("grep"));
+    }
+
+    #[test]
+    fn json_byte_len_matches_serialized_length_exactly() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(42),
+            json!("café \"quoted\"\nline\\slash"),
+            json!({"role":"assistant","content":"hello","nested":[1,2,{"k":"v"}]}),
+        ] {
+            assert_eq!(json_byte_len(&value), value.to_string().len());
+        }
     }
 }

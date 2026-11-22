@@ -46,7 +46,8 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<ToolOutput, OperationError> {
     let base = resolve_path(directory, input.path.as_deref().unwrap_or("."));
-    let metadata = std::fs::metadata(&base)
+    let metadata = tokio::fs::metadata(&base)
+        .await
         .map_err(|error| failure(format!("Cannot search {}: {error}", base.display())))?;
     let pattern = &input.pattern;
     let glob = matches!(mode, Mode::Glob);
@@ -156,7 +157,7 @@ pub async fn run(
                 }
                 let (line, is_match) = if paths_only {
                     record.pop();
-                    let path = String::from_utf8(record.clone())
+                    let path = std::str::from_utf8(&record)
                         .map_err(|_| failure("ripgrep returned a non-UTF-8 path"))?;
                     (
                         cwd.join(path.trim_start_matches("./"))

@@ -205,13 +205,13 @@ impl App {
     fn new_inner(
         #[cfg(feature = "sandbox")] overrides: ocmini_sandbox::config::Overrides,
     ) -> Result<Self, String> {
-        let config = Config::load()?;
+        let directory = std::env::current_dir().unwrap_or_default();
+        let directory = directory.to_string_lossy().into_owned();
+        let config = Config::load_for(&directory)?;
         #[cfg(not(feature = "sandbox"))]
         config.check_sandbox_support()?;
 
         crate::tools::cleanup_outputs()?;
-        let directory = std::env::current_dir().unwrap_or_default();
-        let directory = directory.to_string_lossy().into_owned();
         let hook_runtime = crate::hooks::Runtime::new();
         let hooks = hook_runtime.install(&config, &directory)?;
         let store = Arc::new(Store::open(
@@ -235,7 +235,7 @@ impl App {
             )?),
             store,
             v2,
-            config: Arc::new(config),
+            config,
             auth: Arc::new(AuthStore::load()),
             perms: PermissionState::default(),
             questions: QuestionState::default(),
@@ -286,7 +286,7 @@ impl App {
         scope.hub.set_hooks(hooks.clone(), directory);
         let mut scoped = self.clone();
         scoped.mcp_scope = scope;
-        scoped.config = Arc::new(config);
+        scoped.config = config;
         scoped.hooks = hooks;
         Ok(scoped)
     }

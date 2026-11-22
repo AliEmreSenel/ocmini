@@ -36,20 +36,25 @@ pub(super) const MAX_EXPANDED: usize = 50 * 1024;
 /// marker. A cut-off block names what it left out, so truncation never reads as
 /// a complete answer.
 pub(super) fn expand(text: &str) -> String {
-    let shown: String = text.chars().take(MAX_EXPANDED).collect();
-    let omitted = text.chars().count() - shown.chars().count();
-    let note = if omitted == 0 {
-        String::new()
-    } else {
-        format!("\n… {omitted} more characters not shown")
-    };
-    format!("{shown}{note}").replace('\n', "\n  ")
+    let mut out = String::with_capacity(text.len().min(MAX_EXPANDED));
+    let mut chars = text.chars();
+    for (shown, ch) in chars.by_ref().enumerate() {
+        if shown == MAX_EXPANDED {
+            let omitted = 1 + chars.count();
+            use std::fmt::Write;
+            let _ = write!(out, "\n  … {omitted} more characters not shown");
+            return out;
+        }
+        if ch == '\n' {
+            out.push_str("\n  ");
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
-/// A call's brief and full command rows. The grouped view derives its count
-/// and tool names from retained calls instead of printing these rows. Live
-/// events and saved history use the same formatting.
-pub(super) fn tool_line(part: &Value) -> (String, String) {
+fn tool_line_for(part: &Value, need_brief: bool, need_full: bool) -> (String, String) {
     let mark = format!("{CYAN}● {}{RESET}", part["tool"].as_str().unwrap_or("tool"));
     let input = input_summary(&part["state"]["input"]);
     let status = part["state"]["status"]
@@ -57,17 +62,28 @@ pub(super) fn tool_line(part: &Value) -> (String, String) {
         .filter(|status| !matches!(*status, "completed" | "error"))
         .map(|status| format!(" {DIM}· {status}{RESET}"))
         .unwrap_or_default();
-    (
-        format!("{mark} {DIM}{}{RESET}{status}", truncate(&input, 120)),
-        format!("{mark} {DIM}{}{RESET}{status}", expand(&input)),
-    )
+    let brief = if need_brief {
+        format!("{mark} {DIM}{}{RESET}{status}", truncate(&input, 120))
+    } else {
+        String::new()
+    };
+    let full = if need_full {
+        format!("{mark} {DIM}{}{RESET}{status}", expand(&input))
+    } else {
+        String::new()
+    };
+    (brief, full)
 }
 
-/// The result row of a finished tool call, in both forms: `✓` with an output
-/// preview, `✗` with the error. `None` while the call is still pending or
-/// running. A failure shows in both forms, so collapsing a call can never make
-/// it look like it succeeded.
-pub(super) fn tool_result(part: &Value) -> Option<(String, String)> {
+/// A call's brief and full command rows. The grouped view derives its count
+/// and tool names from retained calls instead of printing these rows. Live
+/// events and saved history use the same formatting.
+#[cfg(test)]
+pub(super) fn tool_line(part: &Value) -> (String, String) {
+    tool_line_for(part, true, true)
+}
+
+fn tool_result_for(part: &Value, need_brief: bool, need_full: bool) -> Option<(String, String)> {
     let state = &part["state"];
     let (mark, text) = match state["status"].as_str() {
         // The preview is dim as a secondary line; a failure is not.
@@ -81,10 +97,26 @@ pub(super) fn tool_result(part: &Value) -> Option<(String, String)> {
         ),
         _ => return None,
     };
-    Some((
-        format!("  {mark}{}{RESET}", truncate(text, 160)),
-        format!("  {mark}{}{RESET}", expand(text)),
-    ))
+    let brief = if need_brief {
+        format!("  {mark}{}{RESET}", truncate(text, 160))
+    } else {
+        String::new()
+    };
+    let full = if need_full {
+        format!("  {mark}{}{RESET}", expand(text))
+    } else {
+        String::new()
+    };
+    Some((brief, full))
+}
+
+/// The result row of a finished tool call, in both forms: `✓` with an output
+/// preview, `✗` with the error. `None` while the call is still pending or
+/// running. A failure shows in both forms, so collapsing a call can never make
+/// it look like it succeeded.
+#[cfg(test)]
+pub(super) fn tool_result(part: &Value) -> Option<(String, String)> {
+    tool_result_for(part, true, true)
 }
 
 /// Option label and description in the order shown to the user.
@@ -265,11 +297,17 @@ pub(super) struct ToolCall {
 }
 
 impl ToolCall {
-    fn from_part(part: &Value) -> Self {
-        let (mut brief, mut full) = tool_line(part);
-        if let Some((result, full_result)) = tool_result(part) {
-            brief.push_str(&format!("\n{result}"));
-            full.push_str(&format!("\n{full_result}"));
+    fn from_part(part: &Value, need_brief: bool, need_full: bool) -> Self {
+        let (mut brief, mut full) = tool_line_for(part, need_brief, need_full);
+        if let Some((result, full_result)) = tool_result_for(part, need_brief, need_full) {
+            if need_brief {
+                brief.push('\n');
+                brief.push_str(&result);
+            }
+            if need_full {
+                full.push('\n');
+                full.push_str(&full_result);
+            }
         }
         Self {
             id: format!(
@@ -347,10 +385,18 @@ pub(super) fn render_part(ui: &mut Ui, part: &Value) -> Vec<Row> {
         let id = part["id"].as_str().unwrap_or_default();
         let key = format!("{}:{id}", part["sessionID"].as_str().unwrap_or_default());
         if !ui.tool_done.contains(&key) {
-            if tool_result(part).is_some() {
+            if matches!(
+                part["state"]["status"].as_str(),
+                Some("completed" | "error")
+            ) {
                 ui.tool_done.insert(key);
             }
-            rows.push(Row::Tool(ToolCall::from_part(part)));
+            let (need_brief, need_full) = match ui.native_tool_view {
+                None => (true, true),
+                Some(super::ToolView::Full) => (false, true),
+                Some(_) => (true, false),
+            };
+            rows.push(Row::Tool(ToolCall::from_part(part, need_brief, need_full)));
         }
     }
     rows

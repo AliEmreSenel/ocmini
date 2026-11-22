@@ -274,12 +274,16 @@ impl Effects {
                 return Ok(result);
             }
             "skill" => {
-                return Ok(EffectResult::Output(crate::skills::load_content(
-                    directory,
-                    &serde_json::from_value::<Vec<String>>(args["paths"].clone())
-                        .map_err(|e| OperationError::from(e.to_string()))?,
-                    name,
-                )?))
+                let directory = directory.to_owned();
+                let paths = serde_json::from_value::<Vec<String>>(args["paths"].clone())
+                    .map_err(|e| OperationError::from(e.to_string()))?;
+                let skill_name = name.to_owned();
+                let loaded = tokio::task::spawn_blocking(move || {
+                    crate::skills::load_content(&directory, &paths, &skill_name)
+                })
+                .await
+                .map_err(|e| OperationError::from(e.to_string()))??;
+                return Ok(EffectResult::Output(loaded));
             }
             _ => return Err(format!("Unknown tool operation: {method}").into()),
         };

@@ -141,7 +141,9 @@ pub async fn fetch_hop(input: &Input, cancel: CancellationToken) -> Result<Hop, 
         let is_html =
             content_type.contains("text/html") || content_type.contains("application/xhtml+xml");
         let body = if is_html && format != Format::Html {
-            render_html(&bytes, format)?
+            tokio::task::spawn_blocking(move || render_html(&bytes, format))
+                .await
+                .map_err(|error| failure(format!("HTML render task failed: {error}")))??
         } else {
             String::from_utf8(bytes).map_err(|_| failure("Response is not UTF-8 text"))?
         };

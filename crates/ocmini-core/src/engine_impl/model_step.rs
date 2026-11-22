@@ -315,58 +315,52 @@ pub(super) async fn request_step(
         // A context overflow can never succeed verbatim: compact
         // the history to the provider's stated window and replay
         // this step against the summary.
-        let request_bytes = req
-            .messages
-            .iter()
-            .map(|message| message.to_string().len())
-            .sum::<usize>();
         let kind = error.kind;
         let mut message = error.message;
-        if error.overflow
-            && compaction.settings.automatic()
-            && previous_overflow_bytes.is_none_or(|previous| request_bytes < previous)
-            && !cancel.is_cancelled()
-        {
-            previous_overflow_bytes = Some(request_bytes);
-            if let Some(parsed) = provider::parse_context_limit(&message) {
-                compaction.context = Some(parsed);
-            }
-            match compact_history(
-                app,
-                adapter,
-                info,
-                std::mem::take(&mut req.messages),
-                has_summary,
-                compaction,
-                cancel,
-            )
-            .await
-            {
-                Ok(()) => {
-                    (req.messages, has_summary) = history::load_messages(
-                        app.store.clone(),
-                        sid,
-                        uid,
-                        chat,
-                        &ModelRef {
-                            provider_id: info.provider_id.clone().ok_or("Missing provider")?,
-                            model_id: info.model_id.clone().ok_or("Missing model")?,
-                        },
-                    )
-                    .await?;
-                    req.system = system.clone();
-                    req.options = Value::Null;
-                    req.headers.clear();
-                    req.variant = variant.clone();
-                    context["requestID"] = json!(hex_id("req_"));
-                    provider::prepare_hooks(app, context, &mut req, Some(cancel)).await?;
-                    continue;
+        if error.overflow && compaction.settings.automatic() && !cancel.is_cancelled() {
+            let request_bytes = req.messages.iter().map(json_byte_len).sum::<usize>();
+            if previous_overflow_bytes.is_none_or(|previous| request_bytes < previous) {
+                previous_overflow_bytes = Some(request_bytes);
+                if let Some(parsed) = provider::parse_context_limit(&message) {
+                    compaction.context = Some(parsed);
                 }
-                Err(compact_error) => {
-                    // The server's stderr is invisible to the TUI, so
-                    // the reason recovery gave up must reach the user.
-                    eprintln!("ocmini: auto-compaction failed: {compact_error}");
-                    message = format!("{} (auto-compaction failed: {compact_error})", message);
+                match compact_history(
+                    app,
+                    adapter,
+                    info,
+                    std::mem::take(&mut req.messages),
+                    has_summary,
+                    compaction,
+                    cancel,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        (req.messages, has_summary) = history::load_messages(
+                            app.store.clone(),
+                            sid,
+                            uid,
+                            chat,
+                            &ModelRef {
+                                provider_id: info.provider_id.clone().ok_or("Missing provider")?,
+                                model_id: info.model_id.clone().ok_or("Missing model")?,
+                            },
+                        )
+                        .await?;
+                        req.system = system.clone();
+                        req.options = Value::Null;
+                        req.headers.clear();
+                        req.variant = variant.clone();
+                        context["requestID"] = json!(hex_id("req_"));
+                        provider::prepare_hooks(app, context, &mut req, Some(cancel)).await?;
+                        continue;
+                    }
+                    Err(compact_error) => {
+                        // The server's stderr is invisible to the TUI, so
+                        // the reason recovery gave up must reach the user.
+                        eprintln!("ocmini: auto-compaction failed: {compact_error}");
+                        message = format!("{} (auto-compaction failed: {compact_error})", message);
+                    }
                 }
             }
         }

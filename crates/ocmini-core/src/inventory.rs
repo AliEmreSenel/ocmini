@@ -50,48 +50,96 @@ pub fn provider_inventory(config: &Config, auth: &AuthStore) -> Value {
     json!({"all": all, "connected": auth.connected_for(config), "default": defaults})
 }
 
-pub fn agents_json(config: &Config) -> Value {
-    let mut definitions = BTreeMap::new();
-    for (name, description, mode) in [
-        (
-            "build",
-            "Coding agent with the configured tool permissions.",
-            "primary",
-        ),
-        (
-            "plan",
-            "Analyze and plan changes without editing the workspace.",
-            "primary",
-        ),
-        (
-            "general",
-            "Delegate multi-step research and implementation tasks.",
-            "subagent",
-        ),
-        (
-            "explore",
-            "Read and search a codebase without editing it.",
-            "subagent",
-        ),
-    ] {
-        let rules = config.agent_permission_rules(name);
-        definitions.insert(name.to_owned(), json!({"name": name, "description": description, "mode": mode, "native": true, "hidden": false, "options": {}, "permission": rules}));
+const BUILTIN_AGENTS: [(&str, &str, &str); 4] = [
+    (
+        "build",
+        "Coding agent with the configured tool permissions.",
+        "primary",
+    ),
+    (
+        "plan",
+        "Analyze and plan changes without editing the workspace.",
+        "primary",
+    ),
+    (
+        "general",
+        "Delegate multi-step research and implementation tasks.",
+        "subagent",
+    ),
+    (
+        "explore",
+        "Read and search a codebase without editing it.",
+        "subagent",
+    ),
+];
+
+fn build_agent_json(config: &Config, name: &str, builtin: Option<(&str, &str)>) -> Option<Value> {
+    let definition = config.agent.get(name);
+    if definition
+        .and_then(|d| d.get("disable"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return None;
     }
-    for (name, definition) in &config.agent {
-        if definition.get("disable").and_then(Value::as_bool) == Some(true) {
-            definitions.remove(name);
-            continue;
-        }
-        let mut agent = definitions.remove(name).unwrap_or_else(|| json!({"name": name, "mode": "all", "native": false, "hidden": false, "options": {}, "permission": config.agent_permission_rules(name)}));
-        if let Some(properties) = definition.as_object() {
-            for (key, value) in properties {
-                if key != "permission" && key != "disable" {
-                    agent[key] = value.clone();
-                }
+    if builtin.is_none() && definition.is_none() {
+        return None;
+    }
+    let rules = config.agent_permission_rules(name);
+    let mut agent = match builtin {
+        Some((description, mode)) => json!({
+            "name": name,
+            "description": description,
+            "mode": mode,
+            "native": true,
+            "hidden": false,
+            "options": {},
+            "permission": rules
+        }),
+        None => json!({
+            "name": name,
+            "mode": "all",
+            "native": false,
+            "hidden": false,
+            "options": {},
+            "permission": rules
+        }),
+    };
+    if let Some(properties) = definition.and_then(Value::as_object) {
+        for (key, value) in properties {
+            if key != "permission" && key != "disable" {
+                agent[key] = value.clone();
             }
         }
-        agent["name"] = json!(name);
-        definitions.insert(name.clone(), agent);
+    }
+    agent["name"] = json!(name);
+    Some(agent)
+}
+
+pub fn agent_json(config: &Config, name: &str) -> Option<Value> {
+    let builtin = BUILTIN_AGENTS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, desc, mode)| (*desc, *mode));
+    build_agent_json(config, name, builtin)
+}
+
+pub fn agents_json(config: &Config) -> Value {
+    let mut definitions = BTreeMap::new();
+    for (name, description, mode) in BUILTIN_AGENTS {
+        if let Some(agent) = build_agent_json(config, name, Some((description, mode))) {
+            definitions.insert(name.to_owned(), agent);
+        }
+    }
+    for name in config.agent.keys() {
+        if definitions.contains_key(name)
+            || BUILTIN_AGENTS.iter().any(|(n, _, _)| *n == name.as_str())
+        {
+            continue;
+        }
+        if let Some(agent) = build_agent_json(config, name, None) {
+            definitions.insert(name.clone(), agent);
+        }
     }
     json!(definitions.into_values().collect::<Vec<_>>())
 }

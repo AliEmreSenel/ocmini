@@ -193,10 +193,16 @@ async fn catalog(st: &AppState, dir: &str) -> Result<Config> {
     Ok(config)
 }
 fn connected_models(st: &AppState, cfg: &Config) -> Vec<Value> {
-    let connected = st.app.auth.connected_for(cfg);
+    let connected_list = st.app.auth.connected_for(cfg);
+    let connected: std::collections::HashSet<&str> =
+        connected_list.iter().map(String::as_str).collect();
     cfg.catalog()
         .into_iter()
-        .filter(|m| connected.iter().any(|p| m["providerID"] == p.as_str()))
+        .filter(|m| {
+            m["providerID"]
+                .as_str()
+                .is_some_and(|p| connected.contains(p))
+        })
         .map(|m| {
             let variants: Vec<_> = m["variants"]
                 .as_object()
@@ -248,23 +254,28 @@ async fn default_model(
         None => Ok(Json(json!({"location":{"directory":dir}}))),
     }
 }
+fn provider_json(id: &str, p: &crate::config::ProviderCfg) -> Value {
+    json!({"id":id,"name":p.name,"package":p.npm,"env":p.env,"models":{},"enabled":true,"activation":"auto","settings":{},"headers":{},"body":{}})
+}
 fn provider_list_for(st: &AppState, dir: &str) -> Result<Vec<Value>> {
     // Provider metadata does not depend on remote model enumeration.
-    let mut cfg = Config::load_for(dir).map_err(OperationError::invalid)?;
-    for id in st.app.auth.connected_for(&cfg) {
-        cfg.provider
-            .entry(id.clone())
-            .or_insert_with(|| crate::config::ProviderCfg {
-                name: id,
-                ..Default::default()
-            });
-    }
-    Ok(cfg
+    let cfg = Config::load_for(dir).map_err(OperationError::invalid)?;
+    let mut providers: Vec<Value> = cfg
         .provider
         .iter()
         .filter(|(id, _)| cfg.provider_enabled(id))
-        .map(|(id, p)| json!({"id":id,"name":p.name,"package":p.npm,"env":p.env,"models":{},"enabled":true,"activation":"auto","settings":{},"headers":{},"body":{}}))
-        .collect())
+        .map(|(id, p)| provider_json(id, p))
+        .collect();
+    for id in st.app.auth.connected_for(&cfg) {
+        if !cfg.provider.contains_key(&id) && cfg.provider_enabled(&id) {
+            let p = crate::config::ProviderCfg {
+                name: id.clone(),
+                ..Default::default()
+            };
+            providers.push(provider_json(&id, &p));
+        }
+    }
+    Ok(providers)
 }
 async fn providers(
     State(st): State<AppState>,
@@ -279,14 +290,30 @@ async fn provider_get(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
     let dir = directory(&query)?;
-    let provider = provider_list_for(&st, &dir)?
-        .into_iter()
-        .find(|p| p["id"] == id.as_str())
-        .ok_or_else(|| Error {
-            status: StatusCode::NOT_FOUND,
-            value: json!({"_tag":"ProviderNotFoundError","providerID":id,"message":format!("ProviderNotFoundError: {id}")}),
-        })?;
+    let cfg = Config::load_for(&dir).map_err(OperationError::invalid)?;
+    let provider = if cfg.provider_enabled(&id) {
+        if let Some(p) = cfg.provider.get(&id) {
+            Some(provider_json(&id, p))
+        } else if st.app.auth.connected_for(&cfg).iter().any(|p| p == &id) {
+            let p = crate::config::ProviderCfg {
+                name: id.clone(),
+                ..Default::default()
+            };
+            Some(provider_json(&id, &p))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .ok_or_else(|| Error {
+        status: StatusCode::NOT_FOUND,
+        value: json!({"_tag":"ProviderNotFoundError","providerID":id,"message":format!("ProviderNotFoundError: {id}")}),
+    })?;
     Ok(located(&dir, provider))
+}
+fn agent_wire(cfg: &Config, a: &Value) -> Value {
+    json!({"id":a["name"],"name":a["name"],"mode":a["mode"],"hidden":a["hidden"].as_bool().unwrap_or(false),"description":a["description"].as_str().unwrap_or_default(),"request":{"settings":{},"headers":{},"body":{}},"permissions":wire::rules_out(&cfg.agent_permission_rules(a["name"].as_str().unwrap_or_default()))})
 }
 fn agent_list_for(dir: &str) -> Result<Vec<Value>> {
     let cfg = Config::load_for(dir).map_err(OperationError::invalid)?;
@@ -294,7 +321,7 @@ fn agent_list_for(dir: &str) -> Result<Vec<Value>> {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|a| json!({"id":a["name"],"name":a["name"],"mode":a["mode"],"hidden":a["hidden"].as_bool().unwrap_or(false),"description":a["description"].as_str().unwrap_or_default(),"request":{"settings":{},"headers":{},"body":{}},"permissions":wire::rules_out(&cfg.agent_permission_rules(a["name"].as_str().unwrap_or_default()))}))
+        .map(|a| agent_wire(&cfg, a))
         .collect())
 }
 async fn agents(Query(query): Query<HashMap<String, String>>) -> Result<Json<Value>> {
@@ -306,9 +333,9 @@ async fn agent_get(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>> {
     let dir = directory(&query)?;
-    let agent = agent_list_for(&dir)?
-        .into_iter()
-        .find(|a| a["id"] == id.as_str())
+    let cfg = Config::load_for(&dir).map_err(OperationError::invalid)?;
+    let agent = crate::inventory::agent_json(&cfg, &id)
+        .map(|a| agent_wire(&cfg, &a))
         .ok_or_else(|| Error {
             status: StatusCode::NOT_FOUND,
             value: json!({"_tag":"AgentNotFoundError","agentID":id,"message":format!("AgentNotFoundError: {id}")}),
@@ -704,10 +731,7 @@ async fn submit(st: &AppState, sid: &str, body: &Value, kind: &str) -> Result<Js
         )?),
         ..Default::default()
     };
-    let receiver = st
-        .engine
-        .admit(st.app.clone(), sid.into(), request.clone())
-        .await?;
+    let receiver = st.engine.admit(st.app.clone(), sid.into(), request).await?;
     drop(receiver);
     let message = st
         .app
@@ -768,13 +792,12 @@ async fn control(
     payload: Value,
 ) -> Result<Json<Value>> {
     required(st, sid)?;
+    let id = body["id"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| hex_id("msg_"));
     let request = PromptRequest {
-        message_id: Some(
-            body["id"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| hex_id("msg_")),
-        ),
+        message_id: Some(id.clone()),
         parts: vec![match body["ocminiFocus"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
@@ -786,17 +809,13 @@ async fn control(
         v2: Some(input(body, kind, payload)?),
         ..Default::default()
     };
-    drop(
-        st.engine
-            .admit(st.app.clone(), sid.into(), request.clone())
-            .await?,
-    );
+    drop(st.engine.admit(st.app.clone(), sid.into(), request).await?);
     let m = st
         .app
         .store
-        .message(sid, request.message_id.as_deref().unwrap_or_default())?
+        .message(sid, &id)?
         .ok_or_else(|| invalid("Control receipt missing"))?;
-    Ok(data(wire::inbox(sid, &request, m.info.time.created)))
+    Ok(data(wire::receipt(sid, &m)?))
 }
 async fn compact(
     State(st): State<AppState>,
@@ -1037,7 +1056,11 @@ async fn session_context(
     Path(sid): Path<String>,
 ) -> Result<Json<Value>> {
     required(&st, &sid)?;
-    let all = st.app.store.messages(&sid)?;
+    let last = st.app.store.messages_limited(&sid, Some(1))?;
+    let all = match last.last() {
+        Some(last) => st.app.store.context_messages(&sid, &last.info.id)?,
+        None => Vec::new(),
+    };
     let pending: std::collections::HashSet<String> = st
         .app
         .store
@@ -1045,13 +1068,8 @@ async fn session_context(
         .into_iter()
         .filter_map(|item| item["id"].as_str().map(str::to_owned))
         .collect();
-    let start = all
-        .iter()
-        .rposition(|m| m.info.summary == Some(true) && m.info.time.completed.is_some())
-        .unwrap_or(0);
     let projected: Vec<_> = all
         .into_iter()
-        .skip(start)
         .filter(|m| !pending.contains(&m.info.id))
         .filter_map(|m| wire::message(&m))
         .collect();
@@ -1077,7 +1095,17 @@ async fn fork(
     state.as_object_mut().unwrap().remove("outcome");
     state.as_object_mut().unwrap().remove("busy");
     state.as_object_mut().unwrap().remove("idle");
-    state["fork"] = json!({"sessionID":sid,"boundary":{"type":if before.is_some(){"before"}else{"through"},"messageID":before.map(str::to_owned).or(st.app.store.messages_limited(&sid,Some(1))?.last().map(|m|m.info.id.clone())).unwrap_or_default()}});
+    let boundary_id = match before {
+        Some(id) => id.to_owned(),
+        None => st
+            .app
+            .store
+            .messages_limited(&sid, Some(1))?
+            .last()
+            .map(|m| m.info.id.clone())
+            .unwrap_or_default(),
+    };
+    state["fork"] = json!({"sessionID":sid,"boundary":{"type":if before.is_some(){"before"}else{"through"},"messageID":boundary_id}});
     st.app.store.v2_update(&fork.id, &state)?;
     st.app.v2.emit(
         &fork.id,

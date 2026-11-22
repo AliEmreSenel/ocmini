@@ -500,7 +500,12 @@ where
                     .await?
                     .output()?
             } else {
-                skills::load_content(&ctx.dir, &ctx.app.skill_paths(), &input.name)?
+                let dir = ctx.dir.clone();
+                let paths = ctx.app.skill_paths();
+                let skill_name = input.name.clone();
+                tokio::task::spawn_blocking(move || skills::load_content(&dir, &paths, &skill_name))
+                    .await
+                    .map_err(|e| failure(e.to_string()))??
             };
             let mut context = hook_context(ctx, name);
             context["name"] = json!(input.name);

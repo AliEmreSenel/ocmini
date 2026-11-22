@@ -405,12 +405,12 @@ fn spawn_inner(
             {
                 continue;
             }
-            let fd = open_path(&path)?;
             mounts.push(Mount {
                 mask: false,
                 ensure: true,
                 file: path.is_file(),
-                source: cstr(format!("/proc/self/fd/{}", fd.as_raw_fd()))?,
+                // `ensure` mounts are cloned via SYS_open_tree/SYS_move_mount on `target`.
+                source: cstr("")?,
                 target: cstr(path.as_os_str())?,
                 kind: None,
                 // Landlock's /tmp write grant also covers bind mounts below it.
@@ -418,7 +418,6 @@ fn spawn_inner(
                 // writable descendants as separate trees afterward.
                 flags: libc::MS_BIND | libc::MS_REC | if can_write { 0 } else { libc::MS_RDONLY },
             });
-            fences.push(fd);
             bound.push((path, can_write));
         }
     }

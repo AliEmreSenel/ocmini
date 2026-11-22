@@ -106,23 +106,29 @@ fn word_char(grapheme: &str) -> bool {
         .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
 }
 
-fn word_start(chars: &[&str], from: usize) -> usize {
-    let mut i = from.min(chars.len());
-    while i > 0 && !word_char(chars[i - 1]) {
+fn word_start_offset(text: &str, cursor: usize, cursor_bytes: usize) -> usize {
+    let mut i = cursor;
+    let mut iter = text[..cursor_bytes].graphemes(true).rev().peekable();
+    while iter.peek().is_some_and(|g| !word_char(g)) {
+        iter.next();
         i -= 1;
     }
-    while i > 0 && word_char(chars[i - 1]) {
+    while iter.peek().is_some_and(|g| word_char(g)) {
+        iter.next();
         i -= 1;
     }
     i
 }
 
-fn word_end(chars: &[&str], from: usize) -> usize {
-    let mut i = from.min(chars.len());
-    while i < chars.len() && !word_char(chars[i]) {
+fn word_end_offset(text: &str, cursor: usize, cursor_bytes: usize) -> usize {
+    let mut i = cursor;
+    let mut iter = text[cursor_bytes..].graphemes(true).peekable();
+    while iter.peek().is_some_and(|g| !word_char(g)) {
+        iter.next();
         i += 1;
     }
-    while i < chars.len() && word_char(chars[i]) {
+    while iter.peek().is_some_and(|g| word_char(g)) {
+        iter.next();
         i += 1;
     }
     i
@@ -415,13 +421,13 @@ impl Draft {
                     .map_or(self.text.len(), |i| bytes + i);
                 graphemes(&self.text[..end])
             }
-            Motion::WordLeft | Motion::WordRight => {
-                let chars: Vec<&str> = self.text.graphemes(true).collect();
-                if matches!(motion, Motion::WordLeft) {
-                    word_start(&chars, cursor)
-                } else {
-                    word_end(&chars, cursor)
-                }
+            Motion::WordLeft => {
+                let bytes = byte_index(&self.text, cursor);
+                word_start_offset(&self.text, cursor, bytes)
+            }
+            Motion::WordRight => {
+                let bytes = byte_index(&self.text, cursor);
+                word_end_offset(&self.text, cursor, bytes)
             }
         };
         self.settle_anchor();
@@ -491,15 +497,17 @@ impl Draft {
         if let Some(killed) = self.delete_selection() {
             return Some(killed);
         }
-        let chars: Vec<&str> = self.text.graphemes(true).collect();
-        let start = word_start(&chars, self.clamped());
-        if start == self.cursor {
+        let cursor = self.clamped();
+        let end = byte_index(&self.text, cursor);
+        let start_cursor = word_start_offset(&self.text, cursor, end);
+        if start_cursor == self.cursor {
             return None;
         }
-        let bytes = byte_index(&self.text, start)..byte_index(&self.text, self.cursor);
-        let killed = self.text[bytes.clone()].to_string();
-        self.replace(bytes, "", false);
-        self.cursor = start;
+        let start = byte_index(&self.text, start_cursor);
+        let killed = self.text[start..end].to_string();
+        self.replace(start..end, "", false);
+        self.cursor = start_cursor;
+        self.position = Some((self.cursor, start));
         Some(killed)
     }
 
@@ -508,33 +516,35 @@ impl Draft {
         if self.delete_selection().is_some() {
             return;
         }
-        let count = graphemes(&self.text);
-        self.cursor = self.cursor.min(count);
-        if self.cursor == count {
+        let start = self.offset();
+        let Some(next) = self.text[start..].graphemes(true).next() else {
+            self.cursor = graphemes(&self.text);
             return;
-        }
-        self.replace(
-            byte_index(&self.text, self.cursor)..byte_index(&self.text, self.cursor + 1),
-            "",
-            false,
-        );
+        };
+        let end = start + next.len();
+        self.replace(start..end, "", false);
+        self.position = Some((self.cursor, start));
     }
 
     pub fn backspace(&mut self) {
         if self.delete_selection().is_some() {
             return;
         }
-        self.cursor = self.cursor.min(graphemes(&self.text));
         if self.cursor == 0 {
             if self.text.is_empty() {
                 self.attachments.pop();
             }
             return;
         }
-        let start = byte_index(&self.text, self.cursor - 1);
-        let end = byte_index(&self.text, self.cursor);
+        let end = self.offset();
+        let Some(prev) = self.text[..end].graphemes(true).next_back() else {
+            self.cursor = 0;
+            return;
+        };
+        let start = end - prev.len();
         self.replace(start..end, "", false);
-        self.cursor -= 1;
+        self.cursor = self.cursor.min(graphemes(&self.text) + 1).saturating_sub(1);
+        self.position = Some((self.cursor, start));
     }
 
     pub fn clear_text(&mut self) {
@@ -714,10 +724,13 @@ pub(super) struct Layout {
     prefix_len: usize,
 }
 
-fn highlight(sel: Option<(usize, usize)>, index: usize, shown: String) -> String {
-    match sel {
-        Some((lo, hi)) if index >= lo && index < hi => format!("\x1b[7m{shown}\x1b[27m"),
-        _ => shown,
+fn push_highlighted(row: &mut String, sel: Option<(usize, usize)>, index: usize, shown: &str) {
+    if matches!(sel, Some((lo, hi)) if index >= lo && index < hi) {
+        row.push_str("\x1b[7m");
+        row.push_str(shown);
+        row.push_str("\x1b[27m");
+    } else {
+        row.push_str(shown);
     }
 }
 
@@ -742,27 +755,29 @@ fn layout(
     let text_len = graphemes(&clean);
     let sel = sel.map(|(lo, hi)| (prefix_len + lo.min(text_len), prefix_len + hi.min(text_len)));
     let mut rows: Vec<String> = Vec::new();
-    let mut row = String::new();
+    let mut row = format!("{BOLD}›{RESET} ");
     let mut col = 0usize;
-    let mut positions: Vec<(usize, usize, usize)> = Vec::new();
-    let place = |styled: String,
+    let mut positions: Vec<(usize, usize, usize)> = Vec::with_capacity(prefix_len + text_len + 1);
+    let place = |shown: &str,
+                 index: usize,
                  w: usize,
                  rows: &mut Vec<String>,
                  row: &mut String,
                  col: &mut usize,
                  positions: &mut Vec<(usize, usize, usize)>| {
         if *col + w > capacity && *col > 0 {
-            rows.push(std::mem::take(row));
+            rows.push(std::mem::replace(row, String::from("  ")));
             *col = 0;
         }
         positions.push((rows.len(), 2 + *col, w));
-        row.push_str(&styled);
+        push_highlighted(row, sel, index, shown);
         *col += w;
     };
     for (index, grapheme) in prefix.graphemes(true).enumerate() {
         let w = grapheme.width();
         place(
-            highlight(sel, index, grapheme.to_string()),
+            grapheme,
+            index,
             w,
             &mut rows,
             &mut row,
@@ -774,18 +789,15 @@ fn layout(
         let index = prefix_len + offset;
         if grapheme == "\n" {
             positions.push((rows.len(), 2 + col, 0));
-            rows.push(std::mem::take(&mut row));
+            rows.push(std::mem::replace(&mut row, String::from("  ")));
             col = 0;
             continue;
         }
-        let shown = if grapheme == "\t" {
-            "    ".to_string()
-        } else {
-            grapheme.to_string()
-        };
-        let w = shown.width();
+        let shown = if grapheme == "\t" { "    " } else { grapheme };
+        let w = if grapheme == "\t" { 4 } else { shown.width() };
         place(
-            highlight(sel, index, shown),
+            shown,
+            index,
             w,
             &mut rows,
             &mut row,
@@ -803,17 +815,6 @@ fn layout(
         (prefix_len + cursor).min(prefix_len + text_len)
     };
     let (crow, ccol, _) = positions[caret];
-    let rows = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            if index == 0 {
-                format!("{BOLD}›{RESET} {row}")
-            } else {
-                format!("  {row}")
-            }
-        })
-        .collect();
     Layout {
         rows,
         cursor: (crow, ccol),
@@ -879,6 +880,38 @@ fn wrap_row(row: &str, width: usize) -> Vec<String> {
     rows
 }
 
+fn is_blank_styled(text: &str) -> bool {
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(end) = escape_len(rest) {
+            rest = &rest[end..];
+        } else {
+            let ch = rest.chars().next().unwrap();
+            if !ch.is_whitespace() {
+                return false;
+            }
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    true
+}
+
+fn styled_width(text: &str) -> usize {
+    let mut rest = text;
+    let mut width = 0;
+    while !rest.is_empty() {
+        if let Some(end) = escape_len(rest) {
+            rest = &rest[end..];
+        } else {
+            let end = rest.find("\x1b[").unwrap_or(rest.len());
+            width += rest[..end].width();
+            rest = &rest[end..];
+        }
+    }
+    width
+}
+
+#[cfg(test)]
 fn unstyled(text: &str) -> String {
     let mut rest = text;
     let mut plain = String::new();
@@ -904,7 +937,7 @@ struct Spacing {
 
 impl Spacing {
     fn accept(&mut self, row: &str) -> bool {
-        let blank = unstyled(row).trim().is_empty();
+        let blank = is_blank_styled(row);
         if blank && self.blank {
             return false;
         }
@@ -1001,39 +1034,138 @@ struct WrappedRows {
     work: usize,
 }
 
+#[derive(Default)]
+struct ToolWrap {
+    width: usize,
+    view: ToolView,
+    rows: Vec<String>,
+}
+
+struct CachedTool {
+    call: ToolCall,
+    wrapped: RefCell<ToolWrap>,
+}
+
+impl CachedTool {
+    fn new(call: ToolCall) -> Self {
+        Self {
+            call,
+            wrapped: RefCell::new(ToolWrap::default()),
+        }
+    }
+
+    fn append_wrapped(&self, view: ToolView, width: usize, out: &mut Vec<String>) {
+        let mut cache = self.wrapped.borrow_mut();
+        if cache.width != width || cache.view != view {
+            let text = if view == ToolView::Brief {
+                &self.call.brief
+            } else {
+                &self.call.full
+            };
+            cache.rows = wrap_row(&format!("{text}{RESET}"), width);
+            cache.width = width;
+            cache.view = view;
+        }
+        out.extend(cache.rows.iter().cloned());
+    }
+}
+
 struct ToolChain {
     anchor: usize,
-    calls: Vec<ToolCall>,
+    calls: Vec<CachedTool>,
+}
+
+#[derive(Default)]
+struct ThoughtWrap {
+    width: usize,
+    committed_done: usize,
+    rows: Vec<String>,
 }
 
 struct Thought {
     anchor: usize,
     message_id: String,
-    text: String,
+    has_non_ws: bool,
+    char_count: usize,
     start: i64,
     end: Option<i64>,
     tokens: Option<i64>,
+    markdown: Markdown,
+    committed: Vec<String>,
+    pending: Option<String>,
+    trailing_blank: bool,
+    tail_pending_rows: RefCell<usize>,
+    wrapped: RefCell<ThoughtWrap>,
 }
 
 impl Thought {
-    fn rows(&self, expanded: bool) -> Vec<String> {
-        if self.text.trim().is_empty() {
-            return Vec::new();
+    fn new(anchor: usize, message_id: String, start: i64) -> Self {
+        Self {
+            anchor,
+            message_id,
+            has_non_ws: false,
+            char_count: 0,
+            start,
+            end: None,
+            tokens: None,
+            markdown: Markdown::default(),
+            committed: Vec::new(),
+            pending: None,
+            trailing_blank: false,
+            tail_pending_rows: RefCell::new(0),
+            wrapped: RefCell::new(ThoughtWrap::default()),
         }
-        if expanded {
-            // The block's rows open at the top of their own anchor, so their
-            // leading blank row belongs to them; `Spacing::default` drops it.
-            let mut spacing = Spacing { blank: true };
-            let rendered = Markdown::default().push(self.text.trim_end()).text;
-            return std::iter::once(format!("{}◦ thinking{RESET}", super::DIM))
-                .chain(
-                    rendered
-                        .lines()
-                        .filter(|line| spacing.accept(line))
-                        .map(|line| format!("{line}{RESET}")),
-                )
-                .collect();
+    }
+
+    fn reset(&mut self) {
+        self.has_non_ws = false;
+        self.char_count = 0;
+        self.markdown.restart();
+        self.committed.clear();
+        self.pending = None;
+        self.trailing_blank = false;
+        *self.tail_pending_rows.get_mut() = 0;
+        let wrap = self.wrapped.get_mut();
+        wrap.committed_done = 0;
+        wrap.rows.clear();
+    }
+
+    fn push(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
         }
+        for ch in delta.chars() {
+            self.char_count += 1;
+            if !ch.is_whitespace() {
+                self.has_non_ws = true;
+            }
+        }
+        let rendered = self.markdown.push(delta);
+        let complete = &rendered.text[..rendered.text.len() - rendered.line];
+        if let Some(lines) = complete.strip_suffix('\n') {
+            for line in lines.split('\n') {
+                if is_blank_styled(line) {
+                    if !self.committed.is_empty() {
+                        self.trailing_blank = true;
+                    }
+                } else {
+                    if self.trailing_blank {
+                        self.committed.push(RESET.to_owned());
+                        self.trailing_blank = false;
+                    }
+                    self.committed.push(format!("{line}{RESET}"));
+                }
+            }
+        }
+        let tail = rendered.text[rendered.text.len() - rendered.line..].trim_end();
+        if tail.is_empty() || is_blank_styled(tail) {
+            self.pending = None;
+        } else {
+            self.pending = Some(format!("{tail}{RESET}"));
+        }
+    }
+
+    fn summary_row(&self) -> String {
         let seconds = self
             .end
             .unwrap_or_else(crate::types::now_ms)
@@ -1043,38 +1175,82 @@ impl Thought {
         let tokens = self
             .tokens
             .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| format!("~{}", self.text.chars().count().div_ceil(4)));
+            .unwrap_or_else(|| format!("~{}", self.char_count.div_ceil(4)));
         let label = if self.end.is_some() {
             "Thought"
         } else {
             "Thinking"
         };
-        vec![format!(
+        format!(
             "{}◦ {label} for {seconds:.1}s ({tokens} tokens){RESET}",
             super::DIM
-        )]
+        )
+    }
+
+    fn rows(&self, expanded: bool) -> Vec<String> {
+        if !self.has_non_ws {
+            return Vec::new();
+        }
+        if expanded {
+            let mut rows = Vec::with_capacity(1 + self.committed.len() + 2);
+            rows.push(format!("{}◦ thinking{RESET}", super::DIM));
+            rows.extend(self.committed.iter().cloned());
+            if let Some(pending) = &self.pending {
+                if self.trailing_blank {
+                    rows.push(RESET.to_owned());
+                }
+                rows.push(pending.clone());
+            }
+            return rows;
+        }
+        vec![self.summary_row()]
+    }
+
+    fn append_wrapped(&self, expanded: bool, width: usize, out: &mut Vec<String>) {
+        if !self.has_non_ws {
+            *self.tail_pending_rows.borrow_mut() = 0;
+            return;
+        }
+        if !expanded {
+            *self.tail_pending_rows.borrow_mut() = 0;
+            out.extend(wrap_row(&self.summary_row(), width));
+            return;
+        }
+        let mut cache = self.wrapped.borrow_mut();
+        if cache.width != width || cache.rows.is_empty() {
+            cache.width = width;
+            cache.committed_done = 0;
+            cache.rows.clear();
+            cache
+                .rows
+                .extend(wrap_row(&format!("{}◦ thinking{RESET}", super::DIM), width));
+        }
+        for line in &self.committed[cache.committed_done..] {
+            cache.rows.extend(wrap_row(line, width));
+        }
+        cache.committed_done = self.committed.len();
+        out.extend(cache.rows.iter().cloned());
+        let mut pending_rows = 0;
+        if let Some(pending) = &self.pending {
+            if self.trailing_blank {
+                let w = wrap_row(RESET, width);
+                pending_rows += w.len();
+                out.extend(w);
+            }
+            let w = wrap_row(pending, width);
+            pending_rows += w.len();
+            out.extend(w);
+        }
+        *self.tail_pending_rows.borrow_mut() = pending_rows;
     }
 }
 
 impl ToolChain {
-    fn rows(&self, view: ToolView) -> Vec<String> {
-        if view != ToolView::Grouped {
-            return self
-                .calls
-                .iter()
-                .map(|call| {
-                    let text = if view == ToolView::Brief {
-                        &call.brief
-                    } else {
-                        &call.full
-                    };
-                    format!("{text}{RESET}")
-                })
-                .collect();
-        }
+    fn grouped_row(&self) -> String {
         let mut tools: Vec<(&str, usize)> = Vec::new();
         let (mut pending, mut running, mut failed) = (0, 0, 0);
-        for call in &self.calls {
+        for item in &self.calls {
+            let call = &item.call;
             if let Some((_, count)) = tools.iter_mut().find(|(name, _)| *name == call.name) {
                 *count += 1;
             } else {
@@ -1104,10 +1280,38 @@ impl ToolChain {
         }
         let mark = if failed > 0 { "✗" } else { "▸" };
         let count = self.calls.len();
-        vec![format!(
+        format!(
             "{mark} {count} tool call{} · {tools}{status}{RESET}",
             if count == 1 { "" } else { "s" }
-        )]
+        )
+    }
+
+    fn rows(&self, view: ToolView) -> Vec<String> {
+        if view != ToolView::Grouped {
+            return self
+                .calls
+                .iter()
+                .map(|item| {
+                    let text = if view == ToolView::Brief {
+                        &item.call.brief
+                    } else {
+                        &item.call.full
+                    };
+                    format!("{text}{RESET}")
+                })
+                .collect();
+        }
+        vec![self.grouped_row()]
+    }
+
+    fn append_wrapped(&self, view: ToolView, width: usize, out: &mut Vec<String>) {
+        if view == ToolView::Grouped {
+            out.extend(wrap_row(&self.grouped_row(), width));
+            return;
+        }
+        for item in &self.calls {
+            item.append_wrapped(view, width, out);
+        }
     }
 }
 
@@ -1185,7 +1389,7 @@ impl Display {
         if self.md_row && !line.is_empty() {
             self.tail.truncate(self.md_tail);
             self.tail.push_str(&line);
-            self.columns = unstyled(&self.tail).width();
+            self.columns = styled_width(&self.tail);
         }
         self.md_row = false;
         if self.columns > 0 {
@@ -1298,23 +1502,23 @@ impl Display {
             // block's separator has to survive the blank-row collapse.
             self.spacing.blank = false;
             let index = self.thoughts.len();
-            self.thoughts.push(Thought {
-                anchor: self.lines.len(),
-                message_id: update.message_id.clone(),
-                text: String::new(),
-                start: update.start.unwrap_or_else(crate::types::now_ms),
-                end: None,
-                tokens: None,
-            });
+            self.thoughts.push(Thought::new(
+                self.lines.len(),
+                update.message_id.clone(),
+                update.start.unwrap_or_else(crate::types::now_ms),
+            ));
             self.thought_ids.insert(update.id, index);
             self.lines.push((RowKind::Thought(index), String::new()));
             index
         };
         let thought = &mut self.thoughts[index];
+        let was_non_ws = thought.has_non_ws;
+        let prev_committed = thought.committed.len();
+        let prev_pending_rows = *thought.tail_pending_rows.get_mut();
         if update.reset {
-            thought.text.clear();
+            thought.reset();
         }
-        thought.text.push_str(&update.text);
+        thought.push(&update.text);
         if !update.message_id.is_empty() {
             thought.message_id = update.message_id;
         }
@@ -1325,7 +1529,44 @@ impl Display {
             thought.end = Some(end);
         }
         let anchor = thought.anchor;
-        self.invalidate_from(anchor);
+        let cache = self.wrapped.get_mut();
+        let can_increment = !update.reset
+            && was_non_ws
+            && self.visibility.thinking
+            && cache.width > 0
+            && cache.visibility == self.visibility
+            && cache.through == self.lines.len()
+            && anchor + 1 == self.lines.len()
+            && thought.wrapped.get_mut().width == cache.width
+            && thought.wrapped.get_mut().committed_done == prev_committed;
+        if can_increment {
+            let width = cache.width;
+            let keep = cache.rows.len().saturating_sub(prev_pending_rows);
+            cache.rows.truncate(keep);
+            let wrap = thought.wrapped.get_mut();
+            let before_new = wrap.rows.len();
+            for line in &thought.committed[prev_committed..] {
+                wrap.rows.extend(wrap_row(line, width));
+            }
+            wrap.committed_done = thought.committed.len();
+            cache.rows.extend(wrap.rows[before_new..].iter().cloned());
+            let mut pending_rows = 0;
+            if let Some(pending) = &thought.pending {
+                if thought.trailing_blank {
+                    let w = wrap_row(RESET, width);
+                    pending_rows += w.len();
+                    cache.rows.extend(w);
+                }
+                let w = wrap_row(pending, width);
+                pending_rows += w.len();
+                cache.rows.extend(w);
+            }
+            *thought.tail_pending_rows.get_mut() = pending_rows;
+            cache.ends[anchor] = cache.rows.len();
+        } else {
+            *thought.tail_pending_rows.get_mut() = 0;
+            self.invalidate_from(anchor);
+        }
     }
 
     fn invalidate_from(&mut self, anchor: usize) {
@@ -1351,10 +1592,10 @@ impl Display {
             }
         });
         let chain = if let Some(&(chain, index)) = self.calls.get(&call.id) {
-            if self.chains[chain].calls[index] == call {
+            if self.chains[chain].calls[index].call == call {
                 return;
             }
-            self.chains[chain].calls[index] = call;
+            self.chains[chain].calls[index] = CachedTool::new(call);
             chain
         } else {
             let chain = match self.active_chain {
@@ -1376,7 +1617,7 @@ impl Display {
             };
             self.calls
                 .insert(call.id.clone(), (chain, self.chains[chain].calls.len()));
-            self.chains[chain].calls.push(call);
+            self.chains[chain].calls.push(CachedTool::new(call));
             chain
         };
         if let Some(text) = native_text {
@@ -1440,7 +1681,7 @@ impl Display {
             let rendered = self.markdown.push(text);
             if self.md_row {
                 self.tail.truncate(self.md_tail);
-                self.columns = unstyled(&self.tail).width();
+                self.columns = styled_width(&self.tail);
             }
             // Every rendered span closes itself, so the style in effect where
             // the row starts is exactly the style the write leaves behind.
@@ -1465,7 +1706,7 @@ impl Display {
     }
 
     fn write(&mut self, text: &str, width: usize) {
-        if !unstyled(text).trim().is_empty() {
+        if !is_blank_styled(text) {
             // Only consecutive tool calls belong to a group. Even when
             // thinking is collapsed, intervening messages keep their place.
             self.active_chain = None;
@@ -1657,13 +1898,13 @@ impl Display {
         }
         for (kind, line) in &self.lines[cache.through..] {
             if let RowKind::Tools(chain) = *kind {
-                for line in self.chains[chain].rows(self.visibility.tools) {
-                    cache.rows.extend(wrap_row(&line, width));
-                }
+                self.chains[chain].append_wrapped(self.visibility.tools, width, &mut cache.rows);
             } else if let RowKind::Thought(index) = *kind {
-                for line in self.thoughts[index].rows(self.visibility.thinking) {
-                    cache.rows.extend(wrap_row(&line, width));
-                }
+                self.thoughts[index].append_wrapped(
+                    self.visibility.thinking,
+                    width,
+                    &mut cache.rows,
+                );
             } else if self.visibility.visible(*kind) {
                 cache.rows.extend(wrap_row(line, width));
                 #[cfg(test)]
@@ -1681,6 +1922,7 @@ impl Display {
 
     /// Transcript display rows for the current scroll position, oldest first,
     /// at most `self.page` rows.
+    #[cfg(test)]
     fn viewport(&self, width: usize) -> Vec<String> {
         let rows = self.wrapped(width);
         let last = rows.len().saturating_sub(self.page);
@@ -1688,6 +1930,7 @@ impl Display {
         rows[top..(top + self.page).min(rows.len())].to_vec()
     }
 
+    #[cfg(test)]
     pub fn draw<H: super::HeaderSource + ?Sized>(
         &mut self,
         ui: &Ui,
@@ -1695,9 +1938,19 @@ impl Display {
         width: usize,
         status: &H,
     ) {
+        let (_, height) = terminal_size();
+        self.draw_sized(ui, draft, (width, height), status);
+    }
+
+    pub fn draw_sized<H: super::HeaderSource + ?Sized>(
+        &mut self,
+        ui: &Ui,
+        draft: &Draft,
+        (width, height): (usize, usize),
+        status: &H,
+    ) {
         let (prefix, text, cursor, sel) = active_input(ui, draft);
         let header = status.format(ui.visibility, width);
-        let (_, height) = terminal_size();
         let changed = self.input.as_ref().is_none_or(|cache| {
             cache.prefix != prefix
                 || cache.text != text
@@ -1760,17 +2013,20 @@ impl Display {
             Vec::new()
         };
         if self.fullscreen {
-            self.draw_screen(&layout, &suggestions);
+            self.draw_screen((width, height), &layout, &suggestions);
             return;
         }
         self.drawn_rows = 0;
-        print!("\r");
+        let live = self.native_live_rows(width, available.saturating_sub(suggestions.len()));
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        let _ = out.write_all(b"\r");
         // Bound and wrap every live row before drawing. Counting a long or
         // multiline header as one row makes erase leave a row behind on each
         // event, even while the model is only generating pending calls.
-        let live = self.native_live_rows(width, available.saturating_sub(suggestions.len()));
         for row in &live {
-            crate::println!("{row}{RESET}");
+            let _ = out.write_all(row.as_bytes());
+            let _ = out.write_all(RESET.as_bytes());
+            let _ = out.write_all(b"\r\n");
         }
         self.drawn_rows = live.len();
         // A flushed transcript row sits above the draft, so the block starts
@@ -1778,21 +2034,21 @@ impl Display {
         let first = self.drawn_rows;
         for (index, row) in layout.rows.iter().chain(&suggestions).enumerate() {
             if index > 0 {
-                crate::print!("\r\n");
+                let _ = out.write_all(b"\r\n");
             }
-            crate::print!("{row}");
+            let _ = out.write_all(row.as_bytes());
             self.drawn_rows += 1;
         }
         self.caret_row = first + layout.cursor.0;
         let up = self.drawn_rows - 1 - self.caret_row;
         if up > 0 {
-            print!("\x1b[{up}A");
+            let _ = write!(out, "\x1b[{up}A");
         }
-        print!("\r");
+        let _ = out.write_all(b"\r");
         if layout.cursor.1 > 0 {
-            print!("\x1b[{}C", layout.cursor.1);
+            let _ = write!(out, "\x1b[{}C", layout.cursor.1);
         }
-        let _ = std::io::stdout().flush();
+        let _ = out.flush();
     }
 
     fn native_live_rows(&self, width: usize, available: usize) -> Vec<String> {
@@ -1800,17 +2056,17 @@ impl Display {
         if self.columns > 0 && self.visibility.visible(self.tail_kind) {
             rows.extend(wrap_row(&format!("{}{RESET}", self.tail), width));
         }
-        if let Some(call) = self
+        if let Some(item) = self
             .chains
             .iter()
             .rev()
             .flat_map(|chain| chain.calls.iter().rev())
-            .find(|call| !matches!(call.status.as_str(), "completed" | "error"))
+            .find(|item| !matches!(item.call.status.as_str(), "completed" | "error"))
         {
             let text = if self.visibility.tools == ToolView::Full {
-                &call.full
+                &item.call.full
             } else {
-                &call.brief
+                &item.call.brief
             };
             rows.extend(wrap_row(text, width));
         }
@@ -1819,41 +2075,65 @@ impl Display {
         rows
     }
 
-    /// Repaint the whole screen: the transcript window, then the draft. The
-    /// clear replaces every cell, so nothing needs row-by-row erase
-    /// bookkeeping, and rows are joined without a trailing newline so the
-    /// bottom row never scrolls the screen.
-    fn draw_screen(&mut self, layout: &Layout, suggestions: &[String]) {
-        let (width, height) = terminal_size();
+    /// Repaint the whole screen without `\x1b[2J` flicker: home the cursor,
+    /// overwrite every visible row with `\x1b[K`, then clear any trailing rows
+    /// with `\x1b[J`, writing directly to locked stdout without copying the
+    /// viewport or running a second newline pass.
+    fn draw_screen(
+        &mut self,
+        (width, height): (usize, usize),
+        layout: &Layout,
+        suggestions: &[String],
+    ) {
         self.page = height.saturating_sub(layout.rows.len() + suggestions.len());
         self.paint_width = width;
         // The tail is the unfinished transcript row: paint it, never commit
         // it. Committing on every repaint would stack a snapshot of the text
         // so far each time a streaming delta arrives.
-        let mut rows = self.viewport(width);
-        if self.columns > 0 && self.scroll.is_none() && self.visibility.visible(self.tail_kind) {
-            rows.extend(wrap_row(&format!("{}{RESET}", self.tail), width));
-            let cut = rows.len().saturating_sub(self.page);
-            rows.drain(..cut);
-        }
-        let mut out = String::from("\x1b[2J\x1b[H");
+        let tail_rows =
+            if self.columns > 0 && self.scroll.is_none() && self.visibility.visible(self.tail_kind)
+            {
+                wrap_row(&format!("{}{RESET}", self.tail), width)
+            } else {
+                Vec::new()
+            };
+        let wrapped = self.wrapped(width);
+        let (base_slice, tail_slice) = if tail_rows.is_empty() {
+            let last = wrapped.len().saturating_sub(self.page);
+            let top = self.scroll.unwrap_or(last).min(last);
+            (&wrapped[top..(top + self.page).min(wrapped.len())], &[][..])
+        } else {
+            let tail_take = tail_rows.len().min(self.page);
+            let tail_slice = &tail_rows[tail_rows.len() - tail_take..];
+            let base_take = self.page - tail_take;
+            let base_start = wrapped.len().saturating_sub(base_take);
+            (&wrapped[base_start..], tail_slice)
+        };
+        let transcript_rows = base_slice.len() + tail_slice.len();
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        let _ = out.write_all(b"\x1b[H");
         let mut drawn = 0usize;
-        for row in rows.iter().chain(&layout.rows).chain(suggestions) {
+        for row in base_slice
+            .iter()
+            .chain(tail_slice.iter())
+            .chain(&layout.rows)
+            .chain(suggestions)
+        {
             if drawn > 0 {
-                out.push_str("\r\n");
+                let _ = out.write_all(b"\r\n");
             }
-            out.push_str(row);
+            let _ = out.write_all(row.as_bytes());
+            let _ = out.write_all(b"\x1b[K");
             drawn += 1;
         }
-        self.caret_row = rows.len() + layout.cursor.0;
+        let _ = out.write_all(b"\x1b[J");
+        let caret_row = transcript_rows + layout.cursor.0;
+        let _ = write!(out, "\x1b[{};{}H", caret_row + 1, layout.cursor.1 + 1);
+        let _ = out.flush();
+        drop(out);
+        drop(wrapped);
+        self.caret_row = caret_row;
         self.drawn_rows = drawn;
-        out.push_str(&format!(
-            "\x1b[{};{}H",
-            self.caret_row + 1,
-            layout.cursor.1 + 1
-        ));
-        crate::print!("{out}");
-        let _ = std::io::stdout().flush();
     }
 }
 
@@ -2157,11 +2437,6 @@ mod tests {
         // The question's own draft is what the input row draws; the prompt
         // draft stays hidden underneath it.
         let ui = Ui {
-            interactions: Default::default(),
-            completion: Default::default(),
-            text: crate::client::TextState::default(),
-            tool_done: std::collections::HashSet::new(),
-            answer_labelled: false,
             prompt: Some(PendingPrompt::Question {
                 id: "q1".into(),
                 questions: vec![serde_json::json!({"question": "Pick", "options": []})],
@@ -2174,7 +2449,7 @@ mod tests {
                     ..Draft::default()
                 }],
             }),
-            visibility: Visibility::default(),
+            ..Ui::default()
         };
         let mut prompt = Draft::default();
         prompt.insert_str("hidden prompt");
@@ -2208,15 +2483,7 @@ mod tests {
 
     #[test]
     fn erasing_the_draft_starts_at_the_caret_row() {
-        let ui = Ui {
-            interactions: Default::default(),
-            completion: Default::default(),
-            text: crate::client::TextState::default(),
-            tool_done: std::collections::HashSet::new(),
-            answer_labelled: false,
-            prompt: None,
-            visibility: Visibility::default(),
-        };
+        let ui = Ui::default();
         let mut draft = Draft::default();
         draft.insert_str("alpha\nbravo\ncharlie");
         let mut display = Display::default();
@@ -2306,15 +2573,7 @@ mod tests {
 
     #[test]
     fn a_hidden_streaming_row_never_peeks_above_the_draft() {
-        let ui = Ui {
-            interactions: Default::default(),
-            completion: Default::default(),
-            text: crate::client::TextState::default(),
-            tool_done: std::collections::HashSet::new(),
-            answer_labelled: false,
-            prompt: None,
-            visibility: Visibility::default(),
-        };
+        let ui = Ui::default();
         let draft = Draft::default();
         let mut display = Display::default();
         display.set_visibility(Visibility {
@@ -2332,15 +2591,7 @@ mod tests {
 
     #[test]
     fn fullscreen_repaint_keeps_the_streaming_tail_uncommitted() {
-        let ui = crate::tui::Ui {
-            interactions: Default::default(),
-            completion: Default::default(),
-            text: crate::client::TextState::default(),
-            tool_done: std::collections::HashSet::new(),
-            answer_labelled: false,
-            prompt: None,
-            visibility: Visibility::default(),
-        };
+        let ui = crate::tui::Ui::default();
         let draft = Draft::default();
         let mut display = Display::new(true);
         display.output("assistant\n", 40);
@@ -2386,15 +2637,7 @@ mod tests {
 
     #[test]
     fn status_redraws_stay_one_row_and_never_enter_the_transcript() {
-        let mut ui = Ui {
-            interactions: Default::default(),
-            completion: Default::default(),
-            text: crate::client::TextState::default(),
-            tool_done: std::collections::HashSet::new(),
-            answer_labelled: false,
-            prompt: None,
-            visibility: Visibility::default(),
-        };
+        let mut ui = Ui::default();
         let mut draft = Draft::default();
         draft.insert_str("unfinished");
         let model = "provider/中👩‍💻".repeat(30);
@@ -3379,5 +3622,77 @@ mod tests {
         );
         say(&mut ui, &mut display, "step_4", "text_5");
         assert_eq!(labels(&display), 2, "a new prompt labels a new answer");
+    }
+
+    #[test]
+    fn incremental_thought_streaming_matches_whole_render_across_chunk_sizes() {
+        let full_text = "First **bold** thought.\n\n\nSecond line\n```rust\nlet x = 1;\n\n```\nAfter code   \n\n";
+        let mut whole = Display::new(true);
+        whole.update_thought(
+            ThoughtUpdate {
+                id: "t1".into(),
+                message_id: "m1".into(),
+                text: full_text.into(),
+                new: true,
+                reset: false,
+                start: Some(1000),
+                end: Some(2000),
+            },
+            40,
+        );
+        let expected_expanded = whole.wrapped(40).clone();
+        whole.set_visibility(Visibility {
+            thinking: false,
+            tools: ToolView::Brief,
+        });
+        let expected_collapsed = whole.wrapped(40).clone();
+
+        for chunk in [1, 3, 7, 17] {
+            let mut streamed = Display::new(true);
+            let mut first = true;
+            for slice in full_text.as_bytes().chunks(chunk) {
+                streamed.update_thought(
+                    ThoughtUpdate {
+                        id: "t1".into(),
+                        message_id: "m1".into(),
+                        text: std::str::from_utf8(slice).unwrap().into(),
+                        new: first,
+                        reset: false,
+                        start: Some(1000),
+                        end: None,
+                    },
+                    40,
+                );
+                first = false;
+                // Trigger wrapped cache on every delta to exercise the tail fast path.
+                let _ = streamed.wrapped(40);
+            }
+            streamed.update_thought(
+                ThoughtUpdate {
+                    id: "t1".into(),
+                    message_id: "m1".into(),
+                    text: String::new(),
+                    new: false,
+                    reset: false,
+                    start: None,
+                    end: Some(2000),
+                },
+                40,
+            );
+            assert_eq!(
+                *streamed.wrapped(40),
+                expected_expanded,
+                "expanded mismatch for chunk={chunk}"
+            );
+            streamed.set_visibility(Visibility {
+                thinking: false,
+                tools: ToolView::Brief,
+            });
+            assert_eq!(
+                *streamed.wrapped(40),
+                expected_collapsed,
+                "collapsed mismatch for chunk={chunk}"
+            );
+        }
     }
 }

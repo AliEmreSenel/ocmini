@@ -155,7 +155,7 @@ pub fn read(
         if metadata.len() > 16 * 1024 * 1024 {
             return Err(failure("Media attachment exceeds 16 MiB"));
         }
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
         reader
             .take(16 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
@@ -186,16 +186,31 @@ pub fn read(
     } else {
         MAX_OUTPUT
     };
-    let total = scan_text(&path, reader, cancel, |index, line| {
-        let selected = ranges
-            .as_ref()
-            .map_or(index >= offset && returned < limit, |ranges| {
+    let total = scan_text_with(
+        &path,
+        reader,
+        cancel,
+        |index| {
+            if let Some(ranges) = &ranges {
                 while range_index < ranges.len() && ranges[range_index].end < index as u64 {
                     range_index += 1;
                 }
-                range_index < ranges.len() && ranges[range_index].start <= index as u64
-            });
-        if selected && !output_capped {
+                if range_index >= ranges.len() {
+                    LineAction::Stop
+                } else if ranges[range_index].start <= index as u64 {
+                    LineAction::Collect
+                } else {
+                    LineAction::Skip
+                }
+            } else if index < offset {
+                LineAction::Skip
+            } else if limit == 0 {
+                LineAction::Stop
+            } else {
+                LineAction::Collect
+            }
+        },
+        |index, line| {
             let mut preview: String = line.chars().take(MAX_LINE).collect();
             if preview.len() < line.len() {
                 preview.push_str("... (line truncated to 2000 chars)");
@@ -214,13 +229,13 @@ pub fn read(
                 output_capped = true;
                 next_line = Some(index);
             }
-        }
-        if ranges.is_some() {
-            !output_capped
-        } else {
-            index < offset || (returned < limit && !output_capped)
-        }
-    })?;
+            if ranges.is_some() {
+                !output_capped
+            } else {
+                returned < limit && !output_capped
+            }
+        },
+    )?;
     if let Some(ranges) = &ranges {
         let missing: Vec<_> = ranges
             .iter()
@@ -261,12 +276,30 @@ pub fn read(
     output(text, &path, metadata)
 }
 
-/// Reuse one line buffer instead of retaining the entire file. Scan even past
-/// the requested output window to validate UTF-8/binary data and count lines.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineAction {
+    Skip,
+    Collect,
+    Stop,
+}
+
+#[cfg(test)]
 fn scan_text(
     path: &Path,
     reader: impl BufRead,
     cancel: &CancellationToken,
+    visit: impl FnMut(usize, &str) -> bool,
+) -> Result<usize, OperationError> {
+    scan_text_with(path, reader, cancel, |_| LineAction::Collect, visit)
+}
+
+/// Reuse one line buffer instead of retaining the entire file. Scan even past
+/// the requested output window to validate UTF-8/binary data and count lines.
+fn scan_text_with(
+    path: &Path,
+    reader: impl BufRead,
+    cancel: &CancellationToken,
+    mut action: impl FnMut(usize) -> LineAction,
     mut visit: impl FnMut(usize, &str) -> bool,
 ) -> Result<usize, OperationError> {
     let mut reader = reader;
@@ -277,6 +310,10 @@ fn scan_text(
     let mut extra_characters = false;
     let mut has_bytes = false;
     let mut total = 0;
+    let mut current = action(1);
+    if current == LineAction::Stop {
+        return count_remaining_lines(path, reader, cancel);
+    }
     loop {
         if cancel.is_cancelled() {
             return Err(failure("File scan cancelled"));
@@ -290,7 +327,9 @@ fn scan_text(
             }
             if has_bytes {
                 total += 1;
-                visit(total, &line);
+                if current == LineAction::Collect {
+                    visit(total, &line);
+                }
             }
             return Ok(total);
         }
@@ -303,29 +342,36 @@ fn scan_text(
                 path.display()
             )));
         }
-        decoded.clear();
-        decoded.extend_from_slice(&carry);
-        decoded.extend_from_slice(chunk);
-        let (text, pending) = match std::str::from_utf8(&decoded) {
+        let slice: &[u8] = if carry.is_empty() {
+            chunk
+        } else {
+            decoded.clear();
+            decoded.extend_from_slice(&carry);
+            decoded.extend_from_slice(chunk);
+            &decoded
+        };
+        let (text, pending) = match std::str::from_utf8(slice) {
             Ok(text) => (text, &[][..]),
             Err(error) if error.error_len().is_none() => (
-                std::str::from_utf8(&decoded[..error.valid_up_to()])
+                std::str::from_utf8(&slice[..error.valid_up_to()])
                     .map_err(|_| failure("Invalid UTF-8 prefix"))?,
-                &decoded[error.valid_up_to()..],
+                &slice[error.valid_up_to()..],
             ),
             Err(_) => return Err(failure(format!("{} is not UTF-8 text", path.display()))),
         };
-        // Retain only enough characters to expose the per-line truncation.
-        // Continue validating and counting without allocating the whole line.
-        let mut incoming = text.chars();
-        for character in incoming
-            .by_ref()
-            .take((MAX_LINE + 1).saturating_sub(characters))
-        {
-            line.push(character);
-            characters += 1;
+        if current == LineAction::Collect && !extra_characters {
+            // Retain only enough characters to expose the per-line truncation.
+            // Continue validating and counting without allocating the whole line.
+            let mut incoming = text.chars();
+            for character in incoming
+                .by_ref()
+                .take((MAX_LINE + 1).saturating_sub(characters))
+            {
+                line.push(character);
+                characters += 1;
+            }
+            extra_characters |= incoming.next().is_some();
         }
-        extra_characters |= incoming.next().is_some();
         carry.clear();
         carry.extend_from_slice(pending);
         has_bytes |= length > 0;
@@ -334,16 +380,25 @@ fn scan_text(
                 return Err(failure(format!("{} is not UTF-8 text", path.display())));
             }
             total += 1;
-            let continue_page = visit(
-                total,
-                if extra_characters {
-                    &line
-                } else {
-                    line.strip_suffix('\r').unwrap_or(&line)
-                },
-            );
+            let continue_page = if current == LineAction::Collect {
+                visit(
+                    total,
+                    if extra_characters {
+                        &line
+                    } else {
+                        line.strip_suffix('\r').unwrap_or(&line)
+                    },
+                )
+            } else {
+                true
+            };
+            reader.consume(length + 1);
             if !continue_page {
-                reader.consume(length + 1);
+                return count_remaining_lines(path, reader, cancel)
+                    .map(|remaining| total + remaining);
+            }
+            current = action(total + 1);
+            if current == LineAction::Stop {
                 return count_remaining_lines(path, reader, cancel)
                     .map(|remaining| total + remaining);
             }
@@ -351,8 +406,9 @@ fn scan_text(
             characters = 0;
             extra_characters = false;
             has_bytes = false;
+        } else {
+            reader.consume(length);
         }
-        reader.consume(length + usize::from(newline.is_some()));
     }
 }
 
@@ -1027,5 +1083,55 @@ mod tests {
             0o751
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn fast_skip_validates_skipped_lines_for_binary_and_utf8() {
+        let directory = Directory::new();
+        std::fs::write(
+            directory.0.path().join("nul_prefix.txt"),
+            b"bad\0line\nok\nok2\n",
+        )
+        .unwrap();
+        let err = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"nul_prefix.txt","offset":2,"limit":2}),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("binary"));
+
+        std::fs::write(
+            directory.0.path().join("bad_utf8_prefix.txt"),
+            b"\xff\xfe\nok\nok2\n",
+        )
+        .unwrap();
+        let err = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"bad_utf8_prefix.txt","offset":2,"limit":2}),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("UTF-8"));
+
+        std::fs::write(
+            directory.0.path().join("many.txt"),
+            (1..=20).map(|i| format!("line-{i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let out = run(
+            directory.dir(),
+            "read",
+            &json!({"filePath":"many.txt","ranges":[{"start":5,"end":6},{"start":15,"end":15}]}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(out.output.contains("5: line-5"));
+        assert!(out.output.contains("6: line-6"));
+        assert!(out.output.contains("15: line-15"));
+        assert!(!out.output.contains("4: line-4"));
+        assert_eq!(out.metadata["totalLines"], 20);
     }
 }

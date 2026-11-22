@@ -86,6 +86,9 @@ impl Echo {
         Ok(true)
     }
     pub fn poll(&mut self) -> Vec<Vec<u8>> {
+        if self.flows.is_empty() {
+            return Vec::new();
+        }
         let mut packets = Vec::new();
         let mut bytes = [0u8; 65535];
         for (key, flow) in &mut self.flows {
@@ -96,15 +99,17 @@ impl Echo {
                 bytes[4..6].copy_from_slice(&key.id.to_be_bytes());
                 bytes[2..4].fill(0);
                 let payload = &mut bytes[..n];
-                let mut pseudo = Vec::new();
-                if let (IpAddr::V6(src), IpAddr::V6(dst)) = (key.remote, key.guest) {
-                    pseudo.extend(src.octets());
-                    pseudo.extend(dst.octets());
-                    pseudo.extend((n as u32).to_be_bytes());
-                    pseudo.extend([0, 0, 0, 58]);
-                }
-                pseudo.extend_from_slice(payload);
-                payload[2..4].copy_from_slice(&checksum(&pseudo).to_be_bytes());
+                let sum = if let (IpAddr::V6(src), IpAddr::V6(dst)) = (key.remote, key.guest) {
+                    let mut pseudo = [0u8; 40];
+                    pseudo[..16].copy_from_slice(&src.octets());
+                    pseudo[16..32].copy_from_slice(&dst.octets());
+                    pseudo[32..36].copy_from_slice(&(n as u32).to_be_bytes());
+                    pseudo[36..40].copy_from_slice(&[0, 0, 0, 58]);
+                    checksum_parts(&[&pseudo, payload])
+                } else {
+                    checksum(payload)
+                };
+                payload[2..4].copy_from_slice(&sum.to_be_bytes());
                 packets.extend(ip_packets(
                     key.remote,
                     key.guest,
@@ -152,9 +157,14 @@ fn header(p: &[u8]) -> Option<(IpAddr, IpAddr, usize, u8)> {
     }
 }
 fn checksum(bytes: &[u8]) -> u16 {
+    checksum_parts(&[bytes])
+}
+fn checksum_parts(parts: &[&[u8]]) -> u16 {
     let mut sum = 0u32;
-    for c in bytes.chunks(2) {
-        sum += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;
+    for bytes in parts {
+        for c in bytes.chunks(2) {
+            sum += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;
+        }
     }
     while sum >> 16 != 0 {
         sum = (sum & 65535) + (sum >> 16);
@@ -217,4 +227,21 @@ pub fn echo_reply(packet: &[u8]) -> bool {
         }
         matches!((proto, packet.get(offset)), (1, Some(0)) | (58, Some(129)))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_echo_poll_is_noop_and_split_checksum_matches_contiguous() {
+        let mut echo = Echo::default();
+        assert!(echo.poll().is_empty());
+        let header = [0x20u8; 40];
+        for payload in [&b"abcdefgh"[..], &b"odd-length-payload!"[..]] {
+            let mut combined = Vec::from(header);
+            combined.extend_from_slice(payload);
+            assert_eq!(checksum_parts(&[&header, payload]), checksum(&combined));
+        }
+    }
 }

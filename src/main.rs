@@ -423,7 +423,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(cfg.as_ref()).map_err(|e| e.to_string())?
                 );
             } else {
                 println!("directory:    {dir}");
