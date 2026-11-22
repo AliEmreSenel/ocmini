@@ -1203,6 +1203,7 @@ mod tests {
             source: Some("127.0.0.1".into()),
             destination: None,
             port: Some(8080),
+            ..Default::default()
         });
         assert_eq!(
             loopback_v4.inbound_bindings(Protocol::Tcp),
@@ -1219,6 +1220,7 @@ mod tests {
             source: Some("::1".into()),
             destination: None,
             port: Some(9090),
+            ..Default::default()
         });
         for proto in [Protocol::Tcp, Protocol::Udp] {
             assert_eq!(
@@ -1236,6 +1238,7 @@ mod tests {
             source: Some("2001:db8::/32".into()),
             destination: None,
             port: Some(8443),
+            ..Default::default()
         });
         assert_eq!(
             explicit_v6.inbound_bindings(Protocol::Tcp),
@@ -1251,12 +1254,14 @@ mod tests {
             source: Some("127.0.0.1".into()),
             destination: None,
             port: Some(8080),
+            ..Default::default()
         });
         mixed_v4.allow.push(Rule {
             protocol: Protocol::Tcp,
             source: Some("10.0.0.0/8".into()),
             destination: None,
             port: Some(8080),
+            ..Default::default()
         });
         assert_eq!(
             mixed_v4.inbound_bindings(Protocol::Tcp),
@@ -1272,6 +1277,7 @@ mod tests {
             source: None,
             destination: None,
             port: Some(7000),
+            ..Default::default()
         });
         assert_eq!(
             wildcard.inbound_bindings(Protocol::Tcp),
@@ -1293,6 +1299,7 @@ mod tests {
             source: Some("127.0.0.1".into()),
             destination: None,
             port: Some(8081),
+            ..Default::default()
         });
         assert_eq!(
             default_allow.inbound_bindings(Protocol::Tcp),

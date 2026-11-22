@@ -427,6 +427,7 @@ mod tests {
             source: Some("127.0.0.1".into()),
             destination: None,
             port: Some(port4),
+            ..Default::default()
         });
         let pub4 = Publisher::new(0, &test_policy(inbound4)).unwrap();
         assert_eq!(pub4.explicit.len(), 1);
@@ -443,6 +444,7 @@ mod tests {
             source: Some("::1".into()),
             destination: None,
             port: Some(port6),
+            ..Default::default()
         });
         let pub6 = Publisher::new(0, &test_policy(inbound6)).unwrap();
         assert_eq!(pub6.explicit.len(), 1);
@@ -459,6 +461,7 @@ mod tests {
             source: Some("::1".into()),
             destination: None,
             port: Some(udp_port6),
+            ..Default::default()
         });
         let udp6 = UdpIngress::new(&test_policy(udp_inbound6)).unwrap();
         assert_eq!(udp6.listeners.len(), 1);
@@ -481,6 +484,7 @@ mod tests {
             source: None,
             destination: None,
             port: Some(port),
+            ..Default::default()
         });
         let publisher = Publisher::new(0, &test_policy(inbound)).unwrap();
         let guest4 = SocketAddr::new(super::super::GUEST4.into(), port);
