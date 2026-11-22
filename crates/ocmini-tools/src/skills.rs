@@ -301,7 +301,7 @@ mod tests {
         .map(|rel| base.join(rel).display().to_string())
         .collect();
         assert_eq!(resources, expected);
-        assert!(out.output.contains("scripts/sub/deep.py"));
+        assert!(out.output.contains(&expected[3]));
         assert!(!out.output.contains("secret.txt"));
     }
 }
