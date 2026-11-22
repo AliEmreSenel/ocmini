@@ -700,8 +700,8 @@ async fn tui_completes_and_runs_configured_commands() {
         json!([
             [["F1 help"], "/rev"],
             [
-                ["/review  Review arguments"],
-                "\t\"alpha beta\" gamma delta\r"
+                ["/revert  Revert", "/review  Review arguments"],
+                "\u{1b}[B\t\"alpha beta\" gamma delta\r"
             ],
             [["Reviewed"], ""]
         ]),
@@ -774,4 +774,238 @@ finally:
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test]
+async fn cli_session_mcp_and_config_subcommands_cover_lifecycle_and_json() {
+    let provider = Provider::start(vec![text_script("first", ""), text_script("forked", "")]).await;
+    let server = TestServer::start(
+        &provider,
+        json!({
+            "mcp": {
+                "demo": {
+                    "type": "local",
+                    "command": ["echo", "hi"],
+                    "enabled": false
+                }
+            }
+        }),
+    )
+    .await;
+
+    // Create a session via `run --directory` (alias for --dir)
+    let out = configured_command(server.root.path(), &server.directory)
+        .args([
+            "run",
+            "--auto",
+            "--directory",
+            ".",
+            "--title",
+            "Original",
+            "hello world",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Fork using -c --fork (not only -s)
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["run", "--auto", "-c", "--fork", "branching out"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // session list --json --roots --limit 1
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "list", "--json", "--roots", "--limit", "1"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let limited: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(limited.len(), 1);
+
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "list", "--json"])
+        .output()
+        .await
+        .unwrap();
+    let all: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(all.len(), 2);
+    let sid = all[0]["id"].as_str().unwrap().to_owned();
+
+    // session rename
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "rename", &sid, "Renamed Title"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Renamed Title"));
+
+    // session show --json
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "show", &sid, "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let shown: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(shown["session"]["title"], "Renamed Title");
+    assert!(!shown["messages"].as_array().unwrap().is_empty());
+
+    // session export
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "export", &sid])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let exported: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(exported["session"]["id"], sid);
+    assert!(exported["messages"].is_array());
+    assert!(exported["todos"].is_array());
+
+    // session fork --json
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "fork", &sid, "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let forked: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let forked_id = forked["id"].as_str().unwrap().to_owned();
+    assert_ne!(forked_id, sid);
+
+    // session delete
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "delete", &forked_id])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["session", "show", &forked_id])
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+
+    // mcp list --json
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["mcp", "list", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let mcps: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(mcps.len(), 1);
+    assert_eq!(mcps[0]["name"], "demo");
+    assert_eq!(mcps[0]["enabled"], false);
+
+    // config --json
+    let out = configured_command(server.root.path(), &server.directory)
+        .args(["config", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let cfg: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(cfg["provider"]["mock"].is_object());
+}
+
+#[tokio::test]
+async fn tui_and_run_share_consistent_cli_flags_and_interactive_quit() {
+    let tui_help = Command::new(env!("CARGO_BIN_EXE_ocmini"))
+        .args(["tui", "--help"])
+        .output()
+        .await
+        .unwrap();
+    assert!(tui_help.status.success());
+    let text = String::from_utf8(tui_help.stdout).unwrap();
+    for flag in [
+        "-m",
+        "--model",
+        "--agent",
+        "--variant",
+        "--fork",
+        "--title",
+        "-f",
+        "--file",
+        "--directory",
+    ] {
+        assert!(text.contains(flag), "tui --help missing {flag}: {text}");
+    }
+
+    let run_help = Command::new(env!("CARGO_BIN_EXE_ocmini"))
+        .args(["run", "--help"])
+        .output()
+        .await
+        .unwrap();
+    assert!(run_help.status.success());
+    let text = String::from_utf8(run_help.stdout).unwrap();
+    for flag in ["-r", "--resume", "--fork", "--dir"] {
+        assert!(text.contains(flag), "run --help missing {flag}: {text}");
+    }
+
+    // Non-TTY `run -i` accepts `/quit` cleanly.
+    let provider = Provider::start(vec![text_script("first reply", "")]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    let mut child = configured_command(server.root.path(), &server.directory)
+        .args(["run", "--auto", "-i", "initial prompt"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"/quit\n").await.unwrap();
+    }
+    let output = child.wait_with_output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("first reply"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tui_runtime_slash_commands_switch_state_and_attach_files() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::write(server.directory.join("notes.txt"), "hello attachment\n").unwrap();
+    tui_terminal(
+        &server,
+        json!([
+            [["F1 help"], "/agent plan\r"],
+            [["agent: plan"], "/model mock/test-model#high\r"],
+            [["model: mock/test-model#high"], "/rename Parity Session\r"],
+            [["title: Parity Session"], "/attach notes.txt\r"],
+            [["attached: notes.txt"], "/exit\r"]
+        ]),
+    )
+    .await;
 }

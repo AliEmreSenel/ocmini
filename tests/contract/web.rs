@@ -175,3 +175,75 @@ async fn settings_edit_project_configuration_and_reject_invalid_results() {
     assert_eq!(snapshot["files"]["project"]["editable"], false);
     assert_eq!(snapshot["effective"]["small_model"], "mock/test-model");
 }
+
+#[tokio::test]
+async fn web_quick_open_and_parity_assets_are_served_cleanly() {
+    let provider = Provider::start(vec![]).await;
+    let server = TestServer::start(&provider, json!({})).await;
+    std::fs::create_dir_all(server.directory.join("src")).unwrap();
+    std::fs::write(server.directory.join("src/widget.rs"), "pub struct Widget;").unwrap();
+
+    // Quick-open find route shares password gate and searches files
+    let anon = reqwest::get(format!(
+        "{}/web/api/fs/find?root={}&query=widget",
+        server.url,
+        query(&server.directory)
+    ))
+    .await
+    .unwrap();
+    assert_eq!(anon.status(), 401);
+
+    let found = json_of(
+        server
+            .get(&format!(
+                "/web/api/fs/find?root={}&query=widget",
+                query(&server.directory)
+            ))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
+    assert_eq!(found["entries"][0]["relative"], "src/widget.rs");
+
+    // Verify embedded assets include accessibility roles and parity controls
+    let html = server.get("/").send().await.unwrap().text().await.unwrap();
+    for marker in [
+        r#"role="tab""#,
+        r#"role="radio""#,
+        r#"role="listbox""#,
+        r#"id="attach-btn""#,
+        r#"id="archived-toggle""#,
+        r#"id="mcp-btn""#,
+        r#"id="instructions""#,
+        r#"id="move-session""#,
+        r#"id="toggle-thinking""#,
+        r#"id="toggle-tools""#,
+        r#"id="theme-toggle""#,
+        r#"id="skill-pick""#,
+    ] {
+        assert!(html.contains(marker), "index.html missing {marker}");
+    }
+
+    let js = server
+        .get("/web/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for marker in [
+        "/api/skill?",
+        "/api/mcp?",
+        "/context",
+        "/instructions/entries",
+        "/inbox/",
+        "/move",
+        "/web/api/fs/find?",
+        "Open subagent",
+    ] {
+        assert!(js.contains(marker), "app.js missing {marker}");
+    }
+}

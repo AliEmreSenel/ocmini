@@ -22,8 +22,10 @@ use crate::attachments::Attachment;
 use crate::client::{parse_answer, shutdown_signal, TextState};
 #[cfg(test)]
 use clipboard::image_attachment;
-use clipboard::{file_attachment, paste_clipboard, pasted_image_path};
-use completion::Completion;
+use clipboard::{
+    copy_text, file_attachment, paste_clipboard, pasted_image_path, resolve_user_path,
+};
+use completion::{Completion, CompletionContext};
 pub(crate) use input::Motion;
 use input::{
     clean_input, input_prefix, page_move, terminal_width, Display, Draft, History, KillRing,
@@ -223,11 +225,177 @@ enum PendingPrompt {
     },
 }
 
+#[derive(Clone, Default)]
+pub(super) struct StatusBar {
+    pub agent: String,
+    pub model: String,
+    pub variant: Option<String>,
+    pub sandbox: Option<String>,
+    pub busy: bool,
+    pub tokens: i64,
+    pub cost: f64,
+}
+
+impl StatusBar {
+    fn from_state(
+        app: &App,
+        session: &crate::types::Session,
+        selected: &PromptRequest,
+        busy: bool,
+    ) -> Self {
+        let agent = selected
+            .agent
+            .as_deref()
+            .or_else(|| {
+                app.config
+                    .extra
+                    .get("default_agent")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("build")
+            .to_owned();
+        let model = display_model(selected.model.as_ref(), &app.config.model);
+        let sandbox = session
+            .sandbox
+            .as_ref()
+            .and_then(|s| s["preset"].as_str())
+            .filter(|p| !p.is_empty() && *p != "off")
+            .map(str::to_owned);
+        let tokens = session.tokens.input
+            + session.tokens.output
+            + session.tokens.reasoning
+            + session.tokens.cache.read
+            + session.tokens.cache.write;
+        Self {
+            agent,
+            model,
+            variant: selected.variant.clone(),
+            sandbox,
+            busy,
+            tokens,
+            cost: session.cost,
+        }
+    }
+}
+
+pub(super) trait HeaderSource {
+    fn format(&self, visibility: Visibility, width: usize) -> String;
+}
+
+impl HeaderSource for str {
+    fn format(&self, visibility: Visibility, _width: usize) -> String {
+        prompt_header(self, visibility)
+    }
+}
+
+impl HeaderSource for String {
+    fn format(&self, visibility: Visibility, _width: usize) -> String {
+        prompt_header(self, visibility)
+    }
+}
+
+impl HeaderSource for StatusBar {
+    fn format(&self, visibility: Visibility, width: usize) -> String {
+        prompt_header_for(self, visibility, width)
+    }
+}
+
+fn compact_tokens(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_usage(tokens: i64, cost: f64) -> Option<String> {
+    if tokens <= 0 && cost <= 0.0 {
+        return None;
+    }
+    let mut out = if tokens > 0 {
+        format!("{} tok", compact_tokens(tokens))
+    } else {
+        String::new()
+    };
+    if cost > 0.0 {
+        if !out.is_empty() {
+            out.push_str(" · ");
+        }
+        if cost < 1.0 {
+            out.push_str(&format!("${cost:.4}"));
+        } else {
+            out.push_str(&format!("${cost:.2}"));
+        }
+    }
+    Some(out)
+}
+
 fn prompt_header(model: &str, visibility: Visibility) -> String {
     format!(
         "{DIM}┌ /help · F1 help · model {model}{}{RESET}",
         visibility.hints()
     )
+}
+
+fn prompt_header_for(status: &StatusBar, visibility: Visibility, width: usize) -> String {
+    let mut parts: Vec<String> = vec!["/help · F1 help".into()];
+    if status.busy {
+        parts.push(format!("{YELLOW}● working{RESET}{DIM}"));
+    }
+    let model_label = match &status.variant {
+        Some(variant) if !variant.is_empty() => format!("{}#{variant}", status.model),
+        _ => status.model.clone(),
+    };
+    let agent = if status.agent.is_empty() {
+        "build"
+    } else {
+        &status.agent
+    };
+    parts.push(format!("{agent} · {model_label}"));
+
+    let mut optional: Vec<String> = Vec::new();
+    if let Some(sandbox) = status.sandbox.as_deref().filter(|s| *s != "off") {
+        optional.push(format!("sandbox {sandbox}"));
+    }
+    if let Some(usage) = format_usage(status.tokens, status.cost) {
+        optional.push(usage);
+    }
+    optional.push(format!(
+        "thinking {} · tools {}",
+        if visibility.thinking { "on" } else { "off" },
+        visibility.tools.label()
+    ));
+
+    let visible_len = |s: &str| {
+        let mut plain = 0usize;
+        let mut rest = s;
+        while !rest.is_empty() {
+            if rest.starts_with("\x1b[") {
+                if let Some(end) = rest[2..].find(|ch: char| ('@'..='~').contains(&ch)) {
+                    rest = &rest[end + 3..];
+                    continue;
+                }
+            }
+            let ch = rest.chars().next().unwrap();
+            plain += 1;
+            rest = &rest[ch.len_utf8()..];
+        }
+        plain
+    };
+
+    let mut line = format!("┌ {}", parts.join(" · "));
+    let mut len = visible_len(&line);
+    for seg in optional {
+        let add = 3 + visible_len(&seg);
+        if len + add <= width {
+            line.push_str(" · ");
+            line.push_str(&seg);
+            len += add;
+        }
+    }
+    format!("{DIM}{line}{RESET}")
 }
 
 /// Local help is shown only on request, never sent to the model.
@@ -258,8 +426,9 @@ fn help_text(fullscreen: bool) -> String {
     format!(
         "\n{BOLD}Help{RESET}\n{commands}\
   /                      Show commands (Up/Down select, Tab completes, Esc hides)\n\
+  @path                  Complete and attach workspace files\n\
   Enter                  Send\n\
-  Alt+Enter              Insert newline\n\
+  Alt/Shift+Enter, Ctrl+J Insert newline\n\
   Up/Down                History on empty draft; move in text\n\
   Left/Right, Home/End   Move caret\n\
   Alt+Left/Right         Move by word (also Ctrl+Left/Right)\n\
@@ -271,14 +440,15 @@ fn help_text(fullscreen: bool) -> String {
   Ctrl+Z                 Undo\n\
   Paste                  Insert all lines\n\
   Ctrl+V/Ctrl+Shift+V    Attach clipboard image\n\
-  Alt+Backspace          Remove latest image\n\
-  Ctrl+U                 Clear draft and images\n\
+  Alt+Backspace          Remove latest attachment\n\
+  Ctrl+U                 Clear draft and attachments\n\
   Ctrl+C                 Abort turn\n\
   Ctrl+L                 Clear screen\n\
   Ctrl+R                 Switch session\n\
   Ctrl+T                 Toggle thinking\n\
   Ctrl+O                 {tools}\n\
 {scroll}\
+  Permissions: y/o once; a always; n/r/Esc reject\n\
   Questions: Tab/Shift+Tab switch; Enter answers/confirms; Esc dismisses\n"
     )
 }
@@ -371,14 +541,6 @@ fn render_confirmation(questions: &[Value], answers: &[Vec<String>]) -> String {
         "{DIM}Enter: send · Tab: edit answers · Esc: dismiss{RESET}\n"
     ));
     out
-}
-
-/// Send the confirmed answers. True when the question prompt is finished.
-fn confirm_question(app: &App, state: &mut PendingPrompt) -> bool {
-    let PendingPrompt::Question { id, answers, .. } = state else {
-        return false;
-    };
-    app.questions.reply(id, answers.clone())
 }
 
 /// Move to the next (positive) or previous (negative) question, wrapping.
@@ -492,9 +654,13 @@ pub(crate) fn decode_event(event: Event) -> Key {
             (KeyCode::Backspace, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                 Key::RemoveAttachment
             }
-            // Plain Enter sends; Alt+Enter inserts a newline. Ctrl+J is reported by
-            // crossterm as a bare Enter, so it is not a distinct binding here.
-            (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::ALT) => Key::NewLine,
+            // Plain Enter sends; Alt+Enter, Shift+Enter and Ctrl+J insert a newline.
+            (KeyCode::Enter, modifiers)
+                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                Key::NewLine
+            }
+            (KeyCode::Char('j'), KeyModifiers::CONTROL) => Key::NewLine,
             (KeyCode::Enter, _) => Key::Enter,
             (KeyCode::Backspace, _) => Key::Backspace,
             (KeyCode::Delete, _) => Key::Delete,
@@ -551,7 +717,10 @@ pub(crate) fn decode_event(event: Event) -> Key {
 
 /// Interactive resume path for `--resume`: needs a real terminal because it
 /// enters raw mode and reads keys before the chat loop exists.
-async fn pick_session(app: &App, directory: Option<&str>) -> Result<crate::types::Session, String> {
+pub(crate) async fn pick_session(
+    app: &App,
+    directory: Option<&str>,
+) -> Result<crate::types::Session, String> {
     if !std::io::stdout().is_terminal() {
         return Err("Session selection needs a terminal; resume by ID with --session ID".into());
     }
@@ -567,6 +736,15 @@ async fn pick_session(app: &App, directory: Option<&str>) -> Result<crate::types
 impl Ui {
     /// Resolve dialog keys before ordinary draft editing. Global controls stay in the main loop.
     fn prompt_key(&mut self, app: &App, key: &Key) -> Option<String> {
+        self.prompt_key_with(&app.perms, &app.questions, key)
+    }
+
+    fn prompt_key_with(
+        &mut self,
+        perms: &crate::permission::PermissionState,
+        questions: &crate::engine::question::QuestionState,
+        key: &Key,
+    ) -> Option<String> {
         if matches!(
             key,
             Key::CtrlD
@@ -582,13 +760,19 @@ impl Ui {
         let state = self.prompt.as_mut()?;
         if let PendingPrompt::Permission(id) = state {
             let reply = match key {
-                Key::Char('o' | 'O') => "once",
+                Key::Char('y' | 'Y' | 'o' | 'O') => "once",
                 Key::Char('a' | 'A') => "always",
-                Key::Char(_) | Key::Esc => "reject",
-                Key::Enter => return Some(String::new()),
-                _ => return None,
+                Key::Char('n' | 'N' | 'r' | 'R') | Key::Esc => "reject",
+                Key::PageUp
+                | Key::PageDown
+                | Key::ScrollTop
+                | Key::ScrollBottom
+                | Key::ScrollUp(_)
+                | Key::ScrollDown(_) => return None,
+                // Ignore unrecognized keys instead of silently rejecting on a stray press.
+                _ => return Some(String::new()),
             };
-            if app.perms.reply(id, reply) {
+            if perms.reply(id, reply) {
                 self.prompt = None;
             }
             return Some(String::new());
@@ -596,8 +780,10 @@ impl Ui {
         let confirming = matches!(state, PendingPrompt::Question { confirm: true, .. });
         match key {
             Key::Enter if confirming => {
-                if confirm_question(app, state) {
-                    self.prompt = None;
+                if let PendingPrompt::Question { id, answers, .. } = state {
+                    if questions.reply(id, answers.clone()) {
+                        self.prompt = None;
+                    }
                 }
                 Some(String::new())
             }
@@ -627,7 +813,7 @@ impl Ui {
             ),
             Key::Esc => {
                 if let PendingPrompt::Question { id, .. } = state {
-                    app.questions.reject(id);
+                    questions.reject(id);
                 }
                 self.prompt = None;
                 Some(String::new())
@@ -651,10 +837,202 @@ impl Ui {
     }
 }
 
-pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
-    let session = if args.resume {
-        pick_session(&app, args.directory.as_deref()).await?
+fn parse_model_spec(spec: &str) -> Result<(crate::types::ModelRef, Option<String>), String> {
+    let trimmed = spec.trim();
+    let (model_str, variant) = match trimmed.split_once('#') {
+        Some((m, v)) => (m.trim(), Some(v.trim().to_owned())),
+        None => (trimmed, None),
+    };
+    let model = crate::types::ModelRef::parse(model_str)?;
+    let variant = variant.filter(|v| !v.is_empty());
+    Ok((model, variant))
+}
+
+fn available_sandbox_presets(app: &App) -> Vec<String> {
+    crate::sessions::sandbox_choices(app, &app.config)
+        .ok()
+        .and_then(|v| {
+            v["presets"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn last_assistant_text(messages: &[crate::types::MessageWithParts]) -> Option<String> {
+    for message in messages.iter().rev() {
+        if message.info.role != "assistant" {
+            continue;
+        }
+        let text: String = message
+            .parts
+            .iter()
+            .filter(|part| part["type"].as_str() == Some("text"))
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn format_model_list(app: &App, selected: &PromptRequest) -> String {
+    let active = display_model(selected.model.as_ref(), &app.config.model);
+    let mut out = format!("\n{BOLD}Model{RESET}: {active}");
+    if let Some(variant) = selected.variant.as_deref() {
+        out.push_str(&format!("#{variant}"));
+    }
+    out.push('\n');
+    let connected = app.auth.connected_for(&app.config);
+    let mut models: Vec<String> = app
+        .config
+        .catalog()
+        .into_iter()
+        .filter(|m| {
+            connected.is_empty()
+                || connected
+                    .iter()
+                    .any(|p| m["providerID"].as_str() == Some(p.as_str()))
+        })
+        .filter_map(|m| {
+            let p = m["providerID"].as_str()?;
+            let id = m["modelID"].as_str()?;
+            let mut label = format!("{p}/{id}");
+            if let Some(variants) = m["variants"].as_object().filter(|v| !v.is_empty()) {
+                let mut keys: Vec<&str> = variants.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                label.push_str(&format!(" {DIM}[{}]{RESET}", keys.join(", ")));
+            }
+            Some(label)
+        })
+        .collect();
+    models.sort_unstable();
+    if models.is_empty() {
+        out.push_str(&format!("{DIM}  No configured models.{RESET}\n"));
     } else {
+        for item in models {
+            out.push_str(&format!("  {item}\n"));
+        }
+    }
+    out
+}
+
+fn format_agent_list(app: &App, selected: &PromptRequest) -> String {
+    let active = selected
+        .agent
+        .as_deref()
+        .or_else(|| {
+            app.config
+                .extra
+                .get("default_agent")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("build");
+    let mut out = format!("\n{BOLD}Agent{RESET}: {active}\n");
+    for agent in crate::inventory::agents_json(&app.config)
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if agent["hidden"] == true {
+            continue;
+        }
+        let name = agent["name"].as_str().unwrap_or_default();
+        let mode = agent["mode"].as_str().unwrap_or("all");
+        let desc = agent["description"].as_str().unwrap_or_default();
+        let mark = if name == active { "›" } else { " " };
+        out.push_str(&format!("  {mark} {name} {DIM}({mode}) {desc}{RESET}\n"));
+    }
+    out
+}
+
+fn format_variant_list(app: &App, selected: &PromptRequest) -> String {
+    let current = selected.variant.as_deref().unwrap_or("default");
+    let mut out = format!("\n{BOLD}Variant{RESET}: {current}\n");
+    let model_ref = selected
+        .model
+        .clone()
+        .or_else(|| crate::types::ModelRef::parse(&app.config.model).ok());
+    let mut variants = Vec::new();
+    if let Some(mref) = model_ref {
+        if let Some(model) = app.config.catalog().into_iter().find(|m| {
+            m["providerID"].as_str() == Some(mref.provider_id.as_str())
+                && m["modelID"].as_str() == Some(mref.model_id.as_str())
+        }) {
+            if let Some(map) = model["variants"].as_object() {
+                variants.extend(map.keys().cloned());
+                variants.sort_unstable();
+            }
+        }
+    }
+    if variants.is_empty() {
+        out.push_str(&format!(
+            "{DIM}  No named variants declared for this model (use /variant default to clear).{RESET}\n"
+        ));
+    } else {
+        out.push_str(&format!("  Available: default, {}\n", variants.join(", ")));
+    }
+    out
+}
+
+fn format_mcp_status(app: &App) -> String {
+    let runtime = app.mcp().status();
+    let mut names: Vec<String> = app.config.mcp.keys().cloned().collect();
+    if let Some(obj) = runtime.as_object() {
+        for key in obj.keys() {
+            if !names.contains(key) {
+                names.push(key.clone());
+            }
+        }
+    }
+    names.sort_unstable();
+    if names.is_empty() {
+        return format!("\n{DIM}No MCP servers configured.{RESET}\n");
+    }
+    let mut out = format!("\n{BOLD}MCP servers{RESET}\n");
+    for name in names {
+        let status_obj = runtime.get(&name);
+        let status = match status_obj.and_then(|v| v["status"].as_str()) {
+            Some(s) => s,
+            None => {
+                if app
+                    .config
+                    .mcp
+                    .get(&name)
+                    .is_some_and(|c| c.enabled == Some(false))
+                {
+                    "disabled"
+                } else {
+                    "configured (not started)"
+                }
+            }
+        };
+        let error = status_obj
+            .and_then(|v| v["error"].as_str())
+            .filter(|e| !e.is_empty())
+            .map(|e| format!(" — {e}"))
+            .unwrap_or_default();
+        out.push_str(&format!("  {name}: {status}{error}\n"));
+    }
+    out
+}
+
+pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
+    if args.fork && args.session.is_none() && !args.continue_last && !args.resume {
+        return Err("--fork requires --session, --continue, or --resume".into());
+    }
+    let mut initial_attachments = Vec::new();
+    for path in &args.file {
+        initial_attachments.push(crate::attachments::from_file(std::path::Path::new(path))?);
+    }
+    let mut session = if args.resume {
+        pick_session(&app, args.directory.as_deref()).await?
+    } else if args.session.is_some() || args.continue_last {
         crate::sessions::open_for_app(
             &app,
             args.directory.as_deref(),
@@ -662,16 +1040,39 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
             args.continue_last,
         )
         .await?
+    } else {
+        let dir = crate::sessions::directory(args.directory.as_deref().unwrap_or("."))?;
+        let mut session =
+            crate::types::Session::new(args.title.as_deref().unwrap_or("tui session"), &dir);
+        if args.title.is_some() {
+            session.title_source = Some(crate::types::TitleSource::Explicit);
+        }
+        crate::sessions::create(&app, session, None).await?
     };
-    let mut session = session;
-    let engine = Engine::new();
+    if args.fork {
+        session = crate::sessions::fork(&app, &session, None).await?;
+    }
     let model_override = args.model.clone();
-    let mut selected = PromptRequest {
+    let selected = PromptRequest {
         model: args.model,
+        agent: args.agent,
+        variant: args.variant,
         ..Default::default()
     };
+    run_session(app, session, selected, model_override, initial_attachments).await
+}
+
+pub(crate) async fn run_session(
+    app: App,
+    mut session: crate::types::Session,
+    mut selected: PromptRequest,
+    model_override: Option<crate::types::ModelRef>,
+    initial_attachments: Vec<Attachment>,
+) -> Result<(), String> {
+    let engine = Engine::new();
     let (mut app, history) = crate::client::activate(&app, &session, &mut selected)?;
-    let mut model_display = display_model(selected.model.as_ref(), &app.config.model);
+    let mut sandbox_presets = available_sandbox_presets(&app);
+    let mut status_bar = StatusBar::from_state(&app, &session, &selected, false);
 
     let fullscreen = matches!(app.config.as_ref().ui.scroll_mode, ScrollMode::Fullscreen);
     let shutdown =
@@ -683,6 +1084,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
     tokio::pin!(shutdown);
 
     let mut draft = Draft::default();
+    draft.attachments = initial_attachments;
     let mut killring = KillRing::default();
     let mut prompt_history = History::default();
     prompt_history.load(session_prompts(&history));
@@ -704,7 +1106,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
         width,
     );
     render_history(&mut display, &mut ui, &history);
-    display.draw(&ui, &draft, terminal_width(), &model_display);
+    display.draw(&ui, &draft, terminal_width(), &status_bar);
 
     loop {
         tokio::select! {
@@ -721,18 +1123,35 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                 let pending_question = matches!(ui.prompt, Some(PendingPrompt::Question { .. }));
                 if let Some(text) = ui.prompt_key(&app, &key) {
                     if !text.is_empty() { display.output(&text, terminal_width()); }
-                    display.draw(&ui, &draft, terminal_width(), &model_display);
+                    display.draw(&ui, &draft, terminal_width(), &status_bar);
                     continue;
                 }
-                if ui.prompt.is_none() && ui.completion.key(&key, &mut draft) {
-                    ui.completion.update(&draft, Registry::new(&app.config));
-                    display.draw(&ui, &draft, terminal_width(), &model_display);
-                    continue;
+                if ui.prompt.is_none() {
+                    let (handled, notice) = ui.completion.apply_key(
+                        &key,
+                        &mut draft,
+                        Some(std::path::Path::new(&session.directory)),
+                    );
+                    if let Some(msg) = notice {
+                        display.output(&format!("\n{YELLOW}{msg}{RESET}\n"), terminal_width());
+                    }
+                    if handled {
+                        let ctx = CompletionContext {
+                            config: &app.config,
+                            auth: &app.auth,
+                            directory: std::path::Path::new(&session.directory),
+                            active_model: selected.model.as_ref(),
+                            sandbox_presets: &sandbox_presets,
+                        };
+                        ui.completion.update_with(&draft, &ctx);
+                        display.draw(&ui, &draft, terminal_width(), &status_bar);
+                        continue;
+                    }
                 }
                 match key {
                     Key::CtrlD => break,
                     Key::CtrlC if pending_permission => { if let Some(PendingPrompt::Permission(id)) = ui.prompt.take() { app.perms.reply(&id, "reject"); } }
-                    Key::CtrlC => { ui.prompt = None; engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
+                    Key::CtrlC => { ui.prompt = None; status_bar.busy = false; engine.abort(&session.id); display.output(&format!("\n{YELLOW}⏹ aborted{RESET}\n"), terminal_width()); }
                     Key::CtrlL => display.clear_screen(),
                     Key::Help => {
                         display.finish_line();
@@ -790,12 +1209,13 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                                         engine.abort(&session.id);
                                         app = scoped;
                                         session = resumed;
+                                        sandbox_presets = available_sandbox_presets(&app);
                                         ui.interactions.clear();
                                         ui.text = TextState::default();
                                         ui.tool_done.clear();
                                         ui.prompt = None;
                                         ui.completion = Completion::default();
-                                        model_display = display_model(selected.model.as_ref(), &app.config.model);
+                                        status_bar = StatusBar::from_state(&app, &session, &selected, false);
                                         draft = Draft::default();
                                         prompt_history.load(session_prompts(&history));
                                         display.output(
@@ -833,7 +1253,8 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                         let command = Registry::new(&app.config).resolve_terminal(&draft.text);
                         let configured = match command {
                             Some((Command::Local(command), arguments)) => {
-                                // Local actions leave attachments in the draft.
+                                let arguments = arguments.to_owned();
+                                // Local actions leave attachments in the draft (except /new and /fork).
                                 match command.action {
                                     LocalAction::Help => {
                                         draft.clear_text();
@@ -851,7 +1272,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                                     LocalAction::Compact => {
                                         let mut part = serde_json::json!({"type":"compaction","auto":false});
                                         if !arguments.is_empty() {
-                                            part["ocminiFocus"] = Value::String(arguments.to_owned());
+                                            part["ocminiFocus"] = Value::String(arguments);
                                         }
                                         display.user_prompt(draft.text.trim(), terminal_width());
                                         draft.clear_text();
@@ -865,13 +1286,299 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                                             display.output(&format!("{RED}error:{RESET} {error}\n"), terminal_width());
                                         }
                                     }
+                                    LocalAction::Model => {
+                                        draft.clear_text();
+                                        if arguments.is_empty() {
+                                            display.output(&format_model_list(&app, &selected), terminal_width());
+                                        } else {
+                                            match parse_model_spec(&arguments) {
+                                                Ok((model_ref, variant)) => {
+                                                    let changed = selected.model.as_ref() != Some(&model_ref);
+                                                    selected.model = Some(model_ref.clone());
+                                                    if let Some(v) = variant {
+                                                        selected.variant = (!matches!(v.as_str(), "default" | "none" | "off")).then_some(v);
+                                                    } else if changed {
+                                                        selected.variant = None;
+                                                    }
+                                                    status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                                    let shown = match &selected.variant {
+                                                        Some(v) => format!("{model_ref}#{v}"),
+                                                        None => model_ref.to_string(),
+                                                    };
+                                                    display.output(&format!("\n{DIM}◦ model: {shown}{RESET}\n"), terminal_width());
+                                                }
+                                                Err(error) => {
+                                                    display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width());
+                                                }
+                                            }
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Agent => {
+                                        draft.clear_text();
+                                        if arguments.is_empty() {
+                                            display.output(&format_agent_list(&app, &selected), terminal_width());
+                                        } else {
+                                            let known = crate::inventory::agents_json(&app.config)
+                                                .as_array()
+                                                .is_some_and(|list| list.iter().any(|a| a["name"].as_str() == Some(arguments.as_str())));
+                                            if known {
+                                                selected.agent = Some(arguments.clone());
+                                                status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                                display.output(&format!("\n{DIM}◦ agent: {arguments}{RESET}\n"), terminal_width());
+                                            } else {
+                                                display.output(&format!("\n{RED}error:{RESET} Unknown agent: {arguments}\n"), terminal_width());
+                                            }
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Variant => {
+                                        draft.clear_text();
+                                        if arguments.is_empty() {
+                                            display.output(&format_variant_list(&app, &selected), terminal_width());
+                                        } else if matches!(arguments.as_str(), "default" | "clear" | "off") {
+                                            selected.variant = None;
+                                            status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                            display.output(&format!("\n{DIM}◦ variant: default{RESET}\n"), terminal_width());
+                                        } else {
+                                            selected.variant = Some(arguments.clone());
+                                            status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                            display.output(&format!("\n{DIM}◦ variant: {arguments}{RESET}\n"), terminal_width());
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::New => {
+                                        draft.clear();
+                                        engine.abort(&session.id);
+                                        let fresh = crate::types::Session::new("tui session", &session.directory);
+                                        match crate::sessions::create(&app, fresh, None).await {
+                                            Ok(created) => {
+                                                selected = PromptRequest { model: model_override.clone(), ..Default::default() };
+                                                match crate::client::activate(&app, &created, &mut selected) {
+                                                    Ok((scoped, history)) => {
+                                                        app = scoped;
+                                                        session = created;
+                                                        sandbox_presets = available_sandbox_presets(&app);
+                                                        ui.interactions.clear();
+                                                        ui.text = TextState::default();
+                                                        ui.tool_done.clear();
+                                                        ui.prompt = None;
+                                                        ui.completion = Completion::default();
+                                                        ui.answer_labelled = false;
+                                                        status_bar = StatusBar::from_state(&app, &session, &selected, false);
+                                                        prompt_history.load(session_prompts(&history));
+                                                        display.clear_screen();
+                                                        display.output(
+                                                            &format!("{BOLD}new session{RESET} {DIM}{} · {}{RESET}\n", session.id, session.directory),
+                                                            terminal_width(),
+                                                        );
+                                                    }
+                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                }
+                                            }
+                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                        }
+                                    }
+                                    LocalAction::Fork => {
+                                        draft.clear_text();
+                                        match crate::sessions::fork(&app, &session, None).await {
+                                            Ok(forked) => {
+                                                match crate::client::activate(&app, &forked, &mut selected) {
+                                                    Ok((scoped, history)) => {
+                                                        app = scoped;
+                                                        session = forked;
+                                                        sandbox_presets = available_sandbox_presets(&app);
+                                                        ui.interactions.clear();
+                                                        ui.text = TextState::default();
+                                                        ui.tool_done.clear();
+                                                        ui.prompt = None;
+                                                        ui.completion = Completion::default();
+                                                        ui.answer_labelled = false;
+                                                        status_bar = StatusBar::from_state(&app, &session, &selected, false);
+                                                        prompt_history.load(session_prompts(&history));
+                                                        display.clear_screen();
+                                                        display.output(
+                                                            &format!("{BOLD}forked{RESET} {DIM}{} · {}{RESET}\n", session.id, session.title),
+                                                            terminal_width(),
+                                                        );
+                                                        render_history(&mut display, &mut ui, &history);
+                                                    }
+                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                }
+                                            }
+                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                        }
+                                    }
+                                    LocalAction::Rename => {
+                                        draft.clear_text();
+                                        if arguments.is_empty() {
+                                            display.output(&format!("\n{YELLOW}usage: /rename <title>{RESET}\n"), terminal_width());
+                                        } else {
+                                            match crate::sessions::update(&app, &session, serde_json::json!({"title": arguments})).await {
+                                                Ok(updated) => {
+                                                    session = updated;
+                                                    display.output(&format!("\n{DIM}◦ title: {}{RESET}\n", clean_input(&session.title)), terminal_width());
+                                                }
+                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            }
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Revert => {
+                                        draft.clear_text();
+                                        if app.store.is_busy(&session.id).unwrap_or(false) {
+                                            display.output(&format!("\n{YELLOW}Stop the current turn before reverting.{RESET}\n"), terminal_width());
+                                        } else {
+                                            match app.store.messages(&session.id) {
+                                                Ok(messages) => {
+                                                    if let Some(last_user) = messages.iter().rev().find(|m| m.info.role == "user") {
+                                                        let restored_text = last_user
+                                                            .parts
+                                                            .iter()
+                                                            .filter(|p| p["type"].as_str() == Some("text"))
+                                                            .filter_map(|p| p["text"].as_str())
+                                                            .collect::<Vec<_>>()
+                                                            .join("\n");
+                                                        match app.store.v2_revert(&session.id, Some(&last_user.info.id)) {
+                                                            Ok(()) => {
+                                                                let history = app.store.messages(&session.id).unwrap_or_default();
+                                                                if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
+                                                                    session = fresh;
+                                                                }
+                                                                ui.text = TextState::default();
+                                                                ui.tool_done.clear();
+                                                                ui.answer_labelled = false;
+                                                                status_bar = StatusBar::from_state(&app, &session, &selected, false);
+                                                                prompt_history.load(session_prompts(&history));
+                                                                display.clear_screen();
+                                                                render_history(&mut display, &mut ui, &history);
+                                                                display.output(&format!("\n{DIM}◦ reverted last turn{RESET}\n"), terminal_width());
+                                                                if !restored_text.is_empty() {
+                                                                    draft.insert_str(&restored_text);
+                                                                }
+                                                            }
+                                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                        }
+                                                    } else {
+                                                        display.output(&format!("\n{YELLOW}Nothing to revert.{RESET}\n"), terminal_width());
+                                                    }
+                                                }
+                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            }
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Mcp => {
+                                        draft.clear_text();
+                                        let mut parts = arguments.split_whitespace();
+                                        match (parts.next(), parts.next()) {
+                                            (Some("connect"), Some(name)) => {
+                                                app.wait_mcp_ready().await;
+                                                match app.mcp().connect_async(name).await {
+                                                    Ok(st) => display.output(&format!("\n{DIM}◦ mcp {name}: {}{RESET}\n", st["status"].as_str().unwrap_or("unknown")), terminal_width()),
+                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                }
+                                            }
+                                            (Some("disconnect"), Some(name)) => {
+                                                match app.mcp().disconnect(name) {
+                                                    Ok(_) => display.output(&format!("\n{DIM}◦ mcp {name}: disconnected{RESET}\n"), terminal_width()),
+                                                    Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                                }
+                                            }
+                                            _ => {
+                                                display.output(&format_mcp_status(&app), terminal_width());
+                                            }
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Sandbox => {
+                                        draft.clear_text();
+                                        if arguments.is_empty() {
+                                            match crate::sessions::sandbox_choices(&app, &app.config) {
+                                                Ok(info) => {
+                                                    let current = session
+                                                        .sandbox
+                                                        .as_ref()
+                                                        .and_then(|s| s["preset"].as_str())
+                                                        .or_else(|| info["default"].as_str())
+                                                        .unwrap_or("off");
+                                                    let presets: Vec<&str> = info["presets"]
+                                                        .as_array()
+                                                        .into_iter()
+                                                        .flatten()
+                                                        .filter_map(Value::as_str)
+                                                        .collect();
+                                                    let forced = info["forced"].as_str().map(|f| format!(" (forced: {f})")).unwrap_or_default();
+                                                    display.output(
+                                                        &format!("\n{BOLD}Sandbox{RESET}: {current}{forced}\n  Presets: {}\n", presets.join(", ")),
+                                                        terminal_width(),
+                                                    );
+                                                }
+                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            }
+                                        } else if app.store.is_busy(&session.id).unwrap_or(false) {
+                                            display.output(&format!("\n{YELLOW}Stop the current turn before switching sandbox.{RESET}\n"), terminal_width());
+                                        } else {
+                                            match crate::sessions::select_sandbox(&app, &session, &arguments) {
+                                                Ok(saved) => {
+                                                    session.sandbox = Some(saved);
+                                                    status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                                    display.output(&format!("\n{DIM}◦ sandbox: {arguments} (applies from next turn){RESET}\n"), terminal_width());
+                                                }
+                                                Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                            }
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Copy => {
+                                        draft.clear_text();
+                                        match app.store.messages(&session.id) {
+                                            Ok(messages) => match last_assistant_text(&messages) {
+                                                Some(reply) => match copy_text(&reply).await {
+                                                    Ok(()) => display.output(
+                                                        &format!("\n{DIM}◦ copied last reply to clipboard ({} chars){RESET}\n", reply.chars().count()),
+                                                        terminal_width(),
+                                                    ),
+                                                    Err(error) => display.output(&format!("\n{YELLOW}{error}{RESET}\n"), terminal_width()),
+                                                },
+                                                None => display.output(&format!("\n{YELLOW}No assistant reply to copy.{RESET}\n"), terminal_width()),
+                                            },
+                                            Err(error) => display.output(&format!("\n{RED}error:{RESET} {error}\n"), terminal_width()),
+                                        }
+                                        display.scroll_bottom();
+                                    }
+                                    LocalAction::Attach => {
+                                        draft.clear_text();
+                                        if arguments.is_empty() {
+                                            display.output(&format!("\n{YELLOW}usage: /attach <path>{RESET}\n"), terminal_width());
+                                        } else {
+                                            match resolve_user_path(&arguments, &session.directory)
+                                                .and_then(|path| crate::attachments::from_file(&path))
+                                            {
+                                                Ok(attachment) => {
+                                                    let name = clean_input(&attachment.filename);
+                                                    draft.attachments.push(attachment);
+                                                    display.output(&format!("\n{DIM}◦ attached: {name}{RESET}\n"), terminal_width());
+                                                }
+                                                Err(error) => display.output(&format!("\n{YELLOW}{error}{RESET}\n"), terminal_width()),
+                                            }
+                                        }
+                                        display.scroll_bottom();
+                                    }
                                     LocalAction::Quit => {
                                         display.user_prompt(&draft.text, terminal_width());
                                         break;
                                     }
                                 }
-                                ui.completion.update(&draft, Registry::new(&app.config));
-                                display.draw(&ui, &draft, terminal_width(), &model_display);
+                                let ctx = CompletionContext {
+                                    config: &app.config,
+                                    auth: &app.auth,
+                                    directory: std::path::Path::new(&session.directory),
+                                    active_model: selected.model.as_ref(),
+                                    sandbox_presets: &sandbox_presets,
+                                };
+                                ui.completion.update_with(&draft, &ctx);
+                                display.draw(&ui, &draft, terminal_width(), &status_bar);
                                 continue;
                             }
                             Some((Command::Configured { name, .. }, arguments)) => {
@@ -997,21 +1704,66 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     }
                     _ => {}
                 }
-                ui.completion.update(&draft, Registry::new(&app.config));
-                display.draw(&ui, &draft, terminal_width(), &model_display);
+                let ctx = CompletionContext {
+                    config: &app.config,
+                    auth: &app.auth,
+                    directory: std::path::Path::new(&session.directory),
+                    active_model: selected.model.as_ref(),
+                    sandbox_presets: &sandbox_presets,
+                };
+                ui.completion.update_with(&draft, &ctx);
+                display.draw(&ui, &draft, terminal_width(), &status_bar);
             }
             event = events.recv() => {
                 display.erase();
                 match event {
                     Ok(event) => {
                         if !crate::client::accepts(&app.store, &session.id, &event) { continue; }
+                        let is_current = crate::client::event_session(&event)
+                            .is_none_or(|id| id == session.id);
+                        if is_current {
+                            match event.kind {
+                                crate::events::EventKind::Session(crate::events::SessionKind::Status) => {
+                                    let kind = event.properties["status"]["type"].as_str().unwrap_or_default();
+                                    status_bar.busy = matches!(kind, "busy" | "retry");
+                                }
+                                crate::events::EventKind::Session(crate::events::SessionKind::Idle) => {
+                                    status_bar.busy = false;
+                                    if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
+                                        session = fresh;
+                                        status_bar = StatusBar::from_state(&app, &session, &selected, false);
+                                    }
+                                }
+                                crate::events::EventKind::Part(crate::events::PartKind::Updated)
+                                    if event.properties["part"]["type"].as_str() == Some("step-finish") =>
+                                {
+                                    if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
+                                        session = fresh;
+                                        status_bar = StatusBar::from_state(&app, &session, &selected, status_bar.busy);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         let event_session = crate::client::event_session(&event).unwrap_or(&session.id);
                         display.apply(render_event(&mut ui, &event, event_session), terminal_width());
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let history = app.store.messages(&session.id)?;
+                        if let Ok(Some(fresh)) = app.store.get_session(&session.id) {
+                            session = fresh;
+                        }
+                        let busy = app.store.is_busy(&session.id).unwrap_or(false);
+                        status_bar = StatusBar::from_state(&app, &session, &selected, busy);
                         ui = Ui { visibility: ui.visibility, ..Default::default() };
-                        ui.completion.update(&draft, Registry::new(&app.config));
+                        let ctx = CompletionContext {
+                            config: &app.config,
+                            auth: &app.auth,
+                            directory: std::path::Path::new(&session.directory),
+                            active_model: selected.model.as_ref(),
+                            sandbox_presets: &sandbox_presets,
+                        };
+                        ui.completion.update_with(&draft, &ctx);
                         display.clear_screen();
                         display.output(&format!("{YELLOW}⚠ event stream resynchronized{RESET}\n"), terminal_width());
                         render_history(&mut display, &mut ui, &history);
@@ -1021,7 +1773,7 @@ pub async fn run(app: App, args: crate::TuiArgs) -> Result<(), String> {
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                display.draw(&ui, &draft, terminal_width(), &model_display);
+                display.draw(&ui, &draft, terminal_width(), &status_bar);
             }
         }
     }
@@ -1925,5 +2677,119 @@ mod tests {
         assert_eq!(overridden.model.as_ref(), Some(&cli_model));
         assert_eq!(overridden.agent.as_deref(), Some("explore"));
         assert!(overridden.variant.is_none());
+    }
+
+    #[test]
+    fn newline_shortcuts_support_shift_enter_ctrl_j_and_alt_enter() {
+        for (code, modifiers) in [
+            (KeyCode::Enter, KeyModifiers::ALT),
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(
+                decode_event(Event::Key(KeyEvent::new(code, modifiers))),
+                Key::NewLine,
+                "{code:?} + {modifiers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_prompt_accepts_run_keys_and_ignores_stray_characters() {
+        let perms = crate::permission::PermissionState::default();
+        let questions = crate::engine::question::QuestionState::default();
+        let make = |perms: &crate::permission::PermissionState| {
+            let (req, rx) = perms.ask_for_tool(
+                serde_json::json!({"sessionID": "ses_perm", "tool": "bash"}),
+                "bash",
+                "ls",
+                &serde_json::json!({"command": "ls"}),
+            );
+            let ui = Ui {
+                prompt: Some(PendingPrompt::Permission(req.id)),
+                ..Default::default()
+            };
+            (ui, rx)
+        };
+
+        // Stray characters do NOT dismiss or reject the permission prompt.
+        let (mut ui, mut rx) = make(&perms);
+        assert_eq!(
+            ui.prompt_key_with(&perms, &questions, &Key::Char('x')),
+            Some(String::new())
+        );
+        assert_eq!(
+            ui.prompt_key_with(&perms, &questions, &Key::Char(' ')),
+            Some(String::new())
+        );
+        assert_eq!(
+            ui.prompt_key_with(&perms, &questions, &Key::Enter),
+            Some(String::new())
+        );
+        assert!(ui.prompt.is_some());
+        assert!(rx.try_recv().is_err());
+
+        // y / o -> once
+        assert_eq!(
+            ui.prompt_key_with(&perms, &questions, &Key::Char('y')),
+            Some(String::new())
+        );
+        assert!(ui.prompt.is_none());
+        assert_eq!(rx.try_recv().unwrap().decision, "once");
+
+        let (mut ui, mut rx) = make(&perms);
+        assert_eq!(
+            ui.prompt_key_with(&perms, &questions, &Key::Char('o')),
+            Some(String::new())
+        );
+        assert_eq!(rx.try_recv().unwrap().decision, "once");
+
+        // a -> always
+        let (mut ui, mut rx) = make(&perms);
+        assert_eq!(
+            ui.prompt_key_with(&perms, &questions, &Key::Char('a')),
+            Some(String::new())
+        );
+        assert_eq!(rx.try_recv().unwrap().decision, "always");
+
+        // n / r / Esc -> reject
+        for key in [Key::Char('n'), Key::Char('r'), Key::Esc] {
+            let (mut ui, mut rx) = make(&perms);
+            assert_eq!(
+                ui.prompt_key_with(&perms, &questions, &key),
+                Some(String::new())
+            );
+            assert!(ui.prompt.is_none());
+            assert_eq!(rx.try_recv().unwrap().decision, "reject");
+        }
+    }
+
+    #[test]
+    fn model_spec_and_status_bar_render_rich_metadata() {
+        let (m, v) = super::parse_model_spec("openai/gpt-5#high").unwrap();
+        assert_eq!(m.provider_id, "openai");
+        assert_eq!(m.model_id, "gpt-5");
+        assert_eq!(v.as_deref(), Some("high"));
+
+        let (m, v) = super::parse_model_spec("mock/test-model").unwrap();
+        assert_eq!(m.provider_id, "mock");
+        assert_eq!(m.model_id, "test-model");
+        assert!(v.is_none());
+
+        let bar = super::StatusBar {
+            agent: "plan".into(),
+            model: "mock/m".into(),
+            variant: Some("high".into()),
+            sandbox: Some("read-only".into()),
+            busy: true,
+            tokens: 1_500,
+            cost: 0.0125,
+        };
+        let wide = plain(&super::prompt_header_for(&bar, Visibility::default(), 160));
+        assert!(wide.contains("● working"), "{wide}");
+        assert!(wide.contains("plan · mock/m#high"), "{wide}");
+        assert!(wide.contains("sandbox read-only"), "{wide}");
+        assert!(wide.contains("1.5k tok · $0.0125"), "{wide}");
+        assert!(wide.contains("thinking on · tools brief"), "{wide}");
     }
 }

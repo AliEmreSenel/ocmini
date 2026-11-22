@@ -154,6 +154,96 @@ impl Draft {
         self.text.get(start..cursor)
     }
 
+    /// When the cursor is in the first argument of a slash command (e.g.
+    /// `/model foo`), returns `(command_name, typed_prefix)`.
+    pub fn command_argument_prefix(&self) -> Option<(&str, &str)> {
+        if self.selection().is_some() {
+            return None;
+        }
+        let (name, suffix) = crate::commands::split_slash(&self.text)?;
+        if suffix.is_empty() {
+            return None;
+        }
+        let cmd_end = self.text.len() - suffix.len();
+        let cursor = self.offset();
+        if cursor <= cmd_end {
+            return None;
+        }
+        let after_cmd = &self.text[cmd_end..cursor];
+        let trimmed = after_cmd.trim_start_matches([' ', '\t']);
+        if trimmed.len() == after_cmd.len() {
+            return None;
+        }
+        if trimmed.contains(char::is_whitespace) {
+            return None;
+        }
+        Some((name, trimmed))
+    }
+
+    /// Replace the first argument token of a slash command with `value`.
+    pub fn complete_argument(&mut self, value: &str) {
+        let Some((_, suffix)) = crate::commands::split_slash(&self.text) else {
+            return;
+        };
+        let cmd_end = self.text.len() - suffix.len();
+        let ws_len = suffix
+            .bytes()
+            .take_while(|b| *b == b' ' || *b == b'\t')
+            .count();
+        let start = cmd_end + ws_len;
+        let rest = &self.text[start..];
+        let token_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let end = start + token_len;
+        self.replace(start..end, value, false);
+        let after = start + value.len();
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .take_while(|(index, _)| *index < after)
+            .count();
+    }
+
+    /// When the cursor is inside an `@path` token (preceded by start-of-input or
+    /// whitespace), returns `(at_byte_index, token_end_byte, prefix_after_at)`.
+    pub fn at_file_token(&self) -> Option<(usize, usize, &str)> {
+        if self.selection().is_some() {
+            return None;
+        }
+        let cursor = self.offset();
+        let before = &self.text[..cursor];
+        let token_start = before.rfind(char::is_whitespace).map_or(0, |idx| {
+            idx + before[idx..].chars().next().unwrap().len_utf8()
+        });
+        let token = &before[token_start..];
+        let prefix = token.strip_prefix('@')?;
+        let rest = &self.text[cursor..];
+        let tail_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        Some((token_start, cursor + tail_len, prefix))
+    }
+
+    /// Replace the current `@path` token with `@value ` (with trailing space if none).
+    pub fn complete_at_file(&mut self, value: &str) {
+        let Some((start, end, _)) = self.at_file_token() else {
+            return;
+        };
+        let has_space_after = self.text[end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace);
+        let replacement = if has_space_after {
+            format!("@{value}")
+        } else {
+            format!("@{value} ")
+        };
+        let after = start + replacement.len();
+        self.replace(start..end, &replacement, false);
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .take_while(|(index, _)| *index < after)
+            .count();
+    }
+
     /// Replace the entire command name, even when completing from inside it.
     pub fn complete_command(&mut self, name: &str) {
         let Some((current, suffix)) = crate::commands::split_slash(&self.text) else {
@@ -592,7 +682,7 @@ fn active_input<'a>(
             (prefix, &draft.text, draft.cursor, draft.selection())
         }
         Some(PendingPrompt::Permission(_)) => {
-            (prefix, "[o]nce [a]lways [r]eject", usize::MAX, None)
+            (prefix, "[y/o]nce [a]lways [n/r]eject", usize::MAX, None)
         }
         _ => (prefix, &draft.text, draft.cursor, draft.selection()),
     }
@@ -1598,9 +1688,15 @@ impl Display {
         rows[top..(top + self.page).min(rows.len())].to_vec()
     }
 
-    pub fn draw(&mut self, ui: &Ui, draft: &Draft, width: usize, model: &str) {
+    pub fn draw<H: super::HeaderSource + ?Sized>(
+        &mut self,
+        ui: &Ui,
+        draft: &Draft,
+        width: usize,
+        status: &H,
+    ) {
         let (prefix, text, cursor, sel) = active_input(ui, draft);
-        let header = super::prompt_header(model, ui.visibility);
+        let header = status.format(ui.visibility, width);
         let (_, height) = terminal_size();
         let changed = self.input.as_ref().is_none_or(|cache| {
             cache.prefix != prefix
@@ -1640,6 +1736,7 @@ impl Display {
         }
         let layout = self.input.as_ref().unwrap().layout.clone();
         let available = height.saturating_sub(layout.rows.len());
+        let prefix_marker = ui.completion.display_prefix();
         let suggestions: Vec<_> = if ui.prompt.is_none() {
             ui.completion
                 .visible(available.saturating_sub(1).min((height / 3).max(1)))
@@ -1650,7 +1747,11 @@ impl Display {
                         " ".into()
                     };
                     let description = clean_input(description.lines().next().unwrap_or_default());
-                    let row = format!("  {marker} /{name}  {description}");
+                    let row = if description.is_empty() {
+                        format!("  {marker} {prefix_marker}{name}")
+                    } else {
+                        format!("  {marker} {prefix_marker}{name}  {description}")
+                    };
                     let row = wrap_row(&row, width).into_iter().next().unwrap_or_default();
                     format!("{row}{RESET}")
                 })

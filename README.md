@@ -18,9 +18,9 @@ ocmini serve --hostname 127.0.0.1 --port 4096
 ocmini web                                # same server; open http://127.0.0.1:4096/
 ```
 
-The input shows a compact status row that updates in place. Type `/help` or press F1 for the full shortcut list; F1 keeps your current draft. Help is handled locally.
+The input shows a live status row (active agent, model/variant, sandbox preset, busy state, usage, and transcript toggles) that updates in place. Type `/help` or press F1 for the full shortcut and slash-command list (`/model`, `/agent`, `/variant`, `/new`, `/fork`, `/rename`, `/revert`, `/mcp`, `/sandbox`, `/copy`, `/attach`, `/context`, `/compact`, `/quit`/`/exit`); F1 keeps your current draft. Local slash commands and `@path` workspace file attachments support Tab completion.
 
-Terminal controls: Enter sends, bracketed paste inserts multiline text, Ctrl+V (or Ctrl+Shift+V when forwarded by the terminal) attaches a clipboard image, and pasting an image file path attaches it. Alt+Backspace removes the latest attachment; Backspace also removes it when the text is empty. Ctrl+U clears text and attachments. Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector. The draft wraps across rows and preserves pasted line breaks. Backspace removes whole Unicode graphemes and stays within the draft.
+Terminal controls: Enter sends, Alt+Enter / Shift+Enter / Ctrl+J insert a newline, bracketed paste inserts multiline text, Ctrl+V (or Ctrl+Shift+V when forwarded by the terminal) attaches a clipboard image, `/attach <path>` or `@path` completion attaches any supported file (code, text, PDF, image), and pasting an image file path attaches it. Alt+Backspace removes the latest attachment; Backspace also removes it when the text is empty. Ctrl+U clears text and attachments. Ctrl+C aborts the current turn, Ctrl+D exits, Ctrl+R opens the session selector. Interactive permissions accept `y`/`o` (once), `a` (always), and `n`/`r`/`Esc` (reject) and ignore unrecognized keys. The draft wraps across rows and preserves pasted line breaks. Backspace removes whole Unicode graphemes and stays within the draft.
 
 Undo records changes rather than copying the draft. Consecutive typing is one undo step, and sending a prompt or switching sessions clears undo history. History is limited to 1 MiB and 1,000 edits; a deletion too large to fit clears undo history. Large text pastes do not multiply memory use with each subsequent keystroke.
 
@@ -61,12 +61,13 @@ To use it with T3 Code, set the OpenCode provider's binary path to the installed
 
 `ocmini serve` (also available as `ocmini web`) serves a browser interface at `/` alongside the API, so you can code from any device that can reach the server. It prints the address on stderr after the unchanged listening banner. The page is built into the binary: no Node.js, build step, CDN or extra process.
 
-- **Chat:** every saved session (including terminal and T3 chats), grouped by project or filtered to the current one, with search, rename, archive and delete. Opening a chat switches to its project; streamed answers, reasoning and tool calls (with edit diffs); model, variant and agent selection; steer or queue delivery while the agent works; Stop (or Esc) interrupts; file attachments by picker, paste or drop; `/` lists configured commands and `/compact`; rewind to or fork from any of your messages.
+- **Chat:** every saved session (including terminal and T3 chats), grouped by project or filtered to the current one or **Archived** sessions (with unarchive), with search, rename, archive, delete, and directory move; subagent tool calls link directly to child transcripts, and background permission/question notifications jump to their session on click; streamed answers, reasoning (with `Ctrl+T` visibility toggle) and tool calls (with edit diffs and `Ctrl+O` brief/full/grouped cycling); model, variant and agent selection; skill attachment picker; steer or queue delivery while the agent works (with live steer ↔ queue toggle on pending items); Stop (or Esc) interrupts; file attachments by picker, paste or drop; prompt history (`Up`/`Down`); `/` lists configured commands plus `/compact`, `/context`, and `/help`; session keyed instructions editor; rewind to or fork from any of your messages.
+- **MCP & Theme:** header controls open an MCP status and connect/disconnect panel and cycle the light/dark/system theme.
 - **Shared sessions:** any number of browsers or devices can open the same chat on one server. Each sees the live stream, the same pending inputs, approvals and questions, and can steer or queue while the agent works. Steers are taken at the next model step boundary. A chat that another ocmini process is running, such as T3's own server, is followed from its saved history every 2 seconds while it is open and running there. New input waits until that process finishes, since its live state, approvals and interrupts belong to it.
 - **Approvals and questions** appear as cards above the composer and are answered in place.
 - **Sandbox per session:** the chat header picks the sandbox preset. A new session starts directly under the chosen preset. Changing an existing root session's preset requires it to be idle: its runner and background jobs stop, and the next turn uses the new settings. Subagents keep their parent's sandbox, and `--sandbox-preset` locks the choice.
 - **Settings (⚙):** default model, small and title models, default sandbox and compaction switches, saved to the global or project `opencode.json`. The merged configuration is validated after each save, and an invalid result restores the file. JSONC files with comments are opened in the editor instead of being rewritten. Everything else (providers, agents, permissions, MCP, hooks) is edited in the file.
-- **Files:** a lazily loaded tree with new file/folder, rename/move and delete, and a tabbed editor with line numbers, indentation keys and Ctrl+S. Saves are atomic and refuse to overwrite a file that changed on disk since it was opened (for example by the agent) unless you confirm. Clean open files reload after the agent edits them. "Attach" adds the current file to the next prompt.
+- **Files:** a lazily loaded tree with quick-open filename search (`Ctrl+P`), new file/folder, rename/move and delete, and a tabbed editor with line numbers, indentation keys and Ctrl+S. Saves are atomic and refuse to overwrite a file that changed on disk since it was opened (for example by the agent) unless you confirm. Clean open files reload after the agent edits them. "Attach" adds the current file to the next prompt.
 
 Click the project path in the header to open another directory or a known project. The layout switches between chat and editor on narrow screens. Text files are streamed to the browser rather than buffered on the server. The editor opens binary or non-UTF-8 files read-only or not at all.
 
@@ -77,16 +78,23 @@ The interface uses the same v2 HTTP/SSE API as other clients, plus `/web/api/*` 
 ```sh
 ocmini --continue                         # latest session in this project
 ocmini --resume                           # interactive session selector
-ocmini session list                       # saved IDs, titles and directories
+ocmini session list [--json] [--limit N] [--roots] # saved IDs, titles and directories
+ocmini session show <id> [--json]         # inspect session and messages
+ocmini session rename <id> <title>        # rename a session
+ocmini session fork <id> [--json]         # fork a session
+ocmini session export <id>                # export session, messages and todos as JSON
+ocmini session delete <id>                # delete a session and its children
+ocmini mcp list [--json]                  # inspect configured MCP servers
+ocmini config [--json]                    # inspect effective configuration
 ocmini --session ses_…                    # resume by ID
 ocmini session list --directory ~/project # filter by project
 ```
 
 The selector lists saved sessions with live search (title, ID, directory), a cycling sort order (updated/created/title, Tab) and arrow/page navigation; Enter resumes, Esc cancels. `Ctrl+R` opens it inside the chat to switch sessions.
 
-A new session is named after the first line of its first prompt, so the list shows what each conversation was about instead of `tui session`. A title you set (`ocmini run --title …`, `PATCH /session`) is kept.
+A new session is named after the first line of its first prompt, so the list shows what each conversation was about instead of `tui session`. A title you set (`--title …`, `PATCH /session`) is kept.
 
-`--continue` and `--session` also work with `ocmini tui`. Resuming shows the saved conversation and keeps its last model and agent; `--model` overrides the model. An explicit session ID uses the saved project directory. A normal launch starts a new session.
+`ocmini` / `ocmini tui` and `ocmini run` share consistent session flags: `-m`/`--model`, `--agent`, `--variant`, `--title`, `-f`/`--file`, `--dir`/`--directory`, `-c`/`--continue`, `-s`/`--session`, `-r`/`--resume`, and `--fork` (works with `--session`, `--continue`, or `--resume`). Resuming shows the saved conversation and keeps its last model and agent; `--model` overrides the model. An explicit session ID uses the saved project directory. A normal launch starts a new session.
 
 ## One-shot prompts
 
@@ -94,13 +102,13 @@ A new session is named after the first line of its first prompt, so the list sho
 ocmini run "explain this project"            # new session, prints the answer
 git diff | ocmini run "review this diff"     # piped stdin appends to the prompt
 ocmini run --continue "and the tests?"       # keep the latest session here
-ocmini run -s ses_… --fork "try another way" # fork a session by ID
+ocmini run -c --fork "try another way"       # fork the latest (or -s <id>) session
 ocmini run --format json "summarize"         # JSONL: step_start, text, step_finish
 ocmini run -f screenshot.png "what changed?" # attach files (repeatable)
 ocmini run --auto -m provider/model "…"      # allow tools without asking
 ```
 
-`run` drives the same engine as the TUI: sessions, agents, models, tools, permissions and questions all behave the same. Text mode prints the agent/model header, tool lines and the streamed answer. `--thinking` also prints chain of thought. `--format json` emits one JSON object per line (`step_start`, `text`, `step_finish`, `tool_use`, and `reasoning` with `--thinking`) for scripts. In a non-interactive run, shell, file mutations, subagents, web fetches and MCP tool calls require `--auto`. Other tools follow their configured permissions. A terminal can answer approval prompts with `[y]es/[a]lways/[n]o`. With `--auto`, the CLI approves pending tool requests for that invocation. Explicit denies still apply. `--interactive` (`-i`) keeps prompting after the first answer (exit with `/exit` or Ctrl+D); `ocmini` without `run` is the full TUI. Flags: `--agent`, `--variant`, `--title`, `--dir`, `--command`, `--model`.
+`run` drives the same engine as the TUI: sessions, agents, models, tools, permissions and questions all behave the same. Text mode prints the agent/model header, tool lines and the streamed answer. `--thinking` also prints chain of thought. `--format json` emits one JSON object per line (`step_start`, `text`, `step_finish`, `tool_use`, and `reasoning` with `--thinking`) for scripts. In a non-interactive run, shell, file mutations, subagents, web fetches and MCP tool calls require `--auto`. Other tools follow their configured permissions. A terminal can answer approval prompts with `[y]es/[a]lways/[n]o`. With `--auto`, the CLI approves pending tool requests for that invocation. Explicit denies still apply. `--interactive` (`-i`) hands off into the full interactive TUI on that session after the first turn when attached to a TTY (falling back to a line loop accepting `/exit` and `/quit` when not on a TTY). Flags: `--agent`, `--variant`, `--title`, `--dir`/`--directory`, `--command`, `--model`, `-r`/`--resume`, `--fork`.
 
 ## What stays
 

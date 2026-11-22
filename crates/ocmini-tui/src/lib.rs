@@ -9,9 +9,19 @@ fn parse_model(value: &str) -> Result<types::ModelRef, String> {
 #[derive(Args, Default)]
 #[group(id = "tui_options")]
 pub struct TuiArgs {
-    #[arg(long, value_name = "PROVIDER/MODEL", value_parser = parse_model)]
+    #[arg(short = 'm', long, value_name = "PROVIDER/MODEL", value_parser = parse_model)]
     pub model: Option<types::ModelRef>,
-    #[arg(long, value_name = "DIR")]
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub variant: Option<String>,
+    /// Title for a new session
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Attach a file (repeatable)
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    pub file: Vec<String>,
+    #[arg(long, alias = "dir", value_name = "DIR")]
     pub directory: Option<String>,
     /// Resume the latest top-level session in this directory
     #[arg(short = 'c', long = "continue", conflicts_with = "session")]
@@ -27,6 +37,9 @@ pub struct TuiArgs {
         conflicts_with = "continue_last"
     )]
     pub resume: bool,
+    /// Fork the resumed session instead of continuing it
+    #[arg(long)]
+    pub fork: bool,
 }
 
 #[derive(Args, Default)]
@@ -39,8 +52,16 @@ pub struct RunArgs {
     /// Resume a session by ID, using its saved directory
     #[arg(short = 's', long, value_name = "ID")]
     pub session: Option<String>,
+    /// Pick a saved session interactively (search and sort)
+    #[arg(
+        short = 'r',
+        long,
+        conflicts_with = "session",
+        conflicts_with = "continue_last"
+    )]
+    pub resume: bool,
     /// Fork the resumed session instead of continuing it
-    #[arg(long, requires = "session")]
+    #[arg(long)]
     pub fork: bool,
     #[arg(short = 'm', long, value_name = "PROVIDER/MODEL", value_parser = parse_model)]
     pub model: Option<types::ModelRef>,
@@ -61,7 +82,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub thinking: bool,
     /// Directory for a new session (defaults to the current directory)
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, alias = "directory", value_name = "DIR")]
     pub dir: Option<String>,
     /// Enter the interactive TUI after the turn
     #[arg(short = 'i', long)]

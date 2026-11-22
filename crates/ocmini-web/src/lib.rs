@@ -62,6 +62,7 @@ fn files<S: Clone + Send + Sync + 'static>() -> Router<S> {
         )
         .route("/web/api/info", get(info))
         .route("/web/api/fs/list", get(list))
+        .route("/web/api/fs/find", get(find))
         .route("/web/api/fs/read", get(read))
         .route("/web/api/fs/write", put(write))
         .route("/web/api/fs/mkdir", post(mkdir))
@@ -244,6 +245,84 @@ async fn list(Query(query): Query<PathQuery>) -> Result<Json<Value>> {
             "path": path.to_string_lossy(),
             "parent": parent,
             "entries": entries.into_iter().map(|e| e.2).collect::<Vec<_>>(),
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct FindQuery {
+    root: String,
+    #[serde(default)]
+    query: String,
+    limit: Option<usize>,
+}
+
+async fn find(Query(query): Query<FindQuery>) -> Result<Json<Value>> {
+    let root = absolute(&query.root)?;
+    let needle = query.query.trim().to_lowercase();
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let include_hidden = needle.starts_with('.') || needle.contains("/.");
+    blocking(move || {
+        if !root.is_dir() {
+            return Err(WebError::invalid(format!(
+                "{} is not a directory",
+                root.display()
+            )));
+        }
+        let mut stack = vec![root.clone()];
+        let mut hits: Vec<(u8, String, String)> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if matches!(name_str.as_ref(), ".git" | "target" | "node_modules") {
+                    continue;
+                }
+                if !include_hidden && name_str.starts_with('.') {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let Ok(rel) = path.strip_prefix(&root) else {
+                    continue;
+                };
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let rel_lower = rel_str.to_lowercase();
+                if !needle.is_empty() && !rel_lower.contains(&needle) {
+                    continue;
+                }
+                let rank = if needle.is_empty() || name_str.to_lowercase().starts_with(&needle) {
+                    0
+                } else if rel_lower.starts_with(&needle) {
+                    1
+                } else {
+                    2
+                };
+                hits.push((rank, rel_str, path.to_string_lossy().into_owned()));
+            }
+        }
+        hits.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        hits.truncate(limit);
+        let entries: Vec<Value> = hits
+            .into_iter()
+            .map(|(_, relative, path)| json!({"relative": relative, "path": path}))
+            .collect();
+        Ok(Json(json!({
+            "root": root.to_string_lossy(),
+            "entries": entries,
         })))
     })
     .await
@@ -677,5 +756,47 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(!root.path().join("a").exists());
+    }
+
+    #[tokio::test]
+    async fn find_searches_workspace_files_and_skips_git() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/ui")).unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.path().join("src/ui/panel.rs"), "").unwrap();
+        std::fs::write(root.path().join(".git/config"), "").unwrap();
+
+        let (status, body) = call(
+            "GET",
+            &format!("/web/api/fs/find?root={}&query=panel", query(root.path())),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let found: Value = serde_json::from_slice(&body).unwrap();
+        let rels: Vec<_> = found["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["relative"].as_str().unwrap())
+            .collect();
+        assert_eq!(rels, ["src/ui/panel.rs"]);
+
+        let (status, body) = call(
+            "GET",
+            &format!("/web/api/fs/find?root={}", query(root.path())),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let all: Value = serde_json::from_slice(&body).unwrap();
+        let rels: Vec<_> = all["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["relative"].as_str().unwrap())
+            .collect();
+        assert_eq!(rels, ["src/main.rs", "src/ui/panel.rs"]);
     }
 }
