@@ -65,11 +65,13 @@ pub(super) fn compaction_messages(
     policy: &CompactionPolicy,
 ) -> (Vec<Value>, Vec<Value>) {
     let first = usize::from(has_summary);
+    let is_user_turn =
+        |message: &Value| message["role"] == "user" && message[provider::SYNTHETIC_CONTEXT] != true;
     let user = messages
         .iter()
         .enumerate()
         .skip(first)
-        .rfind(|(_, message)| message["role"] == "user")
+        .rfind(|(_, message)| is_user_turn(message))
         .map(|(index, _)| index);
     let budget = policy.settings.recent_bytes(policy.usable());
     let retain = budget > 0 && policy.settings.tail_turns != Some(0);
@@ -83,7 +85,7 @@ pub(super) fn compaction_messages(
                 .enumerate()
                 .skip(first)
                 .rev()
-                .filter(|(_, message)| message["role"] == "user")
+                .filter(|(_, message)| is_user_turn(message))
                 .nth(usize::try_from(turns.saturating_sub(1)).unwrap_or(usize::MAX))
                 .map(|(index, _)| index)
         })
@@ -390,6 +392,12 @@ pub(super) async fn summarize_history(
             &completion.finish,
             &completion.usage,
         )?;
+        if !matches!(completion.finish.as_str(), "stop" | "end_turn" | "stop_sequence") {
+            return Err(format!(
+                "Compaction did not finish (provider finish reason: {}); original history retained",
+                completion.finish
+            ).into());
+        }
         let summary = provider::complete_text(app, &context, completion.text, Some(cancel)).await?;
         let text = compaction_summary(app, &context, summary, source_bytes, cancel).await?;
         let now = now_ms();

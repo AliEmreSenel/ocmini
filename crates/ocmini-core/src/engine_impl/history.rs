@@ -83,6 +83,17 @@ pub(super) fn build_messages(
     project_messages(history, chat, model)
 }
 
+fn model_provenance(info: &MessageInfo) -> (Option<&str>, Option<&str>) {
+    (
+        info.provider_id
+            .as_deref()
+            .or_else(|| info.model.as_ref().map(|m| m.provider_id.as_str())),
+        info.model_id
+            .as_deref()
+            .or_else(|| info.model.as_ref().map(|m| m.model_id.as_str())),
+    )
+}
+
 pub(super) fn project_messages(
     mut history: Vec<MessageWithParts>,
     chat: bool,
@@ -100,22 +111,26 @@ pub(super) fn project_messages(
     let mut run: Option<ChatRun> = None;
     let mut turn_model: Option<(String, String)> = None;
     let start = if let Some(index) = summary {
-        let text = crate::types::text_parts(&history[index].parts)
+        let checkpoint = &mut history[index];
+        let (source_provider, source_model) = model_provenance(&checkpoint.info);
+        let text = crate::types::text_parts(&checkpoint.parts)
             .collect::<Vec<_>>()
             .join("\n");
         out.push(json!({"role":"user","content":format!("Continuation summary of the earlier conversation:\n{text}")}));
-        for part in &mut history[index].parts {
+        for part in &mut checkpoint.parts {
             if let Some(value) = part.get_mut("compactionRecent") {
                 if let Value::Array(recent) = value.take() {
                     out.extend(recent.into_iter().map(|mut message| {
                         let meta = &message["providerMetadata"];
                         if model.is_some_and(|model| {
-                            meta["provider"] == "openai-chat"
+                            meta.is_object()
                                 && (meta["providerID"]
                                     .as_str()
+                                    .or(source_provider)
                                     .is_some_and(|id| id != model.provider_id)
                                     || meta["modelID"]
                                         .as_str()
+                                        .or(source_model)
                                         .is_some_and(|id| id != model.model_id))
                         }) {
                             message
@@ -136,11 +151,10 @@ pub(super) fn project_messages(
             continue;
         }
         if message.info.role == "user" {
-            turn_model = message
-                .info
-                .provider_id
-                .clone()
-                .zip(message.info.model_id.clone());
+            let (provider, model) = model_provenance(&message.info);
+            turn_model = provider
+                .zip(model)
+                .map(|(p, m)| (p.to_owned(), m.to_owned()));
             flush_chat_run(&mut out, run.take());
             let mut content = Vec::new();
             for part in &message.parts {
@@ -250,24 +264,21 @@ pub(super) fn project_messages(
         for part in &message.parts {
             if part["ocminiInstructionPath"].is_string() {
                 if let Some(text) = part["text"].as_str() {
-                    tail.push(json!({"role":"user","content":text}));
+                    tail.push(
+                        json!({"role":"user","content":text,provider::SYNTHETIC_CONTEXT:true}),
+                    );
                 }
             }
         }
         if !attachments.is_empty() {
-            tail.push(json!({"role":"user","content":attachments}));
+            tail.push(
+                json!({"role":"user","content":attachments,provider::SYNTHETIC_CONTEXT:true}),
+            );
         }
         let compatible = model.is_none_or(|model| {
-            let provider = message
-                .info
-                .provider_id
-                .as_deref()
-                .or_else(|| turn_model.as_ref().map(|m| m.0.as_str()));
-            let source_model = message
-                .info
-                .model_id
-                .as_deref()
-                .or_else(|| turn_model.as_ref().map(|m| m.1.as_str()));
+            let (provider, source_model) = model_provenance(&message.info);
+            let provider = provider.or_else(|| turn_model.as_ref().map(|m| m.0.as_str()));
+            let source_model = source_model.or_else(|| turn_model.as_ref().map(|m| m.1.as_str()));
             provider.is_none_or(|id| id == model.provider_id)
                 && source_model.is_none_or(|id| id == model.model_id)
         });
@@ -334,12 +345,9 @@ pub(super) fn project_messages(
             .and_then(Value::as_array)
         {
             flush_chat_run(&mut out, run.take());
-            out.extend(
-                feedback
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|text| json!({"role":"user","content":text})),
-            );
+            out.extend(feedback.iter().filter_map(Value::as_str).map(
+                |text| json!({"role":"user","content":text,provider::SYNTHETIC_CONTEXT:true}),
+            ));
         }
     }
     flush_chat_run(&mut out, run.take());

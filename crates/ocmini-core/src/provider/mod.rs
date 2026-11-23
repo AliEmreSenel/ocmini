@@ -16,6 +16,10 @@ pub use catalog::normalize_provider;
 pub use hooks::{complete_text, prepare_hooks, TEXT_TRANSFORMED};
 pub use replay::reconcile_text;
 
+/// Internal context messages belong to the surrounding user turn. Keep this
+/// marker through compaction, but never expose it to providers or hooks.
+pub(crate) const SYNTHETIC_CONTEXT: &str = "ocminiSynthetic";
+
 use crate::auth::{configured_credential, AuthEntry, AuthStore};
 use crate::config::{deep_merge, ProviderCfg};
 use crate::types::{ProviderEvent, Tokens};

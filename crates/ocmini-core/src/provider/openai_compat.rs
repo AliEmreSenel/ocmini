@@ -34,6 +34,7 @@ fn request_body(settings: &Settings, req: &ChatRequest) -> Result<Value, String>
         if let Some(map) = message.as_object_mut() {
             map.remove("is_error");
             map.remove(super::TEXT_TRANSFORMED);
+            map.remove(super::SYNTHETIC_CONTEXT);
             if let Some(metadata) = map.remove("providerMetadata") {
                 if metadata["provider"] == "openai-chat" {
                     let source = &metadata["message"];

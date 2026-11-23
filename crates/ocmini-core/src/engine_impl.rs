@@ -856,6 +856,100 @@ mod tests {
         assert_eq!(assistants[1]["content"], "done");
     }
 
+    #[test]
+    fn legacy_steps_inherit_the_typed_user_model() {
+        let (store, sid) = two_step_turn_store();
+        let source = ModelRef {
+            provider_id: "source".into(),
+            model_id: "old-model".into(),
+        };
+        let mut prompt = store.message(&sid, "prompt").unwrap().unwrap();
+        prompt.info.model = Some(source.clone());
+        store.add_message(&prompt).unwrap();
+        let target = ModelRef {
+            model_id: "new-model".into(),
+            ..source.clone()
+        };
+        let (same, _) = build_messages(&store, &sid, "prompt", true, Some(&source)).unwrap();
+        assert!(same[1].get("providerMetadata").is_some());
+        let (switched, _) = build_messages(&store, &sid, "prompt", true, Some(&target)).unwrap();
+        assert!(switched[1].get("providerMetadata").is_none());
+        assert!(switched[3].get("providerMetadata").is_none());
+        assert_eq!(switched[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn compacted_native_replay_respects_checkpoint_model_provenance() {
+        let source = ModelRef {
+            provider_id: "source".into(),
+            model_id: "same-api-model".into(),
+        };
+        for protocol in ["anthropic", "openai-responses", "openai-chat"] {
+            let native = json!({"provider":protocol,"model":"same-api-model",
+                "content":[{"type":"thinking","thinking":"private","signature":"signed"}],
+                "output":[{"type":"reasoning","encrypted_content":"encrypted"}],
+                "message":{"reasoning_content":"private"}});
+            let mut info = MessageInfo::assistant("session", None, &source, "compaction");
+            info.summary = Some(true);
+            info.time.completed = Some(now_ms());
+            let history = vec![MessageWithParts {
+                info,
+                parts: vec![
+                    json!({"type":"text","text":"checkpoint","compactionRecent":[
+                        {"role":"assistant","content":"public answer","providerMetadata":native}
+                    ]}),
+                ],
+            }];
+            let (same, _) =
+                history::project_messages(history.clone(), false, Some(&source)).unwrap();
+            assert_eq!(same[1]["providerMetadata"], native);
+            for target in [
+                ModelRef {
+                    provider_id: "other".into(),
+                    ..source.clone()
+                },
+                ModelRef {
+                    model_id: "other-model".into(),
+                    ..source.clone()
+                },
+            ] {
+                let (switched, _) =
+                    history::project_messages(history.clone(), false, Some(&target)).unwrap();
+                assert!(
+                    switched[1].get("providerMetadata").is_none(),
+                    "{protocol} must not replay foreign native state"
+                );
+                assert_eq!(switched[1]["content"], "public answer");
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_real_user_turns_across_injected_context() {
+        let (store, sid) = two_step_turn_store();
+        let mut first = store.message(&sid, "step-1").unwrap().unwrap();
+        first.parts.push(json!({"id":"instruction","messageID":"step-1","sessionID":sid,
+            "type":"ocmini_instruction","ocminiInstructionPath":"nested/AGENTS.md","text":"nested rules"}));
+        first.parts[0]["state"]["metadata"]["attachments"] = json!([
+            {"type":"image","mimeType":"image/png","data":"YQ=="}
+        ]);
+        first
+            .info
+            .extra
+            .insert("ocminiHookFeedback".into(), json!(["Continue checking"]));
+        store.add_message(&first).unwrap();
+        for chat in [true, false] {
+            let (messages, _) = build_messages(&store, &sid, "prompt", chat, None).unwrap();
+            let mut policy = retention(8000);
+            policy.settings.tail_turns = Some(1);
+            let (_, recent) = compaction_messages(messages.clone(), false, &policy);
+            assert_eq!(
+                recent, messages,
+                "injected instructions and media are part of the original turn"
+            );
+        }
+    }
+
     fn retention(bytes: u64) -> CompactionPolicy {
         CompactionPolicy {
             context: Some(bytes),

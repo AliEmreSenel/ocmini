@@ -589,6 +589,10 @@ async fn nested_read_instructions_reach_model_once() {
     assert!(first.contains(suffix.trim_matches('"')));
     let second = provider.request().await.to_string();
     assert_eq!(second.matches("nested instruction marker").count(), 1);
+    assert!(
+        !second.contains("ocminiSynthetic"),
+        "internal turn markers must stay off the wire"
+    );
     let v2_messages: Value = server
         .get(&format!("/api/session/{id}/message"))
         .send()
