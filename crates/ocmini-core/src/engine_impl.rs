@@ -753,24 +753,33 @@ mod tests {
     }
 
     #[test]
-    fn chat_requests_merge_the_turn_into_one_assistant_message() {
+    fn chat_requests_keep_reasoning_and_tool_results_in_step_order() {
         let (store, sid) = two_step_turn_store();
         let (messages, _) = build_messages(&store, &sid, "prompt", true, None).unwrap();
         let assistants: Vec<&Value> = messages
             .iter()
             .filter(|m| m["role"] == "assistant")
             .collect();
-        assert_eq!(assistants.len(), 1, "every step of the turn merges");
+        assert_eq!(assistants.len(), 2, "each step follows its tool results");
         let assistant = assistants[0];
-        assert_eq!(assistant["content"], "done");
+        assert!(assistant.get("content").is_none());
         assert_eq!(assistant["tool_calls"][0]["function"]["name"], "read");
         assert_eq!(
             assistant["providerMetadata"]["message"]["reasoning_content"],
-            "first thinking\nsecond thinking"
+            "first thinking"
         );
         assert_eq!(
             assistant["providerMetadata"]["message"]["reasoning_details"],
-            json!([{"id":"rs_1","data":"one"},{"id":"rs_2","data":"two"}])
+            json!([{"id":"rs_1","data":"one"}])
+        );
+        assert_eq!(assistants[1]["content"], "done");
+        assert_eq!(
+            assistants[1]["providerMetadata"]["message"]["reasoning_content"],
+            "second thinking"
+        );
+        assert_eq!(
+            assistants[1]["providerMetadata"]["message"]["reasoning_details"],
+            json!([{"id":"rs_2","data":"two"}])
         );
         let assistant_index = messages
             .iter()
@@ -779,9 +788,10 @@ mod tests {
         let tool_index = messages.iter().position(|m| m["role"] == "tool").unwrap();
         assert!(
             assistant_index < tool_index,
-            "tool results follow the merged assistant message"
+            "tool results follow the step that requested them"
         );
         assert_eq!(messages[tool_index]["tool_call_id"], "call_1");
+        assert_eq!(messages[tool_index + 1]["content"], "done");
     }
 
     #[test]
@@ -795,7 +805,7 @@ mod tests {
         let (legacy, _) = build_messages(&store, &sid, "prompt", true, Some(&target)).unwrap();
         assert_eq!(
             legacy[1]["providerMetadata"]["message"]["reasoning_content"],
-            "first thinking\nsecond thinking"
+            "first thinking"
         );
         let mut prompt = store.message(&sid, "prompt").unwrap().unwrap();
         prompt.info.provider_id = Some("provider".into());
@@ -813,7 +823,8 @@ mod tests {
         store.add_message(&second).unwrap();
         let (switched, _) = build_messages(&store, &sid, "prompt", true, Some(&target)).unwrap();
         assert!(switched[1].get("providerMetadata").is_none());
-        assert_eq!(switched[1]["content"], "done");
+        assert!(switched[3].get("providerMetadata").is_none());
+        assert_eq!(switched[3]["content"], "done");
         assert_eq!(switched[1]["tool_calls"][0]["id"], "call_1");
         assert_eq!(switched[2]["tool_call_id"], "call_1");
         first.info.model_id = Some("model".into());

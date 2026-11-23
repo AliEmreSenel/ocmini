@@ -14,9 +14,8 @@ pub(super) async fn load_messages(
         .map_err(|error| error.to_string())?
 }
 
-/// One turn of assistant output, merged into the single assistant message
-/// OpenCode's Chat Completions converter sends: every step's chain of thought
-/// in order, every step's tool calls, then the tool results.
+/// One assistant step, with its own reasoning and parallel tool calls followed
+/// by their results. Later steps must stay after the evidence they consumed.
 #[derive(Default)]
 struct ChatRun {
     texts: Vec<String>,
@@ -248,18 +247,15 @@ pub(super) fn project_messages(
                 }
             }
         }
-        let mut has_user_tail = false;
         for part in &message.parts {
             if part["ocminiInstructionPath"].is_string() {
                 if let Some(text) = part["text"].as_str() {
                     tail.push(json!({"role":"user","content":text}));
-                    has_user_tail = true;
                 }
             }
         }
         if !attachments.is_empty() {
             tail.push(json!({"role":"user","content":attachments}));
-            has_user_tail = true;
         }
         let compatible = model.is_none_or(|model| {
             let provider = message
@@ -308,9 +304,7 @@ pub(super) fn project_messages(
                 }
             }
             chat_run.tail.extend(tail);
-            if has_user_tail {
-                flush_chat_run(&mut out, run.take());
-            }
+            flush_chat_run(&mut out, run.take());
         } else {
             let replay_metadata = metadata.filter(|_| compatible);
             if !text.is_empty() || !calls.is_empty() || replay_metadata.is_some() {

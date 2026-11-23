@@ -77,9 +77,8 @@ async fn prepare_turn(
         cfg.provider(&model.provider_id),
         &app.auth,
     );
-    // Chat adapters replay chain of thought once per turn, so history is
-    // merged per turn there. Responses and Anthropic rebuild each step from
-    // their own opaque payloads and need the per-step shape kept.
+    // Replay every protocol in step order. Chat reconstructs assistant fields;
+    // Responses and Anthropic also replay their own opaque payloads.
     let mut base = ChatRequest {
         model: model.model_id.clone(),
         system,
