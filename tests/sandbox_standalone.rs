@@ -339,6 +339,11 @@ for preset in ['read-only', 'locked-read']:
   try:
    while True:
     assert time.monotonic() < deadline, repr(data)
+    # READY can precede the supervisor's foreground handoff. Wait for the
+    # command's group before sending input or Ctrl-C to the terminal.
+    if b'READY' in data and not sent and os.tcgetpgrp(fd) != pid:
+     os.write(fd, b'\x03' if interrupt else b'input\n')
+     sent = True
     if not select.select([fd], [], [], 0.1)[0]: continue
     try: chunk = os.read(fd, 4096)
     except OSError as error:
@@ -346,9 +351,6 @@ for preset in ['read-only', 'locked-read']:
      raise
     if not chunk: break
     data += chunk
-    if b'READY' in data and not sent:
-     os.write(fd, b'\x03' if interrupt else b'input\n')
-     sent = True
    assert (b'RESULT:130:True' if interrupt else b'RESULT:19:True') in data, repr(data)
    if not interrupt: assert b'TTY:input' in data, repr(data)
   finally:

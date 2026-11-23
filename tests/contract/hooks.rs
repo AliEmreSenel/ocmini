@@ -359,7 +359,10 @@ pathlib.Path('finalizer_started').write_text('yes')
 time.sleep(1.5)"#;
     let observer = r#"import json,sys,pathlib
 r=json.load(sys.stdin)
-pathlib.Path('recovered_event').write_text(json.dumps(r['events'][0]))"#;
+# Publish only after the JSON has been written and closed.
+path=pathlib.Path('recovered_event.tmp')
+path.write_text(json.dumps(r['events'][0]))
+path.rename('recovered_event')"#;
     let mut config = hook_config(vec![registration("turn.end.after", after)]);
     config["ocmini"]["hooks"]["observers"] = json!([{"id":"recover-terminal","on":"ocmini.turn.ended","delivery":"durable","command":[PYTHON,"-S","-c",observer]}]);
     let mut server = TestServer::start(&provider, config).await;

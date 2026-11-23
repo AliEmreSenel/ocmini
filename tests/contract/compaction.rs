@@ -1,6 +1,71 @@
 use super::*;
 
 #[tokio::test]
+async fn incomplete_compaction_keeps_original_history_after_restart() {
+    let mut truncated = text_script("Partial checkpoint", "");
+    truncated.chunks.last_mut().unwrap()["choices"][0]["finish_reason"] = json!("length");
+    let mut provider = Provider::start(vec![
+        text_script("Original answer", ""),
+        truncated,
+        text_script("Continued", ""),
+    ])
+    .await;
+    let mut server = TestServer::start(&provider, json!({})).await;
+    let sid = server.session(allow()).await;
+    server
+        .post(
+            &format!("/session/{sid}/message"),
+            &prompt("original", "Never remove the original constraint"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    provider.request().await;
+    let response = server
+        .post(
+            &format!("/session/{sid}/summarize"),
+            &json!({"providerID":"mock","modelID":"test-model"}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !response.status().is_success(),
+        "an output-limited summary is not a complete checkpoint"
+    );
+    provider.request().await;
+    let messages = server.messages(&sid).await;
+    assert!(!messages.iter().any(|m| m["info"]["summary"] == true));
+    let failed = messages
+        .iter()
+        .find(|m| !m["info"]["error"].is_null())
+        .unwrap();
+    assert!(failed["info"]["error"].to_string().contains("length"));
+    assert_eq!(
+        failed["info"]["tokens"]["output"], 7,
+        "failed summary usage is still recorded"
+    );
+    server.restart().await;
+    server
+        .post(
+            &format!("/session/{sid}/message"),
+            &prompt("continue", "Continue"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let next = provider.request().await;
+    let next = next.to_string();
+    assert!(next.contains("Never remove the original constraint"));
+    assert!(next.contains("Original answer"));
+    assert!(!next.contains("Partial checkpoint"));
+}
+
+#[tokio::test]
 async fn one_tool_turn_can_compact_proactively_repeatedly() {
     let mut scripts = Vec::new();
     for step in 0..4 {
