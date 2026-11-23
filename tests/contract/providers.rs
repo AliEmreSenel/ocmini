@@ -391,11 +391,9 @@ async fn retry_exhaustion_reports_a_visible_failure() {
 }
 
 #[tokio::test]
-async fn chat_requests_merge_reasoning_of_every_step_into_one_assistant_message() {
-    // OpenCode's Chat Completions converter replays chain of thought as
-    // reasoning_content on the assistant message. ocmini merges a turn's
-    // steps into that single message: one assistant message per turn, the
-    // steps' reasoning concatenated in order, tool calls and results kept.
+async fn chat_requests_replay_each_steps_reasoning_after_previous_tool_results() {
+    // Keep reasoning paired with its own tool calls, after previous results.
+    // Flattening a turn would make later decisions precede their evidence.
     let step = |thinking: &str, id: &str| {
         Script::ok(vec![
             json!({"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": thinking}, "finish_reason": null}]}),
@@ -438,7 +436,7 @@ async fn chat_requests_merge_reasoning_of_every_step_into_one_assistant_message(
     assert_eq!(second[1]["reasoning_content"], "first thinking");
     assert_eq!(second[1]["tool_calls"][0]["id"], "call_one");
     assert_eq!(second[2]["role"], "tool");
-    let third = provider.request().await; // step 3: the whole turn is replayed
+    let third = provider.request().await; // step 3: both steps replay in order
     let third: Vec<Value> = third["messages"]
         .as_array()
         .unwrap()
@@ -448,19 +446,19 @@ async fn chat_requests_merge_reasoning_of_every_step_into_one_assistant_message(
         .collect();
     assert_eq!(
         third.iter().filter(|m| m["role"] == "assistant").count(),
-        1,
-        "both steps merge into a single assistant message"
+        2,
+        "each step retains its own assistant message"
     );
-    assert_eq!(
-        third[1]["reasoning_content"],
-        "first thinking\nsecond thinking"
-    );
+    assert_eq!(third[1]["reasoning_content"], "first thinking");
     assert_eq!(third[1]["tool_calls"][0]["id"], "call_one");
-    assert_eq!(third[1]["tool_calls"][1]["id"], "call_two");
+    assert_eq!(third[1]["tool_calls"].as_array().unwrap().len(), 1);
     assert_eq!(third[2]["role"], "tool");
     assert_eq!(third[2]["tool_call_id"], "call_one");
-    assert_eq!(third[3]["role"], "tool");
-    assert_eq!(third[3]["tool_call_id"], "call_two");
+    assert_eq!(third[3]["role"], "assistant");
+    assert_eq!(third[3]["reasoning_content"], "second thinking");
+    assert_eq!(third[3]["tool_calls"][0]["id"], "call_two");
+    assert_eq!(third[4]["role"], "tool");
+    assert_eq!(third[4]["tool_call_id"], "call_two");
 }
 
 #[tokio::test]
